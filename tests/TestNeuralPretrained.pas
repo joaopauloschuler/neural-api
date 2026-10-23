@@ -1482,6 +1482,20 @@ type
     procedure TestStableDiffusionDeepCacheOpenCL;
     // SDUNetSelfAttentionNames / SDUNetPAGLayerIndices on tiny_sd15: diffusers'
     // module names, re.search patterns, an unmatched pattern refused.
+    // MultiDiffusion on the pico SD pipeline: a canvas of one window (the
+    // window equal to the image, then clamped down to it) is bit for bit the
+    // plain Denoise under DDIM + CFG, Euler a, DeepCache, ControlNet,
+    // T2I-Adapter and img2img.
+    procedure TestStableDiffusionPanoramaOneWindowParity;
+    // A 24x16 canvas, 16x16 windows every 8 pixels (2 windows sharing 4
+    // latent columns): one guided DDIM step equals each window run alone where
+    // one window covers a cell and their mean in the overlap; several steps,
+    // circular windows and Euler a stay finite (one canvas noise per step);
+    // the refused combinations raise.
+    procedure TestStableDiffusionPanoramaTwoWindows;
+    // VaeTileSize: a tile covering the image is the plain decode; a smaller one
+    // runs TiledVaeDecode at the image size.
+    procedure TestStableDiffusionVaeTiling;
     procedure TestStableDiffusionPAGLayerNames;
     // PerturbedGuidance with PerturbedScale 0 (or < 0) bit-identical to none.
     procedure TestStableDiffusionPAGScaleZero;
@@ -49010,6 +49024,289 @@ end;
 // noise, sampled VAE latents, a 16x12 image): strength 0.6 of 5 guided steps
 // with DDIM, PNDM, DPM++ 2M, Euler and Euler a (replayed step noise), and DDIM
 // at strength 1.
+// Fills Image (Width, Height, Channels) with a fixed 0..255 pattern.
+procedure FillSDTestPattern(Image: TNNetVolume; Width, Height,
+  Channels: integer);
+var
+  X, Y, D: integer;
+begin
+  Image.ReSize(Width, Height, Channels);
+  for Y := 0 to Height - 1 do
+    for X := 0 to Width - 1 do
+      for D := 0 to Channels - 1 do
+        Image[X, Y, D] := (X * 37 + Y * 71 + D * 113) mod 256;
+end;
+
+// Max |Canvas - expected| for two windows of WindowCells columns at x = 0
+// and StrideCells: Alone0's cells where only window 0 covers, Alone1's where
+// only window 1 does, their mean in the overlap.
+function SDTwoWindowCanvasDiff(Canvas, Alone0, Alone1: TNNetVolume;
+  WindowCells, StrideCells: integer): double;
+var
+  X, Y, D: integer;
+  Expected: TNeuralFloat;
+begin
+  Result := 0;
+  for Y := 0 to Canvas.SizeY - 1 do
+    for X := 0 to Canvas.SizeX - 1 do
+      for D := 0 to Canvas.Depth - 1 do
+      begin
+        if X < StrideCells then Expected := Alone0[X, Y, D]
+        else if X >= WindowCells then Expected := Alone1[X - StrideCells, Y, D]
+        else Expected := (Alone0[X, Y, D] + Alone1[X - StrideCells, Y, D]) / 2;
+        Result := Max(Result, Abs(Canvas[X, Y, D] - Expected));
+      end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPanoramaOneWindowParity;
+const
+  Side = 16;
+  StepCount = 3;
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNet: TStableDiffusionControlNet;
+  Adapter: TStableDiffusionT2IAdapter;
+  Img2Img: TStableDiffusionImg2Img;
+  Embeds, Initial, Plain, Windowed, HintImage: TNNetVolume;
+
+  // Denoise from Initial; the global RNG (Euler a, the img2img sample)
+  // restarts so both runs draw the same noise.
+  procedure RunInto(Latents: TNNetVolume);
+  begin
+    Latents.Copy(Initial);
+    RandSeed := 7;
+    Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents);
+  end;
+
+  procedure CheckOneWindow(const Name: string);
+  begin
+    Pipeline.PanoramaWindowWidth := 0;
+    Pipeline.PanoramaWindowHeight := 0;
+    RunInto(Plain);
+    AssertEquals(Name + ': plain, no windows', 0,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    Pipeline.PanoramaWindowWidth := Side;
+    Pipeline.PanoramaWindowHeight := Side;
+    RunInto(Windowed);
+    AssertEquals(Name + ': one window', 1,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    AssertEquals(Name + ': one window = plain', 0,
+      MaxAbsVolumeDiff(Plain, Windowed), 0);
+    Pipeline.PanoramaWindowWidth := 1024;
+    Pipeline.PanoramaWindowHeight := 1024;
+    RunInto(Windowed);
+    AssertEquals(Name + ': clamped window = plain', 0,
+      MaxAbsVolumeDiff(Plain, Windowed), 0);
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  Adapter := TStableDiffusionT2IAdapter.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_t2i_adapter/config.json')));
+  Img2Img := TStableDiffusionImg2Img.Create();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Windowed := TNNetVolume.Create;
+  HintImage := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompt('a red cube on a table', Embeds);
+    Pipeline.MakeInitialLatents(Side, Side, 3, Initial);
+    CheckOneWindow('ddim cfg');
+    Pipeline.Sampler := smEulerAncestral;
+    CheckOneWindow('euler a');
+    Pipeline.Sampler := smDDIM;
+    Pipeline.DeepCacheInterval := 2;
+    CheckOneWindow('deepcache');
+    Pipeline.DeepCacheInterval := 1;
+    FillSDTestPattern(HintImage, Side, Side, 3);
+    ControlNet.SetControlImage(HintImage);
+    ControlNet.ConditioningScale := 0.5;
+    Pipeline.Conditioner := ControlNet;
+    CheckOneWindow('controlnet');
+    FillSDTestPattern(HintImage, Side, Side, 1);
+    Adapter.SetHintImage(HintImage);
+    Adapter.ConditioningScale := 0.8;
+    Pipeline.Conditioner := Adapter;
+    CheckOneWindow('t2i-adapter');
+    FillSDTestPattern(HintImage, Side, Side, 3);
+    Img2Img.SetImage(HintImage);
+    Img2Img.Strength := 0.6;
+    Pipeline.Conditioner := Img2Img;
+    CheckOneWindow('img2img');
+  finally
+    HintImage.Free;
+    Windowed.Free;
+    Plain.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    Img2Img.Free;
+    Adapter.Free;
+    ControlNet.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPanoramaTwoWindows;
+const
+  CanvasWidth = 24;
+  Side = 16;
+  // Latent cells: a 12x8 canvas, 8x8 windows at x = 0 and 4.
+  GridW = 12;
+  GridH = 8;
+  WindowCells = 8;
+  StrideCells = 4;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Windows: TMultiDiffusionWindows;
+  Embeds, Initial, Latents, Crop: TNNetVolume;
+  Alone: array[0..1] of TNNetVolume;
+  WindowPos, ValuePos: integer;
+  MaxDiff: double;
+
+  procedure CheckRefused(const Name: string);
+  begin
+    Latents.Copy(Initial);
+    try
+      Pipeline.Denoise(Embeds, CanvasWidth, Side, 2, Latents);
+      Fail(Name + ' must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  Windows := TMultiDiffusionWindows.Create();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Crop := TNNetVolume.Create;
+  Alone[0] := TNNetVolume.Create;
+  Alone[1] := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompt('a wide mountain valley', Embeds);
+    Pipeline.MakeInitialLatents(CanvasWidth, Side, 4, Initial);
+    AssertEquals('canvas grid', GridW, Initial.SizeX);
+    // Each window's latents alone through one plain guided DDIM step.
+    Windows.Plan(GridW, GridH, WindowCells, WindowCells, StrideCells,
+      StrideCells);
+    AssertEquals('reference windows', 2, Windows.WindowCount);
+    for WindowPos := 0 to 1 do
+    begin
+      Windows.GatherWindow(Initial, WindowPos, Crop);
+      Pipeline.Denoise(Embeds, Side, Side, 1, Crop);
+      Alone[WindowPos].Copy(Crop);
+    end;
+    Pipeline.PanoramaWindowWidth := Side;
+    Pipeline.PanoramaWindowHeight := Side;
+    Pipeline.PanoramaStride := StrideCells * Pipeline.VaeScaleFactor;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, CanvasWidth, Side, 1, Latents);
+    AssertEquals('two windows', 2, Pipeline.ImageStats.PanoramaWindowCount);
+    AssertEquals('a CFG pair per window', 4, Pipeline.ImageStats.UNetPassCount);
+    AssertEquals('canvas width', GridW, Latents.SizeX);
+    AssertEquals('canvas height', GridH, Latents.SizeY);
+    // DDIM is affine in the prediction: the step of the mean prediction is the
+    // mean of the windows' steps.
+    MaxDiff := SDTwoWindowCanvasDiff(Latents, Alone[0], Alone[1], WindowCells,
+      StrideCells);
+    AssertTrue('windows alone vs canvas max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-5);
+    // Several steps; circular windows (3, every 4 cells, wrapping); Euler a
+    // draws one canvas-sized noise per step.
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, CanvasWidth, Side, 3, Latents);
+    Pipeline.PanoramaCircular := true;
+    Pipeline.Sampler := smEulerAncestral;
+    FSD15NoiseValue := 0.1;
+    FSD15NoiseCount := 0;
+    Pipeline.OnAncestralNoise := @SD15ConstantNoise;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, CanvasWidth, Side, 3, Latents);
+    AssertEquals('circular windows', 3, Pipeline.ImageStats.PanoramaWindowCount);
+    AssertEquals('one noise draw per step', 3, FSD15NoiseCount);
+    AssertEquals('canvas size', Initial.Size, Latents.Size);
+    for ValuePos := 0 to Latents.Size - 1 do
+      AssertFalse('finite latents', IsNan(Latents.FData[ValuePos]) or
+        IsInfinite(Latents.FData[ValuePos]));
+    Pipeline.OnAncestralNoise := nil;
+    Pipeline.PanoramaCircular := false;
+    Pipeline.Sampler := smDDIM;
+    Pipeline.DeepCacheInterval := 2;
+    CheckRefused('DeepCache over two windows');
+    Pipeline.DeepCacheInterval := 1;
+    Latents.Copy(Initial);
+    try
+      Pipeline.InvertLatents(Embeds, CanvasWidth, Side, 2, 1, Latents);
+      Fail('DDIM inversion over windows must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+    Pipeline.PanoramaStride := Side + 2;
+    CheckRefused('a stride larger than the window');
+    Pipeline.PanoramaStride := 3;
+    CheckRefused('a stride off the VAE factor');
+    Pipeline.PanoramaStride := 0;
+    Pipeline.PanoramaWindowWidth := 15;
+    CheckRefused('a window off the VAE factor');
+  finally
+    Alone[1].Free;
+    Alone[0].Free;
+    Crop.Free;
+    Latents.Free;
+    Initial.Free;
+    Embeds.Free;
+    Windows.Free;
+    Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionVaeTiling;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Latents, Plain, Tiled: TNNetVolume;
+  ValuePos: integer;
+begin
+  Pipeline := CreateSD15Pipeline();
+  Latents := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Tiled := TNNetVolume.Create;
+  try
+    Pipeline.MakeInitialLatents(16, 16, 5, Latents);
+    Pipeline.DecodeLatents(Latents, 16, 16, Plain);
+    Pipeline.VaeTileSize := 32;
+    Pipeline.DecodeLatents(Latents, 16, 16, Tiled);
+    AssertEquals('a tile over the image = plain', 0,
+      MaxAbsVolumeDiff(Plain, Tiled), 0);
+    Pipeline.MakeInitialLatents(24, 16, 5, Latents);
+    Pipeline.VaeTileSize := 8;
+    Pipeline.DecodeLatents(Latents, 24, 16, Tiled);
+    AssertEquals('tiled width', 24, Tiled.SizeX);
+    AssertEquals('tiled height', 16, Tiled.SizeY);
+    AssertEquals('tiled channels', 3, Tiled.Depth);
+    for ValuePos := 0 to Tiled.Size - 1 do
+      AssertTrue('pixel in [0, 1]', (Tiled.FData[ValuePos] >= 0) and
+        (Tiled.FData[ValuePos] <= 1));
+    Pipeline.VaeTileSize := 3;
+    try
+      Pipeline.DecodeLatents(Latents, 24, 16, Tiled);
+      Fail('a tile off the VAE factor must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+  finally
+    Tiled.Free;
+    Plain.Free;
+    Latents.Free;
+    Pipeline.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestStableDiffusionImg2ImgParity;
 begin
   CheckSDImg2ImgParity('tiny_sd15', 'tiny_sd15_img2img_io.json');

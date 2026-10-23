@@ -934,6 +934,69 @@ step (`TestStableDiffusionICLightBackgroundParity`), and the highres re-encode
 (`TestStableDiffusionICLightHighRes`). No real IC-Light checkpoint has been
 run yet.
 
+## Panoramas (`--panorama`)
+
+`--panorama WxH` runs MultiDiffusion (Bar-Tal et al. 2023), as diffusers
+`StableDiffusionPanoramaPipeline`: the latents of a WxH canvas are denoised by
+the UNet in overlapping windows of `--width` x `--height` pixels (default the
+checkpoint's size, 512x512 on SD 1.5), so the attention cost stays that of
+one window and every region of the canvas is drawn at the size the UNet was
+trained on. Each step runs every window's UNet passes with its own
+classifier-free guidance (and PAG / SAG passes when set); each latent cell
+takes the mean prediction of the windows over it; then the sampler steps the
+whole canvas once.
+
+* `--panorama-stride N` is the window step in pixels (default 64, diffusers'
+  8 latent cells). A 2048x512 canvas on SD 1.5 has 25 windows of 512x512, so
+  a step costs 25 times a 512x512 step; a larger stride (e.g. 256) trades
+  seam smoothness for speed.
+* `--panorama-wrap` wraps the windows past the right edge to the left edge
+  (diffusers `circular_padding`), for 360-degree panoramas whose two ends
+  meet.
+* `--vae-tile N` decodes the canvas in overlapping N x N tiles (diffusers
+  `enable_vae_tiling`, overlap 0.25, `TiledVaeDecode`), so the VAE memory is
+  that of one tile; without it the canvas is decoded at once.
+* `--init-image` runs image-to-image over the windows (the image is resized to
+  the canvas). `--ip-adapter`, `--pag-scale`, `--sag-scale`, `--freeu`,
+  `--lora` and every sampler combine with it. `--edit-prompt`,
+  `--invert-image`, `--gligen`, `--deepcache`, `--upscale-image` and
+  `--relight` are refused.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --prompt "a photo of the dolomites" --panorama 2048x512 --gpu
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --prompt "a city street at night, 360 view" --panorama 2048x512 \
+  --panorama-stride 128 --panorama-wrap --vae-tile 512 --gpu
+```
+
+The windows are planned by `TMultiDiffusionWindows` (neuraldiffusion.pas),
+the same planner and averaging as examples/QwenImage `--panorama`. Where it
+differs from diffusers:
+
+* diffusers places `(side - window) // stride + 1` windows per axis and leaves
+  the cells past the last one uncovered (their latents become zero) when the
+  stride does not divide `side - window`; here the last window is moved back
+  to end at the edge, so every cell is covered. With the default stride and
+  sides that are multiples of 64 the windows are the same.
+* diffusers steps the scheduler once per window (keeping each window's
+  scheduler state) and averages the stepped latents; here the predictions are
+  averaged and the sampler steps once. DDIM, PNDM, Euler and DPM-Solver++ 2M
+  steps are linear in the prediction and its history, so both give the same
+  latents.
+  Euler a, DPM-Solver++ 2M SDE and LCM add their step noise once to the whole
+  canvas; diffusers draws it per window, which averages several independent
+  draws in the overlaps.
+
+Tested on the pico folder: a canvas of one window is bit for bit the plain
+run under DDIM with guidance, Euler a, DeepCache, ControlNet, T2I-Adapter and
+img2img (`TestStableDiffusionPanoramaOneWindowParity`); on a 24x16 canvas of
+two 16x16 windows one guided DDIM step equals each window run alone where one
+window covers a cell and their mean where both do
+(`TestStableDiffusionPanoramaTwoWindows`, which also runs circular windows
+and Euler a and checks the refusals). No diffusers panorama oracle and no
+real checkpoint run yet.
+
 ## Usage
 
 ```
@@ -1064,6 +1127,15 @@ StableDiffusion [--model DIR] [options]
                     (diffusers pag_adaptive_scale, default 0)
   --sag-scale S     Self-Attention Guidance scale (default 0 = off; diffusers
                     uses 0.75): one more UNet pass per step
+  --panorama WxH    MultiDiffusion: a WxH canvas (multiples of the VAE factor)
+                    denoised in --width x --height windows (default the checkpoint's
+                    size), each with its own CFG, averaged where they overlap
+  --panorama-stride N window step in pixels, a multiple of the VAE factor no larger
+                    than a window side (default 64 = diffusers' 8 latent cells)
+  --panorama-wrap   wrap the windows past the right edge to the left edge (360-degree
+                    panorama, diffusers circular_padding)
+  --vae-tile N      VAE-decode images larger than N pixels in overlapping N x N tiles
+                    (diffusers enable_vae_tiling; default 0 = one decode)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)
@@ -1128,6 +1200,9 @@ Stages of image 2 (wall time):
   `<|startoftext|>` ids `<|endoftext|>` then pads, as A1111 and the diffusers
   pipeline lay out one chunk; lpw puts a single `<|endoftext|>` at the end of
   each chunk instead, so its pad rows differ there.
+* `--panorama` and `--vae-tile` are pico-tested against the plain pipeline
+  only (see the panorama section); the VAE encoder of image-to-image runs on
+  the whole canvas at once.
 * Every UNet pass recomputes the cross-attention K/V of the text states,
   which do not change across steps. This costs about 0.4% of a 512x512 SD 1.5
   pass, so the K/V are not cached.

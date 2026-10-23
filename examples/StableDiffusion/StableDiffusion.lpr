@@ -76,6 +76,13 @@ left|right|top|bottom starts from a light gradient, --relight-background PNG
 (with iclight_sd15_fbc) relights against a background, and a highres pass
 upscales by 1.5. The subject's alpha (RGBA), or --birefnet FILE (BiRefNet /
 RMBG-2.0), mattes it on gray.
+--panorama WxH runs MultiDiffusion (Bar-Tal et al. 2023, diffusers
+StableDiffusionPanoramaPipeline): each step runs the UNet, with its own CFG,
+on overlapping --width x --height windows (default the checkpoint size) of a
+WxH canvas every --panorama-stride pixels (default 64, diffusers' 8 latent
+cells), averages the predictions where windows overlap and steps the whole
+canvas once; --panorama-wrap wraps the windows in X for a 360-degree panorama.
+--vae-tile N decodes in N-pixel tiles (diffusers enable_vae_tiling).
 --edit-prompt TEXT runs Prompt-to-Prompt (Hertz et al. 2022, the
 google/prompt-to-prompt controllers): the prompt and the edit prompt sample
 together from one latent with DDIM, and the edit takes the prompt's
@@ -200,6 +207,12 @@ type
     PAGLayers: TStringArray;
     // --sag-scale (<= 0: off).
     SAGScale: double;
+    // --panorama canvas (0: off), --panorama-stride (0: the pipeline's
+    // default) and --panorama-wrap; the windows are --width x --height.
+    PanoramaWidth, PanoramaHeight, PanoramaStride: integer;
+    PanoramaWrap: boolean;
+    // --vae-tile pixels (0: one decode).
+    VaeTileSize: integer;
   end;
 
   // Prints the pipeline's stages and steps as they run.
@@ -274,6 +287,9 @@ begin
     if (Phase = sdphDenoise) and (Stats.UNetCachedPassCount > 0) then
       Detail := Detail + Format(' (%d shallow only)',
         [Stats.UNetCachedPassCount]);
+    if (Phase = sdphDenoise) and (Stats.PanoramaWindowCount > 0) then
+      Detail := Detail + Format(', %d panorama windows',
+        [Stats.PanoramaWindowCount]);
     if Stats.TransfersCounted and ((Stats.PhaseUploadBytes[Phase] > 0) or
       (Stats.PhaseDownloadBytes[Phase] > 0)) then
       Detail := Trim(Detail + Format('  up %.2f MB, down %.2f MB',
@@ -494,6 +510,23 @@ begin
   WriteLn('  --sag-scale S     Self-Attention Guidance scale (default 0 = off; ',
     'diffusers');
   WriteLn('                    uses 0.75): one more UNet pass per step');
+  WriteLn('  --panorama WxH    MultiDiffusion: a WxH canvas (multiples of the ',
+    'VAE factor)');
+  WriteLn('                    denoised in --width x --height windows (default ',
+    'the checkpoint''s');
+  WriteLn('                    size), each with its own CFG, averaged where ',
+    'they overlap');
+  WriteLn('  --panorama-stride N window step in pixels, a multiple of the VAE ',
+    'factor no larger');
+  WriteLn('                    than a window side (default 64 = diffusers'' 8 ',
+    'latent cells)');
+  WriteLn('  --panorama-wrap   wrap the windows past the right edge to the left ',
+    'edge (360-degree');
+  WriteLn('                    panorama, diffusers circular_padding)');
+  WriteLn('  --vae-tile N      VAE-decode images larger than N pixels in ',
+    'overlapping N x N tiles');
+  WriteLn('                    (diffusers enable_vae_tiling; default 0 = one ',
+    'decode)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -548,6 +581,18 @@ begin
   for FactorPos := 0 to 3 do
     Factors[FactorPos] := StrToFloat(Trim(Parts[FactorPos]),
       DefaultFormatSettings);
+end;
+
+// A WxH value of Option (e.g. 2048x512): both sides positive.
+procedure ParseSizeSpec(const Option, Spec: string; out Width, Height: integer);
+var
+  Parts: TStringArray;
+begin
+  Parts := LowerCase(Spec).Split(['x']);
+  if (Length(Parts) <> 2) or not TryStrToInt(Trim(Parts[0]), Width) or
+    not TryStrToInt(Trim(Parts[1]), Height) or (Width < 1) or (Height < 1) then
+    raise Exception.Create(Option + ' wants WxH, e.g. 2048x512, not "' +
+      Spec + '"');
 end;
 
 // --reweight value: WORD=SCALE pairs separated by commas, appended to Words
@@ -682,6 +727,11 @@ begin
   Opt.PAGAdaptiveScale := 0;
   Opt.PAGLayers := nil;
   Opt.SAGScale := 0;
+  Opt.PanoramaWidth := 0;
+  Opt.PanoramaHeight := 0;
+  Opt.PanoramaStride := 0;
+  Opt.PanoramaWrap := false;
+  Opt.VaeTileSize := 0;
   SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
@@ -793,6 +843,12 @@ begin
       Opt.PAGLayers := NextArg().Split([','])
     else if Arg = '--sag-scale' then
       Opt.SAGScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--panorama' then
+      ParseSizeSpec(Arg, NextArg(), Opt.PanoramaWidth, Opt.PanoramaHeight)
+    else if Arg = '--panorama-stride' then
+      Opt.PanoramaStride := StrToInt(NextArg())
+    else if Arg = '--panorama-wrap' then Opt.PanoramaWrap := true
+    else if Arg = '--vae-tile' then Opt.VaeTileSize := StrToInt(NextArg())
     else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
     else if Arg = '--max-prompt-chunks' then
       Opt.MaxPromptChunkCount := StrToInt(NextArg())
@@ -933,6 +989,23 @@ begin
     raise Exception.Create('--edit-prompt samples with ddim');
   if (Opt.EditPrompt <> '') and (Opt.RepeatCount > 1) then
     raise Exception.Create('--edit-prompt makes one image pair; drop --repeat');
+  if (Opt.PanoramaWidth = 0) and ((Opt.PanoramaStride <> 0) or
+    Opt.PanoramaWrap) then
+    raise Exception.Create('--panorama-stride and --panorama-wrap need ' +
+      '--panorama');
+  if Opt.PanoramaStride < 0 then
+    raise Exception.Create('--panorama-stride must be >= 1');
+  if Opt.VaeTileSize < 0 then
+    raise Exception.Create('--vae-tile must be >= 0');
+  // The windows share one latent canvas and one sampler; these keep a
+  // second track, a per-pass cache or image coordinates.
+  if (Opt.PanoramaWidth > 0) and ((Opt.EditPrompt <> '') or
+    (Opt.InvertImageFile <> '') or (Opt.GLIGENFile <> '') or
+    (Opt.DeepCacheInterval > 1) or (Opt.UpscaleImageFile <> '') or
+    (Opt.RelightImageFile <> '')) then
+    raise Exception.Create('--panorama cannot be combined with ' +
+      '--edit-prompt, --invert-image, --gligen, --deepcache, --upscale-image ' +
+      'or --relight');
 end;
 
 // Splits an --embedding value at its last ':' unless that is a drive letter's
@@ -1018,6 +1091,8 @@ var
   EditImageFile: string;
   WordPos: integer;
   IsDepthUNet, IsUpscalerUNet: boolean;
+  WindowWidth, WindowHeight, PanoramaStride: integer;
+  PanoramaText: string;
   GuidanceScale: double;
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
@@ -1190,6 +1265,21 @@ begin
     if Opt.EditPrompt <> '' then Pipeline.Sampler := smDDIM;
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
+    if Opt.PanoramaWidth > 0 then
+    begin
+      // --width x --height (default the checkpoint's) are the windows.
+      if Opt.ImageWidth >= 1 then WindowWidth := Opt.ImageWidth
+      else WindowWidth := Pipeline.DefaultImageSize;
+      if Opt.ImageHeight >= 1 then WindowHeight := Opt.ImageHeight
+      else WindowHeight := Pipeline.DefaultImageSize;
+      Pipeline.PanoramaWindowWidth := WindowWidth;
+      Pipeline.PanoramaWindowHeight := WindowHeight;
+      Pipeline.PanoramaStride := Opt.PanoramaStride;
+      Pipeline.PanoramaCircular := Opt.PanoramaWrap;
+      ImageWidth := Opt.PanoramaWidth;
+      ImageHeight := Opt.PanoramaHeight;
+    end;
+    Pipeline.VaeTileSize := Opt.VaeTileSize;
     if Opt.SamplerName <> 'auto' then
       Pipeline.SelectSampler(
         SamplerOptionMethods[SamplerOptionIndex(Opt.SamplerName)],
@@ -1314,6 +1404,18 @@ begin
     if Opt.SAGScale > 0 then
       WriteLn(Format('SAG:      scale %.2f, mid-block self-attention mask',
         [Opt.SAGScale]));
+    if Opt.PanoramaWidth > 0 then
+    begin
+      PanoramaText := '';
+      if Opt.PanoramaWrap then PanoramaText := ', wrapping in X';
+      PanoramaStride := Opt.PanoramaStride;
+      if PanoramaStride = 0 then PanoramaStride := 8 * Pipeline.VaeScaleFactor;
+      WriteLn(Format('Panorama: %dx%d windows every %d pixels%s',
+        [Pipeline.PanoramaWindowWidth, Pipeline.PanoramaWindowHeight,
+         PanoramaStride, PanoramaText]));
+    end;
+    if Opt.VaeTileSize > 0 then
+      WriteLn(Format('VAE:      decoded in %d-pixel tiles', [Opt.VaeTileSize]));
     for EmbeddingPos := 0 to High(Opt.Embeddings) do
     begin
       SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,
@@ -1475,7 +1577,11 @@ begin
       WriteLn('Loading the text encoder, the UNet and the VAE decoder to ',
         'keep them in memory.');
       StartTime := Now();
-      Pipeline.LoadComponents(ImageWidth, ImageHeight);
+      // The UNet runs at the window size; the VAE builds for the image later.
+      if Opt.PanoramaWidth > 0 then
+        Pipeline.LoadComponents(Pipeline.PanoramaWindowWidth,
+          Pipeline.PanoramaWindowHeight)
+      else Pipeline.LoadComponents(ImageWidth, ImageHeight);
       WriteLn(Format('Loaded:   %.1f s', [(Now() - StartTime) * 86400.0]));
       Pipeline.EncodePrompt(Opt.Prompt, PromptEmbeds);
     end;

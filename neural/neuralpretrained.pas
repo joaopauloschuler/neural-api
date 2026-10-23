@@ -12387,6 +12387,8 @@ type
     UNetCachedPassCount: integer;
     // ControlNet runs of those passes: only the residuals the shallow branch reads.
     ControlNetShallowRunCount: integer;
+    // MultiDiffusion windows each step ran (0: one pass over the image).
+    PanoramaWindowCount: integer;
   end;
 
   TStableDiffusionPipeline = class;
@@ -12682,6 +12684,21 @@ type
     FConditioner: TStableDiffusionConditioner;
     // Runs Denoise when Conditioner is nil.
     FPlainConditioner: TStableDiffusionConditioner;
+    // MultiDiffusion settings in pixels (a window side 0: off).
+    FPanoramaWindowWidth, FPanoramaWindowHeight, FPanoramaStride: integer;
+    FPanoramaCircular: boolean;
+    // During a windowed Denoise: the windows over the latent grid, the same
+    // windows over the image pixels, the window the running UNet pass sees
+    // (-1: none) and PredictPanoramaWindow's step inputs.
+    FPanoramaWindows, FPanoramaPixelWindows: TMultiDiffusionWindows;
+    FPanoramaWindowIdx: integer;
+    FPanoramaNet: TNNet;
+    FPanoramaConfig: TSDUNetConfig;
+    FPanoramaConditioner: TStableDiffusionConditioner;
+    FPanoramaEmbeds: TNNetVolume;
+    FPanoramaTimestep: TNeuralFloat;
+    // DecodeLatents tile side in pixels (0: one decode of the whole image).
+    FVaeTileSize: integer;
     {$IFDEF OpenCL}
     FUseOpenCL: boolean;
     FOpenCLPlatform: cl_platform_id;
@@ -12807,6 +12824,13 @@ type
       StepCount: integer; Latents: TNNetVolume; IsInversion: boolean;
       Edit: TSDPromptToPromptEdit = nil; EditEmbeds: TNNetVolume = nil;
       EditLatents: TNNetVolume = nil; UncondEmbeds: TNNetVolumeList = nil);
+    // Plans FPanoramaWindows / FPanoramaPixelWindows over a Width x Height
+    // image (both nil when the panorama window is off).
+    procedure PlanPanorama(Width, Height: integer);
+    procedure FreePanorama();
+    // TMultiDiffusionPredictEvent of RunSteps' windows: the guided prediction.
+    procedure PredictPanoramaWindow(WindowIdx: integer;
+      WindowInput, WindowOutput: TNNetVolume);
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12921,6 +12945,13 @@ type
     // VAE decode to a (Width, Height, 3) RGB image in [0, 1].
     procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
       Image: TNNetVolume);
+    // For conditioners: the latent grid their UNet-side nets run at during
+    // Denoise of Latents (a MultiDiffusion window's, else Latents').
+    procedure PassGridFor(Latents: TNNetVolume; out GridX, GridY: integer);
+    // During the UNet pass of a MultiDiffusion window: Window := that
+    // window of Canvas, a volume at the latent grid or at the image size;
+    // true. Else false and Window is untouched.
+    function PanoramaWindowOf(Canvas, Window: TNNetVolume): boolean;
     // Denoise + DecodeLatents; InitialLatents (noise) = nil draws it from Seed.
     procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Seed: cardinal; Image: TNNetVolume;
@@ -13021,6 +13052,32 @@ type
     property SAGScale: TNeuralFloat read FSAGScale write FSAGScale;
     // The SAG mask of the last pass that ran the mid block (mid-block grid, 0/1).
     property SelfAttentionMask: TNNetVolume read FSelfAttentionMask;
+    // MultiDiffusion (diffusers StableDiffusionPanoramaPipeline): both > 0
+    // run the UNet passes of every Denoise step (with their CFG, PAG and SAG)
+    // on overlapping windows of this many pixels (multiples of VaeScaleFactor,
+    // clamped to the image), each latent cell taking the mean prediction of
+    // the windows over it, then one sampler step on the whole latents.
+    // ControlNet hints, T2I-Adapter hints and the extra UNet channels of image
+    // conditioners are cropped per window. GLIGEN, Prompt-to-Prompt, DDIM and
+    // null-text inversion are refused, and DeepCache over several windows.
+    // 0 (default) = off.
+    property PanoramaWindowWidth: integer read FPanoramaWindowWidth
+      write FPanoramaWindowWidth;
+    property PanoramaWindowHeight: integer read FPanoramaWindowHeight
+      write FPanoramaWindowHeight;
+    // Window step in pixels, a multiple of VaeScaleFactor no larger than a
+    // window side; 0 = 8 latent cells (diffusers' stride 8).
+    property PanoramaStride: integer read FPanoramaStride
+      write FPanoramaStride;
+    // Windows past the right edge wrap to the left edge (diffusers
+    // circular_padding, 360-degree panoramas).
+    property PanoramaCircular: boolean read FPanoramaCircular
+      write FPanoramaCircular;
+    // > 0: DecodeLatents of an image wider or taller than this many pixels
+    // runs TiledVaeDecode on square tiles of this side (clamped to the
+    // shorter image side; a multiple of VaeScaleFactor), overlap 0.25 as
+    // diffusers enable_vae_tiling. 0 (default): one decode.
+    property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
   end;
 
 // A1111 / lpw_stable_diffusion parse_prompt_attention: "(a:1.3)", "(a)" x 1.1,
@@ -13247,7 +13304,9 @@ type
     FConfig, FNetConfig: TControlNetConfig;
     FNet: TNNet;
     FNetGridX, FNetGridY: integer;
-    FSourceImage, FControlImage, FMidResidual: TNNetVolume;
+    // FControlImage is at the image size; FWindowControlImage holds the
+    // running MultiDiffusion window's crop of it.
+    FSourceImage, FControlImage, FWindowControlImage, FMidResidual: TNNetVolume;
     FDownResiduals: array of TNNetVolume;
     FConditioningScale: TNeuralFloat;
     FGuidanceStart, FGuidanceEnd: double;
@@ -13293,9 +13352,15 @@ type
     FConfig, FNetConfig: TT2IAdapterConfig;
     FNet: TNNet;
     FNetGridX, FNetGridY: integer;
-    FSourceImage, FHintImage: TNNetVolume;
+    FSourceImage, FHintImage, FWindowHintImage: TNNetVolume;
     FFeatures: array of TNNetVolume;
     FConditioningScale: TNeuralFloat;
+    // Over several MultiDiffusion windows the features are of one window's
+    // hint crop: FFeaturesWindow's (-1: none yet).
+    FWindowedFeatures: boolean;
+    FFeaturesWindow: integer;
+    // FFeatures := the adapter features of Hint times ConditioningScale.
+    procedure ComputeFeatures(Hint: TNNetVolume);
   protected
     procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
@@ -13323,6 +13388,8 @@ type
     FImageLatents: TNNetVolume;
     // latents | ExtraChannels, the input of a UNet wider than the latents.
     FUNetInput: TNNetVolume;
+    // The running MultiDiffusion window of ExtraChannels.
+    FWindowExtraChannels: TNNetVolume;
     // VaeImage := the image in [-1, 1] at the latent grid times VaeScaleFactor.
     procedure ResizeSourceImage(Latents, VaeImage: TNNetVolume); virtual;
     // From BeginDenoise: VaeImage is the image ResizeSourceImage made.
@@ -102547,6 +102614,7 @@ begin
   FMaxPromptChunkCount := 3;
   FOpenPhase := sdphDone;
   FPlainConditioner := TStableDiffusionConditioner.Create();
+  FPanoramaWindowIdx := -1;
   IndexFile := FModelFolder + 'model_index.json';
   TokenizerConfigFile := ComponentFolder('tokenizer') + 'tokenizer_config.json';
   SpecialTokensFile := ComponentFolder('tokenizer') + 'special_tokens_map.json';
@@ -102640,6 +102708,7 @@ begin
   FPerturbedGuidance.Free;
   FSelfAttentionMask.Free;
   FPlainConditioner.Free;
+  FreePanorama();
   {$IFDEF OpenCL}
   FOpenCLDevices.Free;
   {$ENDIF}
@@ -104279,6 +104348,9 @@ begin
     ImportError('TStableDiffusionPipeline.NullTextInversion: a ' +
       FConditioner.ClassName + ' is set; null-text inversion runs the plain ' +
       'UNet.');
+  if (FPanoramaWindowWidth > 0) and (FPanoramaWindowHeight > 0) then
+    ImportError('TStableDiffusionPipeline.NullTextInversion: panorama ' +
+      'windows are set; null-text inversion fits one UNet window.');
   if (StepCount < 1) or (InnerSteps < 0) then
     ImportError('TStableDiffusionPipeline.NullTextInversion: ' +
       IntToStr(StepCount) + ' steps of ' + IntToStr(InnerSteps) +
@@ -104469,12 +104541,31 @@ var
   IsGuided, WithControl, WithAdapter, UseSigmaSchedule: boolean;
   IPAdapterFile, GLIGENFile: string;
   DeepCacheLayout: TSDUNetDeepCacheLayout;
-  GridX, GridY, StepPos, MaxStepPos, CachePos: integer;
+  GridX, GridY, PassGridX, PassGridY, StepPos, MaxStepPos, CachePos: integer;
   Eta, NoiseScale, SqrtAb, SqrtOneMinusAb: TNeuralFloat;
   Timestep: double;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
   StepConditioner := ActiveConditioner();
+  PlanPanorama(Width, Height);
+  PassGridX := GridX;
+  PassGridY := GridY;
+  if Assigned(FPanoramaWindows) then
+  begin
+    PassGridX := FPanoramaWindows.WindowWidth;
+    PassGridY := FPanoramaWindows.WindowHeight;
+    // The windows step one shared latent canvas; these keep state per track
+    // or map image coordinates the windows would have to split.
+    if IsInversion or Assigned(Edit) or
+      (StepConditioner.UNetGLIGENFile() <> '') or
+      ((FDeepCacheInterval > 1) and (FPanoramaWindows.WindowCount > 1)) then
+    begin
+      FreePanorama();
+      ImportError('TStableDiffusionPipeline.Denoise: panorama windows do ' +
+        'not run with DDIM inversion, Prompt-to-Prompt, GLIGEN or (over ' +
+        'more than one window) DeepCache.');
+    end;
+  end;
   if IsInversion and StepConditioner.StartsFromImage() then
     ImportError('TStableDiffusionPipeline.InvertLatents: a ' +
       StepConditioner.ClassName + ' starts from its own image; invert with ' +
@@ -104496,17 +104587,25 @@ begin
       'x' + IntToStr(Height) + ' image.');
   IsGuided := StepConditioner.IsGuided(CFGGuidanceScale);
   if IsGuided then EnsureNegativePromptEmbeds(PromptEmbeds);
-  StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
+  StepConfig := UNetStepConfig(PassGridX, PassGridY, PromptEmbeds.SizeX);
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;
   FImageStats.UNetCachedPassCount := 0;
   FImageStats.ControlNetShallowRunCount := 0;
+  FImageStats.PanoramaWindowCount := 0;
+  if Assigned(FPanoramaWindows) then
+    FImageStats.PanoramaWindowCount := FPanoramaWindows.WindowCount;
   WithControl := StepConditioner.UNetWithControl();
   WithAdapter := StepConditioner.UNetWithAdapter();
   IPAdapterFile := StepConditioner.UNetIPAdapterFile();
   GLIGENFile := StepConditioner.UNetGLIGENFile();
-  Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX, WithControl,
-    WithAdapter, IPAdapterFile, GLIGENFile, DeepCacheLayout);
+  try
+    Net := AcquireUNet(PassGridX, PassGridY, PromptEmbeds.SizeX, WithControl,
+      WithAdapter, IPAdapterFile, GLIGENFile, DeepCacheLayout);
+  except
+    FreePanorama();
+    raise;
+  end;
   Pred := TNNetVolume.Create();
   StepNoise := nil;
   EditPred := nil;
@@ -104524,7 +104623,7 @@ begin
       end;
     end;
     PreparePerturbedGuidance(Net);
-    PrepareSelfAttentionGuidance(Net, GridX, GridY, FSAGScale > 0);
+    PrepareSelfAttentionGuidance(Net, PassGridX, PassGridY, FSAGScale > 0);
     StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
     FUNetInputs := SDUNetConditioningInputs(Net, StepConfig,
       IPAdapterFile <> '', WithAdapter, WithControl, GLIGENFile <> '');
@@ -104615,7 +104714,20 @@ begin
       if Assigned(Edit) then Edit.BeginStep(StepPos);
       if Assigned(UncondEmbeds) then
         FStepNegativeEmbeds := UncondEmbeds[StepPos];
-      StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
+      if Assigned(FPanoramaWindows) then
+      begin
+        FPanoramaNet := Net;
+        FPanoramaConfig := StepConfig;
+        FPanoramaConditioner := StepConditioner;
+        FPanoramaEmbeds := PromptEmbeds;
+        FPanoramaTimestep := Timestep;
+        try
+          FPanoramaWindows.PredictCanvas(Latents, Pred, @PredictPanoramaWindow);
+        finally
+          FPanoramaWindowIdx := -1;
+        end;
+      end
+      else StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
         PromptEmbeds, Timestep, Pred);
       if Assigned(Edit) then
       begin
@@ -104661,7 +104773,8 @@ begin
     FPassConditioners := nil;
     FPerturbedHeads := nil;
     FIsPerturbed := false;
-    PrepareSelfAttentionGuidance(Net, GridX, GridY, false);
+    PrepareSelfAttentionGuidance(Net, PassGridX, PassGridY, false);
+    FreePanorama();
     if Assigned(Edit) then Edit.Detach();
     FAttentionEdit := nil;
     FUNetInputs := Default(TSDUNetConditioningInputs);
@@ -104670,6 +104783,88 @@ begin
     Pred.Free;
     ReleaseComponent(Net);
   end;
+end;
+
+procedure TStableDiffusionPipeline.PlanPanorama(Width, Height: integer);
+const
+  // diffusers StableDiffusionPanoramaPipeline get_views stride, latent cells.
+  csDefaultStrideCells = 8;
+var
+  Factor, GridX, GridY, WindowWidth, WindowHeight, StrideX, StrideY: integer;
+begin
+  FreePanorama();
+  if (FPanoramaWindowWidth <= 0) or (FPanoramaWindowHeight <= 0) then exit;
+  Factor := VaeScaleFactor;
+  if (FPanoramaWindowWidth mod Factor <> 0) or
+    (FPanoramaWindowHeight mod Factor <> 0) or (FPanoramaStride < 0) or
+    (FPanoramaStride mod Factor <> 0) or
+    (FPanoramaStride > FPanoramaWindowWidth) or
+    (FPanoramaStride > FPanoramaWindowHeight) then
+    ImportError('TStableDiffusionPipeline: panorama window ' +
+      IntToStr(FPanoramaWindowWidth) + 'x' + IntToStr(FPanoramaWindowHeight) +
+      ' and stride ' + IntToStr(FPanoramaStride) + ' need multiples of ' +
+      IntToStr(Factor) + ', the stride no larger than a window side.');
+  LatentGridFor(Width, Height, GridX, GridY);
+  WindowWidth := Min(FPanoramaWindowWidth, Width) div Factor;
+  WindowHeight := Min(FPanoramaWindowHeight, Height) div Factor;
+  if FPanoramaStride > 0 then StrideX := FPanoramaStride div Factor
+  else StrideX := csDefaultStrideCells;
+  StrideY := StrideX;
+  // A side clamped to the image has one window, whatever its stride.
+  if StrideX > WindowWidth then StrideX := WindowWidth;
+  if StrideY > WindowHeight then StrideY := WindowHeight;
+  FPanoramaWindows := TMultiDiffusionWindows.Create();
+  FPanoramaWindows.Plan(GridX, GridY, WindowWidth, WindowHeight, StrideX,
+    StrideY, FPanoramaCircular);
+  // ComputeTileStarts scales exactly: the same windows, in pixels.
+  FPanoramaPixelWindows := TMultiDiffusionWindows.Create();
+  FPanoramaPixelWindows.Plan(GridX * Factor, GridY * Factor,
+    WindowWidth * Factor, WindowHeight * Factor, StrideX * Factor,
+    StrideY * Factor, FPanoramaCircular);
+end;
+
+procedure TStableDiffusionPipeline.FreePanorama();
+begin
+  FreeAndNil(FPanoramaWindows);
+  FreeAndNil(FPanoramaPixelWindows);
+  FPanoramaWindowIdx := -1;
+  FPanoramaNet := nil;
+  FPanoramaConditioner := nil;
+  FPanoramaEmbeds := nil;
+end;
+
+procedure TStableDiffusionPipeline.PredictPanoramaWindow(WindowIdx: integer;
+  WindowInput, WindowOutput: TNNetVolume);
+begin
+  FPanoramaWindowIdx := WindowIdx;
+  FPanoramaConditioner.PredictGuidedNoise(FPanoramaNet, FPanoramaConfig,
+    WindowInput, FPanoramaEmbeds, FPanoramaTimestep, WindowOutput);
+end;
+
+procedure TStableDiffusionPipeline.PassGridFor(Latents: TNNetVolume;
+  out GridX, GridY: integer);
+begin
+  if Assigned(FPanoramaWindows) then
+  begin
+    GridX := FPanoramaWindows.WindowWidth;
+    GridY := FPanoramaWindows.WindowHeight;
+  end
+  else
+  begin
+    GridX := Latents.SizeX;
+    GridY := Latents.SizeY;
+  end;
+end;
+
+function TStableDiffusionPipeline.PanoramaWindowOf(Canvas,
+  Window: TNNetVolume): boolean;
+begin
+  Result := FPanoramaWindowIdx >= 0;
+  if not Result then exit;
+  if (Canvas.SizeX = FPanoramaWindows.CanvasWidth) and
+    (Canvas.SizeY = FPanoramaWindows.CanvasHeight) then
+    FPanoramaWindows.GatherWindow(Canvas, FPanoramaWindowIdx, Window)
+  else FPanoramaPixelWindows.GatherWindow(Canvas, FPanoramaWindowIdx, Window);
 end;
 
 procedure TStableDiffusionPipeline.FillUNetInputs(Latents,
@@ -104697,17 +104892,43 @@ procedure TStableDiffusionPipeline.DecodeLatents(Latents: TNNetVolume; Width,
   Height: integer; Image: TNNetVolume);
 var
   Net: TNNet;
-  GridX, GridY: integer;
+  Tiled: TNNetVolume;
+  GridX, GridY, TileCells: integer;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
+  if (FVaeTileSize < 0) or (FVaeTileSize mod VaeScaleFactor <> 0) then
+    ImportError('TStableDiffusionPipeline: VaeTileSize ' +
+      IntToStr(FVaeTileSize) + ' must be 0 or a positive multiple of ' +
+      IntToStr(VaeScaleFactor) + '.');
+  TileCells := 0;
+  if FVaeTileSize > 0 then
+  begin
+    TileCells := Min(FVaeTileSize div VaeScaleFactor, Min(GridX, GridY));
+    // One tile covering the whole grid is the plain decode.
+    if (TileCells >= GridX) and (TileCells >= GridY) then TileCells := 0;
+  end;
   ClearPhaseStats([sdphLoadVae, sdphDecode]);
-  Net := AcquireVaeDecoder(GridX, GridY);
+  if TileCells > 0 then Net := AcquireVaeDecoder(TileCells, TileCells)
+  else Net := AcquireVaeDecoder(GridX, GridY);
   try
     DoPhase(sdphDecode);
     // The decoder applies 1/scaling_factor; diffusers postprocess is
     // (x / 2 + 0.5) clamped to [0, 1].
-    Net.Compute(Latents);
-    Net.GetOutput(Image);
+    if TileCells > 0 then
+    begin
+      Tiled := TiledVaeDecode(Net, Latents, TileCells, 0.25);
+      try
+        Image.ReSize(Tiled);
+        Image.Copy(Tiled);
+      finally
+        Tiled.Free;
+      end;
+    end
+    else
+    begin
+      Net.Compute(Latents);
+      Net.GetOutput(Image);
+    end;
     TNNetVolume.ClampAbs(Image.DataPtr, 1.0, Image.Size);
     Image.Mul(0.5);
     Image.Add(0.5);
@@ -105268,6 +105489,7 @@ begin
     'diffusion_pytorch_model');
   FSourceImage := TNNetVolume.Create();
   FControlImage := TNNetVolume.Create();
+  FWindowControlImage := TNNetVolume.Create();
   FMidResidual := TNNetVolume.Create();
   FConditioningScale := 1;
   FGuidanceStart := 0;
@@ -105282,6 +105504,7 @@ begin
   MaxResidualPos := High(FDownResiduals);
   for ResidualPos := 0 to MaxResidualPos do FDownResiduals[ResidualPos].Free;
   FMidResidual.Free;
+  FWindowControlImage.Free;
   FControlImage.Free;
   FSourceImage.Free;
   inherited Destroy();
@@ -105305,8 +105528,7 @@ var
   GridX, GridY, CondFactor, ResidualPos, MaxResidualPos: integer;
 begin
   inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
-  GridX := Latents.SizeX;
-  GridY := Latents.SizeY;
+  Pipeline.PassGridFor(Latents, GridX, GridY);
   if FSourceImage.Size = 0 then
     ImportError('TStableDiffusionControlNet: call SetControlImage first.');
   if (FGuidanceStart < 0) or (FGuidanceEnd > 1) or
@@ -105366,9 +105588,10 @@ begin
     Pipeline.PrepareComponent(FNet, Pipeline.UNetInt8 and
       not Pipeline.ComponentsLoaded);
   end;
-  ConvertAndResizeImagePIL(FSourceImage, FControlImage, FNetConfig.CondGrid,
-    CondGridYOf(FNetConfig), FConfig.CondChannels, {ClipToByteRange=}false,
-    0, 1);
+  // At the image size; a MultiDiffusion window's pass reads its crop.
+  ConvertAndResizeImagePIL(FSourceImage, FControlImage,
+    Latents.SizeX * CondFactor, Latents.SizeY * CondFactor,
+    FConfig.CondChannels, {ClipToByteRange=}false, 0, 1);
   if Length(FDownResiduals) <> FConfig.NumDownResiduals then
   begin
     SetLength(FDownResiduals, FConfig.NumDownResiduals);
@@ -105398,6 +105621,7 @@ var
   StepStart, StepEnd: double;
   ResidualScale: TNeuralFloat;
   LogspaceScales: boolean;
+  ControlImage: TNNetVolume;
 
   // global_pool_conditions: every position takes its channel's H, W mean (the
   // UNet broadcasts the pooled residual over the skip).
@@ -105417,7 +105641,10 @@ begin
   if (StepStart < FGuidanceStart) or (StepEnd > FGuidanceEnd) then exit;
   if FRunGuessMode and not (sdpiPrompt in Inputs) then exit;
   ResidualCount := PassDownResidualCount(Inputs);
-  ControlNetResiduals(FNet, FNetConfig, Latents, Embeds, FControlImage,
+  ControlImage := FControlImage;
+  if FPipeline.PanoramaWindowOf(FControlImage, FWindowControlImage) then
+    ControlImage := FWindowControlImage;
+  ControlNetResiduals(FNet, FNetConfig, Latents, Embeds, ControlImage,
     Timestep, FDownResiduals, FMidResidual, ResidualCount);
   LogspaceScales := FRunGuessMode and not FConfig.GlobalPoolConditions;
   MaxResidualPos := High(FDownResiduals);
@@ -105465,7 +105692,9 @@ begin
     'diffusion_pytorch_model');
   FSourceImage := TNNetVolume.Create();
   FHintImage := TNNetVolume.Create();
+  FWindowHintImage := TNNetVolume.Create();
   FConditioningScale := 1;
+  FFeaturesWindow := -1;
 end;
 
 destructor TStableDiffusionT2IAdapter.Destroy();
@@ -105475,6 +105704,7 @@ begin
   FNet.Free;
   MaxFeaturePos := High(FFeatures);
   for FeaturePos := 0 to MaxFeaturePos do FFeatures[FeaturePos].Free;
+  FWindowHintImage.Free;
   FHintImage.Free;
   FSourceImage.Free;
   inherited Destroy();
@@ -105498,8 +105728,7 @@ var
   GridX, GridY, SideMultiple, OwnerGrid, FeaturePos, MaxFeaturePos: integer;
 begin
   inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
-  GridX := Latents.SizeX;
-  GridY := Latents.SizeY;
+  Pipeline.PassGridFor(Latents, GridX, GridY);
   if FSourceImage.Size = 0 then
     ImportError('TStableDiffusionT2IAdapter: call SetHintImage first.');
   if FConfig.DownscaleFactor <> Pipeline.VaeScaleFactor then
@@ -105561,16 +105790,29 @@ begin
     for FeaturePos := 0 to MaxFeaturePos do
       FFeatures[FeaturePos] := TNNetVolume.Create();
   end;
-  ConvertAndResizeImagePIL(FSourceImage, FHintImage, FNetConfig.CondGrid,
-    CondGridYOf(FNetConfig), FConfig.CondChannels, {ClipToByteRange=}false,
-    0, 1);
-  T2IAdapterFeatures(FNet, FNetConfig, FHintImage, FFeatures);
+  ConvertAndResizeImagePIL(FSourceImage, FHintImage,
+    Latents.SizeX * FConfig.DownscaleFactor,
+    Latents.SizeY * FConfig.DownscaleFactor, FConfig.CondChannels,
+    {ClipToByteRange=}false, 0, 1);
+  // Over several windows each window's pass runs the adapter on its crop.
+  FWindowedFeatures := Assigned(Pipeline.FPanoramaWindows) and
+    (Pipeline.FPanoramaWindows.WindowCount > 1);
+  FFeaturesWindow := -1;
+  if FWindowedFeatures then exit;
+  ComputeFeatures(FHintImage);
+  // The features hold for every step.
+  if not Pipeline.ComponentsLoaded then FreeAndNil(FNet);
+end;
+
+procedure TStableDiffusionT2IAdapter.ComputeFeatures(Hint: TNNetVolume);
+var
+  FeaturePos, MaxFeaturePos: integer;
+begin
+  T2IAdapterFeatures(FNet, FNetConfig, Hint, FFeatures);
   MaxFeaturePos := High(FFeatures);
   if FConditioningScale <> 1 then
     for FeaturePos := 0 to MaxFeaturePos do
       FFeatures[FeaturePos].Mul(FConditioningScale);
-  // The features hold for every step.
-  if not Pipeline.ComponentsLoaded then FreeAndNil(FNet);
 end;
 
 procedure TStableDiffusionT2IAdapter.FillUNetInputs(
@@ -105579,6 +105821,13 @@ procedure TStableDiffusionT2IAdapter.FillUNetInputs(
 var
   FeaturePos, MaxFeaturePos: integer;
 begin
+  // A window's guided passes run in a row: one adapter run per window.
+  if FWindowedFeatures and (FFeaturesWindow <> FPipeline.FPanoramaWindowIdx) and
+    FPipeline.PanoramaWindowOf(FHintImage, FWindowHintImage) then
+  begin
+    ComputeFeatures(FWindowHintImage);
+    FFeaturesWindow := FPipeline.FPanoramaWindowIdx;
+  end;
   MaxFeaturePos := High(FFeatures);
   for FeaturePos := 0 to MaxFeaturePos do
     SDUNetWriteInput(UNetInputs.Adapter[FeaturePos], FFeatures[FeaturePos],
@@ -106288,10 +106537,12 @@ begin
   FSourceImage := TNNetVolume.Create();
   FImageLatents := TNNetVolume.Create();
   FUNetInput := TNNetVolume.Create();
+  FWindowExtraChannels := TNNetVolume.Create();
 end;
 
 destructor TStableDiffusionImageConditioner.Destroy();
 begin
+  FWindowExtraChannels.Free;
   FUNetInput.Free;
   FImageLatents.Free;
   FSourceImage.Free;
@@ -106302,7 +106553,10 @@ procedure TStableDiffusionImageConditioner.PredictWithExtraChannels(
   UNet: TNNet; const Config: TSDUNetConfig; Latents, ExtraChannels,
   Embeds: TNNetVolume; Timestep: TNeuralFloat; Pred: TNNetVolume);
 begin
-  FUNetInput.AddLayers(Latents, ExtraChannels);
+  // The extra channels are at the image's latent grid; a window sees its crop.
+  if FPipeline.PanoramaWindowOf(ExtraChannels, FWindowExtraChannels) then
+    FUNetInput.AddLayers(Latents, FWindowExtraChannels)
+  else FUNetInput.AddLayers(Latents, ExtraChannels);
   DenoiseUNet(UNet, Config, FUNetInput, Embeds, Timestep, Pred);
 end;
 
