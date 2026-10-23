@@ -255,25 +255,9 @@ end;
 // as <bos> ids <eos> and padded with <eos> to the text net context.
 procedure EncodeClipText(var Clip: TFastSAMClip; const TokenIds: array of integer;
   BosId, EosId: integer);
-var
-  TextInput: TNNetVolume;
-  SeqLen, TokenPos, MaxTokenPos: integer;
 begin
-  SeqLen := Clip.TextNet.Layers[0].Output.SizeX;
-  TextInput := TNNetVolume.Create(SeqLen, 1, 1);
-  try
-    TextInput.Fill(EosId);
-    TextInput.FData[0] := BosId;
-    MaxTokenPos := Min(High(TokenIds), SeqLen - 3);
-    for TokenPos := 0 to MaxTokenPos do
-      TextInput.FData[TokenPos + 1] := TokenIds[TokenPos];
-    Clip.TextNet.Compute(TextInput);
-    Clip.TextEmb := TNNetVolume.Create;
-    ClipExtractEmbedding(Clip.TextNet.GetLastLayer().Output,
-      ClipTextEosPosition(TextInput, Clip.Config.EosTokenId), Clip.TextEmb);
-  finally
-    TextInput.Free;
-  end;
+  Clip.TextEmb := TNNetVolume.Create;
+  ClipEncodeText(Clip.TextNet, Clip.Config, TokenIds, BosId, EosId, Clip.TextEmb);
 end;
 
 // Loads the CLIP towers and the image processor of ModelFile / ProcessorFile.

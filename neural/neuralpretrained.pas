@@ -7995,6 +7995,11 @@ procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
 // ClipExtractEmbedding outputs (both are unit-L2).
 function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 
+// Embedding := unit-L2 CLIP text embedding of TokenIds framed as <bos> ids <eos>,
+// padded with EosId to the TextNet context (ids that do not fit are dropped).
+procedure ClipEncodeText(TextNet: TNNet; const Config: TClipConfig;
+  const TokenIds: array of integer; BosId, EosId: integer; Embedding: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // CLIPScore (Hessel et al. 2021, "CLIPScore: A Reference-free Evaluation
 // Metric for Image Captioning"): the standard reference-free text<->image
@@ -17239,6 +17244,19 @@ function RestoreFacesInImage(Detector: TNNet;
 // process_mask_native at the original image size (FastSAM's CLI default);
 // FastSAMSelectByBox / FastSAMSelectByPoint / FastSAMSelectByText are FastSAM's
 // box / point / CLIP text prompts.
+//
+// OPEN-VOCABULARY (model_type "yolo_world": ultralytics YOLO-World v2, e.g.
+// yolov8s-worldv2): the same backbone, PAN and DFL box branch; the neck C2f
+// blocks model.12/15/18/21 become C2fAttn (a MaxSigmoidAttnBlock gates each head
+// of an extra branch by sigmoid(max over prompts of <cell, gl(text)>/sqrt(hc) +
+// bias)), and WorldDetect's class branch ends in a BNContrastiveHead (BatchNorm
+// of the cell embedding . L2-normalised text * exp(logit_scale) + bias). The text
+// embeddings are constant per prompt list, so BuildYoloWorld folds them into
+// plain conv weights: the attention becomes a 1x1 conv to (prompt, head) logits
+// + TNNetMaxOut over prompts + sigmoid, and the contrastive head folds into the
+// class conv, which then emits one logit per prompt - the head layout of a
+// NumClasses = NumPrompts YOLOv8, decoded by DecodeYoloDetections unchanged.
+// YOLO-World v1 (ImagePoolingAttn, L2 ContrastiveHead) is not supported.
 // Coded by Claude (AI).
 type
   TYoloConfig = record
@@ -17257,6 +17275,8 @@ type
     ProtoHidden: integer;            // Proto hidden width (ultralytics npr)
     MaskHidden: integer;             // cv4 hidden width (ultralytics c4)
     ClassNames: TStringArray;        // by class id from names / id2label; nil = none
+    TextEmbedDim: integer;           // yolo_world: CLIP text embedding width (512)
+    AttnHeads: array[0..3] of integer; // yolo_world: C2fAttn heads of model.12/15/18/21
   end;
 
 // Reads a YOLOv8 config. Required: num_classes (FastSAM: 1). Optional: widths,
@@ -17265,6 +17285,8 @@ type
 // num_masks (32), proto_hidden (4*widths[0]), mask_hidden (max(widths[2]/4,
 // num_masks)), names (list or {"0": ..} map) else id2label, num_classes long.
 // Hidden widths default to the ultralytics rules; yolov8n otherwise.
+// yolo_world: num_classes optional (training vocabulary, 80; sets cls_hidden),
+// text_embed_dim (512), attn_heads (4 entries, default (cout/2)/32 each).
 function ReadYoloConfigFromJSONFile(const FileName: string): TYoloConfig;
 
 // Box label of class ClassId: its config name, else the COCO name for an 80-class
@@ -17286,6 +17308,27 @@ function BuildYoloFromSafeTensorsEx(const FileName: string;
 
 function BuildYoloFromSafeTensors(const FileName: string;
   out Config: TYoloConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Sets a yolo_world Config's class count and labels to the prompt list
+// (NumClasses = Length(Prompts); the labels YoloClassLabel and the decode use).
+procedure SetYoloWorldPrompts(var Config: TYoloConfig; const Prompts: array of string);
+
+// Builds YOLO-World v2 with TextEmb ((NumPrompts,1,TextEmbedDim) CLIP text
+// embeddings, any norm) folded into the weights; Config.NumClasses must be NumPrompts.
+function BuildYoloWorld(Reader: TNNetSafeTensorsReader;
+  const Config: TYoloConfig; TextEmb: TNNetVolume;
+  pTrainable: boolean = true): TNNet;
+
+function BuildYoloWorldFromSafeTensorsEx(const FileName: string;
+  const Config: TYoloConfig; TextEmb: TNNetVolume;
+  pTrainable: boolean = true): TNNet;
+
+// Reads the config, applies SetYoloWorldPrompts(Prompts) (none = TextEmb rows,
+// labelled by id) and builds the net; one TextEmb row per prompt.
+function BuildYoloWorldFromSafeTensors(const FileName: string;
+  out Config: TYoloConfig; TextEmb: TNNetVolume;
+  const Prompts: array of string; pTrainable: boolean = true;
   const ConfigFileName: string = ''): TNNet;
 
 type
@@ -65631,6 +65674,28 @@ begin
     EmbA.GetRawPtr(0), EmbB.GetRawPtr(0), EmbA.Size);
 end;
 
+procedure ClipEncodeText(TextNet: TNNet; const Config: TClipConfig;
+  const TokenIds: array of integer; BosId, EosId: integer; Embedding: TNNetVolume);
+var
+  TextInput: TNNetVolume;
+  SeqLen, TokenPos, MaxTokenPos: integer;
+begin
+  SeqLen := TextNet.Layers[0].Output.SizeX;
+  TextInput := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    TextInput.Fill(EosId);
+    TextInput.FData[0] := BosId;
+    MaxTokenPos := Min(High(TokenIds), SeqLen - 3);
+    for TokenPos := 0 to MaxTokenPos do
+      TextInput.FData[TokenPos + 1] := TokenIds[TokenPos];
+    TextNet.Compute(TextInput);
+    ClipExtractEmbedding(TextNet.GetLastLayer().Output,
+      ClipTextEosPosition(TextInput, Config.EosTokenId), Embedding);
+  finally
+    TextInput.Free;
+  end;
+end;
+
 function ClipScoreFromEmbeddings(ImageEmb, TextEmb: TNNetVolume;
   Weight: TNeuralFloat): TNeuralFloat;
 begin
@@ -96918,6 +96983,8 @@ begin
   Result.Strides[0] := 8; Result.Strides[1] := 16; Result.Strides[2] := 32;
   Result.ModelType := 'yolov8';
   Result.ClassNames := nil;
+  Result.TextEmbedDim := 512;
+  for i := 0 to 3 do Result.AttnHeads[i] := 0;
   if not FileExists(FileName) then
     ImportError('YOLO import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
@@ -96937,18 +97004,24 @@ begin
     Obj := TJSONObject(Root);
     Result.ModelType := Obj.Get('model_type', 'yolov8');
     if (Result.ModelType <> 'yolov8') and (Result.ModelType <> 'yolo') and
-       (Result.ModelType <> 'fastsam') then
+       (Result.ModelType <> 'fastsam') and (Result.ModelType <> 'yolo_world') then
       ImportError('YOLO import: config model_type is "' + Result.ModelType +
-        '" - only "yolov8" and "fastsam" are supported.');
+        '" - only "yolov8", "fastsam" and "yolo_world" are supported.');
     if Result.ModelType = 'fastsam' then Task := Obj.Get('task', 'segment')
     else Task := Obj.Get('task', 'detect');
     if (Task <> 'detect') and (Task <> 'segment') then
       ImportError('YOLO import: config task is "' + Task +
         '" - only "detect" and "segment" are supported.');
-    if (Obj.IndexOfName('num_classes') < 0) and (Result.ModelType <> 'fastsam') then
+    if (Task <> 'detect') and (Result.ModelType = 'yolo_world') then
+      ImportError('YOLO import: yolo_world supports task "detect" only.');
+    if (Obj.IndexOfName('num_classes') < 0) and (Result.ModelType <> 'fastsam') and
+       (Result.ModelType <> 'yolo_world') then
       ImportError('YOLO import: config "' + FileName +
         '" is missing the required field "num_classes".');
-    Result.NumClasses := Obj.Get('num_classes', 1);
+    if Result.ModelType = 'yolo_world' then
+      Result.NumClasses := Obj.Get('num_classes', 80)
+    else
+      Result.NumClasses := Obj.Get('num_classes', 1);
     if Result.NumClasses <= 0 then
       ImportError('YOLO import: num_classes must be a positive integer.');
     NamesData := Obj.Find('names');
@@ -96985,6 +97058,25 @@ begin
       if Arr.Count <> 3 then
         ImportError('YOLO import: "strides" must have exactly 3 entries.');
       for i := 0 to 2 do Result.Strides[i] := Arr.Integers[i];
+    end;
+    if Result.ModelType = 'yolo_world' then
+    begin
+      Result.TextEmbedDim := Obj.Get('text_embed_dim', Result.TextEmbedDim);
+      // ultralytics C2fAttn head counts scale with width to 32 channels per head.
+      Result.AttnHeads[0] := Max(1, (Result.Widths[3] div 2) div 32);
+      Result.AttnHeads[1] := Max(1, (Result.Widths[2] div 2) div 32);
+      Result.AttnHeads[2] := Result.AttnHeads[0];
+      Result.AttnHeads[3] := Max(1, (Result.Widths[4] div 2) div 32);
+      ArrData := Obj.Find('attn_heads');
+      if (ArrData <> nil) and (ArrData is TJSONArray) then
+      begin
+        Arr := TJSONArray(ArrData);
+        if Arr.Count <> 4 then
+          ImportError('YOLO import: "attn_heads" must have exactly 4 entries.');
+        for i := 0 to 3 do Result.AttnHeads[i] := Arr.Integers[i];
+      end;
+      if Result.TextEmbedDim <= 0 then
+        ImportError('YOLO import: text_embed_dim must be > 0.');
     end;
     Result.RegMax := Obj.Get('reg_max', Result.RegMax);
     // ultralytics Detect: c2 = max(16, ch0 // 4, 4*reg_max), c3 = max(ch0,
@@ -97037,7 +97129,7 @@ begin
   if (ClassId >= 0) and (ClassId < Length(Config.ClassNames)) then
     Result := Config.ClassNames[ClassId]
   else if (Config.ClassNames = nil) and (Config.ModelType <> 'fastsam') and
-     (Config.NumClasses = csCocoClassCount) and (ClassId >= 0) and
+     (Config.ModelType <> 'yolo_world') and (Config.NumClasses = csCocoClassCount) and (ClassId >= 0) and
      (ClassId < csCocoClassCount) then
     Result := csCocoClassNames[ClassId];
   if Result = '' then Result := IntToStr(ClassId);
@@ -97072,6 +97164,11 @@ begin
   if Config.NumMasks > 0 then
     Result := Result + ', num_masks=' + IntToStr(Config.NumMasks) +
       ', proto_hidden=' + IntToStr(Config.ProtoHidden);
+  if Config.ModelType = 'yolo_world' then
+    Result := Result + ', text_embed_dim=' + IntToStr(Config.TextEmbedDim) +
+      ', attn_heads=[' + IntToStr(Config.AttnHeads[0]) + ',' +
+      IntToStr(Config.AttnHeads[1]) + ',' + IntToStr(Config.AttnHeads[2]) + ',' +
+      IntToStr(Config.AttnHeads[3]) + ']';
   if Config.ClassNames <> nil then
     Result := Result + ', class_names=' + IntToStr(Length(Config.ClassNames));
   Result := Result + ')';
@@ -97102,30 +97199,35 @@ begin
   Refs[n].Conv := Conv; Refs[n].InCh := InCh; Refs[n].K := K; Refs[n].Name := Name;
 end;
 
-// Adds a C2f cross-stage block on NN's last layer and records its convs in Refs.
-// Returns the block output layer. cin/cout = in/out channels, n = bottleneck
-// repeats, shortcut = add residual inside each bottleneck (backbone uses true,
-// neck false). Prefix = ultralytics module prefix e.g. 'model.2'.
-function YoloAddC2f(NN: TNNet; var Refs: TYoloConvRefArray;
-  cin, cout, n: integer; shortcut: boolean; const Prefix: string): TNNetLayer;
+type
+  TYoloLayerArray = array of TNNetLayer;
+  // The folded-text layers of one C2fAttn MaxSigmoidAttnBlock: Logits = 1x1 conv
+  // to (prompt, head) logits; Expand = fixed 0/1 conv repeating each head gate.
+  TYoloAttnRef = record
+    Logits, Expand: TNNetLayer;
+    Channels, Heads: integer;
+    Prefix: string;
+  end;
+  TYoloAttnRefArray = array of TYoloAttnRef;
+
+// C2f front: cv1 1x1 -> 2*cmid, both halves, then n chained Bottlenecks on the
+// second half; Outs = [half0, half1, m_0 .. m_(n-1)] plus ExtraSlots free entries.
+function YoloAddC2fBranches(NN: TNNet; var Refs: TYoloConvRefArray;
+  cin, cmid, n, ExtraSlots: integer; shortcut: boolean;
+  const Prefix: string): TYoloLayerArray;
 var
-  cmid, j, nM1: integer;
-  cv1, Half0, Half1, Cur, Bn1, Bn2, Cat: TNNetLayer;
-  Outs: array of TNNetLayer;
+  j, nM1: integer;
+  cv1, Cur, Bn1, Bn2: TNNetLayer;
 begin
-  cmid := cout div 2;
   nM1 := n - 1;
-  // cv1: 1x1 -> 2*cmid
   cv1 := YoloAddConv(NN, 2 * cmid, 1, 1);
   YoloPushConv(Refs, cv1, cin, 1, Prefix + '.cv1');
   cv1 := NN.GetLastLayer();    // the SiLU output of cv1 (the 2*cmid tensor)
+  SetLength(Result, 2 + n + ExtraSlots);
   // BOTH halves split the SAME cv1 output (not a chain).
-  Half0 := NN.AddLayerAfter(TNNetSplitChannels.Create(0, cmid), cv1);
-  Half1 := NN.AddLayerAfter(TNNetSplitChannels.Create(cmid, cmid), cv1);
-  SetLength(Outs, 2 + n);
-  Outs[0] := Half0;
-  Outs[1] := Half1;
-  Cur := Half1;
+  Result[0] := NN.AddLayerAfter(TNNetSplitChannels.Create(0, cmid), cv1);
+  Result[1] := NN.AddLayerAfter(TNNetSplitChannels.Create(cmid, cmid), cv1);
+  Cur := Result[1];
   for j := 0 to nM1 do
   begin
     Bn1 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(cmid, 3, 1, 1, 0), Cur);
@@ -97137,15 +97239,68 @@ begin
     if shortcut then
       NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Cur]));
     Cur := NN.GetLastLayer();
-    Outs[2 + j] := Cur;
+    Result[2 + j] := Cur;
   end;
+end;
+
+// C2f back: concat Outs -> cv2 1x1 conv + SiLU -> cout. Returns the block output.
+function YoloAddC2fFuse(NN: TNNet; var Refs: TYoloConvRefArray;
+  const Outs: TYoloLayerArray; cmid, cout: integer; const Prefix: string): TNNetLayer;
+var
+  Cat: TNNetLayer;
+begin
   Cat := NN.AddLayer(TNNetDeepConcat.Create(Outs));
-  // cv2: 1x1 -> cout
   Result := NN.AddLayerAfter(
     TNNetConvolutionLinear.Create(cout, 1, 0, 1, 0), Cat);
-  YoloPushConv(Refs, Result, (2 + n) * cmid, 1, Prefix + '.cv2');
+  YoloPushConv(Refs, Result, Length(Outs) * cmid, 1, Prefix + '.cv2');
   NN.AddLayer(TNNetSiLU.Create());
   Result := NN.GetLastLayer();
+end;
+
+// Adds a C2f cross-stage block on NN's last layer and records its convs in Refs.
+// shortcut = residual inside each bottleneck (backbone true, neck false).
+function YoloAddC2f(NN: TNNet; var Refs: TYoloConvRefArray;
+  cin, cout, n: integer; shortcut: boolean; const Prefix: string): TNNetLayer;
+begin
+  Result := YoloAddC2fFuse(NN, Refs,
+    YoloAddC2fBranches(NN, Refs, cin, cout div 2, n, 0, shortcut, Prefix),
+    cout div 2, cout, Prefix);
+end;
+
+// Adds a YOLO-World C2fAttn (neck, no shortcut): the C2f branches plus a
+// MaxSigmoidAttnBlock on the last one, whose text weights BuildYolo writes later.
+function YoloAddC2fAttn(NN: TNNet; var Refs: TYoloConvRefArray;
+  var AttnRefs: TYoloAttnRefArray; cin, cout, n, Heads, NumPrompts: integer;
+  const Prefix: string): TNNetLayer;
+var
+  cmid, AttnPos: integer;
+  Outs: TYoloLayerArray;
+  Source, Proj, Gate: TNNetLayer;
+begin
+  cmid := cout div 2;
+  if (Heads < 1) or (cmid mod Heads <> 0) then
+    ImportError('YOLO-World import: ' + Prefix + ' has ' + IntToStr(cmid) +
+      ' attention channels, not divisible by attn_heads = ' + IntToStr(Heads) + '.');
+  Outs := YoloAddC2fBranches(NN, Refs, cin, cmid, n, 1, False, Prefix);
+  Source := Outs[High(Outs) - 1];
+  AttnPos := Length(AttnRefs);
+  SetLength(AttnRefs, AttnPos + 1);
+  AttnRefs[AttnPos].Channels := cmid;
+  AttnRefs[AttnPos].Heads := Heads;
+  AttnRefs[AttnPos].Prefix := Prefix + '.attn';
+  // Logit channel = prompt * Heads + head, so TNNetMaxOut(NumPrompts) maxes over prompts.
+  AttnRefs[AttnPos].Logits := NN.AddLayerAfter(
+    TNNetConvolutionLinear.Create(NumPrompts * Heads, 1, 0, 1, 0), Source);
+  NN.AddLayer(TNNetMaxOut.Create(NumPrompts));
+  NN.AddLayer(TNNetSigmoid.Create());
+  AttnRefs[AttnPos].Expand := NN.AddLayer(
+    TNNetConvolutionLinear.Create(cmid, 1, 0, 1, 0));
+  Gate := AttnRefs[AttnPos].Expand;
+  // proj_conv is an ultralytics Conv with act=False.
+  Proj := NN.AddLayerAfter(TNNetConvolutionLinear.Create(cmid, 3, 1, 1, 0), Source);
+  YoloPushConv(Refs, Proj, cmid, 3, Prefix + '.attn.proj_conv');
+  Outs[High(Outs)] := NN.AddLayer(TNNetCellMulByCell.Create(Proj, Gate));
+  Result := YoloAddC2fFuse(NN, Refs, Outs, cmid, cout, Prefix);
 end;
 
 const
@@ -97199,12 +97354,167 @@ begin
   Result := NN.AddLayer(TNNetSiLU.Create());
 end;
 
-function BuildYolo(Reader: TNNetSafeTensorsReader;
-  const Config: TYoloConfig; pTrainable: boolean): TNNet;
+// Loads Name into Dest after checking it holds ExpectedCount elements; errors
+// name the importer (ImporterName, e.g. 'YOLO-World').
+procedure LoadCheckedImportTensor(Reader: TNNetSafeTensorsReader;
+  const Name: string; Dest: TNNetVolume; ExpectedCount: integer;
+  const ImporterName: string);
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError(ImporterName + ' import: tensor "' + Name + '" not found.');
+  if Reader.ElementCount(Name) <> ExpectedCount then
+    ImportError(ImporterName + ' import: "' + Name + '" is ' +
+      Reader.ShapeAsString(Name) + ', expected ' + IntToStr(ExpectedCount) +
+      ' elements.');
+  Reader.LoadTensorFlat(Name, Dest);
+end;
+
+// Writes MaxSigmoidAttnBlock Ref.Prefix with the text folded in: logit (prompt n,
+// head m) = <x_m, gl(t_n)_m>/sqrt(hc) + bias_m; Expand copies gate m to its hc channels.
+procedure YoloLoadMaxSigmoidAttn(Reader: TNNetSafeTensorsReader;
+  const Ref: TYoloAttnRef; TextNorm: TNNetVolume);
+var
+  GuideW, GuideB, HeadBias, Guide, ConvW, ConvB: TNNetVolume;
+  NumPrompts, TextDim, Channels, Heads, HeadChannels: integer;
+  PromptPos, MaxPromptPos, ChannelPos, MaxChannelPos, HeadPos, MaxHeadPos: integer;
+  LogitPos, GuideRowBase: integer;
+  InvSqrtHeadChannels: TNeuralFloat;
+begin
+  NumPrompts := TextNorm.SizeX;
+  TextDim := TextNorm.Depth;
+  Channels := Ref.Channels;
+  Heads := Ref.Heads;
+  HeadChannels := Channels div Heads;
+  if Reader.HasTensor(Ref.Prefix + '.ec.conv.weight') then
+    ImportError('YOLO-World import: ' + Ref.Prefix + '.ec (embed channels <> ' +
+      'block channels) is not supported.');
+  GuideW := TNNetVolume.Create; GuideB := TNNetVolume.Create;
+  HeadBias := TNNetVolume.Create; Guide := TNNetVolume.Create;
+  ConvW := TNNetVolume.Create; ConvB := TNNetVolume.Create;
+  try
+    LoadCheckedImportTensor(Reader, Ref.Prefix + '.gl.weight', GuideW,
+      Channels * TextDim, 'YOLO-World');
+    LoadCheckedImportTensor(Reader, Ref.Prefix + '.gl.bias', GuideB, Channels,
+      'YOLO-World');
+    LoadCheckedImportTensor(Reader, Ref.Prefix + '.bias', HeadBias, Heads,
+      'YOLO-World');
+    // Guide (NumPrompts, Channels) = gl(text) with channel = head * hc + j.
+    Guide.ReSize(NumPrompts, 1, Channels);
+    MaxPromptPos := NumPrompts - 1;
+    MaxChannelPos := Channels - 1;
+    for PromptPos := 0 to MaxPromptPos do
+    begin
+      GuideRowBase := PromptPos * Channels;
+      for ChannelPos := 0 to MaxChannelPos do
+        Guide.FData[GuideRowBase + ChannelPos] := GuideB.FData[ChannelPos] +
+          TNNetVolume.DotProduct(GuideW.GetRawPtr(ChannelPos * TextDim),
+          TextNorm.GetRawPtr(PromptPos * TextDim), TextDim);
+    end;
+    // 1/sqrt(hc) > 0 and a per-head bias commute with the max over prompts.
+    InvSqrtHeadChannels := 1 / Sqrt(HeadChannels);
+    ConvW.ReSize(NumPrompts * Heads, 1, Channels);
+    ConvW.Fill(0);
+    ConvB.ReSize(NumPrompts * Heads, 1, 1);
+    MaxHeadPos := Heads - 1;
+    for PromptPos := 0 to MaxPromptPos do
+      for HeadPos := 0 to MaxHeadPos do
+      begin
+        LogitPos := PromptPos * Heads + HeadPos;
+        Move(Guide.FData[PromptPos * Channels + HeadPos * HeadChannels],
+          ConvW.FData[LogitPos * Channels + HeadPos * HeadChannels],
+          HeadChannels * csNeuralFloatSize);
+        ConvB.FData[LogitPos] := HeadBias.FData[HeadPos];
+      end;
+    ConvW.Mul(InvSqrtHeadChannels);
+    WriteTorchConvWeights(Ref.Logits, ConvW, ConvB, nil, nil,
+      NumPrompts * Heads, Channels, 1);
+    ConvW.ReSize(Channels, 1, Heads);
+    ConvW.Fill(0);
+    for ChannelPos := 0 to MaxChannelPos do
+      ConvW.FData[ChannelPos * Heads + ChannelPos div HeadChannels] := 1;
+    WriteTorchConvWeights(Ref.Expand, ConvW, nil, nil, nil, Channels, Heads, 1);
+  finally
+    GuideW.Free; GuideB.Free; HeadBias.Free; Guide.Free; ConvW.Free; ConvB.Free;
+  end;
+end;
+
+// Folds WorldDetect cv3.Level.2 (Conv2d to the embedding) and BNContrastiveHead
+// cv4.Level (BN, . unit-L2 text, *exp(logit_scale), +bias) into Layer (Hidden -> prompts).
+procedure YoloLoadContrastiveClassConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; Level, Hidden: integer; TextNorm: TNNetVolume;
+  BnEps: TNeuralFloat);
+var
+  EmbedW, EmbedB, NormScale, NormShift, HeadBias, LogitScale: TNNetVolume;
+  ConvW, ConvB: TNNetVolume;
+  NumPrompts, TextDim, PromptPos, MaxPromptPos, EmbedPos, MaxEmbedPos: integer;
+  TextRowBase: integer;
+  EmbedName, HeadName: string;
+  ScaleExp, TextCoef: TNeuralFloat;
+begin
+  NumPrompts := TextNorm.SizeX;
+  TextDim := TextNorm.Depth;
+  EmbedName := 'model.22.cv3.' + IntToStr(Level) + '.2';
+  HeadName := 'model.22.cv4.' + IntToStr(Level);
+  if not Reader.HasTensor(HeadName + '.norm.weight') then
+    ImportError('YOLO-World import: "' + HeadName + '.norm.weight" not found - ' +
+      'only YOLO-World v2 (BNContrastiveHead) checkpoints are supported.');
+  EmbedW := TNNetVolume.Create; EmbedB := TNNetVolume.Create;
+  NormScale := TNNetVolume.Create; NormShift := TNNetVolume.Create;
+  HeadBias := TNNetVolume.Create; LogitScale := TNNetVolume.Create;
+  ConvW := TNNetVolume.Create; ConvB := TNNetVolume.Create;
+  try
+    LoadCheckedImportTensor(Reader, EmbedName + '.weight', EmbedW,
+      TextDim * Hidden, 'YOLO-World');
+    LoadCheckedImportTensor(Reader, EmbedName + '.bias', EmbedB, TextDim,
+      'YOLO-World');
+    LoadTorchBatchNormScaleShift(Reader, HeadName + '.norm', TextDim, BnEps,
+      NormScale, NormShift);
+    LoadCheckedImportTensor(Reader, HeadName + '.bias', HeadBias, 1, 'YOLO-World');
+    LoadCheckedImportTensor(Reader, HeadName + '.logit_scale', LogitScale, 1,
+      'YOLO-World');
+    ScaleExp := Exp(LogitScale.FData[0]);
+    // BN folded into the embedding conv: row e scaled by NormScale[e].
+    MaxEmbedPos := TextDim - 1;
+    for EmbedPos := 0 to MaxEmbedPos do
+    begin
+      TNNetVolume.Mul(EmbedW.GetRawPtr(EmbedPos * Hidden), NormScale.FData[EmbedPos],
+        Hidden);
+      EmbedB.FData[EmbedPos] := EmbedB.FData[EmbedPos] * NormScale.FData[EmbedPos] +
+        NormShift.FData[EmbedPos];
+    end;
+    ConvW.ReSize(NumPrompts, 1, Hidden);
+    ConvW.Fill(0);
+    ConvB.ReSize(NumPrompts, 1, 1);
+    MaxPromptPos := NumPrompts - 1;
+    for PromptPos := 0 to MaxPromptPos do
+    begin
+      TextRowBase := PromptPos * TextDim;
+      for EmbedPos := 0 to MaxEmbedPos do
+      begin
+        TextCoef := ScaleExp * TextNorm.FData[TextRowBase + EmbedPos];
+        TNNetVolume.MulAdd(ConvW.GetRawPtr(PromptPos * Hidden),
+          EmbedW.GetRawPtr(EmbedPos * Hidden), TextCoef, Hidden);
+      end;
+      ConvB.FData[PromptPos] := HeadBias.FData[0] + ScaleExp *
+        TNNetVolume.DotProduct(EmbedB.GetRawPtr(0), TextNorm.GetRawPtr(TextRowBase),
+        TextDim);
+    end;
+    WriteTorchConvWeights(Layer, ConvW, ConvB, nil, nil, NumPrompts, Hidden, 1);
+  finally
+    EmbedW.Free; EmbedB.Free; NormScale.Free; NormShift.Free;
+    HeadBias.Free; LogitScale.Free; ConvW.Free; ConvB.Free;
+  end;
+end;
+
+// BuildYolo (TextNorm nil) and BuildYoloWorld (TextNorm = unit-L2 prompt rows)
+// share this body; YOLO-World swaps the neck C2f blocks and the class-head loader.
+function BuildYoloNet(Reader: TNNetSafeTensorsReader;
+  const Config: TYoloConfig; TextNorm: TNNetVolume; pTrainable: boolean): TNNet;
 var
   NN: TNNet;
   Refs: TYoloConvRefArray;
-  i, OutDim, TotalCells, ci: integer;
+  AttnRefs: TYoloAttnRefArray;
+  i, OutDim, TotalCells, ci, MaxAttnRefPos: integer;
   HiRefs: integer;
   w0, w1, w2, w3, w4, d0, d1, nc, rm, cb, cc, nm, npr, c4: integer;
   HeadCh: array[0..2] of integer;
@@ -97214,7 +97524,20 @@ var
   SPPFOut, ProtoUp: TNNetLayer;
   BoxConv, ClsConv, MaskConv: array[0..2] of array[0..2] of TNNetLayer;
   Pref: string;
+  IsWorld: boolean;
+
+  // Neck block BlockPos (model.12/15/18/21): C2f, or C2fAttn for YOLO-World.
+  function AddNeckC2f(cin, cout, BlockPos: integer; const Prefix: string): TNNetLayer;
+  begin
+    if IsWorld then
+      Result := YoloAddC2fAttn(NN, Refs, AttnRefs, cin, cout, d0,
+        Config.AttnHeads[BlockPos], nc, Prefix)
+    else
+      Result := YoloAddC2f(NN, Refs, cin, cout, d0, False, Prefix);
+  end;
+
 begin
+  IsWorld := TextNorm <> nil;
   w0 := Config.Widths[0]; w1 := Config.Widths[1]; w2 := Config.Widths[2];
   w3 := Config.Widths[3]; w4 := Config.Widths[4];
   d0 := Config.Depths[0]; d1 := Config.Depths[1];
@@ -97224,6 +97547,7 @@ begin
   OutDim := 4 * rm + nc + nm;
   ProtoUp := nil;
   SetLength(Refs, 0);
+  SetLength(AttnRefs, 0);
   NN := TNNet.Create();
   try
     // -------------------- Architecture --------------------
@@ -97244,21 +97568,21 @@ begin
     // neck: top-down
     U := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), P5);       // 2x nearest
     Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P4]));
-    N4 := YoloAddC2f(NN, Refs, w4 + w3, w3, d0, False, 'model.12');
+    N4 := AddNeckC2f(w4 + w3, w3, 0, 'model.12');
     U := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), N4);
     Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P3]));
-    H3 := YoloAddC2f(NN, Refs, w3 + w2, w2, d0, False, 'model.15');  // head /8
+    H3 := AddNeckC2f(w3 + w2, w2, 1, 'model.15');  // head /8
     // neck: bottom-up
     T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w2, 3, 1, 2, 0).SetTrainable(pTrainable), H3);
     YoloPushConv(Refs, T, w2, 3, 'model.16'); NN.AddLayer(TNNetSiLU.Create());
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, N4]));
-    H4 := YoloAddC2f(NN, Refs, w2 + w3, w3, d0, False, 'model.18');  // head /16
+    H4 := AddNeckC2f(w2 + w3, w3, 2, 'model.18');  // head /16
     T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w3, 3, 1, 2, 0).SetTrainable(pTrainable), H4);
     YoloPushConv(Refs, T, w3, 3, 'model.19'); NN.AddLayer(TNNetSiLU.Create());
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, P5]));
-    H5 := YoloAddC2f(NN, Refs, w3 + w4, w4, d0, False, 'model.21');  // head /32
+    H5 := AddNeckC2f(w3 + w4, w4, 3, 'model.21');  // head /32
     // -------------------- Segment Proto (stride 4) --------------------
     if nm > 0 then
     begin
@@ -97337,14 +97661,21 @@ begin
       LoadMobileNetSEConv(Reader, BoxConv[i][2],
         'model.22.cv2.' + IntToStr(i) + '.2.weight',
         'model.22.cv2.' + IntToStr(i) + '.2.bias', 4 * rm, cb);
-      LoadMobileNetSEConv(Reader, ClsConv[i][2],
-        'model.22.cv3.' + IntToStr(i) + '.2.weight',
-        'model.22.cv3.' + IntToStr(i) + '.2.bias', nc, cc);
+      if IsWorld then
+        YoloLoadContrastiveClassConv(Reader, ClsConv[i][2], i, cc, TextNorm,
+          Config.BnEps)
+      else
+        LoadMobileNetSEConv(Reader, ClsConv[i][2],
+          'model.22.cv3.' + IntToStr(i) + '.2.weight',
+          'model.22.cv3.' + IntToStr(i) + '.2.bias', nc, cc);
       if nm > 0 then
         LoadMobileNetSEConv(Reader, MaskConv[i][2],
           'model.22.cv4.' + IntToStr(i) + '.2.weight',
           'model.22.cv4.' + IntToStr(i) + '.2.bias', nm, c4);
     end;
+    MaxAttnRefPos := High(AttnRefs);
+    for i := 0 to MaxAttnRefPos do
+      YoloLoadMaxSigmoidAttn(Reader, AttnRefs[i], TextNorm);
     YoloUnshiftSPPF(SPPFOut);
     if nm > 0 then
       LoadConvTranspose2DFoldBN(Reader, ProtoUp, 'model.22.proto.upsample.weight',
@@ -97355,6 +97686,15 @@ begin
     NN.Free;
     raise;
   end;
+end;
+
+function BuildYolo(Reader: TNNetSafeTensorsReader;
+  const Config: TYoloConfig; pTrainable: boolean): TNNet;
+begin
+  if Config.ModelType = 'yolo_world' then
+    ImportError('YOLO import: a yolo_world config needs text embeddings - ' +
+      'use BuildYoloWorld.');
+  Result := BuildYoloNet(Reader, Config, nil, pTrainable);
 end;
 
 function BuildYoloFromSafeTensorsEx(const FileName: string;
@@ -97380,6 +97720,77 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadYoloConfigFromJSONFile(ConfigPath);
   Result := BuildYoloFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure SetYoloWorldPrompts(var Config: TYoloConfig; const Prompts: array of string);
+var
+  PromptPos, MaxPromptPos: integer;
+begin
+  Config.NumClasses := Length(Prompts);
+  SetLength(Config.ClassNames, Length(Prompts));
+  MaxPromptPos := High(Prompts);
+  for PromptPos := 0 to MaxPromptPos do
+    Config.ClassNames[PromptPos] := Trim(Prompts[PromptPos]);
+end;
+
+function BuildYoloWorld(Reader: TNNetSafeTensorsReader;
+  const Config: TYoloConfig; TextEmb: TNNetVolume; pTrainable: boolean): TNNet;
+var
+  TextNorm: TNNetVolume;
+begin
+  if Config.ModelType <> 'yolo_world' then
+    ImportError('YOLO-World import: config model_type is "' + Config.ModelType +
+      '", expected "yolo_world".');
+  if (TextEmb = nil) or (TextEmb.SizeX < 1) or (TextEmb.SizeY <> 1) or
+     (TextEmb.Depth <> Config.TextEmbedDim) then
+    ImportError('YOLO-World import: text embeddings must be a (NumPrompts, 1, ' +
+      IntToStr(Config.TextEmbedDim) + ') volume.');
+  if TextEmb.SizeX <> Config.NumClasses then
+    ImportError('YOLO-World import: ' + IntToStr(TextEmb.SizeX) +
+      ' text embeddings for NumClasses = ' + IntToStr(Config.NumClasses) +
+      ' (call SetYoloWorldPrompts).');
+  if Reader.HasTensor('model.23.cv2.0.0.conv.weight') then
+    ImportError('YOLO-World import: this checkpoint has ImagePoolingAttn ' +
+      '(YOLO-World v1); only v2 (e.g. yolov8s-worldv2) is supported.');
+  TextNorm := TNNetVolume.Create(TextEmb);
+  try
+    NormalizeRowsL2(TextNorm);
+    Result := BuildYoloNet(Reader, Config, TextNorm, pTrainable);
+  finally
+    TextNorm.Free;
+  end;
+end;
+
+function BuildYoloWorldFromSafeTensorsEx(const FileName: string;
+  const Config: TYoloConfig; TextEmb: TNNetVolume; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildYoloWorld(Reader, Config, TextEmb, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildYoloWorldFromSafeTensors(const FileName: string;
+  out Config: TYoloConfig; TextEmb: TNNetVolume;
+  const Prompts: array of string; pTrainable: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadYoloConfigFromJSONFile(ConfigPath);
+  if Length(Prompts) > 0 then SetYoloWorldPrompts(Config, Prompts)
+  else if TextEmb <> nil then
+  begin
+    Config.NumClasses := TextEmb.SizeX;
+    Config.ClassNames := nil;
+  end;
+  Result := BuildYoloWorldFromSafeTensorsEx(FileName, Config, TextEmb, pTrainable);
 end;
 
 function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
@@ -99219,13 +99630,7 @@ end;
 procedure LoadLightGlueTensor(Reader: TNNetSafeTensorsReader;
   const Name: string; Dest: TNNetVolume; ExpectedCount: integer);
 begin
-  if not Reader.HasTensor(Name) then
-    ImportError('LightGlue import: tensor "' + Name + '" not found.');
-  if Reader.ElementCount(Name) <> ExpectedCount then
-    ImportError('LightGlue import: "' + Name + '" is ' +
-      Reader.ShapeAsString(Name) + ', expected ' + IntToStr(ExpectedCount) +
-      ' elements.');
-  Reader.LoadTensorFlat(Name, Dest);
+  LoadCheckedImportTensor(Reader, Name, Dest, ExpectedCount, 'LightGlue');
 end;
 
 // Copies nn.Linear Prefix (weight [OutDim][InDim], bias when HasBias) times

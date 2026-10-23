@@ -1324,6 +1324,10 @@ type
     procedure TestFastSAMPromptSelection;
     procedure TestYoloSegOpenCLParity;
     procedure TestYoloSegNativeMasks;
+    // YOLO-World v2 pico parity: folded C2fAttn + BNContrastiveHead vs the ultralytics oracle.
+    procedure TestYoloWorldParity;
+    // YOLO-World prompts from the pico CLIP text tower, end to end vs the oracle.
+    procedure TestYoloWorldClipTextRoute;
     procedure TestByteTrackKalmanPredictUpdate;
     procedure TestByteTrackerSyntheticSequence;
     procedure TestByteTrackerLostBufferAndReset;
@@ -60819,6 +60823,133 @@ end;
 
 // FastSAM prompt.py box / point selection and the post-NMS box step on
 // hand-made masks.
+// Loads a torch [Rows, Dim] tensor of Reader into Dest as a (Rows, 1, Dim) volume.
+procedure LoadYoloWorldTextRows(Reader: TNNetSafeTensorsReader;
+  const Name: string; Dest: TNNetVolume);
+var
+  Flat: TNNetVolume;
+begin
+  Flat := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, Flat);
+    Dest.ReSize(Reader.DimSize(Name, 0), 1, Reader.DimSize(Name, 1));
+    Move(Flat.FData[0], Dest.FData[0], Dest.Size * csNeuralFloatSize);
+  finally
+    Flat.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestYoloWorldParity;
+var
+  NN: TNNet;
+  Config: TYoloConfig;
+  IO: TNNetSafeTensorsReader;
+  Img, TextEmb, RefHead: TNNetVolume;
+  Dets: TYoloDetectionArray;
+  HeadDiff: double;
+  ValuePos, MaxValuePos: integer;
+begin
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_yolo_world_io.safetensors'));
+  Img := TNNetVolume.Create; TextEmb := TNNetVolume.Create;
+  RefHead := TNNetVolume.Create;
+  NN := nil;
+  try
+    LoadDDColorTorchImage(IO, 'input', Img);
+    LoadYoloWorldTextRows(IO, 'text_embeds', TextEmb);
+    IO.LoadTensorFlat('head', RefHead);
+    NN := BuildYoloWorldFromSafeTensors(FixturePath('tiny_yolo_world.safetensors'),
+      Config, TextEmb, ['cat', ' bus ', 'dog'], {pTrainable=}false,
+      FixturePath('tiny_yolo_world_config.json'));
+    AssertEquals('model type', 'yolo_world', Config.ModelType);
+    AssertEquals('text embed dim', 8, Config.TextEmbedDim);
+    AssertEquals('attn heads of model.18', 3, Config.AttnHeads[2]);
+    AssertEquals('num classes = prompts', 3, Config.NumClasses);
+    AssertEquals('prompt label trimmed', 'bus', YoloClassLabel(Config, 1));
+    NN.Compute(Img);
+    AssertEquals('head depth', 4 * Config.RegMax + 3,
+      NN.GetLastLayer().Output.Depth);
+    AssertEquals('head size', RefHead.Size, NN.GetLastLayer().Output.Size);
+    HeadDiff := 0;
+    MaxValuePos := RefHead.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      HeadDiff := Max(HeadDiff, Abs(NN.GetLastLayer().Output.FData[ValuePos] -
+        RefHead.FData[ValuePos]));
+    WriteLn('  YOLO-World head max|diff| = ', HeadDiff:0:9);
+    AssertTrue('head max |diff| ' + FloatToStr(HeadDiff), HeadDiff < 1e-4);
+    // Pico logits are about -0.5 .. -2.4: a 0.1 score threshold keeps candidates.
+    Dets := DecodeYoloDetections(NN.GetLastLayer().Output, Config, 0.1, 0.45, 10);
+    AssertTrue('decoded detections', Length(Dets) > 0);
+    AssertTrue('detection class is a prompt id',
+      (Dets[0].ClassId >= 0) and (Dets[0].ClassId < 3));
+  finally
+    NN.Free; IO.Free; Img.Free; TextEmb.Free; RefHead.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestYoloWorldClipTextRoute;
+const
+  SeqLen = 8;
+var
+  NN, TextNet, VisionNet: TNNet;
+  ClipConfig: TClipConfig;
+  Config: TYoloConfig;
+  IO: TNNetSafeTensorsReader;
+  Img, TextEmb, RefHead, TokenIds, Embedding: TNNetVolume;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  TextSeqs, SeqArr: TJSONArray;
+  HeadDiff: double;
+  SeqPos, TokenPos, ValuePos, MaxValuePos: integer;
+begin
+  BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'),
+    TextNet, VisionNet, ClipConfig, {TextSeqLen=}SeqLen, {pTrainable=}false,
+    FixturePath('tiny_clip_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_yolo_world_io.safetensors'));
+  Img := TNNetVolume.Create; TextEmb := TNNetVolume.Create;
+  RefHead := TNNetVolume.Create; TokenIds := TNNetVolume.Create(SeqLen, 1, 1);
+  Embedding := TNNetVolume.Create;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_clip_embeds.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    TextSeqs := TJSONArray(TJSONObject(RefRoot).Find('text_sequences'));
+    TextEmb.ReSize(TextSeqs.Count, 1, ClipConfig.ProjectionDim);
+    for SeqPos := 0 to TextSeqs.Count - 1 do
+    begin
+      SeqArr := TJSONArray(TextSeqs.Items[SeqPos]);
+      for TokenPos := 0 to SeqLen - 1 do
+        TokenIds.FData[TokenPos] := SeqArr.Items[TokenPos].AsInteger;
+      TextNet.Compute(TokenIds);
+      // Unit-L2 rows; BuildYoloWorld normalises again, as ultralytics does.
+      ClipExtractEmbedding(TextNet.GetLastLayer().Output,
+        ClipTextEosPosition(TokenIds, ClipConfig.EosTokenId), Embedding);
+      Move(Embedding.FData[0], TextEmb.FData[SeqPos * ClipConfig.ProjectionDim],
+        ClipConfig.ProjectionDim * csNeuralFloatSize);
+    end;
+    LoadDDColorTorchImage(IO, 'input', Img);
+    IO.LoadTensorFlat('clip_head', RefHead);
+    NN := BuildYoloWorldFromSafeTensors(FixturePath('tiny_yolo_world.safetensors'),
+      Config, TextEmb, [], {pTrainable=}false,
+      FixturePath('tiny_yolo_world_config.json'));
+    AssertEquals('num classes = text rows', 2, Config.NumClasses);
+    AssertEquals('unnamed prompt label = id', '1', YoloClassLabel(Config, 1));
+    NN.Compute(Img);
+    AssertEquals('head size', RefHead.Size, NN.GetLastLayer().Output.Size);
+    HeadDiff := 0;
+    MaxValuePos := RefHead.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      HeadDiff := Max(HeadDiff, Abs(NN.GetLastLayer().Output.FData[ValuePos] -
+        RefHead.FData[ValuePos]));
+    WriteLn('  YOLO-World CLIP-route head max|diff| = ', HeadDiff:0:9);
+    AssertTrue('head max |diff| ' + FloatToStr(HeadDiff), HeadDiff < 1e-4);
+  finally
+    NN.Free; TextNet.Free; VisionNet.Free; IO.Free; Img.Free; TextEmb.Free;
+    RefHead.Free; TokenIds.Free; Embedding.Free; RefJson.Free; RefRoot.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestFastSAMPromptSelection;
 var
   Masks, Dest: TNNetVolume;

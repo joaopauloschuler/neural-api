@@ -81,6 +81,9 @@ writes tests/fixtures/tiny_yolo{.safetensors,_config.json,_io.json}.
   /home/bpsa/x/bin/python tools/yolo_tiny_fixture.py --seg
 writes tests/fixtures/tiny_yolo_seg{.safetensors,_config.json,_io.safetensors}
 (needs torch for the seg oracle; the detect mode needs numpy + safetensors only).
+  /home/bpsa/x/bin/python tools/yolo_tiny_fixture.py --world
+writes tests/fixtures/tiny_yolo_world{.safetensors,_config.json,_io.safetensors}
+(YOLO-World v2; reads tests/fixtures/tiny_clip_embeds.json for the CLIP route).
 """
 import sys
 import json
@@ -645,8 +648,189 @@ def main_seg():
     print('wrote tiny_yolo_seg.safetensors + config + io')
 
 
+# ---------------------------------------------------------------------------
+# World mode (YOLO-World v2, ultralytics yolov8s-worldv2): same backbone and
+# DFL box branch; the neck C2f blocks 12/15/18/21 become C2fAttn and the class
+# branch becomes WorldDetect's cv3 (-> embed) + BNContrastiveHead (cv4). The
+# oracle follows the ultralytics modules literally (einsum + max + sigmoid,
+# BatchNorm then dot with the L2-normalised text), NOT the folded weights the
+# CAI importer bakes, so the folding is what the parity test checks.
+#   C2fAttn(c1, c2, n, ec, nh, gc): c = c2 // 2; y = split(cv1(x)); y += m_j(y[-1]);
+#     y.append(MaxSigmoidAttnBlock(y[-1], txt)); cv2(cat(y))   ((3+n)*c -> c2)
+#   MaxSigmoidAttnBlock(c, c, nh, ec=c, gc): guide = gl(txt) -> (nc, nh, hc);
+#     aw = max_n <x_head, guide_n_head> / sqrt(hc) + bias; x = proj_conv(x)
+#     (Conv 3x3, act=False) * sigmoid(aw) per head.
+#   BNContrastiveHead(embed): BN(x) . normalize(txt) * exp(logit_scale) + bias.
+# WorldModel.set_classes L2-normalises the CLIP text features before both uses.
+# ---------------------------------------------------------------------------
+WORLD_EMBED = 8                          # text embed dim = tiny_clip projection_dim
+WORLD_HEADS = [2, 2, 3, 4]               # C2fAttn heads of model.12/15/18/21
+WORLD_PROMPTS = 3                        # random text embeddings
+WORLD_C3 = 8                             # WorldDetect c3 (cls_hidden)
+
+
+def add_c2f_attn(sd, idx, cin, cout, n, nh):
+    add_c2f(sd, idx, cin, cout, n)
+    c = cout // 2
+    sd[f'model.{idx}.cv2.conv.weight'] = randn(cout, (3 + n) * c, 1, 1, std=0.4)
+    sd[f'model.{idx}.attn.gl.weight'] = randn(c, WORLD_EMBED, std=2.0)
+    sd[f'model.{idx}.attn.gl.bias'] = randn(c, std=0.2)
+    sd[f'model.{idx}.attn.bias'] = randn(nh, std=0.5)
+    add_conv_bn(sd, f'model.{idx}.attn.proj_conv', c, c, 3)
+
+
+def build_world_state_dict():
+    sd = build_state_dict()
+    for idx, cin, cout, nh in [(12, W4 + W3, W3, WORLD_HEADS[0]),
+                               (15, W3 + W2, W2, WORLD_HEADS[1]),
+                               (18, W2 + W3, W3, WORLD_HEADS[2]),
+                               (21, W3 + W4, W4, WORLD_HEADS[3])]:
+        add_c2f_attn(sd, idx, cin, cout, D0, nh)
+    for i, ci in enumerate([W2, W3, W4]):
+        for key in [k for k in sd if k.startswith(f'model.22.cv3.{i}.')]:
+            del sd[key]
+        add_conv_bn(sd, f'model.22.cv3.{i}.0', WORLD_C3, ci, 3)
+        add_conv_bn(sd, f'model.22.cv3.{i}.1', WORLD_C3, WORLD_C3, 3)
+        add_conv2d(sd, f'model.22.cv3.{i}.2', WORLD_EMBED, WORLD_C3, 1)
+        sd[f'model.22.cv4.{i}.norm.weight'] = randn(WORLD_EMBED, std=0.3) + 1.0
+        sd[f'model.22.cv4.{i}.norm.bias'] = randn(WORLD_EMBED, std=0.1)
+        sd[f'model.22.cv4.{i}.norm.running_mean'] = randn(WORLD_EMBED, std=0.1)
+        sd[f'model.22.cv4.{i}.norm.running_var'] = np.abs(randn(WORLD_EMBED, std=0.2)) + 0.5
+        sd[f'model.22.cv4.{i}.bias'] = randn(1, std=0.5) - 1.0
+        sd[f'model.22.cv4.{i}.logit_scale'] = np.array(0.3 * i + 0.5)
+    return sd
+
+
+def batchnorm(x, sd, prefix):
+    g, bt = sd[prefix + '.weight'], sd[prefix + '.bias']
+    rm, rv = sd[prefix + '.running_mean'], sd[prefix + '.running_var']
+    return (x - rm[:, None, None]) / np.sqrt(rv + BN_EPS)[:, None, None] * \
+        g[:, None, None] + bt[:, None, None]
+
+
+def max_sigmoid_attn(x, sd, prefix, nh, txt):
+    c, h, w = x.shape
+    hc = c // nh
+    guide = txt @ sd[prefix + '.gl.weight'].T + sd[prefix + '.gl.bias']
+    guide = guide.reshape(-1, nh, hc)                        # (nc, nh, hc)
+    embed = x.reshape(nh, hc, h, w)
+    aw = np.einsum('mchw,nmc->mhwn', embed, guide).max(axis=-1)
+    aw = aw / hc ** 0.5 + sd[prefix + '.bias'][:, None, None]
+    aw = 1.0 / (1.0 + np.exp(-aw))
+    p = conv2d(x, sd[prefix + '.proj_conv.conv.weight'], None, 1, 1)
+    p = batchnorm(p, sd, prefix + '.proj_conv.bn')
+    return (p.reshape(nh, hc, h, w) * aw[:, None]).reshape(c, h, w)
+
+
+def c2f_attn(x, sd, idx, n, nh, txt):
+    y = conv_bn(x, sd, f'model.{idx}.cv1', 1, 1)
+    c = y.shape[0] // 2
+    outs = [y[:c], y[c:]]
+    for j in range(n):
+        outs.append(bottleneck(outs[-1], sd, f'model.{idx}.m.{j}', False))
+    outs.append(max_sigmoid_attn(outs[-1], sd, f'model.{idx}.attn', nh, txt))
+    return conv_bn(np.concatenate(outs, axis=0), sd, f'model.{idx}.cv2', 1, 1)
+
+
+def world_forward(x, sd, txt):
+    txt = txt / np.linalg.norm(txt, axis=-1, keepdims=True)
+    f0 = conv_bn(x, sd, 'model.0', 3, 2)
+    f1 = conv_bn(f0, sd, 'model.1', 3, 2)
+    f2 = c2f(f1, sd, 2, D0, True)
+    f3 = conv_bn(f2, sd, 'model.3', 3, 2)
+    P3 = c2f(f3, sd, 4, D1, True)
+    f5 = conv_bn(P3, sd, 'model.5', 3, 2)
+    P4 = c2f(f5, sd, 6, D1, True)
+    f7 = conv_bn(P4, sd, 'model.7', 3, 2)
+    f8 = c2f(f7, sd, 8, D0, True)
+    P5 = sppf(f8, sd, 9)
+    N4 = c2f_attn(np.concatenate([upsample2x(P5), P4]), sd, 12, D0,
+                  WORLD_HEADS[0], txt)
+    H3 = c2f_attn(np.concatenate([upsample2x(N4), P3]), sd, 15, D0,
+                  WORLD_HEADS[1], txt)
+    d16 = conv_bn(H3, sd, 'model.16', 3, 2)
+    H4 = c2f_attn(np.concatenate([d16, N4]), sd, 18, D0, WORLD_HEADS[2], txt)
+    d19 = conv_bn(H4, sd, 'model.19', 3, 2)
+    H5 = c2f_attn(np.concatenate([d19, P5]), sd, 21, D0, WORLD_HEADS[3], txt)
+    heads = []
+    for i, Hi in enumerate([H3, H4, H5]):
+        bx = conv_bn(Hi, sd, f'model.22.cv2.{i}.0', 3, 1)
+        bx = conv_bn(bx, sd, f'model.22.cv2.{i}.1', 3, 1)
+        bx = conv2d_raw(bx, sd, f'model.22.cv2.{i}.2', 1)
+        em = conv_bn(Hi, sd, f'model.22.cv3.{i}.0', 3, 1)
+        em = conv_bn(em, sd, f'model.22.cv3.{i}.1', 3, 1)
+        em = conv2d_raw(em, sd, f'model.22.cv3.{i}.2', 1)
+        em = batchnorm(em, sd, f'model.22.cv4.{i}.norm')
+        cl = np.einsum('chw,kc->khw', em, txt)
+        cl = cl * np.exp(sd[f'model.22.cv4.{i}.logit_scale']) + \
+            sd[f'model.22.cv4.{i}.bias']
+        heads.append(np.concatenate([bx, cl], axis=0))
+    return flatten_heads(heads)[0]
+
+
+def main_world():
+    global rng
+    rng = np.random.default_rng(20261024)
+    sd = build_world_state_dict()
+    sd_f32 = {k: np.asarray(v, dtype=np.float32) for k, v in sd.items()}
+    sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
+    txt = randn(WORLD_PROMPTS, WORLD_EMBED).astype(np.float32).astype(np.float64)
+    with open('tests/fixtures/tiny_clip_embeds.json') as f:
+        clip_txt = np.array(json.load(f)['text_embeds'], dtype=np.float32)
+    clip_txt = clip_txt.astype(np.float64)
+    x = np.zeros((IN_CH, INPUT, INPUT), dtype=np.float64)
+    for c in range(IN_CH):
+        for y in range(INPUT):
+            for px in range(INPUT):
+                x[c, y, px] = (((c * 1024 + y * 32 + px) * 7) % 17 - 8) / 16.0
+    out = world_forward(x, sd, txt)
+    clip_out = world_forward(x, sd, clip_txt)
+    cls = out[:, 4 * REG_MAX:]
+    print(f'head {out.shape}; clip head {clip_out.shape}; class logits '
+          f'min {cls.min():.4f} max {cls.max():.4f}; best-class histogram '
+          f'{np.bincount(cls.argmax(axis=1), minlength=WORLD_PROMPTS)}')
+    for key in ['model.12.attn.gl.weight', 'model.15.attn.bias',
+                'model.18.attn.proj_conv.conv.weight', 'model.21.attn.gl.bias',
+                'model.22.cv4.0.norm.running_mean', 'model.22.cv4.2.logit_scale']:
+        alt = dict(sd)
+        alt[key] = np.zeros_like(sd[key])
+        d = np.abs(world_forward(x, alt, txt) - out).max()
+        assert d > 1e-5, f'{key} had no effect ({d})'
+        print(f'{key:40s} effect: max|diff| = {d:.4f}')
+    # Every prompt must win the attention max somewhere (else max == one prompt).
+    assert np.abs(world_forward(x, sd, txt[[0, 0, 0]]) - out)[:, :4 * REG_MAX].max() > 1e-5
+
+    save_file(sd_f32, 'tests/fixtures/tiny_yolo_world.safetensors')
+    config = {
+        'model_type': 'yolo_world',
+        'widths': [W0, W1, W2, W3, W4],
+        'depths': [D0, D1],
+        'reg_max': REG_MAX,
+        'box_hidden': CB,
+        'cls_hidden': WORLD_C3,
+        'text_embed_dim': WORLD_EMBED,
+        'attn_heads': WORLD_HEADS,
+        'num_channels': IN_CH,
+        'image_size': INPUT,
+        'bn_eps': BN_EPS,
+        'strides': [8, 16, 32],
+    }
+    with open('tests/fixtures/tiny_yolo_world_config.json', 'w') as f:
+        json.dump(config, f, indent=1)
+    f32 = lambda a: np.ascontiguousarray(np.array(a, dtype=np.float32))
+    save_file({
+        'input': f32(x),                       # (3, H, W)
+        'text_embeds': f32(txt),               # (prompts, embed), not normalised
+        'head': f32(out),                      # (cells, 4*rm + prompts)
+        'clip_head': f32(clip_out),            # tiny_clip text_embeds as prompts
+    }, 'tests/fixtures/tiny_yolo_world_io.safetensors')
+    print(f'wrote tiny_yolo_world.safetensors ({len(sd_f32)} tensors) + config + io')
+
+
 if __name__ == '__main__':
     if '--seg' in sys.argv[1:]:
         main_seg()
+    elif '--world' in sys.argv[1:]:
+        main_world()
     else:
         main()
