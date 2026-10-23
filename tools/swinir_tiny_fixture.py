@@ -12,7 +12,14 @@ as tools/nafnet_tiny_fixture.py and tools/rrdbnet_tiny_fixture.py). Weights use
 the official SwinIR repo state_dict key scheme so the importer is exercised on a
 realistic key layout.
 
-Architecture (this pico, classical SR, upscale=2):
+Three variants share the body and differ in the reconstruction tail (the
+official `upsampler` argument of network_swinir.py):
+  tiny_swinir          'pixelshuffle' x2 (classical SR; config has no
+                       `upsampler` key, so the importer auto-detects it)
+  tiny_swinir_nearest  'nearest+conv' x4 (real-world SR)
+  tiny_swinir_denoise  '' upscale 1 (denoise / JPEG: x + conv_last(feat))
+
+Architecture (classical SR variant, upscale=2):
   conv_first       (3x3, 3->E, pad1, +bias)                       -> feat map F0
   layers[L] RSTB:   x = block_in (token seq over the HxW grid)
       residual_group.blocks[B] Swin layer (W-MSA / SW-MSA + MLP)
@@ -20,9 +27,13 @@ Architecture (this pico, classical SR, upscale=2):
       x = x + block_in                                            (RSTB residual)
   norm              (token LayerNorm over E)
   conv_after_body  (3x3, E->E, pad1, +bias)  ; + F0   (deep-feature residual)
-  conv_before_upsample (3x3, E->Eup, pad1, +bias) -> LeakyReLU(0.2)
+  conv_before_upsample (3x3, E->Eup, pad1, +bias) -> LeakyReLU(0.01)
   upsample.0       (3x3, Eup->4*Eup, pad1, +bias) -> PixelShuffle(2)  (x2)
   conv_last        (3x3, Eup->3, pad1, +bias)
+nearest+conv tail: conv_before_upsample -> LeakyReLU(0.01), then per x2 step
+  nearest x2 -> conv_up1 / conv_up2 (3x3 Eup->Eup) -> LeakyReLU(0.2), then
+  conv_hr (3x3) -> LeakyReLU(0.2) -> conv_last.
+denoise tail: out = input + conv_last(feat)   (conv_last E->3).
 
 One Swin layer (HF/SwinIR semantics, token sequence over the HxW grid):
   shortcut = x
@@ -36,7 +47,8 @@ Coded by Claude (AI).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/swinir_tiny_fixture.py
-writes tests/fixtures/tiny_swinir{.safetensors,_config.json,_io.json}.
+writes tests/fixtures/<stem>{.safetensors,_config.json,_io.json} for the three
+stems above.
 Needs numpy + safetensors only.
 """
 import json
@@ -52,11 +64,17 @@ WINDOW = 2         # window size (grid 4 -> 2x2 windows, shift = 1)
 MLP_RATIO = 2.0
 IN_CH = 3
 IMG = 4            # input grid H=W (multiple of WINDOW)
-UPSCALE = 2
 NUM_FEAT = 4       # conv_before_upsample channels (Eup)
 LN_EPS = 1e-5
 
-rng = np.random.default_rng(20260615)
+SEED = 20260615
+# (stem, upsampler, upscale, write the upsampler key into the config)
+VARIANTS = (
+    ('tiny_swinir', 'pixelshuffle', 2, False),
+    ('tiny_swinir_nearest', 'nearest+conv', 4, True),
+    ('tiny_swinir_denoise', '', 1, True),
+)
+rng = np.random.default_rng(SEED)
 
 
 def randn(*shape, std=1.0):
@@ -95,7 +113,7 @@ def add_swin_layer(sd, prefix):
     add_linear(sd, prefix + 'mlp.fc2', EMBED, hidden)
 
 
-def build_state_dict():
+def build_state_dict(upsampler, upscale):
     sd = {}
     add_conv(sd, 'conv_first', EMBED, IN_CH, 3)
     for li in range(NUM_RSTB):
@@ -105,9 +123,19 @@ def build_state_dict():
     sd['norm.weight'] = randn(EMBED, std=0.2) + 1.0
     sd['norm.bias'] = randn(EMBED, std=0.1)
     add_conv(sd, 'conv_after_body', EMBED, EMBED, 3)
-    add_conv(sd, 'conv_before_upsample.0', NUM_FEAT, EMBED, 3)
-    add_conv(sd, 'upsample.0', 4 * NUM_FEAT, NUM_FEAT, 3)
-    add_conv(sd, 'conv_last', IN_CH, NUM_FEAT, 3)
+    if upsampler == 'pixelshuffle':
+        add_conv(sd, 'conv_before_upsample.0', NUM_FEAT, EMBED, 3)
+        add_conv(sd, 'upsample.0', 4 * NUM_FEAT, NUM_FEAT, 3)
+        add_conv(sd, 'conv_last', IN_CH, NUM_FEAT, 3)
+    elif upsampler == 'nearest+conv':
+        add_conv(sd, 'conv_before_upsample.0', NUM_FEAT, EMBED, 3)
+        add_conv(sd, 'conv_up1', NUM_FEAT, NUM_FEAT, 3)
+        if upscale == 4:
+            add_conv(sd, 'conv_up2', NUM_FEAT, NUM_FEAT, 3)
+        add_conv(sd, 'conv_hr', NUM_FEAT, NUM_FEAT, 3)
+        add_conv(sd, 'conv_last', IN_CH, NUM_FEAT, 3)
+    else:
+        add_conv(sd, 'conv_last', IN_CH, EMBED, 3)
     return sd
 
 
@@ -132,7 +160,7 @@ def conv2d(x, w, b, pad, stride=1):
 
 
 def gelu(x):
-    # exact erf GELU (matches TNNetGELU).
+    # exact erf GELU (nn.GELU; matches TNNetGELUErf).
     from math import sqrt
     import scipy.special as sp  # noqa
     return 0.5 * x * (1.0 + sp.erf(x / sqrt(2.0)))
@@ -274,7 +302,16 @@ def pixel_shuffle(x, r):
     return out
 
 
-def forward(inp, sd):
+def leaky_relu(x, slope):
+    return np.where(x >= 0, x, slope * x)
+
+
+def nearest2x(x):
+    # (C, H, W) -> (C, 2H, 2W), F.interpolate(scale_factor=2, mode='nearest').
+    return np.repeat(np.repeat(x, 2, axis=1), 2, axis=2)
+
+
+def forward(inp, sd, upsampler, upscale):
     H = inp.shape[1]
     Wd = inp.shape[2]
     f0 = conv2d(inp, sd['conv_first.weight'], sd['conv_first.bias'], 1)  # (E,H,W)
@@ -294,18 +331,32 @@ def forward(inp, sd):
     xm = tokens_to_map(x, H, Wd)
     xm = conv2d(xm, sd['conv_after_body.weight'], sd['conv_after_body.bias'], 1)
     feat = xm + f0                                       # deep-feature residual
-    # SR tail.
+    if upsampler == '':
+        # denoise / JPEG tail: residual over the (normalized) input.
+        return inp + conv2d(feat, sd['conv_last.weight'], sd['conv_last.bias'], 1)
+    # conv_before_upsample is Sequential(conv, nn.LeakyReLU()) -> slope 0.01.
     u = conv2d(feat, sd['conv_before_upsample.0.weight'],
                sd['conv_before_upsample.0.bias'], 1)
-    u = np.where(u >= 0, u, 0.2 * u)                     # LeakyReLU(0.2)
-    u = conv2d(u, sd['upsample.0.weight'], sd['upsample.0.bias'], 1)
-    u = pixel_shuffle(u, UPSCALE)
+    u = leaky_relu(u, 0.01)
+    if upsampler == 'pixelshuffle':
+        u = conv2d(u, sd['upsample.0.weight'], sd['upsample.0.bias'], 1)
+        u = pixel_shuffle(u, upscale)
+    else:
+        u = leaky_relu(conv2d(nearest2x(u), sd['conv_up1.weight'],
+                              sd['conv_up1.bias'], 1), 0.2)
+        if upscale == 4:
+            u = leaky_relu(conv2d(nearest2x(u), sd['conv_up2.weight'],
+                                  sd['conv_up2.bias'], 1), 0.2)
+        u = leaky_relu(conv2d(u, sd['conv_hr.weight'], sd['conv_hr.bias'], 1),
+                       0.2)
     out = conv2d(u, sd['conv_last.weight'], sd['conv_last.bias'], 1)
     return out
 
 
-def main():
-    sd = build_state_dict()
+def make_variant(stem, upsampler, upscale, write_upsampler):
+    global rng
+    rng = np.random.default_rng(SEED)
+    sd = build_state_dict(upsampler, upscale)
     sd_f32 = {k: v.astype(np.float32) for k, v in sd.items()}
     sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
 
@@ -316,15 +367,15 @@ def main():
             for px in range(IMG):
                 x[c, y, px] = (((c * 64 + y * 8 + px) * 5) % 13 - 6) / 8.0
 
-    img = forward(x, sd)
-    print(f'input {x.shape} -> image {img.shape}')
+    img = forward(x, sd, upsampler, upscale)
+    print(f'[{stem}] input {x.shape} -> image {img.shape}')
     print(f'image stats: min {img.min():.4f} max {img.max():.4f} '
           f'mean {img.mean():.4f}')
 
-    save_file(sd_f32, 'tests/fixtures/tiny_swinir.safetensors')
+    save_file(sd_f32, f'tests/fixtures/{stem}.safetensors')
     config = {
         'model_type': 'swinir',
-        'upscale': UPSCALE,
+        'upscale': upscale,
         'in_chans': IN_CH,
         'img_size': IMG,
         'window_size': WINDOW,
@@ -335,15 +386,17 @@ def main():
         'num_feat': NUM_FEAT,
         'layer_norm_eps': LN_EPS,
     }
-    with open('tests/fixtures/tiny_swinir_config.json', 'w') as f:
+    if write_upsampler:
+        config['upsampler'] = upsampler
+    with open(f'tests/fixtures/{stem}_config.json', 'w') as f:
         json.dump(config, f, indent=1)
-    with open('tests/fixtures/tiny_swinir_io.json', 'w') as f:
+    with open(f'tests/fixtures/{stem}_io.json', 'w') as f:
         json.dump({
             'input': x.tolist(),
             'image': img.tolist(),
             'image_size': img.shape[1],
         }, f)
-    print(f'wrote tiny_swinir.safetensors ({len(sd_f32)} tensors) + config + io')
+    print(f'wrote {stem}.safetensors ({len(sd_f32)} tensors) + config + io')
 
     # ---- fixture self-checks: each major piece must MATTER. ----
     base = img.copy()
@@ -351,19 +404,31 @@ def main():
     def perturb(key):
         alt = dict(sd)
         alt[key] = np.zeros_like(sd[key])
-        return np.abs(forward(x, alt) - base).max()
+        return np.abs(forward(x, alt, upsampler, upscale) - base).max()
 
-    for key in ('conv_first.weight',
-                'layers.0.residual_group.blocks.0.attn.qkv.weight',
-                'layers.0.residual_group.blocks.1.attn.relative_position_bias_table',
-                'layers.0.residual_group.blocks.0.mlp.fc1.weight',
-                'layers.0.conv.weight', 'conv_after_body.weight',
-                'conv_before_upsample.0.weight', 'upsample.0.weight',
-                'conv_last.weight'):
+    keys = ['conv_first.weight',
+            'layers.0.residual_group.blocks.0.attn.qkv.weight',
+            'layers.0.residual_group.blocks.1.attn.relative_position_bias_table',
+            'layers.0.residual_group.blocks.0.mlp.fc1.weight',
+            'layers.0.conv.weight', 'conv_after_body.weight',
+            'conv_last.weight']
+    if upsampler != '':
+        keys.append('conv_before_upsample.0.weight')
+    if upsampler == 'pixelshuffle':
+        keys.append('upsample.0.weight')
+    if upsampler == 'nearest+conv':
+        keys += ['conv_up1.weight', 'conv_hr.weight']
+        if upscale == 4:
+            keys.append('conv_up2.weight')
+    for key in keys:
         d = perturb(key)
         assert d > 1e-4, f'{key} had no effect ({d})'
         print(f'{key:62s} effect: max|diff| = {d:.4f}')
 
+
+def main():
+    for stem, upsampler, upscale, write_upsampler in VARIANTS:
+        make_variant(stem, upsampler, upscale, write_upsampler)
     print('all fixture self-checks passed')
 
 

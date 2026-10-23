@@ -218,6 +218,10 @@ type
       pRoundTrip: boolean; out Config: TGFPGANConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
       pRoundTrip: boolean; pPackedPath: boolean = false): double;
+    // Max |diff| of the pico SwinIR tests/fixtures/<Stem>.* vs its float64
+    // numpy oracle; Config returns the resolved config.
+    function SwinIRParityMaxDiff(const Stem: string;
+      out Config: TSwinIRConfig): double;
     // Largest |depth - oracle| of BuildDPTFromSafeTensors over every case of
     // IoFile ({"cases": [{"input", "out_grid_w", "out_grid_h", "output"}]}).
     function DPTDepthParityMaxDiff(const WeightsFile, ConfigFile,
@@ -1527,6 +1531,9 @@ type
     procedure TestRIFEFrameSchedule;
     procedure TestSwinIRConfigFromJSONFile;
     procedure TestSwinIRParity;
+    procedure TestSwinIRNearestConvParity;
+    procedure TestSwinIRDenoiseParity;
+    procedure TestSwinIRRejectsPixelShuffleDirect;
     procedure TestRestormerParity;
     procedure TestRestormerDualPixelBiasFreeParity;
     procedure TestRestormerDualPixelPackedParity;
@@ -54658,34 +54665,33 @@ begin
   AssertEquals('depth[0]', 2, Config.Depths[0]);
   AssertEquals('num_heads[0]', 2, Config.NumHeads[0]);
   AssertEquals('num_feat', 4, Config.NumFeat);
+  AssertEquals('absent upsampler', 'auto', Config.Upsampler);
+  Config := ReadSwinIRConfigFromJSONFile(
+    FixturePath('tiny_swinir_nearest_config.json'));
+  AssertEquals('nearest upsampler', 'nearest+conv', Config.Upsampler);
+  AssertEquals('nearest upscale', 4, Config.Upscale);
+  Config := ReadSwinIRConfigFromJSONFile(
+    FixturePath('tiny_swinir_denoise_config.json'));
+  AssertEquals('denoise upsampler', '', Config.Upsampler);
+  AssertEquals('denoise upscale', 1, Config.Upscale);
 end;
 
-// SwinIR transformer image-restoration (classical SR) parity test.
-// tests/fixtures/tiny_swinir.* is a pico random-init SwinIR (img 4, window 2,
-// embed_dim 6, 1 RSTB of 2 Swin layers, 2 heads, upscale 2). The fixture
-// (tools/swinir_tiny_fixture.py) is a self-contained float64 numpy oracle that
-// mirrors the importer's forward path EXACTLY. The 2-layer RSTB exercises the
-// full shifted-window path: layer 0 is W-MSA, layer 1 is SW-MSA (cyclic shift +
-// attention mask). Asserts the upscaled (img*upscale, img*upscale, in_chans)
-// restored image matches the oracle < 1e-4 - exercising TNNetWindowAttention
-// (rel-pos bias + shift mask), TNNetGatherTokens (window partition/reverse),
-// the RSTB residual conv, and the TNNetDepthToSpace pixel-shuffle tail.
-procedure TTestNeuralPretrained.TestSwinIRParity;
+function TTestNeuralPretrained.SwinIRParityMaxDiff(const Stem: string;
+  out Config: TSwinIRConfig): double;
 var
   NN: TNNet;
-  Config: TSwinIRConfig;
   RefRoot: TJSONData;
   RefJson: TStringList;
   InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
   ImgInput: TNNetVolume;
   ImgSize, OutGrid: integer;
   ChanCnt, YCnt, XCnt: integer;
-  Diff, MaxDiff, RefVal, GotVal: double;
+  Diff, RefVal, GotVal: double;
 begin
   RandSeed := 424242;
   NN := BuildSwinIRFromSafeTensors(
-    FixturePath('tiny_swinir.safetensors'), Config,
-    {pTrainable=}true, FixturePath('tiny_swinir_config.json'));
+    FixturePath(Stem + '.safetensors'), Config,
+    {pTrainable=}true, FixturePath(Stem + '_config.json'));
   RefJson := TStringList.Create;
   ImgInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -54693,7 +54699,7 @@ begin
     AssertTrue('net built', NN <> nil);
     AssertEquals('input grid', Config.ImgSize, NN.Layers[0].Output.SizeX);
     OutGrid := Config.ImgSize * Config.Upscale;
-    RefJson.LoadFromFile(FixturePath('tiny_swinir_io.json'));
+    RefJson.LoadFromFile(FixturePath(Stem + '_io.json'));
     RefRoot := GetJSON(RefJson.Text);
     InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
     ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
@@ -54722,7 +54728,7 @@ begin
     end;
     NN.Compute(ImgInput);
     // Compare the (C,H,W) oracle vs the CAI (x,y,depth) output volume.
-    MaxDiff := 0;
+    Result := 0;
     for ChanCnt := 0 to Config.InChans - 1 do
     begin
       RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
@@ -54735,18 +54741,88 @@ begin
           GotVal := NN.GetLastLayer().Output.FData[
             (YCnt * ImgSize + XCnt) * Config.InChans + ChanCnt];
           Diff := Abs(GotVal - RefVal);
-          if Diff > MaxDiff then MaxDiff := Diff;
+          if Diff > Result then Result := Diff;
         end;
       end;
     end;
-    AssertTrue('restored RGB: max |diff| = ' + FloatToStr(MaxDiff) +
-      ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;
     ImgInput.Free;
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// SwinIR transformer image-restoration (classical SR) parity test.
+// tests/fixtures/tiny_swinir.* is a pico random-init SwinIR (img 4, window 2,
+// embed_dim 6, 1 RSTB of 2 Swin layers, 2 heads, upscale 2). The fixture
+// (tools/swinir_tiny_fixture.py) is a self-contained float64 numpy oracle that
+// mirrors the importer's forward path EXACTLY. The 2-layer RSTB exercises the
+// full shifted-window path: layer 0 is W-MSA, layer 1 is SW-MSA (cyclic shift +
+// attention mask). Asserts the upscaled (img*upscale, img*upscale, in_chans)
+// restored image matches the oracle < 1e-4 - exercising TNNetWindowAttention
+// (rel-pos bias + shift mask), TNNetGatherTokens (window partition/reverse),
+// the RSTB residual conv, and the TNNetDepthToSpace pixel-shuffle tail. The
+// config has no "upsampler" key, so this also covers the key-based auto-detect.
+procedure TTestNeuralPretrained.TestSwinIRParity;
+var
+  Config: TSwinIRConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := SwinIRParityMaxDiff('tiny_swinir', Config);
+  AssertEquals('auto-detected upsampler', 'pixelshuffle', Config.Upsampler);
+  AssertTrue('restored RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// Real-world SR tail (upsampler 'nearest+conv', x4): two nearest x2 + conv_up1
+// / conv_up2, then conv_hr, each followed by LeakyReLU(0.2), then conv_last.
+procedure TTestNeuralPretrained.TestSwinIRNearestConvParity;
+var
+  Config: TSwinIRConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := SwinIRParityMaxDiff('tiny_swinir_nearest', Config);
+  AssertEquals('upsampler', 'nearest+conv', Config.Upsampler);
+  AssertEquals('upscale', 4, Config.Upscale);
+  AssertTrue('nearest+conv x4: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// Denoise / JPEG tail (upsampler '', upscale 1): input + conv_last(features).
+procedure TTestNeuralPretrained.TestSwinIRDenoiseParity;
+var
+  Config: TSwinIRConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := SwinIRParityMaxDiff('tiny_swinir_denoise', Config);
+  AssertEquals('upsampler', '', Config.Upsampler);
+  AssertEquals('upscale', 1, Config.Upscale);
+  AssertTrue('denoise: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// 'pixelshuffledirect' depends on the open PixelShuffle channel-order question,
+// so the importer must reject it instead of building a wrong tail.
+procedure TTestNeuralPretrained.TestSwinIRRejectsPixelShuffleDirect;
+var
+  Config: TSwinIRConfig;
+  NN: TNNet;
+  Raised: boolean;
+begin
+  Config := ReadSwinIRConfigFromJSONFile(
+    FixturePath('tiny_swinir_config.json'));
+  Config.Upsampler := 'pixelshuffledirect';
+  Raised := false;
+  NN := nil;
+  try
+    NN := BuildSwinIRFromSafeTensorsEx(
+      FixturePath('tiny_swinir.safetensors'), Config);
+  except
+    on E: Exception do Raised := true;
+  end;
+  NN.Free;
+  AssertTrue('pixelshuffledirect must be rejected', Raised);
 end;
 
 // Max |diff| of pico Restormer Stem (weights WeightsFile) vs its float64 torch

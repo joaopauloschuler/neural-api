@@ -14773,8 +14773,11 @@ procedure RIFEInterpolateFrames(NN: TNNet; const Config: TRIFEConfig;
 //   RSTB[L]: depth Swin layers (W-MSA/SW-MSA + MLP) -> map -> conv 3x3 ->
 //            tokens, + RSTB input (residual)
 //   token LayerNorm (norm) -> map -> conv_after_body 3x3, + conv_first map
-//   conv_before_upsample 3x3 -> LeakyReLU(0.2)
-//   upsample.0 3x3 (Eup -> 4*Eup) -> DepthToSpace(upscale) -> conv_last 3x3
+//   tail by upsampler: 'pixelshuffle' = conv_before_upsample 3x3 ->
+//     LeakyReLU(0.01) -> upsample.0 3x3 (Eup -> 4*Eup) -> DepthToSpace ->
+//     conv_last; 'nearest+conv' = conv_before_upsample -> LeakyReLU(0.01) ->
+//     per x2: nearest x2 -> conv_up1/conv_up2 -> LeakyReLU(0.2), then conv_hr ->
+//     LeakyReLU(0.2) -> conv_last; '' (upscale 1) = input + conv_last(feat).
 // Keys follow the official SwinIR repo state_dict (single packed attn.qkv +
 // attn.proj, layers.L.residual_group.blocks.M.*, layers.L.conv.*).
 // ---------------------------------------------------------------------------
@@ -14791,16 +14794,24 @@ type
     MlpRatio: TNeuralFloat;       // MLP hidden = round(embed_dim * mlp_ratio)
     NumFeat: integer;             // conv_before_upsample / upsample channels
     LayerNormEps: TNeuralFloat;   // 1e-5
+    // 'pixelshuffle', 'nearest+conv', '' (denoise, upscale 1) or 'auto'
+    // (resolved from the checkpoint keys by ResolveSwinIRUpsampler).
+    Upsampler: string;
   end;
 
 // Reads a SwinIR config. Required: embed_dim, window_size, img_size. Optional:
 // upscale (2), in_chans (3), depths ([6]), num_heads ([6]), mlp_ratio (2.0),
-// num_feat (64), layer_norm_eps (1e-5), model_type. depths and num_heads must
-// have the same length (one entry per RSTB).
+// num_feat (64), layer_norm_eps (1e-5), upsampler ('auto' when absent),
+// model_type. depths and num_heads must have the same length (one per RSTB).
 function ReadSwinIRConfigFromJSONFile(
   const FileName: string): TSwinIRConfig;
 
 function SwinIRConfigToString(const Config: TSwinIRConfig): string;
+
+// Replaces Upsampler 'auto' with the tail the checkpoint keys describe, then
+// rejects tails the importer does not build (pixelshuffledirect, _aux).
+procedure ResolveSwinIRUpsampler(Reader: TNNetSafeTensorsReader;
+  var Config: TSwinIRConfig);
 
 // Builds the SwinIR restorer described by Config and loads every weight from
 // Reader (caller owns Reader). Takes an (ImgSize, ImgSize, InChans) image and
@@ -83659,6 +83670,7 @@ begin
     Result.MlpRatio := Obj.Get('mlp_ratio', 2.0);
     Result.NumFeat := Obj.Get('num_feat', 64);
     Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    Result.Upsampler := Obj.Get('upsampler', 'auto');
   finally
     Root.Free;
     JsonText.Free;
@@ -83689,7 +83701,44 @@ begin
     IntToStr(Config.ImgSize) + ', window_size=' + IntToStr(Config.WindowSize) +
     ', embed_dim=' + IntToStr(Config.EmbedDim) + ', depths=[' + DepthStr +
     '], num_heads=[' + HeadStr + '], mlp_ratio=' +
-    FloatToStr(Config.MlpRatio) + ', num_feat=' + IntToStr(Config.NumFeat);
+    FloatToStr(Config.MlpRatio) + ', num_feat=' + IntToStr(Config.NumFeat) +
+    ', upsampler="' + Config.Upsampler + '"';
+end;
+
+procedure ResolveSwinIRUpsampler(Reader: TNNetSafeTensorsReader;
+  var Config: TSwinIRConfig);
+begin
+  if Config.Upsampler = 'auto' then
+  begin
+    if Reader.HasTensor('conv_up1.weight') then
+      Config.Upsampler := 'nearest+conv'
+    else if Reader.HasTensor('conv_before_upsample.0.weight') then
+      Config.Upsampler := 'pixelshuffle'
+    else if Reader.HasTensor('upsample.0.weight') then
+      Config.Upsampler := 'pixelshuffledirect'
+    else
+      Config.Upsampler := '';
+  end;
+  if Config.Upsampler = 'pixelshuffle' then
+  begin
+    if Config.Upscale < 2 then
+      ImportError('SwinIR import: upsampler "pixelshuffle" needs upscale >= 2.');
+  end
+  else if Config.Upsampler = 'nearest+conv' then
+  begin
+    if (Config.Upscale <> 2) and (Config.Upscale <> 4) then
+      ImportError('SwinIR import: upsampler "nearest+conv" needs upscale 2 ' +
+        'or 4, got ' + IntToStr(Config.Upscale) + '.');
+  end
+  else if Config.Upsampler = '' then
+  begin
+    if Config.Upscale <> 1 then
+      ImportError('SwinIR import: the denoise tail (upsampler "") needs ' +
+        'upscale 1, got ' + IntToStr(Config.Upscale) + '.');
+  end
+  else
+    ImportError('SwinIR import: upsampler "' + Config.Upsampler +
+      '" is not supported (pixelshuffle, nearest+conv or "" only).');
 end;
 
 type
@@ -83789,7 +83838,7 @@ begin
   MlpHidden := Round(Dim * MlpRatio);
   Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
   Refs.Fc1 := Fc1;
-  NN.AddLayer( TNNetGELU.Create() );
+  NN.AddLayer( TNNetGELUErf.Create() ); // nn.GELU: exact erf form
   Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
   Refs.Fc2 := Fc2;
   MlpResidual := NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
@@ -83864,6 +83913,8 @@ function BuildSwinIRFromSafeTensors(Reader: TNNetSafeTensorsReader;
 var
   NN: TNNet;
   ConvFirst, ConvAfterBody, ConvBeforeUp, UpConv, ConvLast: TNNetLayer;
+  ConvUp1, ConvUp2, ConvHR: TNNetLayer;
+  Resolved: TSwinIRConfig;
   RSTBConv: array of TNNetLayer;
   LayerRefs: array of array of TSwinIRLayerRefs;
   FinalNorm: TNNetLayer;
@@ -83887,6 +83938,8 @@ begin
     ImportError('SwinIR import: upscale must be >= 1.');
   if (Config.Upscale > 1) and (Config.NumFeat < 1) then
     ImportError('SwinIR import: num_feat must be >= 1 for upscale > 1.');
+  Resolved := Config;
+  ResolveSwinIRUpsampler(Reader, Resolved);
   NumRSTB := Length(Config.Depths);
   NumRSTBM1 := NumRSTB - 1;
   Grid := Config.ImgSize;
@@ -83942,11 +83995,18 @@ begin
     // ---------------- Reconstruction / upsample tail ----------------
     ConvBeforeUp := nil;
     UpConv := nil;
-    if Config.Upscale > 1 then
+    ConvUp1 := nil;
+    ConvUp2 := nil;
+    ConvHR := nil;
+    if Resolved.Upsampler <> '' then
     begin
+      // nn.Sequential(conv, nn.LeakyReLU()): torch's default slope 0.01.
       ConvBeforeUp := NN.AddLayer(
         TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
-      NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+      NN.AddLayer( TNNetLeakyReLU.Create(0.01) );
+    end;
+    if Resolved.Upsampler = 'pixelshuffle' then
+    begin
       // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, DepthToSpace.
       UpConv := NN.AddLayer( TNNetConvolutionLinear.Create(
         Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
@@ -83954,10 +84014,33 @@ begin
       ConvLast := NN.AddLayer(
         TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
     end
-    else
-      // Same-resolution denoise tail: single conv reconstruction.
+    else if Resolved.Upsampler = 'nearest+conv' then
+    begin
+      // Each x2 step: nearest x2 (TNNetDeMaxPool) -> 3x3 conv -> LeakyReLU(0.2).
+      NN.AddLayer( TNNetDeMaxPool.Create(2) );
+      ConvUp1 := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+      if Config.Upscale = 4 then
+      begin
+        NN.AddLayer( TNNetDeMaxPool.Create(2) );
+        ConvUp2 := NN.AddLayer(
+          TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+      end;
+      ConvHR := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
       ConvLast := NN.AddLayer(
         TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
+    end
+    else
+    begin
+      // Denoise / JPEG tail: residual over the network input.
+      ConvLast := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetSum.Create([ConvLast, NN.Layers[0]]) );
+    end;
 
     if not pTrainable then NN.SetTrainable();
 
@@ -83979,12 +84062,22 @@ begin
     LoadLayerNormWeights(Reader, FinalNorm, 'norm.weight', 'norm.bias', Dim);
     LoadVaeConv(Reader, ConvAfterBody, 'conv_after_body.weight',
       'conv_after_body.bias', Dim, Dim, 3);
-    if Config.Upscale > 1 then
+    if Resolved.Upsampler <> '' then
     begin
       LoadVaeConv(Reader, ConvBeforeUp, 'conv_before_upsample.0.weight',
         'conv_before_upsample.0.bias', Config.NumFeat, Dim, 3);
-      LoadVaeConv(Reader, UpConv, 'upsample.0.weight', 'upsample.0.bias',
-        Config.Upscale * Config.Upscale * Config.NumFeat, Config.NumFeat, 3);
+      if UpConv <> nil then
+        LoadVaeConv(Reader, UpConv, 'upsample.0.weight', 'upsample.0.bias',
+          Config.Upscale * Config.Upscale * Config.NumFeat, Config.NumFeat, 3);
+      if ConvUp1 <> nil then
+        LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias',
+          Config.NumFeat, Config.NumFeat, 3);
+      if ConvUp2 <> nil then
+        LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias',
+          Config.NumFeat, Config.NumFeat, 3);
+      if ConvHR <> nil then
+        LoadVaeConv(Reader, ConvHR, 'conv_hr.weight', 'conv_hr.bias',
+          Config.NumFeat, Config.NumFeat, 3);
       LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
         Config.InChans, Config.NumFeat, 3);
     end
@@ -84017,11 +84110,18 @@ function BuildSwinIRFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 var
   ConfigPath: string;
+  Reader: TNNetSafeTensorsReader;
 begin
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinIRConfigFromJSONFile(ConfigPath);
-  Result := BuildSwinIRFromSafeTensorsEx(FileName, Config, pTrainable);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    ResolveSwinIRUpsampler(Reader, Config);
+    Result := BuildSwinIRFromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
 end;
 
 // ===========================================================================
