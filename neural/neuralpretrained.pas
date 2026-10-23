@@ -16858,6 +16858,18 @@ function COCOToOpenPoseBody(const Joints: TPoseJointArray;
 procedure DrawOpenPoseBodies(Canvas: TNNetVolume; Width, Height: integer;
   const Poses: TPoseKeypointsArray; ScoreThreshold: TNeuralFloat = 0.3);
 
+// DWposeDetector's draw size: Canvas := DrawOpenPoseBodies at ControlNetAuxResizeImageSize
+// of the (Width, Height) photo the Poses' pixels refer to (joints rescaled).
+procedure DrawOpenPoseBodiesAtDetectResolution(Canvas: TNNetVolume;
+  Width, Height: integer; const Poses: TPoseKeypointsArray;
+  DetectResolution: integer = 512; ScoreThreshold: TNeuralFloat = 0.3);
+
+// DWposeDetector route: DrawOpenPoseBodiesAtDetectResolution, then bilinear
+// (cv2 INTER_LINEAR) back to Canvas (Width, Height, 3).
+procedure DrawOpenPoseBodiesViaDetectResolution(Canvas: TNNetVolume;
+  Width, Height: integer; const Poses: TPoseKeypointsArray;
+  DetectResolution: integer = 512; ScoreThreshold: TNeuralFloat = 0.3);
+
 // process_mask_native: Masks := (ImageWidth, ImageHeight, N); unpads the Proto masks by
 // the letterbox, bilinear up to the image, crops to the IMAGE-pixel Dets, > 0.5.
 procedure ComputeYoloMasksNative(Head, Proto: TNNetVolume;
@@ -96155,6 +96167,55 @@ begin
       if Bodies[BodyPos].Visible[JointPos] then
         FillCircleCV2(Canvas, Trunc(Bodies[BodyPos].X[JointPos]),
           Trunc(Bodies[BodyPos].Y[JointPos]), csJointRadius, Color);
+  end;
+end;
+
+procedure DrawOpenPoseBodiesAtDetectResolution(Canvas: TNNetVolume;
+  Width, Height: integer; const Poses: TPoseKeypointsArray;
+  DetectResolution: integer; ScoreThreshold: TNeuralFloat);
+var
+  DetectPoses: TPoseKeypointsArray;
+  DetectWidth, DetectHeight, BodyPos, MaxBodyPos, JointPos,
+    MaxJointPos: integer;
+  ScaleX, ScaleY: TNeuralFloat;
+begin
+  ControlNetAuxResizeImageSize(Width, Height, DetectResolution, DetectWidth,
+    DetectHeight);
+  ScaleX := DetectWidth / Width;
+  ScaleY := DetectHeight / Height;
+  SetLength(DetectPoses, Length(Poses));
+  MaxBodyPos := High(Poses);
+  for BodyPos := 0 to MaxBodyPos do
+  begin
+    DetectPoses[BodyPos] := Poses[BodyPos];
+    DetectPoses[BodyPos].Joints := Copy(Poses[BodyPos].Joints);
+    MaxJointPos := High(DetectPoses[BodyPos].Joints);
+    // cv2.resize pixel-centre mapping, as the detector sees the resized photo.
+    for JointPos := 0 to MaxJointPos do
+    begin
+      DetectPoses[BodyPos].Joints[JointPos].X :=
+        (Poses[BodyPos].Joints[JointPos].X + 0.5) * ScaleX - 0.5;
+      DetectPoses[BodyPos].Joints[JointPos].Y :=
+        (Poses[BodyPos].Joints[JointPos].Y + 0.5) * ScaleY - 0.5;
+    end;
+  end;
+  DrawOpenPoseBodies(Canvas, DetectWidth, DetectHeight, DetectPoses,
+    ScoreThreshold);
+end;
+
+procedure DrawOpenPoseBodiesViaDetectResolution(Canvas: TNNetVolume;
+  Width, Height: integer; const Poses: TPoseKeypointsArray;
+  DetectResolution: integer; ScoreThreshold: TNeuralFloat);
+var
+  DetectCanvas: TNNetVolume;
+begin
+  DetectCanvas := TNNetVolume.Create;
+  try
+    DrawOpenPoseBodiesAtDetectResolution(DetectCanvas, Width, Height, Poses,
+      DetectResolution, ScoreThreshold);
+    ResizeImageBilinearNoAntialias(DetectCanvas, Canvas, Width, Height);
+  finally
+    DetectCanvas.Free;
   end;
 end;
 

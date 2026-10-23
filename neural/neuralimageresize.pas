@@ -41,6 +41,11 @@ procedure ConvertAndResizeImagePIL(Source, Dest: TNNetVolume; Width, Height,
 procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
   ShortestEdge: integer; Filter: TImageResampleFilter);
 
+// controlnet_aux util.resize_image output size: scale so the short side is
+// Resolution, then np.round (half to even) each side to a multiple of 64.
+procedure ControlNetAuxResizeImageSize(Width, Height, Resolution: integer;
+  out ResizedWidth, ResizedHeight: integer);
+
 // Separable Gaussian blur of Source (W,H,D) per channel, sigma = Radius (PIL
 // GaussianBlur radius), clamped edges. Dest may be Source; Radius <= 0 copies.
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat); overload;
@@ -368,6 +373,17 @@ begin
   if NewSizeY < 1 then NewSizeY := 1;
   ResizeImagePIL(Source, Dest, NewSizeX, NewSizeY, Filter,
     {RoundToBytes=}true);
+end;
+
+procedure ControlNetAuxResizeImageSize(Width, Height, Resolution: integer;
+  out ResizedWidth, ResizedHeight: integer);
+var
+  Scale: double;
+begin
+  // Double, as numpy; Round is half to even like np.round.
+  Scale := Resolution / Min(Width, Height);
+  ResizedWidth := Round(Width * Scale / 64.0) * 64;
+  ResizedHeight := Round(Height * Scale / 64.0) * 64;
 end;
 
 procedure ResizeImageLanczos(Source, Dest: TNNetVolume; NewSizeX,

@@ -151,12 +151,26 @@ and `lllyasviel/control_v11p_sd15_openpose` expect, from a plain photo:
    both shoulders score > 0.3; every joint needs a score > 0.3), the 17 limbs
    as filled `cv2.ellipse2Poly` polygons 4 pixels wide in the limb color
    x 0.6, then the 18 joint dots (radius 4) in full color, on black.
+   As in DWpose, it draws at the `detect_resolution` size of the photo
+   (`DrawOpenPoseBodiesAtDetectResolution`: short side 512, each side
+   rounded to a multiple of 64 by `ControlNetAuxResizeImageSize`), so the
+   stick width and dot radius are relative to that size.
+4. The drawing is resized to the image size with Lanczos, as diffusers'
+   ControlNet pipeline resizes a control image (`VaeImageProcessor`,
+   `resample="lanczos"`).
+
+Steps 3 and 4 draw at the detect size and resize, instead of drawing at the
+image size, because a DWpose image fed to diffusers goes through these two
+sizes. When the image has a short side of 512 and a long side that is a
+multiple of 64 (512 x 512, 768 x 512), the detect size equals the image size
+and step 4 changes nothing. At other sizes (768 x 768 for SD 2.x, the small
+pico sizes) the sticks scale with the image, as in the Python recipe.
 
 `TestOpenPoseDrawParity` matches the DWpose drawing code, run with
 OpenCV 4.10, value for value on a 96 x 64 canvas with two persons (clipped
 limbs and dots, hidden joints). `--pose-out` saves the drawn image;
-`examples/PoseEstimation --openpose-out` writes the same image at the photo
-size.
+`examples/PoseEstimation --openpose-out` also draws at the detect size, then
+resizes to the photo size with bilinear (cv2 `INTER_LINEAR`).
 
 Not done yet: a real run with `yolov8n`, `usyd-community/vitpose-base-simple`
 and `lllyasviel/sd-controlnet-openpose`. Only the pico fixtures (random

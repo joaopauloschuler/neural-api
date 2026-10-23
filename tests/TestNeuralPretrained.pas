@@ -1270,6 +1270,8 @@ type
     procedure TestMultiPersonPoseStructure;
     procedure TestOpenPoseDrawParity;
     procedure TestCOCOToOpenPoseBodyNeck;
+    procedure TestControlNetAuxResizeImageSize;
+    procedure TestOpenPoseDrawViaDetectResolution;
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
@@ -41925,6 +41927,102 @@ begin
     Canvas.Free;
     Expected.Free;
     RefJson.Free;
+  end;
+end;
+
+// controlnet_aux resize_image sizes: short side to 512, each side np.round to a
+// multiple of 64; 544 -> 8.5 and 608 -> 9.5 blocks pin the half-to-even rule.
+procedure TTestNeuralPretrained.TestControlNetAuxResizeImageSize;
+const
+  csPhotoSizes: array[0..6, 0..1] of integer = ((640, 480), (1920, 1080),
+    (1000, 1500), (544, 512), (608, 512), (100, 50), (512, 512));
+  csResizedSizes: array[0..6, 0..1] of integer = ((704, 512), (896, 512),
+    (512, 768), (512, 512), (640, 512), (1024, 512), (512, 512));
+var
+  CasePos, ResizedWidth, ResizedHeight: integer;
+begin
+  for CasePos := 0 to High(csPhotoSizes) do
+  begin
+    ControlNetAuxResizeImageSize(csPhotoSizes[CasePos, 0],
+      csPhotoSizes[CasePos, 1], 512, ResizedWidth, ResizedHeight);
+    AssertEquals('width of case ' + IntToStr(CasePos),
+      csResizedSizes[CasePos, 0], ResizedWidth);
+    AssertEquals('height of case ' + IntToStr(CasePos),
+      csResizedSizes[CasePos, 1], ResizedHeight);
+  end;
+end;
+
+// The detect-resolution route: canvas sizes at both steps, identical to the
+// native draw when the photo is already 512 x 512, thicker sticks on 1024 x 1024.
+procedure TTestNeuralPretrained.TestOpenPoseDrawViaDetectResolution;
+const
+  // COCO-17 stick figure on a 512 x 512 photo; .25 steps stay exact when scaled.
+  csJointXY: array[0..16, 0..1] of TNeuralFloat = ((256.25, 80.25),
+    (266.25, 70.25), (246.25, 70.25), (276.25, 76.25), (236.25, 76.25),
+    (300.25, 140.25), (212.25, 140.25), (330.25, 210.25), (182.25, 210.25),
+    (350.25, 280.25), (162.25, 280.25), (286.25, 300.25), (226.25, 300.25),
+    (290.25, 390.25), (222.25, 390.25), (294.25, 470.25), (218.25, 470.25));
+var
+  Poses: TPoseKeypointsArray;
+  Canvas, NativeCanvas: TNNetVolume;
+  JointPos, ValuePos, NativeLitCount, RouteLitCount: integer;
+
+  procedure SetPoseScale(Scale: TNeuralFloat);
+  var
+    PosOfJoint: integer;
+  begin
+    for PosOfJoint := 0 to 16 do
+    begin
+      Poses[0].Joints[PosOfJoint].X := csJointXY[PosOfJoint, 0] * Scale;
+      Poses[0].Joints[PosOfJoint].Y := csJointXY[PosOfJoint, 1] * Scale;
+    end;
+  end;
+
+  function LitPixelCount(Image: TNNetVolume): integer;
+  var
+    PixelPos: integer;
+  begin
+    Result := 0;
+    for PixelPos := 0 to Image.SizeX * Image.SizeY - 1 do
+      if Image.FData[PixelPos * 3] + Image.FData[PixelPos * 3 + 1] +
+        Image.FData[PixelPos * 3 + 2] > 0 then Inc(Result);
+  end;
+
+begin
+  SetLength(Poses, 1);
+  SetLength(Poses[0].Joints, 17);
+  for JointPos := 0 to 16 do Poses[0].Joints[JointPos].Score := 0.9;
+  Canvas := TNNetVolume.Create;
+  NativeCanvas := TNNetVolume.Create;
+  try
+    SetPoseScale(1.0);
+    DrawOpenPoseBodiesAtDetectResolution(Canvas, 640, 480, Poses);
+    AssertEquals('detect canvas width', 704, Canvas.SizeX);
+    AssertEquals('detect canvas height', 512, Canvas.SizeY);
+    DrawOpenPoseBodiesViaDetectResolution(Canvas, 640, 480, Poses);
+    AssertEquals('route width is the photo width', 640, Canvas.SizeX);
+    AssertEquals('route height is the photo height', 480, Canvas.SizeY);
+    AssertEquals('route depth', 3, Canvas.Depth);
+    AssertTrue('route draws something', Canvas.GetMax() > 0);
+
+    SetPoseScale(1.0);
+    DrawOpenPoseBodies(NativeCanvas, 512, 512, Poses);
+    DrawOpenPoseBodiesViaDetectResolution(Canvas, 512, 512, Poses);
+    AssertEquals('512 photo: same size', NativeCanvas.Size, Canvas.Size);
+    for ValuePos := 0 to Canvas.Size - 1 do
+      AssertEquals('512 photo: same value at ' + IntToStr(ValuePos),
+        NativeCanvas.FData[ValuePos], Canvas.FData[ValuePos], 1e-3);
+
+    SetPoseScale(2.0);
+    DrawOpenPoseBodies(NativeCanvas, 1024, 1024, Poses);
+    DrawOpenPoseBodiesViaDetectResolution(Canvas, 1024, 1024, Poses);
+    NativeLitCount := LitPixelCount(NativeCanvas);
+    RouteLitCount := LitPixelCount(Canvas);
+    AssertTrue(Format('1024 photo: route sticks are thicker (%d vs %d lit)',
+      [RouteLitCount, NativeLitCount]), RouteLitCount > 3 * NativeLitCount div 2);
+  finally
+    NativeCanvas.Free;
+    Canvas.Free;
   end;
 end;
 

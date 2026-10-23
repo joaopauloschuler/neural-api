@@ -9,8 +9,9 @@
 ///   heatmap peak + DARK refinement -> keypoints in photo pixels.
 /// The person boxes come from --box (one box), from a YOLOv8 detector with
 /// --yolo (every person in the photo), or default to the whole photo.
-/// --openpose-out also writes the OpenPose image of the poses
-/// (DrawOpenPoseBodies), the control image of an openpose ControlNet.
+/// --openpose-out also writes the OpenPose image of the poses, drawn as
+/// controlnet_aux DWpose does (DrawOpenPoseBodiesViaDetectResolution), the
+/// control image of an openpose ControlNet.
 ///
 /// With no arguments it runs the committed PICO fixtures (random weights, a
 /// synthetic photo), so the numbers exercise the pipeline, not real joints.
@@ -31,6 +32,8 @@ type
     ModelFile, ConfigFile, ImageFile, OutputFile: string;
     // --openpose-out: the OpenPose control image of the poses; '' for none.
     OpenPoseFile: string;
+    // --detect-resolution: DWpose draw short side; 0 draws at the photo size.
+    DetectResolution: integer;
     YoloFile, YoloConfigFile: string;
     HasBox: boolean;
     Box: array[0..3] of TNeuralFloat;
@@ -51,6 +54,9 @@ begin
   WriteLn('  --conf X             person score threshold (default 0.25)');
   WriteLn('  --output FILE        photo with boxes and joints (default pose_out.png)');
   WriteLn('  --openpose-out FILE  also the OpenPose image (ControlNet openpose input)');
+  WriteLn('  --detect-resolution N');
+  WriteLn('                       OpenPose draw short side, then resized to the photo');
+  WriteLn('                       (default 512, as DWpose; 0 = draw at the photo size)');
   WriteLn('Without --box or --yolo the whole photo is one person box.');
 end;
 
@@ -91,6 +97,7 @@ begin
   Opt.ModelFile := ''; Opt.ConfigFile := ''; Opt.ImageFile := '';
   Opt.OutputFile := 'pose_out.png';
   Opt.OpenPoseFile := '';
+  Opt.DetectResolution := 512;
   Opt.YoloFile := ''; Opt.YoloConfigFile := '';
   Opt.HasBox := false;
   Opt.ScoreThreshold := 0.25;
@@ -111,6 +118,8 @@ begin
       else if Arg = '--conf' then Opt.ScoreThreshold := StrToFloat(NextArg())
       else if Arg = '--output' then Opt.OutputFile := NextArg()
       else if Arg = '--openpose-out' then Opt.OpenPoseFile := NextArg()
+      else if Arg = '--detect-resolution' then
+        Opt.DetectResolution := StrToInt(NextArg())
       else if (Arg = '--help') or (Arg = '-h') then
       begin
         PrintUsage();
@@ -262,7 +271,11 @@ begin
     for PersonPos := 0 to High(Poses) do PrintPose(Poses[PersonPos]);
     if Opt.OpenPoseFile <> '' then
     begin
-      DrawOpenPoseBodies(OpenPoseImage, Image.SizeX, Image.SizeY, Poses);
+      if Opt.DetectResolution > 0 then
+        DrawOpenPoseBodiesViaDetectResolution(OpenPoseImage, Image.SizeX,
+          Image.SizeY, Poses, Opt.DetectResolution)
+      else
+        DrawOpenPoseBodies(OpenPoseImage, Image.SizeX, Image.SizeY, Poses);
       if SaveImageFromVolumeIntoFile(OpenPoseImage, Opt.OpenPoseFile) then
         WriteLn('Wrote ', Opt.OpenPoseFile)
       else

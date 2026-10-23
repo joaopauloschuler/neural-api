@@ -2211,13 +2211,9 @@ rather than acted on.
       draws differently: limbs then dots PER PERSON, with color * 0.6 at fill
       time, so a later person's limbs cover an earlier person's dots. Compare
       the `--pose-out` image against DWpose output, not OpenposeDetector output.
-      - [ ] Draw resolution: DWpose draws at `detect_resolution` (short side
-            512, rounded to a multiple of 64) and then resizes with
-            INTER_LINEAR, so stick width 4 / dot radius 4 are relative to that
-            size. examples/PoseEstimation `--openpose-out` draws at the photo's
-            native size (thinner sticks on large photos). Add the DWpose
-            resize-draw-resize route as an option of `DrawOpenPoseBodies`'
-            callers (ControlNetCanny already resizes to the generation size).
+      - [ ] Optional: no cv2 oracle covers `DrawOpenPoseBodiesViaDetectResolution`
+            (cv2 `INTER_LINEAR` rounds uint8 with fixed-point weights; the
+            route resizes in float), only size and thickness tests.
 
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user

@@ -17,8 +17,8 @@ FILE instead resizes a photo to the image size and extracts its edges with
 CannyEdges (a cv2.Canny port in neuralimageresize.pas). --pose-photo FILE
 --yolo FILE --vitpose FILE resizes a photo the same way, finds every person
 (EstimateMultiPersonPose) and draws the OpenPose control image of an openpose
-ControlNet (DrawOpenPoseBodies). Without any of them the example draws a
-circle and a square outline.
+ControlNet at DWpose's detect resolution (DrawOpenPoseBodiesAtDetectResolution).
+Without any of them the example draws a circle and a square outline.
 
 --control-start / --control-end limit the ControlNet to that fraction of the
 steps and --guess-mode runs it in the prompt pass only (diffusers
@@ -347,7 +347,7 @@ begin
 end;
 
 // Control := the OpenPose image of every person in Photo (already at the image
-// size): --yolo finds the person boxes, --vitpose their joints.
+// size), drawn at DWpose's detect resolution, then Lanczos-resized (diffusers).
 procedure DrawPoseControlImage(const Opt: TControlNetCannyOptions;
   Photo, Control: TNNetVolume);
 var
@@ -369,7 +369,8 @@ begin
     YoloNN.Free;
   end;
   WriteLn(Format('Pose:       %d person(s) found', [Length(Poses)]));
-  DrawOpenPoseBodies(Control, Photo.SizeX, Photo.SizeY, Poses);
+  DrawOpenPoseBodiesAtDetectResolution(Control, Photo.SizeX, Photo.SizeY, Poses);
+  ResizeImagePIL(Control, Control, Photo.SizeX, Photo.SizeY, irfLanczos, true);
 end;
 
 // Control := the entry's control image: its --control file, the canny edges
