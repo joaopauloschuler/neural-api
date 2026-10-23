@@ -2316,8 +2316,9 @@ rather than acted on.
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
-      - [ ] ObjectTracking `--classes` takes ids only; class names (`person,car`)
-            could be resolved through `YoloClassLabel`.
+      - [x] ObjectTracking `--classes` takes ids or names, mixed and
+            case-insensitive, resolved after the config loads through the new
+            `YoloClassIdOfLabel`; unknown names list close matches (aace686a).
       - [ ] The pico YOLO fixture config has no `names`, so the example smoke
             runs only show ids; the named path is covered by the unit test only.
       - [ ] Optional: BoT-SORT / OC-SORT style camera-motion compensation is
@@ -2600,9 +2601,20 @@ cannot pay for its own transfer.
       (both CPU-only today); when this lands, add `TNNetConvolution` to the
       device-backward list at the top of "OpenCL forward coverage".
 
-- [ ] `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` row FFTs: a lone channel
-      (C = 1, or the odd tail of the channel pairing of 106ffb8d) still runs a
-      full complex row FFT with Im = 0; the N/2 real-FFT packing would halve it too.
+- [x] `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` lone-channel row FFTs use the
+      new N/2-point `RealFFTForward` / `RealFFTInverse` (`TRealFFTPlan`,
+      neuralvolume.pas); also wired into `TNNetForwardSTFT`'s lone frame,
+      `TNNetInverseSTFT`'s FFT path and `ComputeMusicgenMelodyChroma` (fc67be70).
+      1x256x256 AVX2: rfft2 forward ~2.3 -> ~1.75 ms, irfft2 ~2.6 -> ~1.9 ms.
+- [ ] Real-input FFTs that still run a full complex FFT with Im = 0 and are not
+      a drop-in for `RealFFTForward` / `RealFFTInverse`:
+      - `TNNetCirculantLinear` FFT path: real kernel, input and error; would need
+        the product and inverse on the half spectrum (kernel spectrum too).
+      - `TNNetSpectralConv1D`: Modes may exceed SeqLen div 2 + 1, so the bins
+        above Nyquist would have to be rebuilt by conjugate symmetry.
+      - `TNNetSpectralConv2D` / `TNNetFourierMix`: the first axis is real, but
+        the second-axis pass needs every first-axis bin (Hermitian rebuild or a
+        half-spectrum 2-D layout as in rfft2).
 - [ ] Decision for the user: inference-time release of the convolution im2col
       matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
       convolution keeps it after the forward in both memory modes (the FP32
