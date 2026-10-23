@@ -1289,7 +1289,7 @@ rather than acted on.
           at that range) on one thread; 41 ms total is small next to the nets.
   - 2.11 Generator follow-up:
         - [X] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
-          their scratch per call (once per utterance). DONE: `TNNetInverseSTFT`
+          their scratch per call (once per utterance). DONE 2abda4a9: `TNNetInverseSTFT`
           (neuralaudio) builds window, twiddles and FFT plan once, scratch only
           grows, no FullWave copy; Kokoro owns one (`FGeneratorISTFT`). The free
           functions wrap a temporary instance. Test
@@ -2291,7 +2291,7 @@ rather than acted on.
             box, also `--gpu` and `--int8`), then mark its README supported.
       - [X] YoloDetect labels boxes with the class id (`DrawBitmapText`): no
             class names reach `TYoloConfig`; read a `names` / `id2label` map
-            from config.json when present and label with the name. DONE:
+            from config.json when present and label with the name. DONE 87f91c9a:
             `TYoloConfig.ClassNames` (names list or map, else id2label; count
             = num_classes), `YoloClassLabel` (name, else COCO-80 for an
             80-class yolov8 without names, else the id); YoloDetect and
