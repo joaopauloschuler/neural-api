@@ -11505,8 +11505,8 @@ function ReadSAMMaskDecoderConfig(const FileName: string;
 //   ImageEmbedding: the (Grid, Grid, HiddenSize) neck output from the encoder
 //                   (SizeX=row, SizeY=col, Depth=channel) - the SAME volume the
 //                   encoder tower returns.
-//   PointX, PointY: the click in ORIGINAL input-image pixel coordinates
-//                   (x = horizontal, y = vertical), as the HF processor feeds.
+//   PointX, PointY: the click in resized-image pixels (SAMScaleCoordinates maps
+//                   photo pixels there; x = horizontal, y = vertical).
 //   IsPositive:     True for a foreground point (label 1), False for background
 //                   (label 0).
 //   MaskLogits:     OUT (4*Grid, 4*Grid, 1) low-res mask logits (SizeX=row).
@@ -11519,12 +11519,12 @@ procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
 
 // Generalized SAM mask decoder (v2): N point prompts and/or a box prompt,
 // optional multi-mask output, plus the IoU-prediction-head quality scores.
-//   PointsXY:    flat [NumPoints*2] of (x,y) clicks in ORIGINAL image pixels
-//                (x = horizontal, y = vertical). May be empty.
+//   PointsXY:    flat [NumPoints*2] of (x,y) clicks in resized-image pixels
+//                (see SAMScaleCoordinates; x = horizontal). May be empty.
 //   PointLabels: [NumPoints] click labels: 1 = foreground (point_embed[1]),
 //                0 = background (point_embed[0]). Length must equal NumPoints.
 //   Box:         either empty (no box) or [x0,y0,x1,y1] (top-left / bottom-right
-//                in image pixels). The two corners become tokens using
+//                in resized-image pixels). The two corners become tokens using
 //                point_embed[2] (top-left) and point_embed[3] (bottom-right).
 //                When a box is given HF appends NO padding/not-a-point token.
 //   MultiMaskOutput: True -> the 3 multimask masks (mask tokens 1..3, HF's
@@ -11545,6 +11545,66 @@ procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
   MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string = '';
   Cache: TSAMWeightCache = nil);
+
+// ---------------------------------------------------------------------------
+// SAM PROCESSOR (transformers SamProcessor / SamImageProcessorPil): photo
+// pixels in, full-resolution masks out. LongestEdge is the processor's
+// size.longest_edge, which equals TSAMConfig.ImageSize (= pad_size).
+const
+  // SamImageProcessor image_mean / image_std (IMAGENET_DEFAULT_*).
+  csSAMImageMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  csSAMImageStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+
+// SamImageProcessor._get_preprocess_shape: the size whose longest side is
+// LongestEdge, each side rounded as int(side * scale + 0.5).
+procedure SAMResizedImageSize(OriginalWidth, OriginalHeight,
+  LongestEdge: integer; out ResizedWidth, ResizedHeight: integer);
+
+// Image (W,H,3) RGB 0..255 -> Dst (ImageSize,ImageSize,3): PIL bilinear uint8
+// longest-side resize, (x/255 - Mean)/Std, zero padding right and bottom.
+procedure SAMPreprocessImage(Image, Dst: TNNetVolume; ImageSize: integer);
+
+// _normalize_coordinates: rescales every (x, y) pair of Coords (points or box
+// corners) from original-image pixels to the resized-image frame.
+procedure SAMScaleCoordinates(var Coords: array of TNeuralFloat;
+  OriginalWidth, OriginalHeight, LongestEdge: integer);
+
+// post_process_masks: MaskLogits (low-res, Depth = masks) bilinear to ImageSize,
+// crop to the resized image, bilinear to the original; Binarize keeps logit > 0.
+procedure SAMPostprocessMasks(MaskLogits, Masks: TNNetVolume;
+  ImageSize, OriginalWidth, OriginalHeight: integer; Binarize: boolean = true);
+
+type
+  // Encoder net + open checkpoint + decoder weight cache: SetImage runs the
+  // image encoder once, then each Predict (a click or a box) runs the decoder only.
+  TSAMPredictor = class(TObject)
+  private
+    FEncoder: TNNet;
+    FReader: TNNetSafeTensorsReader;
+    FCache: TSAMWeightCache;
+    FConfig: TSAMConfig;
+    FDecoderConfig: TSAMMaskDecoderConfig;
+    FModelInput, FImageEmbedding, FLowResLogits: TNNetVolume;
+    FImageWidth, FImageHeight: integer;
+  public
+    // ConfigFileName '' reads config.json beside FileName.
+    constructor Create(const FileName: string; const ConfigFileName: string = '');
+    destructor Destroy; override;
+    // Image (W,H,3) RGB 0..255: preprocesses it and computes the image embedding.
+    procedure SetImage(Image: TNNetVolume);
+    // Prompts in original-image pixels (see RunSAMMaskDecoderEx); Masks becomes
+    // (ImageWidth, ImageHeight, NumMasks), 1/0 when Binarize, else logits.
+    procedure Predict(const PointsXY: array of TNeuralFloat;
+      const PointLabels: array of integer; const Box: array of TNeuralFloat;
+      MultiMaskOutput: boolean; Masks: TNNetVolume;
+      IoUScores: TNNetVolume = nil; Binarize: boolean = true);
+    property Config: TSAMConfig read FConfig;
+    property DecoderConfig: TSAMMaskDecoderConfig read FDecoderConfig;
+    property ModelInput: TNNetVolume read FModelInput;
+    property LowResLogits: TNNetVolume read FLowResLogits;
+    property ImageWidth: integer read FImageWidth;
+    property ImageHeight: integer read FImageHeight;
+  end;
 
 // ---------------------------------------------------------------------------
 // ViTMatte TRIMAP-BASED IMAGE MATTING IMPORT (transformers VitMatteForImageMatting,
@@ -91379,6 +91439,175 @@ begin
   SetLength(NoBox, 0);
   RunSAMMaskDecoderEx(Reader, Config, ImageEmbedding, Pts, Labels, NoBox,
     {MultiMaskOutput=}false, MaskLogits, {IoUScores=}nil, Prefix, Cache);
+end;
+
+procedure SAMResizedImageSize(OriginalWidth, OriginalHeight,
+  LongestEdge: integer; out ResizedWidth, ResizedHeight: integer);
+var
+  Scale: double;
+begin
+  if (OriginalWidth <= 0) or (OriginalHeight <= 0) then
+    ImportError('SAM processor: image size must be positive, got ' +
+      IntToStr(OriginalWidth) + 'x' + IntToStr(OriginalHeight) + '.');
+  Scale := LongestEdge / Max(OriginalWidth, OriginalHeight);
+  ResizedWidth := Trunc(OriginalWidth * Scale + 0.5);
+  ResizedHeight := Trunc(OriginalHeight * Scale + 0.5);
+end;
+
+procedure SAMPreprocessImage(Image, Dst: TNNetVolume; ImageSize: integer);
+var
+  Work: TNNetVolume;
+  ResizedWidth, ResizedHeight, MaxRowPos, MaxPixelPos: integer;
+  RowPos, PixelPos, ChannelPos, WorkPos, DstPos: integer;
+  ChannelScale, ChannelBias: array[0..2] of TNeuralFloat;
+begin
+  if Image.Depth <> 3 then
+    ImportError('SAM processor: the image must be RGB (depth 3), got depth ' +
+      IntToStr(Image.Depth) + '.');
+  SAMResizedImageSize(Image.SizeX, Image.SizeY, ImageSize, ResizedWidth,
+    ResizedHeight);
+  for ChannelPos := 0 to 2 do
+  begin
+    ChannelScale[ChannelPos] := (1 / 255) / csSAMImageStd[ChannelPos];
+    ChannelBias[ChannelPos] := -csSAMImageMean[ChannelPos] /
+      csSAMImageStd[ChannelPos];
+  end;
+  Work := TNNetVolume.Create;
+  try
+    ResizeImagePIL(Image, Work, ResizedWidth, ResizedHeight, irfBilinear,
+      {RoundToBytes=}true);
+    Dst.ReSize(ImageSize, ImageSize, 3);
+    Dst.Fill(0);
+    MaxRowPos := ResizedHeight - 1;
+    MaxPixelPos := ResizedWidth - 1;
+    for RowPos := 0 to MaxRowPos do
+    begin
+      WorkPos := Work.GetRawPos(0, RowPos);
+      DstPos := Dst.GetRawPos(0, RowPos);
+      for PixelPos := 0 to MaxPixelPos do
+      begin
+        for ChannelPos := 0 to 2 do
+          Dst.FData[DstPos + ChannelPos] := Work.FData[WorkPos + ChannelPos] *
+            ChannelScale[ChannelPos] + ChannelBias[ChannelPos];
+        Inc(WorkPos, 3);
+        Inc(DstPos, 3);
+      end;
+    end;
+  finally
+    Work.Free;
+  end;
+end;
+
+procedure SAMScaleCoordinates(var Coords: array of TNeuralFloat;
+  OriginalWidth, OriginalHeight, LongestEdge: integer);
+var
+  ResizedWidth, ResizedHeight, MaxPairPos, PairPos: integer;
+  ScaleX, ScaleY: TNeuralFloat;
+begin
+  if Odd(Length(Coords)) then
+    ImportError('SAM processor: coordinates must come in (x, y) pairs.');
+  SAMResizedImageSize(OriginalWidth, OriginalHeight, LongestEdge,
+    ResizedWidth, ResizedHeight);
+  ScaleX := ResizedWidth / OriginalWidth;
+  ScaleY := ResizedHeight / OriginalHeight;
+  MaxPairPos := Length(Coords) div 2 - 1;
+  for PairPos := 0 to MaxPairPos do
+  begin
+    Coords[PairPos * 2] := Coords[PairPos * 2] * ScaleX;
+    Coords[PairPos * 2 + 1] := Coords[PairPos * 2 + 1] * ScaleY;
+  end;
+end;
+
+procedure SAMPostprocessMasks(MaskLogits, Masks: TNNetVolume;
+  ImageSize, OriginalWidth, OriginalHeight: integer; Binarize: boolean);
+var
+  Padded, Cropped: TNNetVolume;
+  ResizedWidth, ResizedHeight, MaxMaskPos, MaskPos: integer;
+begin
+  SAMResizedImageSize(OriginalWidth, OriginalHeight, ImageSize, ResizedWidth,
+    ResizedHeight);
+  Padded := TNNetVolume.Create;
+  Cropped := TNNetVolume.Create;
+  try
+    ResizeImageBilinearNoAntialias(MaskLogits, Padded, ImageSize, ImageSize);
+    Cropped.CopyCropping(Padded, 0, 0, ResizedWidth, ResizedHeight);
+    ResizeImageBilinearNoAntialias(Cropped, Masks, OriginalWidth,
+      OriginalHeight);
+  finally
+    Cropped.Free;
+    Padded.Free;
+  end;
+  if Binarize then
+  begin
+    MaxMaskPos := Masks.Size - 1;
+    for MaskPos := 0 to MaxMaskPos do
+      if Masks.FData[MaskPos] > 0 then Masks.FData[MaskPos] := 1
+      else Masks.FData[MaskPos] := 0;
+  end;
+end;
+
+constructor TSAMPredictor.Create(const FileName: string;
+  const ConfigFileName: string);
+var
+  ConfigPath: string;
+begin
+  inherited Create;
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  FConfig := ReadSAMConfigFromJSONFile(ConfigPath);
+  FDecoderConfig := ReadSAMMaskDecoderConfig(ConfigPath, FConfig);
+  FReader := CreatePretrainedTensorReader(FileName);
+  FEncoder := BuildSAMVisionTower(FReader, FConfig, 'vision_encoder.',
+    {pTrainable=}false);
+  FCache := TSAMWeightCache.Create;
+  FModelInput := TNNetVolume.Create;
+  FImageEmbedding := TNNetVolume.Create;
+  FLowResLogits := TNNetVolume.Create;
+end;
+
+destructor TSAMPredictor.Destroy;
+begin
+  FLowResLogits.Free;
+  FImageEmbedding.Free;
+  FModelInput.Free;
+  FCache.Free;
+  FEncoder.Free;
+  FReader.Free;
+  inherited Destroy;
+end;
+
+procedure TSAMPredictor.SetImage(Image: TNNetVolume);
+begin
+  SAMPreprocessImage(Image, FModelInput, FConfig.ImageSize);
+  FEncoder.Compute(FModelInput);
+  FEncoder.GetOutput(FImageEmbedding);
+  FImageWidth := Image.SizeX;
+  FImageHeight := Image.SizeY;
+end;
+
+procedure TSAMPredictor.Predict(const PointsXY: array of TNeuralFloat;
+  const PointLabels: array of integer; const Box: array of TNeuralFloat;
+  MultiMaskOutput: boolean; Masks: TNNetVolume; IoUScores: TNNetVolume;
+  Binarize: boolean);
+var
+  ScaledPoints, ScaledBox: array of TNeuralFloat;
+  CoordPos, MaxCoordPos: integer;
+begin
+  if FImageWidth = 0 then
+    ImportError('TSAMPredictor.Predict: call SetImage first.');
+  SetLength(ScaledPoints, Length(PointsXY));
+  MaxCoordPos := Length(PointsXY) - 1;
+  for CoordPos := 0 to MaxCoordPos do ScaledPoints[CoordPos] := PointsXY[CoordPos];
+  SetLength(ScaledBox, Length(Box));
+  MaxCoordPos := Length(Box) - 1;
+  for CoordPos := 0 to MaxCoordPos do ScaledBox[CoordPos] := Box[CoordPos];
+  SAMScaleCoordinates(ScaledPoints, FImageWidth, FImageHeight, FConfig.ImageSize);
+  SAMScaleCoordinates(ScaledBox, FImageWidth, FImageHeight, FConfig.ImageSize);
+  RunSAMMaskDecoderEx(FReader, FDecoderConfig, FImageEmbedding, ScaledPoints,
+    PointLabels, ScaledBox, MultiMaskOutput, FLowResLogits, IoUScores, '',
+    FCache);
+  SAMPostprocessMasks(FLowResLogits, Masks, FConfig.ImageSize, FImageWidth,
+    FImageHeight, Binarize);
 end;
 
 // ===========================================================================

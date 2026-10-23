@@ -1479,10 +1479,18 @@ rather than acted on.
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
       threads the per-step query/key positional-embedding additions through the
       asymmetric token<->image cross-attentions.
-- [ ] SAM full end-to-end importer + processor parity: a single BuildSAMModel that wires
-      encoder + decoder + the HF SamProcessor coordinate transform (longest-side resize
-      to image_size, point rescaling) so a real sam-vit-base checkpoint segments a real
-      image from pixel-space clicks (v1 assumes input_image_size == raw pixel coords).
+- [x] SAM end-to-end processor: TSAMPredictor + SAMPreprocessImage /
+      SAMScaleCoordinates / SAMPostprocessMasks match SamImageProcessorPil + SamModel
+      (TestSAMProcessorEndToEndParity); examples/SegmentAnything takes --image/--point/--box.
+  - [ ] Run TSAMPredictor on a real facebook/sam-vit-base checkpoint + photo
+        (only the random pico fixture is tested).
+  - [ ] transformers 5.x defaults SamImageProcessor to the torchvision backend
+        (tensor resize); the port matches the PIL backend (uint8 PIL bilinear).
+        Measure the pixel_values gap on a real photo; add a torchvision-mode
+        resize only if it changes masks.
+  - [ ] Not exposed (the decoder lacks it): the input_masks prompt (previous
+        low-res mask fed back) and the automatic mask generator
+        (generate_crop_boxes + point grid + filter_masks + NMS).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,

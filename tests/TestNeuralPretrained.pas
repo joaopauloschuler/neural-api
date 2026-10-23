@@ -1749,6 +1749,7 @@ type
     procedure TestSAMMaskDecoderParity;
     procedure TestSAMMaskDecoderV2Parity;
     procedure TestSAMWeightCacheParity;
+    procedure TestSAMProcessorEndToEndParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -64214,6 +64215,123 @@ begin
     RefRoot.Free; Cache.Free;
     IoUCached.Free; IoUPlain.Free; Cached.Free; Plain.Free;
     ImgEmb.Free; RefJson.Free; Reader.Free;
+  end;
+end;
+
+// TSAMPredictor (SamProcessor pre/post-processing around encoder + decoder) on a
+// 45x30 RGB pattern with the pico fixture. Expected values: transformers 5.17
+// SamImageProcessorPil(size={"longest_edge":32}, pad_size 32x32) + SamModel in
+// float64 on the same fixture, pattern R=(7x+13y) mod 256, G=(x*x+3y) mod 256,
+// B=(5xy+17) mod 256; WeightedSum weights element i by (i mod 7) + 1.
+procedure TTestNeuralPretrained.TestSAMProcessorEndToEndParity;
+  function WeightedSum(V: TNNetVolume): double;
+  var
+    ElementPos, MaxElementPos: integer;
+  begin
+    Result := 0;
+    MaxElementPos := V.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Result := Result + V.FData[ElementPos] * ((ElementPos mod 7) + 1);
+  end;
+const
+  csImageWidth = 45;
+  csImageHeight = 30;
+var
+  Predictor: TSAMPredictor;
+  Image, Masks, Logits, IoUScores: TNNetVolume;
+  X, Y, ResizedWidth, ResizedHeight: integer;
+  Coords: array of TNeuralFloat;
+  Box: array of TNeuralFloat;
+  NoPoints: array of TNeuralFloat;
+  Labels: array of integer;
+begin
+  SAMResizedImageSize(csImageWidth, csImageHeight, 32, ResizedWidth,
+    ResizedHeight);
+  AssertEquals('resized width', 32, ResizedWidth);
+  AssertEquals('resized height', 21, ResizedHeight);
+  SetLength(Coords, 4);
+  Coords[0] := 20; Coords[1] := 12; Coords[2] := 35; Coords[3] := 25;
+  SAMScaleCoordinates(Coords, csImageWidth, csImageHeight, 32);
+  AssertEquals('scaled x0', 14.22222222, Coords[0], 1e-5);
+  AssertEquals('scaled y0', 8.4, Coords[1], 1e-5);
+  AssertEquals('scaled x1', 24.88888889, Coords[2], 1e-5);
+  AssertEquals('scaled y1', 17.5, Coords[3], 1e-5);
+
+  Predictor := TSAMPredictor.Create(FixturePath('tiny_sam.safetensors'),
+    FixturePath('tiny_sam_config.json'));
+  Image := TNNetVolume.Create(csImageWidth, csImageHeight, 3);
+  Masks := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  IoUScores := TNNetVolume.Create;
+  try
+    for Y := 0 to csImageHeight - 1 do
+      for X := 0 to csImageWidth - 1 do
+      begin
+        Image[X, Y, 0] := (X * 7 + Y * 13) mod 256;
+        Image[X, Y, 1] := (X * X + 3 * Y) mod 256;
+        Image[X, Y, 2] := (X * Y * 5 + 17) mod 256;
+      end;
+    Predictor.SetImage(Image);
+    // pixel_values (resize + rescale + normalize + pad), HWC order.
+    AssertEquals('model input size', 32 * 32 * 3, Predictor.ModelInput.Size);
+    AssertEquals('pixel sum', 228.735243926,
+      Predictor.ModelInput.GetSum(), 1e-3);
+    AssertEquals('pixel weighted sum', 881.604673153,
+      WeightedSum(Predictor.ModelInput), 1e-3);
+    AssertEquals('pixel (0,0,0)', -2.015155554, Predictor.ModelInput[0, 0, 0], 1e-5);
+    AssertEquals('pixel (7,5,1)', 0.117647059, Predictor.ModelInput[7, 5, 1], 1e-5);
+    AssertEquals('pixel (31,20,2)', 0.949368358, Predictor.ModelInput[31, 20, 2], 1e-5);
+    AssertEquals('bottom padding', 0, Predictor.ModelInput[3, 21, 0], 0);
+
+    // Two clicks (positive, negative) in photo pixels, single mask.
+    SetLength(Coords, 4);
+    Coords[0] := 20; Coords[1] := 12; Coords[2] := 35; Coords[3] := 25;
+    SetLength(Labels, 2); Labels[0] := 1; Labels[1] := 0;
+    SetLength(Box, 0);
+    Predictor.Predict(Coords, Labels, Box, {MultiMaskOutput=}false,
+      Logits, IoUScores, {Binarize=}false);
+    AssertEquals('points mask width', csImageWidth, Logits.SizeX);
+    AssertEquals('points mask height', csImageHeight, Logits.SizeY);
+    AssertEquals('points mask count', 1, Logits.Depth);
+    AssertEquals('points iou', -0.63909721, IoUScores.FData[0], 1e-4);
+    AssertEquals('points logit sum', -203.565319133, Logits.GetSum(), 2e-2);
+    AssertEquals('points logit weighted sum', -814.507755702,
+      WeightedSum(Logits), 8e-2);
+    AssertEquals('points logit (0,0)', 0.123492576, Logits[0, 0, 0], 1e-4);
+    AssertEquals('points logit (20,12)', -0.120857243, Logits[20, 12, 0], 1e-4);
+    AssertEquals('points logit (35,25)', -0.135166565, Logits[35, 25, 0], 1e-4);
+    AssertEquals('points logit (44,29)', -0.176717314, Logits[44, 29, 0], 1e-4);
+    AssertEquals('points logit (40,7)', -0.147348063, Logits[40, 7, 0], 1e-4);
+    Predictor.Predict(Coords, Labels, Box, false, Masks);
+    AssertEquals('points foreground pixels', 381, Round(Masks.GetSum()));
+
+    // Box prompt in photo pixels, three masks.
+    SetLength(NoPoints, 0);
+    SetLength(Labels, 0);
+    SetLength(Box, 4);
+    Box[0] := 6; Box[1] := 4; Box[2] := 30; Box[3] := 22;
+    Predictor.Predict(NoPoints, Labels, Box, {MultiMaskOutput=}true,
+      Logits, IoUScores, {Binarize=}false);
+    AssertEquals('box mask count', 3, Logits.Depth);
+    AssertEquals('box iou 0', -1.63523145, IoUScores.FData[0], 1e-4);
+    AssertEquals('box iou 1', -1.30445974, IoUScores.FData[1], 1e-4);
+    AssertEquals('box iou 2', 0.71804641, IoUScores.FData[2], 1e-4);
+    AssertEquals('box logit sum', -82.391553391, Logits.GetSum(), 5e-2);
+    AssertEquals('box logit weighted sum', -328.758057682,
+      WeightedSum(Logits), 2e-1);
+    AssertEquals('box mask 0 (18,10)', -0.019167239, Logits[18, 10, 0], 1e-4);
+    AssertEquals('box mask 1 (18,10)', -0.037274082, Logits[18, 10, 1], 1e-4);
+    AssertEquals('box mask 2 (18,10)', 0.020012849, Logits[18, 10, 2], 1e-4);
+    Predictor.Predict(NoPoints, Labels, Box, true, Masks);
+    // Logits within 1e-5 of 0 may flip between float32 and float64.
+    AssertTrue('box foreground pixels ' + FloatToStr(Masks.GetSum()),
+      Abs(Masks.GetSum() - 1848) <= 2);
+  finally
+    IoUScores.Free;
+    Logits.Free;
+    Masks.Free;
+    Image.Free;
+    Predictor.Free;
   end;
 end;
 
