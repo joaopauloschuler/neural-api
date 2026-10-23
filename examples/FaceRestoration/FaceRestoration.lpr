@@ -12,9 +12,10 @@ Modes:
   * --model FILE --detector FILE --input IMG --output IMG: whole-photo
     restoration as inference_gfpgan.py / inference_codeformer.py: RetinaFace
     finds every face, each is aligned to the FFHQ 5-point template, restored and pasted back
-    (RestoreFacesInImage, a port of facexlib's FaceRestoreHelper without face
-    parsing) on the background upscaled by --upscale (Lanczos, or an
-    RRDBNet / Real-ESRGAN checkpoint with --bg-upsampler).
+    (RestoreFacesInImage, a port of facexlib's FaceRestoreHelper) on the
+    background upscaled by --upscale (Lanczos, or an RRDBNet / Real-ESRGAN
+    checkpoint with --bg-upsampler); --parse parsing_parsenet.pth pastes
+    through facexlib's face-parsing mask, as inference_gfpgan.py does.
   * --aligned --model FILE --input IMG --output IMG: the input is already an
     aligned, cropped face (resized to 512), as GFPGAN's own --aligned.
 
@@ -42,7 +43,7 @@ const
 type
   TFaceRestorationOptions = record
     ModelFile, ConfigFile, InputFile, OutputFile: string;
-    DetectorFile, BackgroundFile, SaveFacesPrefix: string;
+    DetectorFile, BackgroundFile, SaveFacesPrefix, ParseFile: string;
     NoiseMode: TStyleGAN2NoiseMode;
     Seed, BackgroundTile, MaxFaces: integer;
     Upscale, DetectionThreshold, MinEyeDistance: TNeuralFloat;
@@ -70,6 +71,8 @@ begin
   WriteLn('                       input size (default: the net resolution, 512)');
   WriteLn('  --detector FILE      RetinaFace checkpoint: facexlib detection_Resnet50_Final.pth');
   WriteLn('                       (GFPGAN''s default) or detection_mobilenet0.25_Final.pth');
+  WriteLn('  --parse FILE         facexlib parsing_parsenet.pth: paste through its face-parsing');
+  WriteLn('                       mask, as inference_gfpgan.py (default: square mask)');
   WriteLn('  --upscale N          output size / input size (default 2, as inference_gfpgan.py)');
   WriteLn('  --bg-upsampler FILE  RRDBNet / Real-ESRGAN checkpoint for the background');
   WriteLn('                       (e.g. RealESRGAN_x2plus.pth; default: Lanczos resize)');
@@ -129,6 +132,7 @@ begin
   Opt.DetectorFile := '';
   Opt.BackgroundFile := '';
   Opt.SaveFacesPrefix := '';
+  Opt.ParseFile := '';
   Opt.NoiseMode := snmRandom;
   Opt.Seed := -1;
   Opt.BackgroundTile := 400;
@@ -155,6 +159,7 @@ begin
     else if Arg = '--aligned' then Opt.IsAligned := true
     else if Arg = '--keep-size' then Opt.KeepSize := true
     else if Arg = '--detector' then Opt.DetectorFile := NextArg()
+    else if Arg = '--parse' then Opt.ParseFile := NextArg()
     else if Arg = '--upscale' then Opt.Upscale := NextFloat()
     else if Arg = '--bg-upsampler' then Opt.BackgroundFile := NextArg()
     else if Arg = '--bg-tile' then Opt.BackgroundTile := StrToInt(NextArg())
@@ -372,8 +377,9 @@ end;
 procedure RestorePhotoFile(const Opt: TFaceRestorationOptions;
   const Device: TComputeDevice);
 var
-  Restorer, Detector: TNNet;
+  Restorer, Detector, Parser: TNNet;
   RestorerFaceSize: integer;
+  ParserConfig: TParseNetConfig;
   DetectorConfig: TRetinaFaceConfig;
   Image, Background, Output: TNNetVolume;
   Crops, RestoredFaces: TNNetVolumeList;
@@ -387,6 +393,7 @@ begin
   Background := nil;
   Restorer := nil;
   Detector := nil;
+  Parser := nil;
   try
     if not LoadImageFromFileIntoVolume(Opt.InputFile, Image) then
       raise Exception.Create('could not load ' + Opt.InputFile);
@@ -399,6 +406,14 @@ begin
     WriteLn(Format('  loaded in %.1f s', [(Now() - StartTime) * 86400.0]));
     EnableDevice(Detector, Device);
     Restorer := LoadRestorer(Opt, Device, RestorerFaceSize);
+    if Opt.ParseFile <> '' then
+    begin
+      // facexlib builds ParseNet(in_size=512) for every restorer.
+      Parser := BuildParseNetFromSafeTensors(Opt.ParseFile, ParserConfig, 512,
+        {pTrainable=}false);
+      WriteLn(ParseNetConfigToString(ParserConfig));
+      EnableDevice(Parser, Device);
+    end;
     if Opt.BackgroundFile <> '' then
       Background := UpscaleBackground(Opt, Device, Image);
     if Opt.Seed >= 0 then RestartRandSeed(Opt.Seed);
@@ -408,7 +423,7 @@ begin
     FaceCount := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
       RestorerFaceSize, Image, Background, Output, Opt.Upscale,
       Opt.DetectionThreshold, Opt.MinEyeDistance, Opt.MaxFaces, Crops,
-      RestoredFaces);
+      RestoredFaces, Parser);
     WriteLn(Format('  %d face(s) in %.1f s', [FaceCount,
       (Now() - StartTime) * 86400.0]));
     if Opt.SaveFacesPrefix <> '' then
@@ -421,6 +436,7 @@ begin
     WriteLn(Format('  %dx%d -> %s', [Output.SizeX, Output.SizeY,
       Opt.OutputFile]));
   finally
+    Parser.Free;
     Detector.Free;
     Restorer.Free;
     Background.Free;
@@ -463,8 +479,9 @@ begin
 end;
 
 // Pico smokes of one restorer: a 40x30 crop through --aligned, then a 256x192
-// photo through the whole-photo path (the random detector finds random "faces").
-procedure RunFixtureSmoke(const ModelFile, ConfigFile, OutPrefix: string);
+// photo through the whole-photo path, again with ParseFile unless it is ''.
+procedure RunFixtureSmoke(const ModelFile, ConfigFile, OutPrefix,
+  ParseFile: string);
 const
   InPng = 'face_in.png';
   PhotoPng = 'face_photo_in.png';
@@ -504,6 +521,10 @@ begin
   Opt.DetectionThreshold := 0.5;
   Opt.MaxFaces := 3;
   RunOptions(Opt);
+  if ParseFile = '' then exit;
+  Opt.ParseFile := ParseFile;
+  Opt.OutputFile := OutPrefix + '_parse_photo_out.png';
+  RunOptions(Opt);
 end;
 
 var
@@ -518,11 +539,12 @@ begin
       WriteLn('GFPGAN face restoration smoke (random pico weights)');
       WriteLn('===================================================');
       RunFixtureSmoke(FixturesDir + 'tiny_gfpgan.pth',
-        FixturesDir + 'tiny_gfpgan_config.json', 'gfpgan');
+        FixturesDir + 'tiny_gfpgan_config.json', 'gfpgan',
+        FixturesDir + 'tiny_parsenet.pth');
       WriteLn('CodeFormer face restoration smoke (random pico weights)');
       WriteLn('=======================================================');
       RunFixtureSmoke(FixturesDir + 'tiny_codeformer.pth',
-        FixturesDir + 'tiny_codeformer_config.json', 'codeformer');
+        FixturesDir + 'tiny_codeformer_config.json', 'codeformer', '');
       WriteLn('Done.');
     end;
   except

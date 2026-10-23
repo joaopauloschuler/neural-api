@@ -849,12 +849,13 @@ rather than acted on.
         on a real photo against facexlib `detect_faces` (oracle in the ~/x venv:
         facexlib 0.3.0 is not installed there; the wheel's retinaface*.py run with
         torchvision from /tmp/tvlib and a cv2 stub).
-  - [ ] ParseNet face-parsing paste mask: GFPGANer builds FaceRestoreHelper with
-        `use_parse=True` (facexlib `parsing_parsenet.pth`, v0.2.2 release), so
-        inference_gfpgan.py blends through a parsing mask (GaussianBlur 101/11
-        twice, 10-px border cleared, warped with flags=3, which warpAffine runs
-        as INTER_LINEAR); our paste uses the square-mask path. Needs a ParseNet
-        importer; WarpImageAffine already covers the mask warp.
+  - [ ] ParseNet paste mask (`BuildParseNet[FromSafeTensors[Ex]]`,
+        `ParseNetFaceMask`, `ParseNetFaceMaskOfFace`, `RestoreFacesInImage(...,
+        Parser)`, `FaceRestoration --parse`) is CODED with pico parity vs the
+        facexlib 0.3.0 parsenet.py + cv2 mask (tools/parsenet_tiny_fixture.py);
+        open: run the real `parsing_parsenet.pth` (v0.2.2 release) on a real
+        restored 512x512 face against facexlib's `face_parse` + mask (argmax
+        flips at near-tied logits are expected to be rare).
   - [ ] Real-checkpoint parity (needs the downloads; oracle in the ~/x venv with
         the facexlib 0.3.0 + gfpgan 1.3.8 wheels unpacked under /tmp and
         opencv-python-headless 4.10 unpacked to /tmp/cvlib4, all on sys.path
@@ -871,7 +872,7 @@ rather than acted on.
         get_inverse_affine -> paste_faces_to_input_image and compare the
         composite with out.png (isolates the paste from GFPGAN noise; expect
         < 1 gray level mean, facexlib truncates to uint8); (c) the full
-        inference_gfpgan.py composite only after the ParseNet item above.
+        inference_gfpgan.py composite (`--parse parsing_parsenet.pth`, use_parse=True).
 - [ ] CodeFormer follow-ups (Zhou et al., NeurIPS 2022, arXiv:2206.11253;
       sczhou/CodeFormer; S-Lab License 1.0, non-commercial, so state it in the
       README row). The importer core LANDED in neuralpretrained.pas:

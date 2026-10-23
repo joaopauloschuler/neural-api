@@ -1564,6 +1564,15 @@ type
     // Pico RetinaFace + tiny CodeFormer through RestoreFacesInImage: each restored
     // face equals CodeFormerRestoreFace on its crop; IsCodeFormerCheckpoint.
     procedure TestRestoreFacesInImageCodeFormer;
+    // tiny_parsenet.*: inferred config, out_mask vs facexlib parsenet.py, round trip.
+    procedure TestParseNetParity;
+    // ParseNetFaceMask vs paste_faces_to_input_image's cv2 mask (112x112, 72x60).
+    procedure TestParseNetFaceMaskMatchesFacexlibOracle;
+    // The tiny fixture with EnableOpenCL against the host net, every layer.
+    procedure TestParseNetOpenCLParity;
+    // Pico RetinaFace + tiny GFPGAN + tiny ParseNet through RestoreFacesInImage:
+    // equals pasting each face through ParseNetFaceMaskOfFace by hand.
+    procedure TestRestoreFacesInImageParseNet;
     procedure TestBiRefNetParity;
     procedure TestBiRefNetInfersConfig;
     procedure TestBiRefNetPrepareAndCompose;
@@ -57015,6 +57024,266 @@ begin
     Background.Free;
     Output.Free;
     Image.Free;
+    Restorer.Free;
+    Detector.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestParseNetParity;
+var
+  Config: TParseNetConfig;
+  NN, Reloaded: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput, Expected: TNNetVolume;
+  MaxDiff: double;
+begin
+  NN := BuildParseNetFromSafeTensors(FixturePath('tiny_parsenet.pth'), Config,
+    32, {pTrainable=}false);
+  Reloaded := nil;
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_parsenet_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    AssertEquals('in_size', 32, Config.InputSize);
+    AssertEquals('base_ch', 8, Config.BaseChannels);
+    AssertEquals('down steps', 2, Config.DownSteps);
+    AssertEquals('res_depth', 2, Config.ResDepth);
+    AssertEquals('up steps', 2, Config.UpSteps);
+    AssertEquals('parsing_ch', 19, Config.ParsingChannels);
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    LoadDDColorTorchImage(IO, 'out_mask', Expected);
+    NN.Compute(NetInput);
+    AssertEquals('output width', 32, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output depth', 19, NN.GetLastLayer().Output.Depth);
+    MaxDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output, Expected);
+    WriteLn('  ParseNet out_mask max|diff| = ', MaxDiff:0:9, ' (logits up to ',
+      Expected.GetMaxAbs():0:2, ')');
+    AssertTrue('max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+      MaxDiff < 1e-4);
+    Reloaded := TNNet.Create();
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.SetTrainable();
+    Reloaded.Compute(NetInput);
+    AssertEquals('save/load round trip', 0,
+      MaxAbsVolumeDiff(Reloaded.GetLastLayer().Output, NN.GetLastLayer().Output),
+      1e-5);
+  finally
+    Expected.Free;
+    NetInput.Free;
+    IO.Free;
+    Reloaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestParseNetFaceMaskMatchesFacexlibOracle;
+const
+  csCaseNames: array[0..1] of string = ('a', 'b');
+var
+  IO: TNNetSafeTensorsReader;
+  Labels, Parsing, Expected, Mask: TNNetVolume;
+  CasePos, X, Y, Height, Width: integer;
+  MaxDiff: double;
+begin
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_parsenet_io.safetensors'));
+  Labels := TNNetVolume.Create;
+  Parsing := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  try
+    for CasePos := 0 to 1 do
+    begin
+      Height := IO.DimSize('labels_' + csCaseNames[CasePos], 0);
+      Width := IO.DimSize('labels_' + csCaseNames[CasePos], 1);
+      IO.LoadTensorFlat('labels_' + csCaseNames[CasePos], Labels);
+      IO.LoadTensorFlat('mask_' + csCaseNames[CasePos], Expected);
+      // One-hot logits whose argmax is the oracle's label.
+      Parsing.ReSize(Width, Height, 19);
+      Parsing.Fill(0);
+      for Y := 0 to Height - 1 do
+        for X := 0 to Width - 1 do
+          Parsing[X, Y, Round(Labels.FData[Y * Width + X])] := 1;
+      ParseNetFaceMask(Parsing, Mask);
+      AssertEquals('mask width', Width, Mask.SizeX);
+      AssertEquals('mask height', Height, Mask.SizeY);
+      AssertEquals('mask depth', 1, Mask.Depth);
+      AssertTrue('the mask is not empty', Mask.GetMax() > 0.1);
+      MaxDiff := 0;
+      for Y := 0 to Height - 1 do
+        for X := 0 to Width - 1 do
+          MaxDiff := Max(MaxDiff, Abs(Mask[X, Y, 0] - Expected.FData[Y * Width + X]));
+      WriteLn('  ParseNetFaceMask ', Width, 'x', Height, ' max|diff| = ',
+        MaxDiff:0:9);
+      AssertTrue(csCaseNames[CasePos] + ': max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-5', MaxDiff < 1e-5);
+    end;
+  finally
+    Mask.Free;
+    Expected.Free;
+    Parsing.Free;
+    Labels.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestParseNetOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TParseNetConfig;
+  NN, NNCPU: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxLayerPos: integer;
+
+  // Computes both nets and asserts the output and every layer match.
+  procedure AssertNetsMatch(const PassName: string);
+  var
+    LayerPos, FirstBadLayer, OpenCLLayerCnt: integer;
+    LayerDiff, MaxDiff, OutputDiff: double;
+  begin
+    NNCPU.Compute(NetInput);
+    NN.ClearTime();
+    NN.Compute(NetInput);
+    NN.Compute(NetInput);
+    OutputDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output,
+      NNCPU.GetLastLayer().Output);
+    MaxDiff := 0;
+    FirstBadLayer := -1;
+    OpenCLLayerCnt := 0;
+    for LayerPos := 1 to MaxLayerPos do
+    begin
+      if NN.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+      if (LayerPos < MaxLayerPos) and
+         (NN.Layers[LayerPos + 1].PrevLayer = NN.Layers[LayerPos]) and
+         (NN.Layers[LayerPos + 1].OpenCLUpsampleFoldLaunchCount() > 0) then
+        continue;
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsVolumeDiff(NN.Layers[LayerPos].Output,
+        NNCPU.Layers[LayerPos].Output) /
+        Max(1.0, NNCPU.Layers[LayerPos].Output.GetMaxAbs());
+      if (LayerDiff >= 1e-4) and (FirstBadLayer < 0) then
+      begin
+        FirstBadLayer := LayerPos;
+        WriteLn('  ParseNet OpenCL ', PassName, ' first layer past 1e-4: ',
+          LayerPos, ' ', NN.Layers[LayerPos].ClassName, ' relative max|diff|=',
+          LayerDiff:0:9);
+      end;
+      if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
+    end;
+    WriteLn('  ParseNet OpenCL ', PassName, ' output max|diff| = ', OutputDiff:0:9,
+      ' any layer (relative) = ', MaxDiff:0:9, ' layers on OpenCL: ',
+      OpenCLLayerCnt, '/', MaxLayerPos);
+    AssertTrue(PassName + ': some layers ran on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue(PassName + ': output OpenCL vs CPU max |diff| = ' +
+      FloatToStr(OutputDiff) + ' must be < 1e-4', OutputDiff < 1e-4);
+    AssertEquals(PassName + ': every layer OpenCL vs CPU within 1e-4 relative',
+      -1, FirstBadLayer);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := BuildParseNetFromSafeTensors(FixturePath('tiny_parsenet.pth'), Config,
+    32, {pTrainable=}false);
+  NNCPU := BuildParseNetFromSafeTensors(FixturePath('tiny_parsenet.pth'), Config,
+    32, {pTrainable=}false);
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_parsenet_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    MaxLayerPos := NN.CountLayers() - 1;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertNetsMatch('default');
+    // Every layer with a kernel, including the ones too small for the size verdict.
+    NN.ForceOpenCL(true);
+    AssertNetsMatch('forced');
+  finally
+    NetInput.Free;
+    IO.Free;
+    NNCPU.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestRestoreFacesInImageParseNet;
+var
+  DetectorConfig: TRetinaFaceConfig;
+  RestorerConfig: TGFPGANConfig;
+  ParserConfig: TParseNetConfig;
+  Detector, Restorer, Parser: TNNet;
+  Image, Output, SquareOutput, Expected, FaceMask: TNNetVolume;
+  RestoredFaces: TNNetVolumeList;
+  Faces: TRetinaFaceDetectionArray;
+  FaceCount, FacePos, X, Y, Channel: integer;
+begin
+  Detector := BuildRetinaFaceFromSafeTensors(
+    FixturePath('tiny_retinaface_mobilenet.pth'), 256, 192, DetectorConfig, false);
+  Restorer := BuildGFPGANFromSafeTensors(FixturePath('tiny_gfpgan.pth'),
+    RestorerConfig, {pTrainable=}false, FixturePath('tiny_gfpgan_config.json'),
+    snmConst);
+  Parser := BuildParseNetFromSafeTensors(FixturePath('tiny_parsenet.pth'),
+    ParserConfig, 32, {pTrainable=}false);
+  Image := TNNetVolume.Create(256, 192, 3);
+  Output := TNNetVolume.Create;
+  SquareOutput := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  FaceMask := TNNetVolume.Create;
+  RestoredFaces := TNNetVolumeList.Create(true);
+  try
+    for Y := 0 to 191 do
+      for X := 0 to 255 do
+        for Channel := 0 to 2 do
+          Image[X, Y, Channel] := 128 + 90 * Sin(X * 0.15 + Channel) *
+            Cos(Y * 0.125);
+    FaceCount := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
+      RestorerConfig, Image, nil, Output, 2, 0.5, 5, 3, nil, RestoredFaces,
+      Parser);
+    AssertTrue('some faces', FaceCount > 0);
+    AssertEquals('restored', FaceCount, RestoredFaces.Count);
+    AssertEquals('output width', 512, Output.SizeX);
+    AssertEquals('output height', 384, Output.SizeY);
+    RestoreFacesInImage(Detector, DetectorConfig, Restorer, RestorerConfig,
+      Image, nil, SquareOutput, 2, 0.5, 5, 3);
+    AssertTrue('the parse mask differs from the square mask',
+      Output.SumDiff(SquareOutput) > 0);
+    // The same paste by hand: the mask of each restored face (64 px, the
+    // parser runs at 32 px), then PasteFaceIntoImage with it.
+    Faces := FilterFacesByEyeDistance(DetectRetinaFaceFaces(Detector,
+      DetectorConfig, Image, 0.5, 0.4, 3), 5);
+    AssertEquals('same faces', FaceCount, Length(Faces));
+    ResizeImageLanczos4CV2(Image, Expected, 512, 384);
+    for FacePos := 0 to FaceCount - 1 do
+    begin
+      ParseNetFaceMaskOfFace(Parser, RestoredFaces[FacePos], FaceMask);
+      AssertEquals('mask width', RestorerConfig.OutSize, FaceMask.SizeX);
+      AssertEquals('mask depth', 1, FaceMask.Depth);
+      AssertTrue('mask in [0,1]', (FaceMask.GetMin() >= 0) and
+        (FaceMask.GetMax() <= 1));
+      AssertTrue('mask not empty', FaceMask.GetMax() > 0);
+      PasteFaceIntoImage(RestoredFaces[FacePos], FaceAlignmentMatrix(
+        Faces[FacePos], RestorerConfig.OutSize), 2, Expected, FaceMask);
+    end;
+    AssertEquals('RestoreFacesInImage with Parser = the hand-made paste', 0,
+      MaxAbsVolumeDiff(Output, Expected), 1e-3);
+    WriteLn('  RestoreFacesInImage ParseNet pico: ', FaceCount, ' faces');
+  finally
+    RestoredFaces.Free;
+    FaceMask.Free;
+    Expected.Free;
+    SquareOutput.Free;
+    Output.Free;
+    Image.Free;
+    Parser.Free;
     Restorer.Free;
     Detector.Free;
   end;

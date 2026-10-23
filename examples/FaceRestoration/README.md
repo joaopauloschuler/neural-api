@@ -37,6 +37,15 @@ forward matches the CPU forward on the same net (`TestCodeFormerOpenCLParity`),
 and `TestRestoreFacesInImageCodeFormer` covers the whole-photo path. The real
 `codeformer.pth` has not been run yet.
 
+**Status, ParseNet paste mask (`--parse`): coded, pico parity only.** The
+facexlib ParseNet importer (`BuildParseNetFromSafeTensors`) is parity-tested
+(< 1e-4) against facexlib 0.3.0's own `parsenet.py` on a random pico net
+(`TestParseNetParity`, OpenCL in `TestParseNetOpenCLParity`); the paste mask
+(`ParseNetFaceMask`) matches facexlib's cv2 recipe to 1e-7
+(`TestParseNetFaceMaskMatchesFacexlibOracle`), and
+`TestRestoreFacesInImageParseNet` covers the whole-photo path. The real
+`parsing_parsenet.pth` has not been run yet.
+
 ## Two modes
 
 **Whole photo** (the default, what the official `inference_gfpgan.py` does):
@@ -72,11 +81,17 @@ Whole photo:
 5. `FaceRestorerRestoreFace` restores the crop with the loaded net (GFPGAN or
    CodeFormer: both take and return a face in [-1, 1] at their resolution).
 6. `PasteFaceIntoImage`: the restored face is warped back by the inverse
-   transform (scaled by `--upscale`) together with a square mask; the mask is
-   eroded by `2*upscale` pixels, then eroded again and Gaussian-blurred by a
-   width proportional to the face size (facexlib's `paste_faces_to_input_image`
-   without face parsing), and the face is blended with it. Pixels away from
-   every face keep the background exactly.
+   transform (scaled by `--upscale`) together with a mask, and blended with it.
+   Without `--parse` the mask is a square, eroded by `2*upscale` pixels, then
+   eroded again and Gaussian-blurred by a width proportional to the face size
+   (facexlib's `paste_faces_to_input_image` with `use_parse=False`). With
+   `--parse`, `ParseNetFaceMaskOfFace` runs ParseNet on the restored face
+   (resized to 512x512) and `ParseNetFaceMask` turns its 19-class parsing map
+   into the mask: face classes 255, background / neck / cloth / hat 0, two
+   Gaussian blurs of 101 taps and sigma 11 (cv2's reflect-101 border), a
+   10-pixel border set to 0, divided by 255 (`use_parse=True`, what
+   `inference_gfpgan.py` does). Pixels away from every face keep the
+   background exactly.
 7. The background is the photo resized with cv2's Lanczos (8 taps,
    `ResizeImageLanczos4CV2`), or, with `--bg-upsampler`, the photo upscaled by
    an RRDBNet / Real-ESRGAN checkpoint (`TRRDBNetUpscaler`, tiles of 400
@@ -100,9 +115,11 @@ features, where `w` is `--fidelity`. The face size is 512; the same
 ### Differences from inference_gfpgan.py
 
 - GFPGAN's `GFPGANer` builds the helper with `use_parse=True`: it pastes each
-  face through a **ParseNet** face-parsing mask (`parsing_parsenet.pth`). That
-  net is not ported; this program uses facexlib's square-mask path
-  (`use_parse=False`), so the blend edge differs, mostly around hair and neck.
+  face through a **ParseNet** face-parsing mask (`parsing_parsenet.pth`). This
+  program does the same only with `--parse parsing_parsenet.pth`; without it,
+  it uses facexlib's square-mask path (`use_parse=False`), so the blend edge
+  differs, mostly around hair and neck. facexlib parses the restored face
+  after rounding it to 8 bits; here the parser sees the float face.
 - facexlib works on 8-bit images and `cv2.warpAffine` rounds sample positions
   to 1/32 pixel; here every step is in float. On a smooth synthetic photo the
   aligned crop differs from cv2's warp by 0.03 gray levels on average (1.5 at
@@ -119,6 +136,8 @@ features, where `w` is `--fidelity`. The face size is 512; the same
 ./FaceRestoration --model GFPGANv1.4.pth --detector detection_Resnet50_Final.pth \
   --input photo.jpg --output photo_restored.png
 ./FaceRestoration --model GFPGANv1.4.pth --detector detection_Resnet50_Final.pth \
+  --parse parsing_parsenet.pth --input photo.jpg --output photo_restored.png
+./FaceRestoration --model GFPGANv1.4.pth --detector detection_Resnet50_Final.pth \
   --input photo.jpg --output photo_restored.png --bg-upsampler RealESRGAN_x2plus.pth --gpu
 ./FaceRestoration --aligned --model GFPGANv1.4.pth --input face.png --output face_restored.png
 ./FaceRestoration --model codeformer.pth --fidelity 0.7 --detector detection_Resnet50_Final.pth \
@@ -133,6 +152,7 @@ features, where `w` is `--fidelity`. The face size is 512; the same
 | `--input IMG` | the photo (with `--aligned`: an aligned, cropped face), PNG / JPEG / BMP | required with `--model` |
 | `--output IMG` | the restored photo or face; the format comes from the extension (PNG recommended) | required with `--model` |
 | `--detector FILE` | facexlib RetinaFace checkpoint: `detection_Resnet50_Final.pth` (GFPGAN's default) or `detection_mobilenet0.25_Final.pth`, read directly | required without `--aligned` |
+| `--parse FILE` | facexlib `parsing_parsenet.pth`, read directly: paste each face through its face-parsing mask, as `inference_gfpgan.py` | square mask |
 | `--upscale N` | output size / photo size | 2 (as `inference_gfpgan.py`) |
 | `--bg-upsampler FILE` | RRDBNet / Real-ESRGAN checkpoint for the background, e.g. `RealESRGAN_x2plus.pth` (its output is resized to the `--upscale` size) | Lanczos resize |
 | `--bg-tile N` | tile size of the background upsampler, 0 = the whole photo at once | 400 |
@@ -145,7 +165,7 @@ features, where `w` is `--fidelity`. The face size is 512; the same
 | `--noise MODE` | GFPGAN only: per-pixel StyleGAN2 noise: `random` (fresh noise each run, what the official tool does), `const` (the noise maps stored in the checkpoint: the same output every run) or `none` | `random` |
 | `--seed N` | seed of the random noise, for a repeatable `random` run | time based |
 | `--int8` | store the restorer's convolution and linear weights in int8 (`TNNet.QuantizeWeightsInt8`): less RAM, small accuracy loss; not yet checked on CodeFormer, where the error can change the chosen codes | FP32 |
-| `--gpu`, `--gpu-platform N`, `--gpu-device N` | run the nets (detector, restorer, background upsampler) on OpenCL (a build with `-dOpenCL`, the `.lpi` default) | CPU |
+| `--gpu`, `--gpu-platform N`, `--gpu-device N` | run the nets (detector, restorer, parser, background upsampler) on OpenCL (a build with `-dOpenCL`, the `.lpi` default) | CPU |
 
 Checkpoints: `GFPGANv1.3.pth` and `GFPGANv1.4.pth` are published on the
 TencentARC/GFPGAN GitHub releases page. Both use the "clean" architecture this
@@ -154,7 +174,8 @@ compiled CUDA operators) is a different network and is not supported. The
 detectors `detection_Resnet50_Final.pth` and `detection_mobilenet0.25_Final.pth`
 are published on the xinntao/facexlib GitHub releases page (v0.1.0); GFPGAN
 downloads the ResNet-50 one on its first run. `RealESRGAN_x2plus.pth` is on the
-xinntao/Real-ESRGAN releases page. `codeformer.pth` (v0.1.0) is on the
+xinntao/Real-ESRGAN releases page. `parsing_parsenet.pth` is on the
+xinntao/facexlib releases page (v0.2.2). `codeformer.pth` (v0.1.0) is on the
 sczhou/CodeFormer GitHub releases page.
 
 The detector runs at the photo's own size, as facexlib does, so a large photo
@@ -168,7 +189,9 @@ random pico nets (`tests/fixtures/tiny_gfpgan.*`, a 64x64 net,
 gradient to `face_in.png` and restores it as an aligned face into
 `gfpgan_out.png` / `codeformer_out.png`, then writes a 256x192 pattern to
 `face_photo_in.png` and runs the whole-photo path into `gfpgan_photo_out.png` /
-`codeformer_photo_out.png` (detection threshold 0.5, at most 3 faces). The weights are random, so the outputs are meaningless; the
+`codeformer_photo_out.png` (detection threshold 0.5, at most 3 faces); the
+GFPGAN photo runs once more with the pico ParseNet
+(`tests/fixtures/tiny_parsenet.pth`) into `gfpgan_parse_photo_out.png`. The weights are random, so the outputs are meaningless; the
 smokes only exercise loading, detection, alignment, the forward pass, the paste
 and PNG I/O. It must be run from this folder (the fixture paths are relative).
 

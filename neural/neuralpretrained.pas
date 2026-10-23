@@ -16176,10 +16176,65 @@ function DetectRetinaFaceFaces(NN: TNNet; const Config: TRetinaFaceConfig;
   NMSThreshold: TNeuralFloat = 0.4; MaxFaces: integer = 0): TRetinaFaceDetectionArray;
 
 // ---------------------------------------------------------------------------
-// WHOLE-PHOTO FACE RESTORATION (port of facexlib FaceRestoreHelper with
-// use_parse=False): RetinaFace landmarks -> 4-DOF similarity onto the FFHQ
-// 5-point template -> bilinear crop -> GFPGAN -> inverse warp pasted with an
-// eroded, Gaussian-feathered square mask on the (upscaled) background.
+// ParseNet FACE PARSING IMPORT (facexlib parsing/parsenet.py, modified from
+// chaofengc/PSFRGAN; the parsing_parsenet.pth release). Input: an aligned face
+// (InputSize, InputSize, 3) in [-1,1]; output: (OutputSize, OutputSize,
+// ParsingChannels) class logits, out_mask (facexlib output [0]); the unused
+// out_img head is not built. Reflect-pad 3x3 conv -> DownSteps stride-2
+// residual blocks -> ResDepth residual blocks plus a skip -> UpSteps nearest-2x
+// residual blocks -> 3x3 conv. BatchNorm folded into the convs, LeakyReLU(0.2).
+// Every width comes from the tensor shapes. Coded by Claude (AI).
+const
+  // FaceRestoreHelper.paste_faces_to_input_image MASK_COLORMAP: 255 = class
+  // pasted (skin, brows, eyes, nose, mouth, ...), 0 = background, neck, cloth, hat.
+  csParseNetFaceMaskColormap: array[0..18] of byte = (0, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 255, 0, 0, 0);
+
+type
+  TParseNetConfig = record
+    InputSize: integer;        // in_size (512 for parsing_parsenet.pth)
+    BaseChannels: integer;     // base_ch, the width of encoder.0
+    DownSteps: integer;        // stride-2 residual blocks (encoder.1..)
+    ResDepth: integer;         // body residual blocks
+    UpSteps: integer;          // nearest-2x residual blocks (decoder.*)
+    ParsingChannels: integer;  // parsing_ch (19)
+    LeakySlope: TNeuralFloat;  // relu_type='LeakyReLU': 0.2
+    BnEps: TNeuralFloat;       // BatchNorm2d eps 1e-5
+  end;
+
+// Counts the encoder / body / decoder blocks and reads the widths from Reader;
+// InputSize is not in the checkpoint (facexlib builds ParseNet(in_size=512)).
+function InferParseNetConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  InputSize: integer = 512): TParseNetConfig;
+
+function ParseNetConfigToString(const Config: TParseNetConfig): string;
+
+// Builds ParseNet and loads every weight (caller owns Reader).
+function BuildParseNet(Reader: TNNetSafeTensorsReader;
+  const Config: TParseNetConfig; pTrainable: boolean = true): TNNet;
+
+function BuildParseNetFromSafeTensorsEx(const FileName: string;
+  const Config: TParseNetConfig; pTrainable: boolean = true): TNNet;
+
+// Same with the config inferred from the .pth / .safetensors checkpoint.
+function BuildParseNetFromSafeTensors(const FileName: string;
+  out Config: TParseNetConfig; InputSize: integer = 512;
+  pTrainable: boolean = true): TNNet;
+
+// facexlib's paste mask of a parsing map: per-pixel argmax -> MASK_COLORMAP ->
+// cv2.GaussianBlur((101, 101), 11) twice -> 10-pixel border zeroed -> / 255.
+procedure ParseNetFaceMask(Parsing, Mask: TNNetVolume);
+
+// Restored face (RGB 0..255) -> its ParseNetFaceMask (W, H, 1) at the face size,
+// the face resized to the Parser input and mapped to [-1,1] as facexlib does.
+procedure ParseNetFaceMaskOfFace(Parser: TNNet; Face, Mask: TNNetVolume);
+
+// ---------------------------------------------------------------------------
+// WHOLE-PHOTO FACE RESTORATION (port of facexlib FaceRestoreHelper):
+// RetinaFace landmarks -> 4-DOF similarity onto the FFHQ 5-point template ->
+// bilinear crop -> GFPGAN / CodeFormer -> inverse warp pasted with an eroded,
+// Gaussian-feathered square mask (use_parse=False) or a ParseNet mask
+// (use_parse=True) on the (upscaled) background.
 // Coded by Claude (AI).
 const
   // FaceRestoreHelper's FFHQ 5-landmark template of a 512 x 512 face, (x, y).
@@ -16199,26 +16254,27 @@ function FaceAlignmentMatrix(const Detection: TRetinaFaceDetection;
 procedure AlignWarpFace(Image: TNNetVolume; const Matrix: TImageAffineMatrix;
   FaceSize: integer; Face: TNNetVolume);
 
-// Blends Face (cropped from the original image by Matrix) into Canvas, that
-// image UpscaleFactor times larger, through facexlib's eroded + feathered mask.
+// Blends Face (cropped by Matrix) into Canvas, the image UpscaleFactor times larger,
+// through FaceMask (W, H, 1) in [0,1]; nil = facexlib's eroded + feathered square mask.
 procedure PasteFaceIntoImage(Face: TNNetVolume; const Matrix: TImageAffineMatrix;
-  UpscaleFactor: TNeuralFloat; Canvas: TNNetVolume);
+  UpscaleFactor: TNeuralFloat; Canvas: TNNetVolume;
+  FaceMask: TNNetVolume = nil);
 
 // The faces whose eye landmarks are at least MinEyeDistance pixels apart.
 function FilterFacesByEyeDistance(const Faces: TRetinaFaceDetectionArray;
   MinEyeDistance: TNeuralFloat): TRetinaFaceDetectionArray;
 
-// GFPGANer.enhance (no face parsing): Output := Background (nil: Image) resized
-// to Trunc(UpscaleFactor * size) with every detected face restored and pasted;
-// returns the face count. Crops / RestoredFaces (optional) receive copies.
-// Restorer is a GFPGAN or CodeFormer net of resolution RestorerFaceSize.
+// GFPGANer.enhance: Output := Background (nil: Image) resized to Trunc(UpscaleFactor
+// * size), each face restored by Restorer (GFPGAN / CodeFormer of RestorerFaceSize)
+// and pasted; returns the face count. Crops / RestoredFaces (optional) get copies.
+// Parser (BuildParseNet) pastes through ParseNetFaceMaskOfFace; nil = square mask.
 function RestoreFacesInImage(Detector: TNNet;
   const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
   RestorerFaceSize: integer; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
   MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
-  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
-  overload;
+  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil;
+  Parser: TNNet = nil): integer; overload;
 
 // Same with the resolution of a GFPGAN / CodeFormer config.
 function RestoreFacesInImage(Detector: TNNet;
@@ -16226,15 +16282,15 @@ function RestoreFacesInImage(Detector: TNNet;
   const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
   MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
-  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
-  overload;
+  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil;
+  Parser: TNNet = nil): integer; overload;
 function RestoreFacesInImage(Detector: TNNet;
   const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
   const RestorerConfig: TCodeFormerConfig; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
   MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
-  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
-  overload;
+  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil;
+  Parser: TNNet = nil): integer; overload;
 
 // ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
@@ -110920,7 +110976,266 @@ begin
 end;
 
 // ===========================================================================
-// WHOLE-PHOTO FACE RESTORATION (facexlib FaceRestoreHelper, use_parse=False)
+// ParseNet face parsing (facexlib parsing_parsenet.pth)
+// ===========================================================================
+
+const
+  csParseNetImporter = 'ParseNet import';
+  csParseNetMaskBlurKernelSize = 101;
+  csParseNetMaskBlurSigma = 11;
+  csParseNetMaskBorder = 10;
+
+function ParseNetDim(Reader: TNNetSafeTensorsReader; const Name: string;
+  Axis: integer): integer;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError(csParseNetImporter + ': missing tensor "' + Name + '".');
+  Result := Reader.DimSize(Name, Axis);
+end;
+
+// The number of residual blocks Prefix + '<N>.' holding conv1, N from FirstPos.
+function ParseNetBlockCount(Reader: TNNetSafeTensorsReader; const Prefix: string;
+  FirstPos: integer): integer;
+begin
+  Result := 0;
+  while Reader.HasTensor(Prefix + IntToStr(FirstPos + Result) +
+    '.conv1.conv2d.weight') do Inc(Result);
+end;
+
+function InferParseNetConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  InputSize: integer): TParseNetConfig;
+begin
+  if not Reader.HasTensor('encoder.0.conv2d.weight') or
+     not Reader.HasTensor('out_mask_conv.conv2d.weight') then
+    ImportError(csParseNetImporter + ': "encoder.0.conv2d.weight" or ' +
+      '"out_mask_conv.conv2d.weight" not found; not a facexlib ParseNet checkpoint.');
+  if not Reader.HasTensor('encoder.1.conv1.norm.norm.running_mean') and
+     Reader.HasTensor('encoder.1.conv1.conv2d.weight') then
+    ImportError(csParseNetImporter + ': only norm_type=''bn'' is supported ' +
+      '(no "encoder.1.conv1.norm.norm.running_mean").');
+  Result.InputSize := InputSize;
+  Result.BaseChannels := ParseNetDim(Reader, 'encoder.0.conv2d.weight', 0);
+  Result.DownSteps := ParseNetBlockCount(Reader, 'encoder.', 1);
+  Result.ResDepth := ParseNetBlockCount(Reader, 'body.', 0);
+  Result.UpSteps := ParseNetBlockCount(Reader, 'decoder.', 0);
+  Result.ParsingChannels := ParseNetDim(Reader, 'out_mask_conv.conv2d.weight', 0);
+  Result.LeakySlope := 0.2;
+  Result.BnEps := 0.00001;
+end;
+
+function ParseNetConfigToString(const Config: TParseNetConfig): string;
+begin
+  Result := 'ParseNet config: in_size=' + IntToStr(Config.InputSize) +
+    ', base_ch=' + IntToStr(Config.BaseChannels) +
+    ', down=' + IntToStr(Config.DownSteps) +
+    ', res_depth=' + IntToStr(Config.ResDepth) +
+    ', up=' + IntToStr(Config.UpSteps) +
+    ', parsing_ch=' + IntToStr(Config.ParsingChannels);
+end;
+
+function BuildParseNet(Reader: TNNetSafeTensorsReader;
+  const Config: TParseNetConfig; pTrainable: boolean): TNNet;
+type
+  TParseNetBlockScale = (pbsNone, pbsDown, pbsUp);
+var
+  NN: TNNet;
+  Feat, Cur: TNNetLayer;
+  BlockPos, MaxBlockPos, Factor: integer;
+
+  // 3x3 conv of Stride, no padding, after Padded.
+  function AddConvAfter(Padded: TNNetLayer; OutCh, Stride: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter( TNNetConvolutionLinear.Create(OutCh, 3, 0,
+      Stride).SetTrainable(pTrainable), Padded );
+  end;
+
+  // ConvLayer: ReflectionPad2d(1) + 3x3 conv of Stride after Source.
+  function AddPaddedConv(Source: TNNetLayer; OutCh, Stride: integer): TNNetLayer;
+  begin
+    Result := AddConvAfter(NN.AddLayerAfter( TNNetPad.Create(1, pmReflect),
+      Source ), OutCh, Stride);
+  end;
+
+  // ConvLayer with norm 'none': conv2d.weight + conv2d.bias.
+  procedure LoadBiasConv(Layer: TNNetLayer; const Prefix: string;
+    OutCh, InCh: integer);
+  begin
+    LoadVaeConv(Reader, Layer, Prefix + 'conv2d.weight', Prefix + 'conv2d.bias',
+      OutCh, InCh, 3);
+  end;
+
+  // ResidualBlock at Prefix after Source: shortcut (identity or a ConvLayer)
+  // + conv1 (BN, LeakyReLU) -> conv2 (BN); 'up' upsamples before both.
+  function AddResidualBlock(Source: TNNetLayer; const Prefix: string;
+    Scale: TParseNetBlockScale): TNNetLayer;
+  var
+    InCh, OutCh, Conv2Stride: integer;
+    Upsampled, Padded, Conv1, Conv2, Shortcut: TNNetLayer;
+    HasShortcutConv: boolean;
+  begin
+    OutCh := ParseNetDim(Reader, Prefix + 'conv1.conv2d.weight', 0);
+    InCh := ParseNetDim(Reader, Prefix + 'conv1.conv2d.weight', 1);
+    if InCh <> Source.Output.Depth then
+      ImportError(csParseNetImporter + ': "' + Prefix + 'conv1.conv2d.weight" ' +
+        'takes ' + IntToStr(InCh) + ' channels, the block input has ' +
+        IntToStr(Source.Output.Depth) + '.');
+    HasShortcutConv := Reader.HasTensor(Prefix + 'shortcut_func.conv2d.weight');
+    if HasShortcutConv <> ((Scale <> pbsNone) or (InCh <> OutCh)) then
+      ImportError(csParseNetImporter + ': block "' + Prefix + '" has an ' +
+        'unexpected shortcut (scale or width change needs a shortcut conv).');
+    if Scale = pbsUp then
+      Upsampled := NN.AddLayerAfter( TNNetDeMaxPool.Create(2), Source )
+    else
+      Upsampled := Source;
+    if Scale = pbsDown then Conv2Stride := 2 else Conv2Stride := 1;
+    Padded := NN.AddLayerAfter( TNNetPad.Create(1, pmReflect), Upsampled );
+    Conv1 := AddConvAfter(Padded, OutCh, 1);
+    LoadResNetConvFoldBN(Reader, Conv1, Prefix + 'conv1.conv2d.weight',
+      Prefix + 'conv1.norm.norm', OutCh, InCh, 3, Config.BnEps);
+    NN.AddLayer( TNNetLeakyReLU.Create(Config.LeakySlope) );
+    Conv2 := AddPaddedConv(NN.GetLastLayer(), OutCh, Conv2Stride);
+    LoadResNetConvFoldBN(Reader, Conv2, Prefix + 'conv2.conv2d.weight',
+      Prefix + 'conv2.norm.norm', OutCh, OutCh, 3, Config.BnEps);
+    if HasShortcutConv then
+    begin
+      Shortcut := AddConvAfter(Padded, OutCh, Conv2Stride);
+      LoadBiasConv(Shortcut, Prefix + 'shortcut_func.', OutCh, InCh);
+    end
+    else
+      Shortcut := Source;
+    Result := NN.AddLayer( TNNetSum.Create([Shortcut, Conv2]) );
+  end;
+
+begin
+  Factor := 1 shl Config.DownSteps;
+  if (Config.InputSize < Factor) or (Config.InputSize mod Factor <> 0) then
+    ImportError(csParseNetImporter + ': in_size ' + IntToStr(Config.InputSize) +
+      ' must be a positive multiple of ' + IntToStr(Factor) + '.');
+  if Config.ParsingChannels < 1 then
+    ImportError(csParseNetImporter + ': parsing_ch must be positive.');
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(Config.InputSize, Config.InputSize, 3) );
+    Cur := AddPaddedConv(NN.GetLastLayer(), Config.BaseChannels, 1);
+    LoadBiasConv(Cur, 'encoder.0.', Config.BaseChannels, 3);
+    MaxBlockPos := Config.DownSteps;
+    for BlockPos := 1 to MaxBlockPos do
+      Cur := AddResidualBlock(Cur, 'encoder.' + IntToStr(BlockPos) + '.', pbsDown);
+    Feat := Cur;
+    MaxBlockPos := Config.ResDepth - 1;
+    for BlockPos := 0 to MaxBlockPos do
+      Cur := AddResidualBlock(Cur, 'body.' + IntToStr(BlockPos) + '.', pbsNone);
+    if Cur <> Feat then Cur := NN.AddLayer( TNNetSum.Create([Feat, Cur]) )
+    else Cur := NN.AddLayer( TNNetMulByConstant.Create(2.0) );
+    MaxBlockPos := Config.UpSteps - 1;
+    for BlockPos := 0 to MaxBlockPos do
+      Cur := AddResidualBlock(Cur, 'decoder.' + IntToStr(BlockPos) + '.', pbsUp);
+    if ParseNetDim(Reader, 'out_mask_conv.conv2d.weight', 1) <> Cur.Output.Depth then
+      ImportError(csParseNetImporter + ': "out_mask_conv.conv2d.weight" takes ' +
+        IntToStr(Reader.DimSize('out_mask_conv.conv2d.weight', 1)) +
+        ' channels, the decoder gives ' + IntToStr(Cur.Output.Depth) + '.');
+    Cur := AddPaddedConv(Cur, Config.ParsingChannels, 1);
+    LoadBiasConv(Cur, 'out_mask_conv.', Config.ParsingChannels,
+      Cur.PrevLayer.Output.Depth);
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildParseNetFromSafeTensorsEx(const FileName: string;
+  const Config: TParseNetConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildParseNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildParseNetFromSafeTensors(const FileName: string;
+  out Config: TParseNetConfig; InputSize: integer; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Config := InferParseNetConfigFromTensors(Reader, InputSize);
+    Result := BuildParseNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure ParseNetFaceMask(Parsing, Mask: TNNetVolume);
+var
+  SizeX, SizeY, X, Y, MaxX, MaxY, BorderX, BorderY: integer;
+  MaskPtr: TNeuralFloatArrPtr;
+begin
+  if Parsing.Depth > Length(csParseNetFaceMaskColormap) then
+    ImportError('ParseNetFaceMask: ' + IntToStr(Parsing.Depth) + ' classes, ' +
+      'the facexlib colormap has ' + IntToStr(Length(csParseNetFaceMaskColormap)) + '.');
+  SizeX := Parsing.SizeX;
+  SizeY := Parsing.SizeY;
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  Mask.ReSize(SizeX, SizeY, 1);
+  for Y := 0 to MaxY do
+  begin
+    MaskPtr := Mask.GetRawPtr(0, Y);
+    for X := 0 to MaxX do
+      MaskPtr^[X] := csParseNetFaceMaskColormap[Parsing.GetClassOnPixel(X, Y)];
+  end;
+  GaussianBlurImage(Mask, Mask, csParseNetMaskBlurSigma, csParseNetMaskBlurKernelSize);
+  GaussianBlurImage(Mask, Mask, csParseNetMaskBlurSigma, csParseNetMaskBlurKernelSize);
+  BorderX := Min(csParseNetMaskBorder, SizeX);
+  BorderY := Min(csParseNetMaskBorder, SizeY);
+  for Y := 0 to MaxY do
+  begin
+    MaskPtr := Mask.GetRawPtr(0, Y);
+    if (Y < BorderY) or (Y >= SizeY - BorderY) then
+      FillChar(MaskPtr^[0], SizeX * csNeuralFloatSize, 0)
+    else
+    begin
+      FillChar(MaskPtr^[0], BorderX * csNeuralFloatSize, 0);
+      FillChar(MaskPtr^[SizeX - BorderX], BorderX * csNeuralFloatSize, 0);
+    end;
+  end;
+  Mask.Divi(255);
+end;
+
+procedure ParseNetFaceMaskOfFace(Parser: TNNet; Face, Mask: TNNetVolume);
+var
+  NetInput, Parsing, ParserMask: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  Parsing := TNNetVolume.Create;
+  ParserMask := TNNetVolume.Create;
+  try
+    FaceRestorerPrepareInput(Face, Parser.Layers[0].Output.SizeX, NetInput);
+    Parser.Compute(NetInput);
+    Parser.GetOutput(Parsing);
+    if (Parsing.SizeX = Face.SizeX) and (Parsing.SizeY = Face.SizeY) then
+      ParseNetFaceMask(Parsing, Mask)
+    else
+    begin
+      ParseNetFaceMask(Parsing, ParserMask);
+      ResizeImageBilinearNoAntialias(ParserMask, Mask, Face.SizeX, Face.SizeY);
+    end;
+  finally
+    ParserMask.Free;
+    Parsing.Free;
+    NetInput.Free;
+  end;
+end;
+
+// ===========================================================================
+// WHOLE-PHOTO FACE RESTORATION (facexlib FaceRestoreHelper)
 // ===========================================================================
 
 function FaceAlignmentMatrix(const Detection: TRetinaFaceDetection;
@@ -110949,7 +111264,7 @@ begin
 end;
 
 procedure PasteFaceIntoImage(Face: TNNetVolume; const Matrix: TImageAffineMatrix;
-  UpscaleFactor: TNeuralFloat; Canvas: TNNetVolume);
+  UpscaleFactor: TNeuralFloat; Canvas: TNNetVolume; FaceMask: TNNetVolume);
 var
   FaceToCanvas: TImageAffineMatrix;
   Warped, Ones, Mask, Eroded, Center, SoftMask: TNNetVolume;
@@ -110959,10 +111274,16 @@ var
   CornerX, CornerY, MappedX, MappedY, MinX, MinY, MaxX, MaxY: double;
   Soft, FaceWeight: TNeuralFloat;
   CanvasPtr, WarpedPtr: TNeuralFloatArrPtr;
+  HasFaceMask: boolean;
 begin
+  HasFaceMask := FaceMask <> nil;
   if (Face.Depth <> Canvas.Depth) then
     ImportError('PasteFaceIntoImage: the face has ' + IntToStr(Face.Depth) +
       ' channels, the canvas ' + IntToStr(Canvas.Depth) + '.');
+  if (FaceMask <> nil) and ((FaceMask.SizeX <> Face.SizeX) or
+     (FaceMask.SizeY <> Face.SizeY) or (FaceMask.Depth <> 1)) then
+    ImportError('PasteFaceIntoImage: the face mask must be (' +
+      IntToStr(Face.SizeX) + ', ' + IntToStr(Face.SizeY) + ', 1).');
   FaceToCanvas := InvertImageAffineMatrix(Matrix);
   for ElementPos := 0 to 5 do
     FaceToCanvas[ElementPos] := FaceToCanvas[ElementPos] * UpscaleFactor;
@@ -111004,12 +111325,20 @@ begin
   SoftMask := TNNetVolume.Create;
   try
     WarpImageAffine(Face, Warped, FaceToCanvas, RegionSizeX, RegionSizeY, []);
-    WarpImageAffine(Ones, Mask, FaceToCanvas, RegionSizeX, RegionSizeY, []);
-    ErodeSize := Trunc(2 * UpscaleFactor);
-    ErodeImage(Mask, Eroded, ErodeSize, ErodeSize);
-    EdgeWidth := Trunc(Sqrt(Max(Eroded.GetSum(), 0))) div 20;
-    ErodeImage(Eroded, Center, 2 * EdgeWidth, 2 * EdgeWidth);
-    GaussianBlurImageCV2(Center, SoftMask, 2 * EdgeWidth + 1);
+    if HasFaceMask then
+    begin
+      // use_parse=True: the warped parse mask, the face itself not eroded.
+      WarpImageAffine(FaceMask, SoftMask, FaceToCanvas, RegionSizeX, RegionSizeY, []);
+    end
+    else
+    begin
+      WarpImageAffine(Ones, Mask, FaceToCanvas, RegionSizeX, RegionSizeY, []);
+      ErodeSize := Trunc(2 * UpscaleFactor);
+      ErodeImage(Mask, Eroded, ErodeSize, ErodeSize);
+      EdgeWidth := Trunc(Sqrt(Max(Eroded.GetSum(), 0))) div 20;
+      ErodeImage(Eroded, Center, 2 * EdgeWidth, 2 * EdgeWidth);
+      GaussianBlurImageCV2(Center, SoftMask, 2 * EdgeWidth + 1);
+    end;
     MaxRegionX := RegionSizeX - 1;
     MaxRegionY := RegionSizeY - 1;
     MaxChannel := Canvas.Depth - 1;
@@ -111018,7 +111347,8 @@ begin
       begin
         Soft := SoftMask.FData[Y * RegionSizeX + X];
         if Soft = 0 then continue;
-        FaceWeight := Soft * Eroded.FData[Y * RegionSizeX + X];
+        if HasFaceMask then FaceWeight := Soft
+        else FaceWeight := Soft * Eroded.FData[Y * RegionSizeX + X];
         CanvasPtr := Canvas.GetRawPtr(RegionX1 + X, RegionY1 + Y);
         WarpedPtr := Warped.GetRawPtr(X, Y);
         for Channel := 0 to MaxChannel do
@@ -111059,13 +111389,14 @@ function RestoreFacesInImage(Detector: TNNet;
   RestorerFaceSize: integer; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
   MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
-  RestoredFaces: TNNetVolumeList): integer;
+  RestoredFaces: TNNetVolumeList; Parser: TNNet): integer;
 var
   Faces: TRetinaFaceDetectionArray;
   Matrices: array of TImageAffineMatrix;
   Crop: TNNetVolume;
   // Restored[FacePos]: the restorer's output for face FacePos.
   Restored: TNNetVolumeList;
+  FaceMask: TNNetVolume;
   FacePos, MaxFacePos, CanvasSizeX, CanvasSizeY: integer;
 
   procedure AddCopy(List: TNNetVolumeList; Volume: TNNetVolume);
@@ -111089,6 +111420,8 @@ begin
   MaxFacePos := Result - 1;
   SetLength(Matrices, Result);
   Crop := TNNetVolume.Create;
+  FaceMask := nil;
+  if Parser <> nil then FaceMask := TNNetVolume.Create;
   Restored := TNNetVolumeList.Create(true);
   try
     // Every face is cropped from Image before Output (which may be Image) changes.
@@ -111110,10 +111443,15 @@ begin
     else
       ResizeImageLanczos4CV2(Image, Output, CanvasSizeX, CanvasSizeY);
     for FacePos := 0 to MaxFacePos do
+    begin
+      if Parser <> nil then
+        ParseNetFaceMaskOfFace(Parser, Restored[FacePos], FaceMask);
       PasteFaceIntoImage(Restored[FacePos], Matrices[FacePos], UpscaleFactor,
-        Output);
+        Output, FaceMask);
+    end;
   finally
     Restored.Free;
+    FaceMask.Free;
     Crop.Free;
   end;
 end;
@@ -111123,11 +111461,11 @@ function RestoreFacesInImage(Detector: TNNet;
   const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
   MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
-  RestoredFaces: TNNetVolumeList): integer;
+  RestoredFaces: TNNetVolumeList; Parser: TNNet): integer;
 begin
   Result := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
     RestorerConfig.OutSize, Image, Background, Output, UpscaleFactor,
-    ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces);
+    ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces, Parser);
 end;
 
 function RestoreFacesInImage(Detector: TNNet;
@@ -111135,11 +111473,11 @@ function RestoreFacesInImage(Detector: TNNet;
   const RestorerConfig: TCodeFormerConfig; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
   MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
-  RestoredFaces: TNNetVolumeList): integer;
+  RestoredFaces: TNNetVolumeList; Parser: TNNet): integer;
 begin
   Result := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
     RestorerConfig.ImageSize, Image, Background, Output, UpscaleFactor,
-    ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces);
+    ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces, Parser);
 end;
 
 {$IFDEF OpenCL}
