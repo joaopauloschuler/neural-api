@@ -851,6 +851,11 @@ rather than acted on.
                 components loaded (CPU only; `--gpu` still builds two UNets,
                 the trainable CPU one for the fit and the OpenCL one for
                 sampling).
+          - [ ] Decide: DDIM / null-text inversion encode through
+                `EncodeVaeImage`, so with `VaeTileSize` set on a large image
+                they now invert a TILED encode (a948d626). They refuse
+                panorama windows but not `VaeTileSize`; either refuse it too
+                or pin that the tiled latent inverts acceptably.
 - [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
       Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`):
       `TStableDiffusionICLight` (`Relight`) and examples/StableDiffusion
