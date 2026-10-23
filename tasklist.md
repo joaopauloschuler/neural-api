@@ -125,6 +125,10 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
+- [ ] examples/YoloDetect has no `.lpi`, so `lazbuild -B` cannot build it (it
+      compiles with plain `fpc -Fu<lazutils> -Funeural`). Add an `.lpi` like the
+      sibling examples (e.g. examples/FastSAM/FastSAM.lpi).
+
 - [ ] OpenCL test suite under 2 minutes (user goal and authorization
       2026-10-05; today ~600 s on PoCL). Diagnosis (single-test runs): idle
       scheduler workers spin hot against PoCL (one VAE test: OpenCL + parallel
