@@ -16304,10 +16304,11 @@ function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
 // >= 0.5 keys allowed; background keys get -inf). Reuses the DETR set-prediction
 // machinery (learned queries + transformer decoder, q/k/v/o projections).
 //
-// SCOPE v1: SEMANTIC inference only, and the importer builds the masked-
-// attention DECODER + heads ONLY -- it takes the PIXEL-DECODER outputs
-// (mask_features + the 3 multi-scale memory levels, already projected and with
-// level_embed + sine pos folded into the keys) as PRECOMPUTED inputs, mirroring
+// SCOPE v1: semantic, instance and panoptic post-processing; the importer
+// builds the masked-attention DECODER + heads ONLY -- it takes the PIXEL-
+// DECODER outputs (mask_features + the 3 multi-scale memory levels, already
+// projected and with level_embed + sine pos folded into the keys) as
+// PRECOMPUTED inputs, mirroring
 // how Mask R-CNN v1 took FPN feature maps directly. Wiring the full Swin
 // backbone + FPN pixel decoder into one forward is a documented deferred
 // follow-up (see tasklist.md).
@@ -16391,6 +16392,41 @@ procedure Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Dest: TNNetVolume;
 // (row-major, label per pixel at 1/4 resolution).
 function DecodeMask2FormerSemantic(ClassLogits, MaskLogits: TNNetVolume;
   NumLabels, MaskWidth, MaskHeight: integer): TMask2FormerLabelMap;
+
+const
+  // transformers resizes the mask logits to this grid before post-processing.
+  csMask2FormerProcessedSize = 384;
+
+type
+  TMask2FormerSegment = record
+    Id, LabelId: integer;
+    WasFused: boolean;
+    Score: TNeuralFloat;                   // not rounded (HF rounds to 6 digits)
+  end;
+
+  TMask2FormerSegmentation = record
+    Width, Height: integer;
+    SegmentMap: TMask2FormerLabelMap;      // row-major segment id per pixel
+    Segments: array of TMask2FormerSegment;
+  end;
+
+// Port of HF post_process_instance_segmentation; top-k runs in descending score
+// order. SegmentMap: -1 = no instance, ids from 0. TargetWidth <= 0: no resize.
+function DecodeMask2FormerInstance(ClassLogits, MaskLogits: TNNetVolume;
+  NumLabels, MaskWidth, MaskHeight: integer; Threshold: double = 0.5;
+  TargetWidth: integer = 0; TargetHeight: integer = 0;
+  ProcessedWidth: integer = csMask2FormerProcessedSize;
+  ProcessedHeight: integer = csMask2FormerProcessedSize): TMask2FormerSegmentation;
+
+// Port of HF post_process_panoptic_segmentation. SegmentMap: 0 = no segment, ids
+// from 1; all -1 when no query passes Threshold. TargetWidth <= 0: no resize.
+function DecodeMask2FormerPanoptic(ClassLogits, MaskLogits: TNNetVolume;
+  NumLabels, MaskWidth, MaskHeight: integer;
+  const LabelIdsToFuse: array of integer; Threshold: TNeuralFloat = 0.5;
+  MaskThreshold: TNeuralFloat = 0.5; OverlapMaskAreaThreshold: double = 0.8;
+  TargetWidth: integer = 0; TargetHeight: integer = 0;
+  ProcessedWidth: integer = csMask2FormerProcessedSize;
+  ProcessedHeight: integer = csMask2FormerProcessedSize): TMask2FormerSegmentation;
 
 // Frees a net returned by BuildMask2FormerFromSafeTensors, including its hidden
 // per-layer sub-nets and query tables. Use this INSTEAD of NN.Free (the
@@ -94712,6 +94748,33 @@ begin
   end;
 end;
 
+// Probs := per-query softmax over all NumLabels+1 class logits, no-object slot
+// last; Probs keeps the (NumQueries, 1, NumLabels+1) shape of ClassLogits.
+procedure Mask2FormerClassSoftmax(ClassLogits, Probs: TNNetVolume);
+begin
+  Probs.Copy(ClassLogits);
+  Probs.PointwiseSoftMax();
+end;
+
+// Dest := MaskLogits (NumQueries,1,MaskWidth*MaskHeight) as a pixel-major
+// (OutWidth,OutHeight,NumQueries) volume, resized with InterpolateVolume2D Mode.
+procedure Mask2FormerPixelMajorMasks(MaskLogits: TNNetVolume;
+  MaskWidth, MaskHeight, OutWidth, OutHeight, Mode: integer;
+  Dest: TNNetVolume);
+var
+  QueryMajor: TNNetVolume;
+begin
+  QueryMajor := TNNetVolume.Create;
+  try
+    QueryMajor.CopyTransposingXD(MaskLogits);
+    QueryMajor.ReSize(MaskWidth, MaskHeight, MaskLogits.SizeX);
+    InterpolateVolume2D(QueryMajor, Dest, OutWidth, OutHeight, Mode,
+      {AlignCorners=}0);
+  finally
+    QueryMajor.Free;
+  end;
+end;
+
 function DecodeMask2FormerSemantic(ClassLogits, MaskLogits: TNNetVolume;
   NumLabels, MaskWidth, MaskHeight: integer): TMask2FormerLabelMap;
 const
@@ -94720,10 +94783,10 @@ const
 var
   q, c, p, NumPix, NumQueries, BestC: integer;
   NumQueriesM1, NumLabelsM1, BlkStart, BlkLen, BlkLenM1, SigStride: integer;
-  clBase, mlPos, mlStride, sigBase, sigPos: integer;
-  MaxLogit, SumExp, prob, BestVal, invSum, e: TNeuralFloat;
+  mlPos, mlStride, sigBase, sigPos, ClassStride: integer;
+  BestVal: TNeuralFloat;
   cpBase: integer;
-  ClsProb: array of TNeuralFloat;
+  ClsProb: TNNetVolume;
   Acc: array of TNeuralFloat;
   Sig: array of TNeuralFloat;
 begin
@@ -94731,80 +94794,354 @@ begin
   NumPix := MaskWidth * MaskHeight;
   mlStride := MaskLogits.GetRawPos(1, 0, 0);  // elements between consecutive q
   SetLength(Result, NumPix);
-  SetLength(ClsProb, NumQueries * NumLabels);
   NumQueriesM1 := NumQueries - 1;
   NumLabelsM1 := NumLabels - 1;
-  // class probabilities: softmax over NumLabels+1, drop the no-object slot.
-  for q := 0 to NumQueriesM1 do
-  begin
-    clBase := ClassLogits.GetRawPos(q, 0, 0);
-    MaxLogit := ClassLogits.FData[clBase];
-    for c := 1 to NumLabels do
+  ClassStride := NumLabels + 1;
+  // class probabilities: softmax over NumLabels+1; the no-object slot (last of
+  // each row) is skipped by the per-pixel accumulation below.
+  ClsProb := TNNetVolume.Create;
+  try
+    Mask2FormerClassSoftmax(ClassLogits, ClsProb);
+    // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
+    // #13/App.E: q drives one contiguous MulAdd over the NumLabels accumulator, so
+    // the ClsProb row for a query is walked contiguously and the sigmoid folds into
+    // the same pass. Per label the accumulation order over q is unchanged.
+    // Scratch allocated once.
+    SetLength(Acc, NumLabels);
+    // A query's mask logits are contiguous along p, so the sigmoid runs as one
+    // bulk pass per query over a block of pixels (#13/#19) and the per-pixel nest
+    // below reads it back. The block bounds the scratch; both arrays are sized
+    // once, before the pixel loop.
+    SigStride := NumPix;
+    if SigStride > cSigBlock then SigStride := cSigBlock;
+    SetLength(Sig, NumQueries * SigStride);
+    BlkStart := 0;
+    if NumLabels > 0 then
+    while BlkStart < NumPix do
     begin
-      e := ClassLogits.FData[clBase + c];   // #4: read once per c
-      if e > MaxLogit then MaxLogit := e;
-    end;
-    // #19: the NumLabels logits are contiguous in ClassLogits and the matching
-    // ClsProb slice is contiguous too, so one fused pass exponentiates and sums.
-    // #5: divide-by-SumExp becomes a multiply by its reciprocal.
-    cpBase := q * NumLabels;
-    SumExp := TNNetVolume.ExpShiftSum(Addr(ClsProb[cpBase]),
-      Addr(ClassLogits.FData[clBase]), MaxLogit, NumLabels);
-    // no-object slot (c = NumLabels): contributes to the denominator only.
-    SumExp := SumExp + NeuralExp(ClassLogits.FData[clBase + NumLabels] - MaxLogit);
-    invSum := 1.0 / SumExp;
-    TNNetVolume.Mul(@ClsProb[cpBase], invSum, NumLabels);
-  end;
-  // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
-  // #13/App.E: q drives one contiguous MulAdd over the NumLabels accumulator, so
-  // the ClsProb row for a query is walked contiguously and the sigmoid folds into
-  // the same pass. Per label the accumulation order over q is unchanged.
-  // Scratch allocated once.
-  SetLength(Acc, NumLabels);
-  // A query's mask logits are contiguous along p, so the sigmoid runs as one
-  // bulk pass per query over a block of pixels (#13/#19) and the per-pixel nest
-  // below reads it back. The block bounds the scratch; both arrays are sized
-  // once, before the pixel loop.
-  SigStride := NumPix;
-  if SigStride > cSigBlock then SigStride := cSigBlock;
-  SetLength(Sig, NumQueries * SigStride);
-  BlkStart := 0;
-  if NumLabels > 0 then
-  while BlkStart < NumPix do
-  begin
-    BlkLen := NumPix - BlkStart;
-    if BlkLen > cSigBlock then BlkLen := cSigBlock;
-    BlkLenM1 := BlkLen - 1;
-    mlPos := BlkStart;  // = MaskLogits.GetRawPos(0, 0, BlkStart)
-    sigBase := 0;
-    for q := 0 to NumQueriesM1 do
-    begin
-      TNNetVolume.Sigmoid(Addr(Sig[sigBase]), Addr(MaskLogits.FData[mlPos]),
-        BlkLen);
-      Inc(mlPos, mlStride);
-      Inc(sigBase, SigStride);
-    end;
-    for p := 0 to BlkLenM1 do
-    begin
-      FillChar(Acc[0], NumLabels * csNeuralFloatSize, 0);
-      sigPos := p;  // Sig[q * SigStride + p]; carry the q stride (#6/#12)
-      cpBase := 0;  // ClsProb[q * NumLabels]; carry the q stride (#6/#12)
+      BlkLen := NumPix - BlkStart;
+      if BlkLen > cSigBlock then BlkLen := cSigBlock;
+      BlkLenM1 := BlkLen - 1;
+      mlPos := BlkStart;  // = MaskLogits.GetRawPos(0, 0, BlkStart)
+      sigBase := 0;
       for q := 0 to NumQueriesM1 do
       begin
-        TNNetVolume.MulAdd(@Acc[0], @ClsProb[cpBase], Sig[sigPos], NumLabels);
-        Inc(sigPos, SigStride);
-        Inc(cpBase, NumLabels);
+        TNNetVolume.Sigmoid(Addr(Sig[sigBase]), Addr(MaskLogits.FData[mlPos]),
+          BlkLen);
+        Inc(mlPos, mlStride);
+        Inc(sigBase, SigStride);
       end;
-      // every Acc[c] is a sum of non-negative terms, so seeding with Acc[0] matches
-      // the old (BestVal = -1, strict >) scan, which always accepted c = 0 first.
-      BestC := 0; BestVal := Acc[0];
-      for c := 1 to NumLabelsM1 do
-        if Acc[c] > BestVal then begin BestVal := Acc[c]; BestC := c; end;
-      Result[BlkStart + p] := BestC;
+      for p := 0 to BlkLenM1 do
+      begin
+        FillChar(Acc[0], NumLabels * csNeuralFloatSize, 0);
+        sigPos := p;  // Sig[q * SigStride + p]; carry the q stride (#6/#12)
+        cpBase := 0;  // ClsProb row q; carry the q stride (#6/#12)
+        for q := 0 to NumQueriesM1 do
+        begin
+          TNNetVolume.MulAdd(@Acc[0], Addr(ClsProb.FData[cpBase]), Sig[sigPos],
+            NumLabels);
+          Inc(sigPos, SigStride);
+          Inc(cpBase, ClassStride);
+        end;
+        // every Acc[c] is a sum of non-negative terms, so seeding with Acc[0] matches
+        // the old (BestVal = -1, strict >) scan, which always accepted c = 0 first.
+        BestC := 0; BestVal := Acc[0];
+        for c := 1 to NumLabelsM1 do
+          if Acc[c] > BestVal then begin BestVal := Acc[c]; BestC := c; end;
+        Result[BlkStart + p] := BestC;
+      end;
+      Inc(BlkStart, BlkLen);
     end;
-    Inc(BlkStart, BlkLen);
+  finally
+    ClsProb.Free;
   end;
-  if prob = 0 then ;
+end;
+
+// A TargetWidth x TargetHeight map (the processed grid when TargetWidth <= 0)
+// filled with FillId, with an empty segment list.
+function Mask2FormerFilledSegmentation(TargetWidth, TargetHeight,
+  ProcessedWidth, ProcessedHeight, FillId: integer): TMask2FormerSegmentation;
+var
+  PixelPos, MaxPixelPos: integer;
+begin
+  if TargetWidth > 0 then
+  begin
+    Result.Width := TargetWidth;
+    Result.Height := TargetHeight;
+  end
+  else
+  begin
+    Result.Width := ProcessedWidth;
+    Result.Height := ProcessedHeight;
+  end;
+  SetLength(Result.SegmentMap, Result.Width * Result.Height);
+  MaxPixelPos := High(Result.SegmentMap);
+  for PixelPos := 0 to MaxPixelPos do Result.SegmentMap[PixelPos] := FillId;
+  SetLength(Result.Segments, 0);
+end;
+
+function DecodeMask2FormerInstance(ClassLogits, MaskLogits: TNNetVolume;
+  NumLabels, MaskWidth, MaskHeight: integer; Threshold: double;
+  TargetWidth, TargetHeight, ProcessedWidth,
+  ProcessedHeight: integer): TMask2FormerSegmentation;
+var
+  ClassProbs, Logits, MaskProbs, ResizedLogits, MapLogits: TNNetVolume;
+  NumQueries, ClassStride, CandidateCount, QueryPos, MaxQueryPos: integer;
+  PixelPos, MaxPixelPos, LabelPos, MaxLabelPos, RankPos, MaxRankPos: integer;
+  CandidatePos, MaxCandidatePos, BestCandidate, PixelBase: integer;
+  SegmentCount, SegmentPos, MaxSegmentPos, Query: integer;
+  BestScore, MaskDenominator, MaskScore, SegmentScore: TNeuralFloat;
+  SigmoidSum: array of double;
+  PositiveCount, MapPositiveCount, SegmentQuery: array of integer;
+  CandidateScore: array of TNeuralFloat;
+  CandidateTaken: array of boolean;
+begin
+  NumQueries := ClassLogits.SizeX;
+  ClassStride := NumLabels + 1;
+  MaxQueryPos := NumQueries - 1;
+  MaxLabelPos := NumLabels - 1;
+  Result := Mask2FormerFilledSegmentation(TargetWidth, TargetHeight,
+    ProcessedWidth, ProcessedHeight, -1);
+  ClassProbs := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  MaskProbs := TNNetVolume.Create;
+  ResizedLogits := TNNetVolume.Create;
+  try
+    Mask2FormerClassSoftmax(ClassLogits, ClassProbs);
+    Mask2FormerPixelMajorMasks(MaskLogits, MaskWidth, MaskHeight,
+      ProcessedWidth, ProcessedHeight, {bilinear}1, Logits);
+    MaskProbs.ReSize(Logits);
+    TNNetVolume.Sigmoid(Addr(MaskProbs.FData[0]), Addr(Logits.FData[0]),
+      Logits.Size);
+    // per query: sum of sigmoid inside the (logit > 0) mask and its area.
+    SetLength(SigmoidSum, NumQueries);
+    SetLength(PositiveCount, NumQueries);
+    MaxPixelPos := ProcessedWidth * ProcessedHeight - 1;
+    PixelBase := 0;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      for QueryPos := 0 to MaxQueryPos do
+        if Logits.FData[PixelBase + QueryPos] > 0 then
+        begin
+          SigmoidSum[QueryPos] := SigmoidSum[QueryPos] +
+            MaskProbs.FData[PixelBase + QueryPos];
+          Inc(PositiveCount[QueryPos]);
+        end;
+      Inc(PixelBase, NumQueries);
+    end;
+    // binary masks on the output grid: nearest resize of (logit > 0).
+    MapLogits := Logits;
+    if TargetWidth > 0 then
+    begin
+      InterpolateVolume2D(Logits, ResizedLogits, TargetWidth, TargetHeight,
+        {nearest}0, {AlignCorners=}0);
+      MapLogits := ResizedLogits;
+    end;
+    SetLength(MapPositiveCount, NumQueries);
+    MaxPixelPos := Result.Width * Result.Height - 1;
+    PixelBase := 0;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      for QueryPos := 0 to MaxQueryPos do
+        if MapLogits.FData[PixelBase + QueryPos] > 0 then
+          Inc(MapPositiveCount[QueryPos]);
+      Inc(PixelBase, NumQueries);
+    end;
+    // top-NumQueries over the flattened (query, label) scores, null class dropped.
+    CandidateCount := NumQueries * NumLabels;
+    SetLength(CandidateScore, CandidateCount);
+    SetLength(CandidateTaken, CandidateCount);
+    CandidatePos := 0;
+    for QueryPos := 0 to MaxQueryPos do
+      for LabelPos := 0 to MaxLabelPos do
+      begin
+        CandidateScore[CandidatePos] :=
+          ClassProbs.FData[QueryPos * ClassStride + LabelPos];
+        Inc(CandidatePos);
+      end;
+    SetLength(SegmentQuery, NumQueries);
+    SetLength(Result.Segments, NumQueries);
+    SegmentCount := 0;
+    MaxCandidatePos := CandidateCount - 1;
+    MaxRankPos := Min(NumQueries, CandidateCount) - 1;
+    for RankPos := 0 to MaxRankPos do
+    begin
+      BestCandidate := -1;
+      BestScore := 0;
+      for CandidatePos := 0 to MaxCandidatePos do
+        if (not CandidateTaken[CandidatePos]) and ((BestCandidate < 0) or
+          (CandidateScore[CandidatePos] > BestScore)) then
+        begin
+          BestCandidate := CandidatePos;
+          BestScore := CandidateScore[CandidatePos];
+        end;
+      CandidateTaken[BestCandidate] := true;
+      Query := BestCandidate div NumLabels;
+      // float32 as in torch; SigmoidSum is double to track torch's pairwise sum.
+      MaskDenominator := PositiveCount[Query] + 1e-6;
+      MaskScore := SigmoidSum[Query] / MaskDenominator;
+      SegmentScore := BestScore * MaskScore;
+      if (MapPositiveCount[Query] > 0) and (SegmentScore >= Threshold) then
+      begin
+        Result.Segments[SegmentCount].Id := SegmentCount;
+        Result.Segments[SegmentCount].LabelId := BestCandidate mod NumLabels;
+        Result.Segments[SegmentCount].WasFused := false;
+        Result.Segments[SegmentCount].Score := SegmentScore;
+        SegmentQuery[SegmentCount] := Query;
+        Inc(SegmentCount);
+      end;
+    end;
+    SetLength(Result.Segments, SegmentCount);
+    // later segments overwrite earlier ones, as in the HF loop.
+    MaxSegmentPos := SegmentCount - 1;
+    PixelBase := 0;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      for SegmentPos := 0 to MaxSegmentPos do
+        if MapLogits.FData[PixelBase + SegmentQuery[SegmentPos]] > 0 then
+          Result.SegmentMap[PixelPos] := SegmentPos;
+      Inc(PixelBase, NumQueries);
+    end;
+  finally
+    ClassProbs.Free;
+    Logits.Free;
+    MaskProbs.Free;
+    ResizedLogits.Free;
+  end;
+end;
+
+function DecodeMask2FormerPanoptic(ClassLogits, MaskLogits: TNNetVolume;
+  NumLabels, MaskWidth, MaskHeight: integer;
+  const LabelIdsToFuse: array of integer; Threshold: TNeuralFloat;
+  MaskThreshold: TNeuralFloat; OverlapMaskAreaThreshold: double;
+  TargetWidth, TargetHeight, ProcessedWidth,
+  ProcessedHeight: integer): TMask2FormerSegmentation;
+var
+  ClassProbs, Logits, ProcessedProbs, ResizedProbs, MaskProbs: TNNetVolume;
+  NumQueries, ClassStride, QueryPos, MaxQueryPos, PredLabel: integer;
+  KeptCount, KeptPos, MaxKeptPos, BestKept, FusePos, MaxFusePos: integer;
+  PixelPos, MaxPixelPos, PixelBase, CurrentSegmentId, SegmentCount: integer;
+  PredScore, WeightedProb, BestProb, AreaRatio: TNeuralFloat;
+  KeptQuery, KeptLabel, KeptArea, KeptOriginalArea, KeptSegmentId,
+    FusedSegmentId, PixelKept: array of integer;
+  KeptScore: array of TNeuralFloat;
+  FuseLabel: array of boolean;
+  ShouldFuse: boolean;
+begin
+  NumQueries := ClassLogits.SizeX;
+  ClassStride := NumLabels + 1;
+  MaxQueryPos := NumQueries - 1;
+  ClassProbs := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  ProcessedProbs := TNNetVolume.Create;
+  ResizedProbs := TNNetVolume.Create;
+  try
+    // remove_low_and_no_objects: per-query best class over all NumLabels+1.
+    Mask2FormerClassSoftmax(ClassLogits, ClassProbs);
+    SetLength(KeptQuery, NumQueries);
+    SetLength(KeptLabel, NumQueries);
+    SetLength(KeptScore, NumQueries);
+    KeptCount := 0;
+    for QueryPos := 0 to MaxQueryPos do
+    begin
+      PredScore := TNNetVolume.MaxPos(
+        Addr(ClassProbs.FData[QueryPos * ClassStride]), ClassStride, PredLabel);
+      if (PredLabel <> NumLabels) and (PredScore > Threshold) then
+      begin
+        KeptQuery[KeptCount] := QueryPos;
+        KeptLabel[KeptCount] := PredLabel;
+        KeptScore[KeptCount] := PredScore;
+        Inc(KeptCount);
+      end;
+    end;
+    if KeptCount = 0 then
+    begin
+      Result := Mask2FormerFilledSegmentation(TargetWidth, TargetHeight,
+        ProcessedWidth, ProcessedHeight, -1);
+      Exit;
+    end;
+    Result := Mask2FormerFilledSegmentation(TargetWidth, TargetHeight,
+      ProcessedWidth, ProcessedHeight, 0);
+    Mask2FormerPixelMajorMasks(MaskLogits, MaskWidth, MaskHeight,
+      ProcessedWidth, ProcessedHeight, {bilinear}1, Logits);
+    ProcessedProbs.ReSize(Logits);
+    TNNetVolume.Sigmoid(Addr(ProcessedProbs.FData[0]), Addr(Logits.FData[0]),
+      Logits.Size);
+    MaskProbs := ProcessedProbs;
+    if TargetWidth > 0 then
+    begin
+      InterpolateVolume2D(ProcessedProbs, ResizedProbs, TargetWidth,
+        TargetHeight, {bilinear}1, {AlignCorners=}0);
+      MaskProbs := ResizedProbs;
+    end;
+    // compute_segments: score-weighted argmax over the kept queries, plus each
+    // kept query's argmax area and its (weighted prob >= MaskThreshold) area.
+    MaxKeptPos := KeptCount - 1;
+    SetLength(KeptArea, KeptCount);
+    SetLength(KeptOriginalArea, KeptCount);
+    SetLength(PixelKept, Result.Width * Result.Height);
+    MaxPixelPos := High(PixelKept);
+    PixelBase := 0;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      BestKept := 0;
+      BestProb := 0;
+      for KeptPos := 0 to MaxKeptPos do
+      begin
+        WeightedProb := MaskProbs.FData[PixelBase + KeptQuery[KeptPos]] *
+          KeptScore[KeptPos];
+        if (KeptPos = 0) or (WeightedProb > BestProb) then
+        begin
+          BestProb := WeightedProb;
+          BestKept := KeptPos;
+        end;
+        if WeightedProb >= MaskThreshold then Inc(KeptOriginalArea[KeptPos]);
+      end;
+      PixelKept[PixelPos] := BestKept;
+      Inc(KeptArea[BestKept]);
+      Inc(PixelBase, NumQueries);
+    end;
+    SetLength(FuseLabel, NumLabels);
+    MaxFusePos := High(LabelIdsToFuse);
+    for FusePos := 0 to MaxFusePos do
+      if (LabelIdsToFuse[FusePos] >= 0) and
+        (LabelIdsToFuse[FusePos] < NumLabels) then
+        FuseLabel[LabelIdsToFuse[FusePos]] := true;
+    // segment id of each fused label so far; 0 = none yet.
+    SetLength(FusedSegmentId, NumLabels);
+    SetLength(KeptSegmentId, KeptCount);
+    SetLength(Result.Segments, KeptCount);
+    SegmentCount := 0;
+    CurrentSegmentId := 0;
+    for KeptPos := 0 to MaxKeptPos do
+    begin
+      PredLabel := KeptLabel[KeptPos];
+      ShouldFuse := FuseLabel[PredLabel];
+      if (KeptArea[KeptPos] = 0) or (KeptOriginalArea[KeptPos] = 0) then
+        continue;
+      AreaRatio := KeptArea[KeptPos] / KeptOriginalArea[KeptPos];
+      if not (AreaRatio > OverlapMaskAreaThreshold) then continue;
+      if FusedSegmentId[PredLabel] > 0 then
+        CurrentSegmentId := FusedSegmentId[PredLabel]
+      else
+        Inc(CurrentSegmentId);
+      KeptSegmentId[KeptPos] := CurrentSegmentId;
+      Result.Segments[SegmentCount].Id := CurrentSegmentId;
+      Result.Segments[SegmentCount].LabelId := PredLabel;
+      Result.Segments[SegmentCount].WasFused := ShouldFuse;
+      Result.Segments[SegmentCount].Score := KeptScore[KeptPos];
+      Inc(SegmentCount);
+      if ShouldFuse then FusedSegmentId[PredLabel] := CurrentSegmentId;
+    end;
+    SetLength(Result.Segments, SegmentCount);
+    for PixelPos := 0 to MaxPixelPos do
+      Result.SegmentMap[PixelPos] := KeptSegmentId[PixelKept[PixelPos]];
+  finally
+    ClassProbs.Free;
+    Logits.Free;
+    ProcessedProbs.Free;
+    ResizedProbs.Free;
+  end;
 end;
 
 procedure FreeMask2Former(NN: TNNet);

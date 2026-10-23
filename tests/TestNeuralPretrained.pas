@@ -1282,6 +1282,8 @@ type
     procedure TestMask2FormerParity;
     procedure TestMask2FormerMaskEinsumOrderParity;
     procedure TestMask2FormerSemanticDecodeReference;
+    procedure TestMask2FormerInstancePanopticReference;
+    procedure TestMask2FormerInstancePanopticFixture;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloConfigClassNames;
     procedure TestYoloObjectDetectionParity;
@@ -42649,6 +42651,219 @@ begin
       MaskLogits.Free;
       ClassLogits.Free;
     end;
+  end;
+end;
+
+// Hand-built Mask2Former logits (5 queries, 3 labels, 4x3 masks) decoded by
+// DecodeMask2FormerPanoptic / DecodeMask2FormerInstance. Expected maps and
+// segments come from transformers' Mask2FormerImageProcessor run on the same
+// arrays, with its fixed 384x384 resize redirected to the Processed* grid and
+// topk forced to sorted order. Covers null-class and low-score removal (q1, q3),
+// overlap-area rejection (q4 at the default 0.8), label fusion (q0+q2), the
+// instance top-k order and scores, and both target-size resizes.
+procedure TTestNeuralPretrained.TestMask2FormerInstancePanopticReference;
+const
+  csNQ = 5; csNL = 3; csMW = 4; csMH = 3;
+  csCls: array[0..csNQ * (csNL + 1) - 1] of TNeuralFloat = (
+    0.0, 4.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 4.0,
+    0.0, 3.6, 0.0, 0.0,
+    0.2, 0.0, 0.5, 0.3,
+    3.5, 0.0, 0.0, 0.2);
+  csMask: array[0..csNQ * csMW * csMH - 1] of TNeuralFloat = (
+    -3, -3, -3, -3,   3, 3, -3, -3,   3, 3, -3, -3,
+    2, 2, 2, 2,   2, 2, 2, 2,   2, 2, 2, 2,
+    -3, -3, -3, -3,   -3, -3, 3, 3,   -3, -3, 3, 3,
+    1, -1, 1, -1,   -1, 1, -1, 1,   1, 1, -1, -1,
+    2.5, 2.5, 2.5, 2.5,   2.5, 2.5, -3, -3,   -3, -3, -3, -3);
+var
+  ClassLogits, MaskLogits: TNNetVolume;
+  Got: TMask2FormerSegmentation;
+
+  procedure CheckSegmentation(const CaseName: string; ExpWidth,
+    ExpHeight: integer; const ExpMap, ExpIds, ExpLabels: array of integer;
+    const ExpFused: array of boolean; const ExpScores: array of TNeuralFloat);
+  var
+    PixelPos, SegmentPos: integer;
+  begin
+    AssertEquals(CaseName + ' width', ExpWidth, Got.Width);
+    AssertEquals(CaseName + ' height', ExpHeight, Got.Height);
+    AssertEquals(CaseName + ' map size', Length(ExpMap), Length(Got.SegmentMap));
+    for PixelPos := 0 to High(ExpMap) do
+      AssertEquals(CaseName + ' map at ' + IntToStr(PixelPos), ExpMap[PixelPos],
+        Got.SegmentMap[PixelPos]);
+    AssertEquals(CaseName + ' segment count', Length(ExpIds),
+      Length(Got.Segments));
+    for SegmentPos := 0 to High(ExpIds) do
+    begin
+      AssertEquals(CaseName + ' id ' + IntToStr(SegmentPos), ExpIds[SegmentPos],
+        Got.Segments[SegmentPos].Id);
+      AssertEquals(CaseName + ' label ' + IntToStr(SegmentPos),
+        ExpLabels[SegmentPos], Got.Segments[SegmentPos].LabelId);
+      AssertEquals(CaseName + ' was_fused ' + IntToStr(SegmentPos),
+        ExpFused[SegmentPos], Got.Segments[SegmentPos].WasFused);
+      AssertEquals(CaseName + ' score ' + IntToStr(SegmentPos),
+        ExpScores[SegmentPos], Got.Segments[SegmentPos].Score, 2e-6);
+    end;
+  end;
+
+begin
+  ClassLogits := TNNetVolume.Create(csNQ, 1, csNL + 1);
+  MaskLogits := TNNetVolume.Create(csNQ, 1, csMW * csMH);
+  try
+    Move(csCls[0], ClassLogits.FData[0], SizeOf(csCls));
+    Move(csMask[0], MaskLogits.FData[0], SizeOf(csMask));
+    // panoptic, fuse label 1, default thresholds, no resize.
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      [1], 0.5, 0.5, 0.8, 0, 0, csMW, csMH);
+    CheckSegmentation('P1', csMW, csMH, [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1, 1], [1, 1], [true, true], [0.947915, 0.924239]);
+    // no fusion, overlap threshold 0.5 keeps q4.
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      [], 0.5, 0.5, 0.5, 0, 0, csMW, csMH);
+    CheckSegmentation('P2', csMW, csMH, [3, 3, 3, 3, 1, 1, 2, 2, 1, 1, 2, 2],
+      [1, 2, 3], [1, 1, 0], [false, false, false],
+      [0.947915, 0.924239, 0.911346]);
+    // nothing passes the class threshold: the map is all -1.
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      [], 0.99, 0.5, 0.8, 0, 0, csMW, csMH);
+    CheckSegmentation('P4', csMW, csMH,
+      [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1], [], [], [], []);
+    // processed grid 6x8 (bilinear), no target.
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      [1], 0.5, 0.5, 0.8, 0, 0, 6, 8);
+    CheckSegmentation('P5', 6, 8,
+      [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+       1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1, 1, 2], [1, 1, 0], [true, true, false],
+      [0.947915, 0.924239, 0.911346]);
+    // processed 6x8, then the bilinear target resize to 5x7.
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      [1], 0.5, 0.5, 0.8, 5, 7, 6, 8);
+    CheckSegmentation('P3', 5, 7,
+      [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+       1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      [1, 1, 2], [1, 1, 0], [true, true, false],
+      [0.947915, 0.924239, 0.911346]);
+    // instance, default threshold: q0/c1, q2/c1, q4/c0 in score order.
+    Got := DecodeMask2FormerInstance(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      0.5, 0, 0, csMW, csMH);
+    CheckSegmentation('I1', csMW, csMH, [2, 2, 2, 2, 2, 2, 1, 1, 0, 0, 1, 1],
+      [0, 1, 2], [1, 1, 0], [false, false, false],
+      [0.902959, 0.880406, 0.842213]);
+    Got := DecodeMask2FormerInstance(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      0.85, 0, 0, csMW, csMH);
+    CheckSegmentation('I3', csMW, csMH, [-1, -1, -1, -1, 0, 0, 1, 1, 0, 0, 1, 1],
+      [0, 1], [1, 1], [false, false], [0.902959, 0.880406]);
+    // low threshold: q3 enters twice (labels 2 and 0) through the top-k.
+    Got := DecodeMask2FormerInstance(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      0.1, 0, 0, csMW, csMH);
+    CheckSegmentation('I4', csMW, csMH, [4, 2, 4, 2, 2, 4, 1, 4, 4, 4, 1, 1],
+      [0, 1, 2, 3, 4], [1, 1, 0, 2, 0], [false, false, false, false, false],
+      [0.902959, 0.880406, 0.842213, 0.230903, 0.171057]);
+    // processed 6x8 (bilinear), then the nearest target resize to 5x7.
+    Got := DecodeMask2FormerInstance(ClassLogits, MaskLogits, csNL, csMW, csMH,
+      0.3, 5, 7, 6, 8);
+    CheckSegmentation('I2', 5, 7,
+      [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2, 2, 1,
+       1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1],
+      [0, 1, 2], [1, 1, 0], [false, false, false],
+      [0.860771, 0.839272, 0.775191]);
+  finally
+    ClassLogits.Free;
+    MaskLogits.Free;
+  end;
+end;
+
+// Instance + panoptic decode of the pico fixture's transformers reference logits
+// at the real 384x384 processed grid; expectations from Mask2FormerImageProcessor.
+procedure TTestNeuralPretrained.TestMask2FormerInstancePanopticFixture;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  ClsArr, MaskArr: TJSONArray;
+  ClassLogits, MaskLogits: TNNetVolume;
+  Got: TMask2FormerSegmentation;
+  ValuePos: integer;
+
+  procedure CheckCounts(const CaseName: string; const ExpIds,
+    ExpCounts: array of integer);
+  var
+    IdPos, PixelPos, Count: integer;
+  begin
+    for IdPos := 0 to High(ExpIds) do
+    begin
+      Count := 0;
+      for PixelPos := 0 to High(Got.SegmentMap) do
+        if Got.SegmentMap[PixelPos] = ExpIds[IdPos] then Inc(Count);
+      AssertEquals(CaseName + ' pixels of id ' + IntToStr(ExpIds[IdPos]),
+        ExpCounts[IdPos], Count);
+    end;
+  end;
+
+  procedure CheckSegments(const CaseName: string;
+    const ExpIds, ExpLabels: array of integer; const ExpFused: array of boolean;
+    const ExpScores: array of TNeuralFloat);
+  var
+    SegmentPos: integer;
+  begin
+    AssertEquals(CaseName + ' segment count', Length(ExpIds),
+      Length(Got.Segments));
+    for SegmentPos := 0 to High(ExpIds) do
+    begin
+      AssertEquals(CaseName + ' id', ExpIds[SegmentPos],
+        Got.Segments[SegmentPos].Id);
+      AssertEquals(CaseName + ' label', ExpLabels[SegmentPos],
+        Got.Segments[SegmentPos].LabelId);
+      AssertEquals(CaseName + ' was_fused', ExpFused[SegmentPos],
+        Got.Segments[SegmentPos].WasFused);
+      AssertEquals(CaseName + ' score', ExpScores[SegmentPos],
+        Got.Segments[SegmentPos].Score, 2e-6);
+    end;
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  ClassLogits := TNNetVolume.Create(5, 1, 5);
+  MaskLogits := TNNetVolume.Create(5, 1, 64);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_mask2former_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    ClsArr := TJSONArray(TJSONObject(RefRoot).Find('class_logits'));
+    MaskArr := TJSONArray(TJSONObject(RefRoot).Find('mask_logits'));
+    for ValuePos := 0 to ClassLogits.Size - 1 do
+      ClassLogits.FData[ValuePos] := ClsArr.Items[ValuePos].AsFloat;
+    for ValuePos := 0 to MaskLogits.Size - 1 do
+      MaskLogits.FData[ValuePos] := MaskArr.Items[ValuePos].AsFloat;
+    Got := DecodeMask2FormerInstance(ClassLogits, MaskLogits, 4, 8, 8, 0.1,
+      8, 8);
+    CheckCounts('instance 8x8', [-1, 4], [34, 30]);
+    AssertEquals('instance 8x8 map[0]', 4, Got.SegmentMap[0]);
+    AssertEquals('instance 8x8 map[1]', -1, Got.SegmentMap[1]);
+    AssertEquals('instance 8x8 map[63]', -1, Got.SegmentMap[63]);
+    CheckSegments('instance 8x8', [0, 1, 2, 3, 4], [3, 3, 3, 3, 3],
+      [false, false, false, false, false],
+      [0.285416, 0.287047, 0.284668, 0.284539, 0.284323]);
+    Got := DecodeMask2FormerInstance(ClassLogits, MaskLogits, 4, 8, 8, 0.1);
+    AssertEquals('instance 384 width', 384, Got.Width);
+    CheckCounts('instance 384', [-1, 1, 2, 3, 4], [80695, 1109, 1, 775, 64876]);
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, 4, 8, 8, [3],
+      0.2, 0.15, 0.3, 8, 8);
+    CheckCounts('panoptic 8x8', [0, 1], [1, 63]);
+    AssertEquals('panoptic 8x8 map[51]', 0, Got.SegmentMap[51]);
+    CheckSegments('panoptic 8x8', [1, 1, 1], [3, 3, 3], [true, true, true],
+      [0.342106, 0.341708, 0.342351]);
+    Got := DecodeMask2FormerPanoptic(ClassLogits, MaskLogits, 4, 8, 8, [3],
+      0.2, 0.15, 0.3);
+    CheckCounts('panoptic 384', [0, 1], [18871, 128585]);
+    CheckSegments('panoptic 384', [1, 1], [3, 3], [true, true],
+      [0.342106, 0.341708]);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    ClassLogits.Free;
+    MaskLogits.Free;
   end;
 end;
 
