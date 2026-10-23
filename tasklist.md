@@ -1826,6 +1826,67 @@ rather than acted on.
         `--prefill-window` batched path (27B TTFT 341 -> 53.9 s) can be reused; report
         + proposed fix. Step 2: the fix, after approval. At 1024x1024 (16x the tokens)
         today's rate is ~9 min per step.
+    - [x] B0 step 1 (2026-10-23, read-only). The "once per TOKEN" premise is wrong.
+          The kernels already tile 16 tokens x 16 rows; they are bound by the inner
+          one-row x one-token dot product, not by DRAM.
+          - Dispatch (CPU, AVX2): `TNNetConvolution.Compute` (neuralnetwork.pas:120552)
+            and the chunk path `ComputeRange` (:119177/:119194; the scheduler splits
+            positions into thread-count slices, :145130) pick one of three kernels.
+            `--int8` (default, no `--int8-input`): `DotProductsTiledInt8`, int8 codes x
+            FP32 input (neuralvolume.pas:15261, inner `AVXDotProductInt8` :2271).
+            `--int8 --int8-input`: `DotProductsTiledInt8Int8` (:15323, `AVXDotProductInt8Int8`
+            :2379). `--int4`: always `DotProductsTiledInt4Int8` (:15390,
+            `AVXDotProductInt4Int8` :2443); `FinishInt4WeightConversion` arms the int8
+            input itself (neuralnetwork.pas:89668). Low-memory mode changes nothing:
+            the quantized branches run before `ActiveLowMemory`.
+          - Reuse today: tile sizes are `GetMaxDivisor(tokens, 16)` x
+            `GetMaxDivisor(neurons, 16)` (neuralnetwork.pas:118770). At 256 tokens each
+            thread re-reads the weight matrix once per 16-token tile: ~112 GB per step,
+            ~3.3 GB/s at 34.3 s, far below DRAM. Inside a tile each (row, token) pair
+            is a separate full-length dot: one weight load and one input load per MAC,
+            and the int8 x FP32 kernel re-converts each weight code 16 times.
+          - Why int4 is ~2.1x faster than int8: different kernels, not bytes. Default
+            int8 is int8 x FP32 (convert + FMA); int4 is int4 x int8 (`vpmaddubsw`).
+          - Probe on this box (1 core i7-1355U VM, single TNNetPointwiseConvLinear,
+            serial, min of 3; indicative only), ms at 64 / 256 / 257 tokens:
+            4096->4096 int8 x FP32 43 / 263 / 421, int8 x int8 21 / 163 / 305, int4
+            22 / 94 / 170. 12288->4096: 194 / 1016 / 1464, 111 / 478 / 1260, 101 / 462
+            / 941. At 256 tokens that is 25-91 GFLOPS. 257 tokens (prime, tile 1, no reuse)
+            costs 1.4-2.6x more per token than 256, so the 16-token tile works.
+          - Existing many-token code: `--prefill-window` added no CPU kernel; it feeds
+            K tokens through these same kernels. Its Phase 4 (tiled quantized GEMM) is
+            OpenCL and not done. B1's tiled int8/int4 kernels are OpenCL only. The
+            int8 x int8 conv project gave the `DotProductInt8Int8` primitive, not a
+            blocked kernel. `DotProductsTiled` (FP32) has the same one-row x one-token
+            inner loop. Nothing on the CPU blocks over tokens in registers.
+    - [ ] B0 step 2, awaiting user approval. Proposed fix:
+          - Option A, no code: run Qwen-Image with `--int8-input`. The probe shows
+            1.6-2.1x on the int8 projections (263 -> 163 ms, 1016 -> 478 ms). Risk: one
+            per-tensor activation scale per projection; image quality is unchecked.
+          - Option B: one A row x 4 B rows (tokens) register-blocked micro-kernel per
+            format, as pointer-form `TNNetVolume` class methods with an AVX2 body and
+            a Pascal fallback (OPTIMIZATION-GUIDE "Authoring a new TNNetVolume
+            method"). The three ranged `DotProductsTiled*` loops call them on groups of
+            4 tokens inside each tile and keep the single dot for the remainder. The
+            callers in neuralnetwork.pas do not change. Decode (1 token) keeps today's
+            kernel. Each weight vector is loaded and converted/unpacked once per 4
+            tokens: ~1.25 loads per MAC instead of 2. Try 2 rows x 4 tokens on the
+            int8 x FP32 kernel (11 ymm registers).
+          - Side fix: tile size fixed at 16 tokens (the ranged kernels already accept a
+            partial trailing tile) instead of `GetMaxDivisor`, so awkward token counts
+            keep the reuse (e.g. 63x63 = 3969 tokens gets 9 today).
+          - Expected gain (estimate, unmeasured): 1.5-2.5x on int8 x FP32, 1.3-2x on
+            int8 x int8 and int4. Gate: A/B the probe above at 256 tokens on this box
+            before wiring; then the user times one 256x256 CPU step.
+          - Tests: length sweeps of each new method against 4 single-dot calls (vector
+            sizes 1..100 and 4096, int4 at multiples of 32); tiled parity for token
+            counts 1..9, ranged BStart/BFinish and AStart/AFinish, partial tiles;
+            int8 x int8 exact, float paths at 1e-5 relative; existing int8/int4 conv
+            and `TestQwenImage21*` parity tests; the 3 suites plus one non-AVX build.
+          - Risks: rule #17 (registers and fixed locals only, no buffer); asm must be
+            PIC-safe (constants built in registers, as `AVXDotProductInt8Int8` does);
+            float summation order changes (no bit parity required); int4 needs ~11
+            ymm registers.
   - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels. Measured at
         1024x1024: 528.2 s on the CPU, 35.2 s on OpenCL (L4, tiles 256/192).
     - [ ] B2b follow-up: Drop the armed nets' host FConcatedWeights/FConcatedWInter
