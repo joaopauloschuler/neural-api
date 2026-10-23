@@ -1348,9 +1348,13 @@ type
     // Inference-only: no gradient buffers, two cache rows, same forward;
     // trainable again: buffers back and the weight gradients still check.
     procedure TestLSTMCellInferenceOnlyBuffers;
+    // The packed input-projection forward against a double-precision
+    // recurrence on odd shapes, inference-only and trainable, and after a reweight.
+    procedure TestLSTMCellBatchedForwardMatchesReference;
     procedure TestGRUCellInputGradientCheck;
     procedure TestGRUCellWeightGradientCheck;
     procedure TestGRUCellSerializationRoundTrip;
+    procedure TestGRUCellBatchedForwardMatchesReference;
     procedure TestAddBidirectionalLSTMBuilder;
     procedure TestAddBidirectionalGRUBuilder;
     procedure TestBidirectionalLSTMUnidirectionalEquivalence;
@@ -41213,6 +41217,7 @@ begin
     L.Neurons[10].Weights.Raw[d] := Cos(d * 0.6) * 0.2;       // b_g
     L.Neurons[11].Weights.Raw[d] := Sin(d * 0.7) * 0.3;       // b_o
   end;
+  L.FlushWeightCache();
 end;
 
 // Deterministic weights for the classic GRU cell: r/z/n input and recurrent
@@ -41237,6 +41242,7 @@ begin
     L.Neurons[8].Weights.Raw[d] := Cos(d * 0.6) * 0.2; // b_in
     L.Neurons[9].Weights.Raw[d] := Sin(d * 0.7) * 0.3; // b_hn
   end;
+  L.FlushWeightCache();
 end;
 
 procedure TTestNeuralNumerical.TestLSTMCellInputGradientCheck;
@@ -41351,10 +41357,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
 
         NN.Compute(Input);
@@ -41448,10 +41457,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss(Input);
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss(Input);
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
         NN.Compute(Input);
         L.Neurons[n].ClearDelta;
@@ -41568,10 +41580,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
         NN.Compute(Input);
         L.Neurons[n].ClearDelta;
@@ -41584,6 +41599,266 @@ begin
       end;
   finally
     NN.Free; ChainedNN.Free; Input.Free; Desired.Free; TrainedOutput.Free;
+  end;
+end;
+
+{$IFDEF OpenCL}
+function AcquireFirstOpenCLDevice(out APlatform: cl_platform_id;
+  out ADevice: cl_device_id): boolean; forward;
+{$ENDIF}
+
+// Fills every weight and bias of Cell with uniform values in [-0.3, 0.3).
+procedure RandomizeRecurrentCellWeights(Cell: TNNetLayer);
+var NeuronPos, WeightPos: integer;
+begin
+  for NeuronPos := 0 to Cell.Neurons.Count - 1 do
+    for WeightPos := 0 to Cell.Neurons[NeuronPos].Weights.Size - 1 do
+      Cell.Neurons[NeuronPos].Weights.Raw[WeightPos] := (Random - 0.5) * 0.6;
+  Cell.FlushWeightCache();
+end;
+
+function ReferenceSigmoid(X: double): double;
+begin
+  Result := 1 / (1 + Exp(-X));
+end;
+
+// Double-precision torch nn.LSTM recurrence over Input from Cell's neurons.
+procedure ReferenceLSTMForward(Cell: TNNetLSTMCell; Input, Expected: TNNetVolume);
+var
+  Hidden, InputDepth, StepPos, HiddenPos, InputPos, GatePos: integer;
+  H, C, NextH: array of double;
+  Pre: array[0..3] of double;
+  NextC: double;
+begin
+  Hidden := Cell.Neurons[8].Weights.Size;
+  InputDepth := Input.Depth;
+  SetLength(H, Hidden); SetLength(C, Hidden); SetLength(NextH, Hidden);
+  Expected.ReSize(Input.SizeX, 1, Hidden);
+  for StepPos := 0 to Input.SizeX - 1 do
+  begin
+    for HiddenPos := 0 to Hidden - 1 do
+    begin
+      for GatePos := 0 to 3 do
+      begin
+        Pre[GatePos] := Cell.Neurons[8 + GatePos].Weights.Raw[HiddenPos];
+        for InputPos := 0 to InputDepth - 1 do
+          Pre[GatePos] := Pre[GatePos] +
+            Cell.Neurons[GatePos].Weights[HiddenPos, 0, InputPos] *
+            Input[StepPos, 0, InputPos];
+        for InputPos := 0 to Hidden - 1 do
+          Pre[GatePos] := Pre[GatePos] +
+            Cell.Neurons[4 + GatePos].Weights[HiddenPos, 0, InputPos] * H[InputPos];
+      end;
+      NextC := ReferenceSigmoid(Pre[1]) * C[HiddenPos] +
+        ReferenceSigmoid(Pre[0]) * Tanh(Pre[2]);
+      C[HiddenPos] := NextC;
+      NextH[HiddenPos] := ReferenceSigmoid(Pre[3]) * Tanh(NextC);
+    end;
+    for HiddenPos := 0 to Hidden - 1 do
+    begin
+      H[HiddenPos] := NextH[HiddenPos];
+      Expected[StepPos, 0, HiddenPos] := NextH[HiddenPos];
+    end;
+  end;
+end;
+
+// Double-precision torch nn.GRU recurrence over Input from Cell's neurons.
+procedure ReferenceGRUForward(Cell: TNNetGRUCell; Input, Expected: TNNetVolume);
+var
+  Depth, StepPos, HiddenPos, InputPos: integer;
+  H, NextH: array of double;
+  PreR, PreZ, InputN, RecurrentN, ResetGate, UpdateGate, Candidate: double;
+begin
+  Depth := Input.Depth;
+  SetLength(H, Depth); SetLength(NextH, Depth);
+  Expected.ReSize(Input.SizeX, 1, Depth);
+  for StepPos := 0 to Input.SizeX - 1 do
+  begin
+    for HiddenPos := 0 to Depth - 1 do
+    begin
+      PreR := Cell.Neurons[6].Weights.Raw[HiddenPos];
+      PreZ := Cell.Neurons[7].Weights.Raw[HiddenPos];
+      InputN := Cell.Neurons[8].Weights.Raw[HiddenPos];
+      RecurrentN := Cell.Neurons[9].Weights.Raw[HiddenPos];
+      for InputPos := 0 to Depth - 1 do
+      begin
+        PreR := PreR + Cell.Neurons[0].Weights[HiddenPos, 0, InputPos] *
+          Input[StepPos, 0, InputPos] +
+          Cell.Neurons[3].Weights[HiddenPos, 0, InputPos] * H[InputPos];
+        PreZ := PreZ + Cell.Neurons[1].Weights[HiddenPos, 0, InputPos] *
+          Input[StepPos, 0, InputPos] +
+          Cell.Neurons[4].Weights[HiddenPos, 0, InputPos] * H[InputPos];
+        InputN := InputN + Cell.Neurons[2].Weights[HiddenPos, 0, InputPos] *
+          Input[StepPos, 0, InputPos];
+        RecurrentN := RecurrentN +
+          Cell.Neurons[5].Weights[HiddenPos, 0, InputPos] * H[InputPos];
+      end;
+      ResetGate := ReferenceSigmoid(PreR);
+      UpdateGate := ReferenceSigmoid(PreZ);
+      Candidate := Tanh(InputN + ResetGate * RecurrentN);
+      NextH[HiddenPos] := (1 - UpdateGate) * Candidate + UpdateGate * H[HiddenPos];
+    end;
+    for HiddenPos := 0 to Depth - 1 do
+    begin
+      H[HiddenPos] := NextH[HiddenPos];
+      Expected[StepPos, 0, HiddenPos] := NextH[HiddenPos];
+    end;
+  end;
+end;
+
+procedure AssertRecurrentOutputMatches(Test: TTestCase; const Msg: string;
+  Expected, Output: TNNetVolume);
+var Pos: integer;
+begin
+  Test.AssertEquals(Msg + ' size', Expected.Size, Output.Size);
+  for Pos := 0 to Expected.Size - 1 do
+    Test.AssertEquals(Msg + ' at ' + IntToStr(Pos), Expected.Raw[Pos],
+      Output.Raw[Pos], 5e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLSTMCellBatchedForwardMatchesReference;
+const
+  // SeqLen, InputDepth, Hidden: odd widths, widths below and across the
+  // 8-float SIMD and 16-row panel sizes, and SeqLen = 1 (no recurrence).
+  csShapes: array[0..5, 0..2] of integer = ((1, 3, 5), (2, 7, 9), (6, 13, 17),
+    (9, 33, 40), (4, 64, 16), (11, 20, 37));
+var
+  NN: TNNet;
+  Cell: TNNetLSTMCell;
+  Input, Expected: TNNetVolume;
+  ShapePos, TrainablePos: integer;
+  ShapeName: string;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  HasOpenCL: boolean;
+  {$ENDIF}
+begin
+  RandSeed := 20261023;
+  {$IFDEF OpenCL}
+  HasOpenCL := AcquireFirstOpenCLDevice(PlatformId, DeviceId);
+  {$ENDIF}
+  Expected := TNNetVolume.Create();
+  try
+    for ShapePos := 0 to High(csShapes) do
+      for TrainablePos := 0 to 1 do
+      begin
+        ShapeName := 'SeqLen=' + IntToStr(csShapes[ShapePos, 0]) + ' In=' +
+          IntToStr(csShapes[ShapePos, 1]) + ' Hidden=' +
+          IntToStr(csShapes[ShapePos, 2]) + ' trainable=' + IntToStr(TrainablePos);
+        NN := TNNet.Create();
+        Input := TNNetVolume.Create(csShapes[ShapePos, 0], 1, csShapes[ShapePos, 1]);
+        try
+          NN.AddLayer(TNNetInput.Create(csShapes[ShapePos, 0], 1,
+            csShapes[ShapePos, 1]));
+          Cell := TNNetLSTMCell.Create(csShapes[ShapePos, 2]);
+          NN.AddLayer(Cell);
+          if TrainablePos = 0 then NN.SetTrainable(false);
+          Input.RandomizeGaussian();
+          RandomizeRecurrentCellWeights(Cell);
+          NN.Compute(Input);
+          ReferenceLSTMForward(Cell, Input, Expected);
+          AssertRecurrentOutputMatches(Self, ShapeName, Expected, Cell.Output);
+          // New weights after a forward: the flushed cache must be repacked.
+          RandomizeRecurrentCellWeights(Cell);
+          NN.Compute(Input);
+          ReferenceLSTMForward(Cell, Input, Expected);
+          AssertRecurrentOutputMatches(Self, ShapeName + ' reweighted', Expected,
+            Cell.Output);
+          {$IFDEF OpenCL}
+          // The OpenCL input projection serves cells of 32 or more channels.
+          if HasOpenCL and (csShapes[ShapePos, 2] >= 32) then
+          begin
+            NN.EnableOpenCL(PlatformId, DeviceId);
+            Cell.ForwardGPUCnt := 0;
+            NN.Compute(Input);
+            AssertRecurrentOutputMatches(Self, ShapeName + ' OpenCL', Expected,
+              Cell.Output);
+            RandomizeRecurrentCellWeights(Cell);
+            NN.Compute(Input);
+            ReferenceLSTMForward(Cell, Input, Expected);
+            AssertRecurrentOutputMatches(Self, ShapeName + ' OpenCL reweighted',
+              Expected, Cell.Output);
+            AssertEquals(ShapeName + ' ran in OpenCL', 2, Cell.ForwardGPUCnt);
+          end;
+          {$ENDIF}
+        finally
+          Input.Free;
+          NN.Free;
+        end;
+      end;
+  finally
+    Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGRUCellBatchedForwardMatchesReference;
+const
+  // SeqLen, Depth: the GRU cell is shape-preserving.
+  csShapes: array[0..4, 0..1] of integer = ((1, 5), (3, 9), (7, 17), (5, 33),
+    (8, 40));
+var
+  NN: TNNet;
+  Cell: TNNetGRUCell;
+  Input, Expected: TNNetVolume;
+  ShapePos: integer;
+  ShapeName: string;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  HasOpenCL: boolean;
+  {$ENDIF}
+begin
+  RandSeed := 20261024;
+  {$IFDEF OpenCL}
+  HasOpenCL := AcquireFirstOpenCLDevice(PlatformId, DeviceId);
+  {$ENDIF}
+  Expected := TNNetVolume.Create();
+  try
+    for ShapePos := 0 to High(csShapes) do
+    begin
+      ShapeName := 'SeqLen=' + IntToStr(csShapes[ShapePos, 0]) + ' Depth=' +
+        IntToStr(csShapes[ShapePos, 1]);
+      NN := TNNet.Create();
+      Input := TNNetVolume.Create(csShapes[ShapePos, 0], 1, csShapes[ShapePos, 1]);
+      try
+        NN.AddLayer(TNNetInput.Create(csShapes[ShapePos, 0], 1,
+          csShapes[ShapePos, 1]));
+        Cell := TNNetGRUCell.Create();
+        NN.AddLayer(Cell);
+        Input.RandomizeGaussian();
+        RandomizeRecurrentCellWeights(Cell);
+        NN.Compute(Input);
+        ReferenceGRUForward(Cell, Input, Expected);
+        AssertRecurrentOutputMatches(Self, ShapeName, Expected, Cell.Output);
+        RandomizeRecurrentCellWeights(Cell);
+        NN.Compute(Input);
+        ReferenceGRUForward(Cell, Input, Expected);
+        AssertRecurrentOutputMatches(Self, ShapeName + ' reweighted', Expected,
+          Cell.Output);
+        {$IFDEF OpenCL}
+        if HasOpenCL and (csShapes[ShapePos, 1] >= 32) then
+        begin
+          NN.EnableOpenCL(PlatformId, DeviceId);
+          Cell.ForwardGPUCnt := 0;
+          NN.Compute(Input);
+          AssertRecurrentOutputMatches(Self, ShapeName + ' OpenCL', Expected,
+            Cell.Output);
+          RandomizeRecurrentCellWeights(Cell);
+          NN.Compute(Input);
+          ReferenceGRUForward(Cell, Input, Expected);
+          AssertRecurrentOutputMatches(Self, ShapeName + ' OpenCL reweighted',
+            Expected, Cell.Output);
+          AssertEquals(ShapeName + ' ran in OpenCL', 2, Cell.ForwardGPUCnt);
+        end;
+        {$ENDIF}
+      finally
+        Input.Free;
+        NN.Free;
+      end;
+    end;
+  finally
+    Expected.Free;
   end;
 end;
 
@@ -41700,10 +41975,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
 
         NN.Compute(Input);

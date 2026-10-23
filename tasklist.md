@@ -1230,9 +1230,27 @@ rather than acted on.
         - [ ] `TNNetEmbedding` sizes its table in its constructor (before the net
           is known), so a borrowing build allocates and frees each table: 3
           tables, 114,176 floats on the real checkpoint. Other layers size none.
-        - [ ] CPU profile of the real stage A: `TNNetLSTMCell` ~51% of layer time
-          (the CPU input projection is per-step dot products, no GEMM; the OpenCL
-          path batches it only at Depth >= 32), `TNNetPointwiseConvLinear` ~44%.
+        - [ ] CPU profile of the real stage A: re-profile on the real checkpoint
+          (not run). Before: `TNNetLSTMCell` ~51% of layer time,
+          `TNNetPointwiseConvLinear` ~44%. The LSTM/GRU CPU forward now computes
+          the input projection of every step as one `DotProductsPacked` GEMM;
+          synthetic bi-LSTM SeqLen 100, In 640, Hidden 256: ~19 -> ~8 ms.
+        - [ ] `TNNetLSTMCell` / `TNNetGRUCell` backward still does the input
+          gradient (W_i^T dGates) and the W_i / W_h weight gradients as per-step
+          rank-1 `MulAdd`s. Batching them needs a [SeqLen][4*Depth] dGates
+          scratch and a transposing variant of `PackDotProductRows` (packed A^T
+          for dX = dGates W_i, X^T / H^T for the weight gradients).
+        - [ ] The per-step recurrent product W_h* h_{t-1} is 4*Depth single-row
+          `DotProduct` calls. No multi-row GEMV kernel exists (`DotProductsPacked`
+          with one B row does 6x the FMAs); a 4-row dot kernel would share each
+          h load across the four gates.
+        - [ ] Borrowing builds (stage A): each borrower cell packs its own
+          `FInputRowsPacked` copy of W_i* (~2.6 MB per Kokoro cell, 10 cells) on
+          its first forward after every `PrepareStageA`. The owner could hold
+          one packed copy, as `ShareOwnerWeightCaches` does for the conv cache.
+          Under OpenCL the CPU packed copy is sized but unused.
+        - [ ] The LSTM/GRU input projection runs on one thread (no position
+          split over the pool); not measured (1-core box).
         - [ ] Real-checkpoint stage A on a GPU: not run (PoCL parity on the tiny
           fixture only). The AdaLayerNorms after the bi-LSTMs run on the CPU
           unless forced, because the LSTM output is on RAM.
