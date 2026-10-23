@@ -1288,6 +1288,7 @@ type
     procedure TestByteTrackKalmanPredictUpdate;
     procedure TestByteTrackerSyntheticSequence;
     procedure TestByteTrackerLostBufferAndReset;
+    procedure TestByteTrackerRemovesDuplicateTracks;
     procedure TestFastSAMTextSelection;
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
@@ -57343,6 +57344,83 @@ begin
     Tracker.Free;
   end;
 end;
+
+// remove_duplicate_stracks on boxes P and Q = P + 2 px in x (IoU distance 1 - 39/43 < 0.15):
+// of a tracked and a lost pair the smaller frame_id - start_frame goes, a tie drops the tracked.
+procedure TTestNeuralPretrained.TestByteTrackerRemovesDuplicateTracks;
+var
+  Tracker: TByteTracker;
+  BothBoxes, BoxP, BoxQ: TYoloDetectionArray;
+  Tracked: TByteTrackedBoxArray;
+
+  procedure SetBox(var Detection: TYoloDetection; Left: TNeuralFloat);
+  begin
+    Detection.ClassId := 0;
+    Detection.Score := 0.9;
+    Detection.X1 := Left;
+    Detection.Y1 := 100;
+    Detection.X2 := Left + 40;
+    Detection.Y2 := 180;
+    Detection.CellIndex := 0;
+  end;
+
+begin
+  SetLength(BothBoxes, 2);
+  SetBox(BothBoxes[0], 100);
+  SetBox(BothBoxes[1], 102);
+  SetLength(BoxP, 1);
+  SetBox(BoxP[0], 100);
+  SetLength(BoxQ, 1);
+  SetBox(BoxQ[0], 102);
+  Tracker := TByteTracker.Create;
+  try
+    // Frame 1 births ids 1 (P) and 2 (Q). Frame 2: id 1 takes P (fused cost
+    // 0.1 vs 0.184); id 2 is lost with age 1 - 1 = 0 < 1, so the lost one goes.
+    AssertEquals('frame 1 count', 2, Length(Tracker.Update(BothBoxes)));
+    Tracked := Tracker.Update(BoxP);
+    AssertEquals('frame 2 count', 1, Length(Tracked));
+    AssertEquals('frame 2 id', 1, Tracked[0].TrackId);
+    // A lost id 2 would be refound on Q; removed, Q is a new unconfirmed id 3.
+    Tracked := Tracker.Update(BothBoxes);
+    AssertEquals('frame 3 count', 1, Length(Tracked));
+    AssertEquals('frame 3 id', 1, Tracked[0].TrackId);
+    Tracked := Tracker.Update(BothBoxes);
+    AssertEquals('frame 4 count', 2, Length(Tracked));
+    AssertEquals('frame 4 first id', 1, Tracked[0].TrackId);
+    AssertEquals('frame 4 new id', 3, Tracked[1].TrackId);
+    AssertEquals('frame 4 new box', 102, Tracked[1].X1, 1e-4);
+
+    // Id 1 on P from frame 1, id 2 born on Q at frame 3 and confirmed at 4.
+    // Frame 5: id 2 takes Q, id 1 is lost with age 4 - 1 = 3 > 5 - 3 = 2, so
+    // the tracked id 2 goes and nothing is shown; frame 6 refinds id 1 on P.
+    Tracker.Reset;
+    Tracker.Update(BoxP);
+    Tracker.Update(BoxP);
+    Tracked := Tracker.Update(BothBoxes);
+    AssertEquals('reset frame 3 count', 1, Length(Tracked));
+    Tracked := Tracker.Update(BothBoxes);
+    AssertEquals('reset frame 4 count', 2, Length(Tracked));
+    AssertEquals('reset frame 4 new id', 2, Tracked[1].TrackId);
+    AssertEquals('younger tracked removed', 0, Length(Tracker.Update(BoxQ)));
+    Tracked := Tracker.Update(BoxP);
+    AssertEquals('reset frame 6 count', 1, Length(Tracked));
+    AssertEquals('older lost refound', 1, Tracked[0].TrackId);
+    AssertEquals('refound box', 100, Tracked[0].X1, 1e-4);
+    // Equal ages: id 2 born on Q at frame 2; at frame 4 both ages are 2 and,
+    // as in the official else branch, the tracked id 2 goes.
+    Tracker.Reset;
+    Tracker.Update(BoxP);
+    AssertEquals('tie frame 2 count', 1, Length(Tracker.Update(BothBoxes)));
+    AssertEquals('tie frame 3 count', 2, Length(Tracker.Update(BothBoxes)));
+    AssertEquals('tie drops tracked', 0, Length(Tracker.Update(BoxQ)));
+    Tracked := Tracker.Update(BoxP);
+    AssertEquals('tie frame 5 count', 1, Length(Tracked));
+    AssertEquals('tie lost refound', 1, Tracked[0].TrackId);
+  finally
+    Tracker.Free;
+  end;
+end;
+
 
 // FastSAMSelectByText on the pico CLIP: a text embedding equal to the CLIP
 // embedding of one box crop selects that mask; masks of area <= 100 are skipped.
