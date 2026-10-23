@@ -1210,8 +1210,8 @@ rather than acted on.
           has one); only the stage-A integration test `TestKokoroStageAOpenCLParity`
           covers it, and that test asserts only that some layer ran on OpenCL.
         - [ ] The unused backward variants (`BackpropagateCPU`, `BackpropagateFastCPU`,
-          `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY` and
-          `FDilationX`; only `BackpropagateFastTiledCPU` is called.
+          `BackpropagateFastCPUDev`, `BackpropagateOpenCL`) ignore `FPaddingY`
+          (they raise when the layer is dilated); only `BackpropagateFastTiledCPU` is called.
         - [ ] `cai_conv_transpose` is untiled (one work-item per output cell and
           channel, like `cai_conv_implicit`); a large dense deconv (Kokoro
           generator ups) may want a tiled or phase-split GEMM. Not timed on a GPU.
@@ -1771,7 +1771,7 @@ rather than acted on.
       transformers model_type `regnet`, e.g. facebook/regnet-y-040 / regnet-x-040;
       conv+BN fold at load, grouped 3x3 via per-group SplitChannels/DeepConcat,
       regnet_y SE gate, NO new leaf layers; pico parity
-      `TestRegNet{Config,XImageClassification,YImageClassification}Parity` < 1e-4
+      `TestRegNetConfigFromJSONFile`, `TestRegNet{X,Y}ImageClassificationParity` < 1e-4
       vs a REAL float64 HF RegNetForImageClassification):
   - [ ] real-checkpoint top-1 sweep (facebook/regnet-y-040 / regnet-x-040)
         through `ReadImagePreprocessConfig` + `PreprocessImageForVisionModel`.
@@ -1857,47 +1857,19 @@ rather than acted on.
       GateUp result buffer (403 MB at 4096 tokens) can hit
       CL_DEVICE_MAX_MEM_ALLOC_SIZE at larger images.
   - [ ] B0. CPU many-token int8/int4 projections. Evidence: at 256x256 a step is
-        34.3 s int8 and 16.4 s int4 (~2.1x, the weight-byte ratio), i.e. ~105 GFLOPS
-        and ~53 GB/s: the projections stream all ~7 GB of block weights once per
-        TOKEN instead of reusing each weight row across the 256 tokens. Step 1
-        (read-only): which kernel a many-token `TNNetPointwiseConvLinear` int8/int4
-        forward runs in inference-only low-memory mode, and whether the
-        `--prefill-window` batched path (27B TTFT 341 -> 53.9 s) can be reused; report
-        + proposed fix. Step 2: the fix, after approval. At 1024x1024 (16x the tokens)
-        today's rate is ~9 min per step.
-    - [x] B0 step 1 (2026-10-23, read-only). The "once per TOKEN" premise is wrong.
-          The kernels already tile 16 tokens x 16 rows; they are bound by the inner
-          one-row x one-token dot product, not by DRAM.
-          - Dispatch (CPU, AVX2): `TNNetConvolution.Compute` (neuralnetwork.pas:120552)
-            and the chunk path `ComputeRange` (:119177/:119194; the scheduler splits
-            positions into thread-count slices, :145130) pick one of three kernels.
-            `--int8` (default, no `--int8-input`): `DotProductsTiledInt8`, int8 codes x
-            FP32 input (neuralvolume.pas:15261, inner `AVXDotProductInt8` :2271).
-            `--int8 --int8-input`: `DotProductsTiledInt8Int8` (:15323, `AVXDotProductInt8Int8`
-            :2379). `--int4`: always `DotProductsTiledInt4Int8` (:15390,
-            `AVXDotProductInt4Int8` :2443); `FinishInt4WeightConversion` arms the int8
-            input itself (neuralnetwork.pas:89668). Low-memory mode changes nothing:
-            the quantized branches run before `ActiveLowMemory`.
-          - Reuse today: tile sizes are `GetMaxDivisor(tokens, 16)` x
-            `GetMaxDivisor(neurons, 16)` (neuralnetwork.pas:118770). At 256 tokens each
-            thread re-reads the weight matrix once per 16-token tile: ~112 GB per step,
-            ~3.3 GB/s at 34.3 s, far below DRAM. Inside a tile each (row, token) pair
-            is a separate full-length dot: one weight load and one input load per MAC,
-            and the int8 x FP32 kernel re-converts each weight code 16 times.
-          - Why int4 is ~2.1x faster than int8: different kernels, not bytes. Default
-            int8 is int8 x FP32 (convert + FMA); int4 is int4 x int8 (`vpmaddubsw`).
-          - Probe on this box (1 core i7-1355U VM, single TNNetPointwiseConvLinear,
-            serial, min of 3; indicative only), ms at 64 / 256 / 257 tokens:
-            4096->4096 int8 x FP32 43 / 263 / 421, int8 x int8 21 / 163 / 305, int4
-            22 / 94 / 170. 12288->4096: 194 / 1016 / 1464, 111 / 478 / 1260, 101 / 462
-            / 941. At 256 tokens that is 25-91 GFLOPS. 257 tokens (prime, tile 1, no reuse)
-            costs 1.4-2.6x more per token than 256, so the 16-token tile works.
-          - Existing many-token code: `--prefill-window` added no CPU kernel; it feeds
-            K tokens through these same kernels. Its Phase 4 (tiled quantized GEMM) is
-            OpenCL and not done. B1's tiled int8/int4 kernels are OpenCL only. The
-            int8 x int8 conv project gave the `DotProductInt8Int8` primitive, not a
-            blocked kernel. `DotProductsTiled` (FP32) has the same one-row x one-token
-            inner loop. Nothing on the CPU blocks over tokens in registers.
+        34.3 s int8 and 16.4 s int4 (~2.1x); at 1024x1024 (16x the tokens) today's
+        rate is ~9 min per step. Step 1 (4de35106) found that the CPU kernels
+        (`DotProductsTiledInt8`, `DotProductsTiledInt8Int8`, `DotProductsTiledInt4Int8`)
+        already tile 16 tokens x 16 rows (`GetMaxDivisor`); they are bound by the
+        inner one-row x one-token dot product (one weight load and one input load
+        per MAC; int8 x FP32 re-converts each weight code 16 times), not by DRAM.
+        int4 is faster than default int8 because it is int4 x int8 (`vpmaddubsw`),
+        not int8 x FP32. Low-memory mode and `--prefill-window` change nothing on
+        the CPU. Probe on this box (1 core VM, single TNNetPointwiseConvLinear, min
+        of 3; indicative only), ms at 64 / 256 / 257 tokens: 4096->4096 int8 x FP32
+        43 / 263 / 421, int8 x int8 21 / 163 / 305, int4 22 / 94 / 170; 12288->4096:
+        194 / 1016 / 1464, 111 / 478 / 1260, 101 / 462 / 941. 257 tokens (prime,
+        tile 1, no reuse) costs 1.4-2.6x more per token than 256.
     - [ ] B0 step 2, awaiting user approval. Proposed fix:
           - Option A, no code: run Qwen-Image with `--int8-input`. The probe shows
             1.6-2.1x on the int8 projections (263 -> 163 ms, 1016 -> 478 ms). Risk: one
@@ -2070,107 +2042,10 @@ rather than acted on.
       through both examples (QwenImage: `--width 512 --height 512 --upscale`);
       (4) not supported: the old ESRGAN `model.N.*` key layout.
 - [ ] Jev-style typed decision models ("System One": a state plus typed questions in,
-      calibrated option probabilities out, no text generated). Plan agreed 2026-10-18,
-      branch a19. Scope: stage 0 (shared decision layer + `/v1/systemone`), stage 1
-      (AnyJev L0 readout on any loaded decoder), stage 2 (Kev and Open-Jev: Qwen3.5 +
-      LoRA + a small head). Laya (ModernBERT encoder + decision head) is LATER, not in
-      this plan. One Opus agent per task, run serially, test + commit after each.
-      Decisions:
-      - Wire format = TypeSafe's `POST /v1/systemone` (OpenAPI 0.2.0 at
-        api.typesafe.ai/openapi.json). Request `{model, state, questions:{id:{type,
-        instructions, criteria}}}`; `state`/`instructions`/descriptions may be a
-        string, an object or an array. `choice.criteria` = name -> description map
-        (1..255, key order = option order, null description allowed);
-        `score.criteria` = ordered array of level descriptions (1..10, levels 0..n-1);
-        `noul.criteria` = optional `{true, false}`. Response `{model, answers, usage:
-        {input_tokens, output_tokens}}`; choice `{type, choice, probabilities (by
-        name), confidence}`; score `{type, score (= sum i*p_i), legend, probabilities
-        (keys "0".."n-1"), confidence}`; noul `{type, noul}` only. Validation errors
-        = HTTP 422 `{"detail":[{loc, msg, type}]}`; other errors `{"detail": str}`.
-        `box` questions and image `assets` are rejected (422).
-      - Confidence = Jev's published formulas on EVERY scorer, computed from the
-        probabilities only: choice `(p_max-1/n)/(1-1/n)`; score
-        `max(0, 1 - sum p_i|i-mode| / D)`, `D = (1/n) sum |i-(n-1)/2|`, mode = first
-        argmax; both 1.0 when n = 1; all-zero p -> uniform. Noul has no confidence.
-        Checks: score (0,0.57,0.43) -> 0.355; (0,0.95,0.05) -> 0.925.
-      - Rendering of object/array values (state, instructions, descriptions): Kev's
-        `api.render` (str/number/bool as text, list -> "- item" lines, dict ->
-        "key: value" lines, nested values indented). One renderer for all scorers.
-      - Special-token strings in caller text: rewrite `<|x|>` -> `<¦x¦>` before
-        tokenizing (Kev's rule), on every scorer. A general "specials as plain text"
-        tokenizer flag is a separate follow-up.
-      - ChatServer always registers `/v1/systemone`. Without `--decision-adapter` it
-        answers with AnyJev L0 on the loaded chat model (nothing extra is loaded).
-        With `--decision-adapter <dir>` the server merges the adapter, reads the head
-        and becomes decision-only: the chat endpoints return an error naming the
-        reason. ChatTerminal does not change.
-      - LoRA is merged in HF TENSOR space before the build (base + scale*B@A in FP32,
-        rounded once), so the importer's row permutations (rotate_half q/k, the
-        Qwen3.5 q/gate split, fused gate+up, fused z/b/a) apply unchanged and
-        int8/int4 quantization follows as usual. No live (unmerged) LoRA path.
-      - `head.pt` is read by `neuraltorchbin.pas` (extended for top-level scalar /
-        string metadata). No Python conversion step for users.
-      - Multi-question and multi-candidate scoring: prefill the shared prefix once,
-        then per branch `TruncateTo(PrefixLen)` + `RestoreStateFrom(checkpoint)`,
-        then feed the branch. Exact on attention-only and GatedDeltaNet hybrids; no
-        new attention masks, no per-token RoPE positions.
-      - AnyJev label prior: the content-free prior (states "N/A", "" and "[MASK]",
-        alpha 1.0) is the default. The running-mean batch prior (stateful across
-        requests) is a follow-up. AnyJev L1/L2 are out of scope (removed upstream in
-        0.3.0, and both need labelled data).
-      - GPT-AGI/OpenJev is not ported: AnyJev L0 covers it, and its first-token-only
-        label scoring is a correctness bug.
-      - Tests: pico fixtures with an HF/PyTorch float64 oracle made by
-        `tools/*_fixture.py` scripts in the `~/x` venv under the 2 GB cap, plus
-        model-free unit tests. Real-checkpoint checks run on the user's box.
-      Reference facts (research 2026-10-18):
-      - AnyJev L0 (`anyjev` 0.3.0 `readout.py`, `calibrate/permute.py`,
-        `calibrate/contextual.py`): system prompt "You are a decision function. You
-        will be given a state and one question. Reply with the answer label only: no
-        words, no punctuation, no explanation."; user message lines "State:", state
-        (or "(empty)"), "", "Question: <q>", then per kind: choice "Options:" + "A. opt"
-        lines + "Answer with the letter only."; score "Pick the level that applies (the
-        levels are ordered):" + "1. lvl" lines + "Answer with the number only."; noul
-        "Answer Yes or No." / "Answer No or Yes.". Chat template with
-        add_generation_prompt and thinking OFF; no template -> "{system}\n\n{user}\n
-        Answer:". Encoded without special tokens. Labels: choice A..Z (max 26), score
-        "1".."K" (letters if a digit is not one token), noul Yes/No. Each label = the
-        first of `lab`, `" "+lab` that is ONE token, else error. Readout = full-vocab
-        log_softmax at the last position, then softmax over the label logits.
-        Rotations: choice cyclic shifts `perm[j] = (j+s) mod K`, noul both orders,
-        score none. Per rotation p = p_raw / prior^alpha, clip 1e-8, renormalise; then
-        map positions back to options and combine by log-mean (mean of log(clip
-        1e-12), subtract max, exp, normalise). Content-free prior = mean over the 3
-        empty-state probes per rotation, clip 1e-8, renormalise. Model-free oracle:
-        raw (0.62,0.38), prior (0.70,0.30), alpha 1 -> 0.4115.
-      - Kev (`jaredpalmer/kev`, HF `jaredpalmer/kev-0.8b|4b|9b|27b`): bases
-        `Qwen/Qwen3.5-{0.8B,4B,9B}-Base` (frozen, LoRA r16 alpha32 on q/k/v/o,
-        gate/up/down, in_proj_qkv/z/a/b, out_proj) and `Qwen/Qwen3.8-27B` (27B = full
-        fine-tune, `Qwen3_5TextModel` keys without `model.` prefix, no lm_head).
-        Adapter keys `base_model.model.layers.N.<module>.lora_{A,B}.weight`, F32.
-        Tokens reused: state `<|fim_prefix|>`, question `<|fim_middle|>`, option open
-        `<|box_start|>`, option close `<|box_end|>`, decide `<|fim_suffix|>`. Row =
-        `[<|fim_prefix|>] + state` then per question `[<|fim_middle|>] + instructions
-        + (<|box_start|> opt <|box_end|>)* + [<|fim_suffix|>]`; no BOS, no chat
-        template. Options: noul `["no[: false desc]", "yes[: true desc]"]` -> answer
-        p[1]; choice "name" or "name: desc"; score rendered level text. Head reads the
-        FINAL hidden state (after the final RMSNorm): `z = (K h_</opt>) . (Q h_decide)
-        / sqrt(256) / T`, Q and K = Linear(d -> 256) with bias. `head.pt` = torch.save
-        dict: `head` (OrderedDict q.weight/q.bias/k.weight/k.bias, fp32), `temperature`
-        (0.8B 2.3510958), `head_dim` 256, `base`, `base_revision`, `lora`, plus nested
-        training metadata. State limit 65536 tokens (422 above it).
-      - Open-Jev (`Zefan-Cai/Open-Jev`, MIT code; HF `ZefanCai/Open-Jev-2B|9B|27B-v1.1`,
-        Apache-2.0): bases `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.8-27B`
-        (post-trained). Package `package/checkpoint/{adapter/, head.pt, model.json,
-        temperature.json}`. LoRA r8 alpha16 on q/k/v/o, in_proj_qkv, out_proj, same key
-        naming as Kev. Head = plain state_dict `weight [1,d]`, `bias [1]` (storage
-        location may be 'cuda:0'). One chat-template prompt per candidate (user turn
-        only, thinking off): "Context:\n{state}\n\nQuestion: {q}\n" + "Proposed
-        answer: {option}\nIs this proposed answer correct? Answer Yes or No."; noul =
-        ONE prompt "...Is the answer to this question yes? Answer Yes or No." with
-        "\nYes means: ..."/"\nNo means: ..." appended to the question. Score s = head(
-        final hidden state of the last token); choice/score p = softmax(s/T), noul
-        p = sigmoid(s/T). Non-string values rendered with json.dumps(sort_keys).
+      calibrated option probabilities out, no text generated). Stages 0-2 are
+      coded (`/v1/systemone` on ChatServer, AnyJev L0 in neuralanyjev.pas, Kev and
+      Open-Jev via `--decision-adapter`; design in c54d68df). Open: the
+      real-checkpoint checks below and the follow-ups.
   Stage 1 — AnyJev L0 readout (no trained weights):
   - [ ] D1.3 user check of the coded AnyJev L0 default scorer on a real checkpoint (this VM cannot hold one):
         ```
@@ -2221,7 +2096,7 @@ rather than acted on.
         ```
         - Open-Jev-2B: sanity check done on the user box 2026-10-19 (`--gpu --int4`, now SUPPORTED); its `--fp32` parity run above is still open.
         - [ ] Kev-0.8B (and the other Kev sizes, Kev-27B above).
-  Follow-ups (not in this plan): Laya; AnyJev batch prior, L1, L2; Kev
+  Follow-ups: Laya (ModernBERT encoder + decision head); AnyJev batch prior, L1, L2; Kev
   `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
   `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer
   "specials as plain text" flag for chat requests; live (unmerged) LoRA.
@@ -2360,11 +2235,7 @@ dev box proves parity; throughput numbers have to come from the GPU box.
       `TNNetMamba2CL` runs `cai_mamba2_scan` (one work-item per d_inner
       channel for the whole sequence, the (d_inner, N) state advanced in
       place) and `cai_mamba2_gated_norm` (one work-group per token) on one
-      queue; the source is bound, the result stays in OpenCL memory. The layer
-      now descends from `TNNetRecurrentDecodeBase`: before 329b0a91
-      `TNNetStreamingDecoder` never collected it, so every width-1 step
-      restarted the scan from h = 0 and a streamed Mamba-2 / Nemotron-H decode
-      (ChatTerminal) diverged from the full forward from the second token. The
+      queue; the source is bound, the result stays in OpenCL memory. The
       decode state now stays in OpenCL memory and checkpoint slots are OpenCL
       buffers. `TNNetRecurrentScanCL` is the new shared parent of the
       GatedDeltaNet, SelectiveSSM and Mamba-2 helpers (state bank plumbing).
@@ -2404,8 +2275,7 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         `cai_sdpa_decode_merge` take an optional per-query-head sink buffer
         (`FHasSinks` = 0 for every other caller); a split launch adds the sink
         in the merge only, so it counts once. The cached forward
-        (`TNNetStreamingDecoder`, i.e. ChatTerminal) ignored the KV cache
-        (max logit error 12.0 on the pico); it now runs the base
+        (`TNNetStreamingDecoder`, i.e. ChatTerminal) runs the base
         `ComputeIncremental` with the sink (virtual `SinkLogits`), FP32 and
         int8, on the host. Open follow-ups:
     - [ ] Resident-KV decode for GPT-OSS: the importer builds one sink layer
@@ -2465,9 +2335,7 @@ for itself even when it sits between two host layers.
 
 Derived by walking the class graph: a layer counts as covered if it declares
 `ComputeOpenCL`, sets an `FActivationOpcode`, dispatches to OpenCL inside its
-own `Compute`, or inherits one of those without overriding `Compute`. Most
-classes fail that test; the ones below are the subset the vision and
-audio builders actually instantiate. Note the third case: a class that
+own `Compute`, or inherits one of those without overriding `Compute`. Note the third case: a class that
 overrides `Compute` with no device branch silently loses its parent's kernel
 (`TNNetMaxPoolPortable` lost `TNNetMaxPool`'s that way; fixed in commit abd639f0).
 
@@ -2490,8 +2358,7 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       `TNNetModulatedConv2D` layers against the parent commit (host w'' slab +
       upload every forward). `examples/StyleGAN2Generate` has no OpenCL switch
       yet, so the run needs `NN.EnableOpenCL` added (or a small timing harness).
-- [ ] The rest of the vision attention subclasses that override `Compute` and
-      so lose `TNNetScaledDotProductAttention`'s device path:
+- [ ] Follow-ups of the vision attention device paths:
       - [ ] SwinV2 follow-up: `cai_sdpa_qk_l2norm_packed` is one work-item
         per (token, Q/K/V part) with a serial d_k loop; fine for Swin windows
         (49 tokens, d_k 32), use work-groups if a large-d_k user appears.
@@ -2552,10 +2419,6 @@ cannot pay for its own transfer.
 
 - [ ] Dilated `TNNetConvolution` follow-ups (c331577c; the 6-argument
       `Create(..., SuppressBias, Dilation)`, FStruct[6]):
-  - [X] `TNNetConvolutionRectangular` takes no dilation argument.
-  - [X] The unused `BackpropagateCPU` / `BackpropagateFastCPU` /
-        `BackpropagateFastCPUDev` and the Debug-only reference routines are
-        still dense-only; either honour FDilationY or raise when it is > 1.
   - [ ] Winograd and the 2x-upsample fold decline dilation > 1 (plain path);
         fine unless a dilated 3x3 shows up hot in a GPU-box profile.
 
