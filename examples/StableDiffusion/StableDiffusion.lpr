@@ -32,6 +32,8 @@ h94/IP-Adapter ip-adapter_sd15 file (its image_encoder/ folder beside it), as
 diffusers load_ip_adapter + set_ip_adapter_scale. --init-image PNG
 [--strength S] turns it into image-to-image (diffusers
 StableDiffusionImg2ImgPipeline): the output takes the image's size.
+--change-map PNG with --init-image is Differential Diffusion (Levin & Fried
+2024): each pixel's gray level sets how much it may change (white = most).
 --init-image on a 5-channel depth UNet folder such as
 stabilityai/stable-diffusion-2-depth runs depth-to-image (diffusers
 StableDiffusionDepth2ImgPipeline): the folder's depth_estimator/ (DPT-Hybrid)
@@ -156,6 +158,9 @@ type
     // --init-image ('' for text-to-image), its --strength and --depth-image.
     InitImageFile, DepthImageFile: string;
     Strength: double;
+    // --change-map ('' for none) and --invert-change-map.
+    ChangeMapFile: string;
+    InvertChangeMap: boolean;
     // --edit-image ('' for none) and its --image-guidance (< 0: default).
     EditImageFile: string;
     ImageGuidanceScale: double;
@@ -414,6 +419,15 @@ begin
   WriteLn('                    runs the last int(steps * S) steps (lcm: all ',
     'steps over');
   WriteLn('                    the first int(50 * S) LCM timesteps)');
+  WriteLn('  --change-map PNG  Differential Diffusion: a gray map of how much ',
+    'to change each');
+  WriteLn('                    pixel of --init-image (white = change most, ',
+    'black = keep;');
+  WriteLn('                    any size), instead of one global strength; ',
+    '--strength (default');
+  WriteLn('                    1) still truncates the schedule');
+  WriteLn('  --invert-change-map  read --change-map as white = keep (the ',
+    'reference''s maps)');
   WriteLn('  --depth-image PNG depth-to-image: the depth map of --init-image ',
     '(luma, brighter =');
   WriteLn('                    nearer; any size) for a 5-channel depth UNet ',
@@ -719,6 +733,8 @@ begin
   Opt.InitImageFile := '';
   Opt.DepthImageFile := '';
   Opt.Strength := -1;
+  Opt.ChangeMapFile := '';
+  Opt.InvertChangeMap := false;
   Opt.EditImageFile := '';
   Opt.ImageGuidanceScale := -1;
   Opt.UpscaleImageFile := '';
@@ -836,6 +852,11 @@ begin
       Opt.GLIGENInpaintImageFile := NextArg()
     else if Arg = '--init-image' then Opt.InitImageFile := NextArg()
     else if Arg = '--depth-image' then Opt.DepthImageFile := NextArg()
+    else if Arg = '--change-map' then Opt.ChangeMapFile := NextArg()
+    else if Arg = '--invert-change-map' then Opt.InvertChangeMap := true
+    else if Arg = '--mask' then
+      raise Exception.Create('--mask (binary inpainting) is not an option ' +
+        'here; give a soft --change-map with --init-image instead')
     else if Arg = '--strength' then
       Opt.Strength := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--edit-image' then Opt.EditImageFile := NextArg()
@@ -986,6 +1007,12 @@ begin
       '--gligen or --ip-adapter');
   if (Opt.DepthImageFile <> '') and (Opt.InitImageFile = '') then
     raise Exception.Create('--depth-image needs --init-image');
+  if (Opt.ChangeMapFile <> '') and ((Opt.InitImageFile = '') or
+    (Opt.DepthImageFile <> '') or (Opt.TileUpscale > 0)) then
+    raise Exception.Create('--change-map needs --init-image (and no ' +
+      '--depth-image or --tile-upscale)');
+  if Opt.InvertChangeMap and (Opt.ChangeMapFile = '') then
+    raise Exception.Create('--invert-change-map needs --change-map');
   if (Opt.ImageGuidanceScale >= 0) and (Opt.EditImageFile = '') then
     raise Exception.Create('--image-guidance needs --edit-image');
   if (Opt.EditImageFile <> '') and (Opt.InitImageFile <> '') then
@@ -1135,6 +1162,7 @@ var
   Img2Img: TStableDiffusionImg2Img;
   GLIGENInpainter: TStableDiffusionGLIGENInpainter;
   Depth2Img: TStableDiffusionDepth2Img;
+  Differential: TStableDiffusionDifferentialImg2Img;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
   Upscaler: TStableDiffusionUpscaler;
   ICLight: TStableDiffusionICLight;
@@ -1205,6 +1233,7 @@ begin
   Multi := nil;
   Img2Img := nil;
   Depth2Img := nil;
+  Differential := nil;
   InstructPix2Pix := nil;
   Upscaler := nil;
   ICLight := nil;
@@ -1259,6 +1288,21 @@ begin
         Depth2Img.SetDepthMap(Image);
       end;
       Img2Img := Depth2Img;
+    end
+    else if Opt.ChangeMapFile <> '' then
+    begin
+      Differential := TStableDiffusionDifferentialImg2Img.Create();
+      if not LoadImageFromFileIntoVolume(Opt.ChangeMapFile, Image,
+        {pWithAlpha=}false) then
+        raise Exception.Create('could not load ' + Opt.ChangeMapFile);
+      // The reference's own maps are white = keep.
+      if Opt.InvertChangeMap then
+      begin
+        Image.Mul(-1);
+        Image.Add(255);
+      end;
+      Differential.SetChangeMap(Image);
+      Img2Img := Differential;
     end
     else if Opt.InitImageFile <> '' then
       Img2Img := TStableDiffusionImg2Img.Create();
@@ -1558,6 +1602,9 @@ begin
       WriteLn(Format('Init image: %s (%dx%d), strength %.2f, %d of %d steps',
         [Opt.InitImageFile, Image.SizeX, Image.SizeY, Img2Img.Strength,
          Img2ImgStepCount, StepCount]));
+      if Assigned(Differential) then
+        WriteLn('Change map: ', Opt.ChangeMapFile, ' (Differential Diffusion',
+          BoolToStr(Opt.InvertChangeMap, ', inverted', ''), ')');
       if Assigned(Depth2Img) and (Opt.DepthImageFile <> '') then
         WriteLn('Depth image: ', Opt.DepthImageFile, ' (depth-to-image)')
       else if Assigned(Depth2Img) then

@@ -272,6 +272,50 @@ PNDM, DPM-Solver++ 2M, Euler and Euler a (replayed step noise), and with DDIM
 at strength 1 (`TestStableDiffusionImg2ImgParity`). No real checkpoint has
 been run yet.
 
+### Differential Diffusion (`--change-map`)
+
+`--change-map PNG` with `--init-image` gives every pixel its own strength
+instead of one global `--strength`: Differential Diffusion (Levin & Fried
+2024, arXiv:2306.00950), as `StableDiffusionDiffImg2ImgPipeline` of
+[exx8/differential-diffusion](https://github.com/exx8/differential-diffusion)
+(`TStableDiffusionDifferentialImg2Img`). The change map is read as gray (PIL
+'L'), resized to the image and then (torch bilinear) to the latent grid, and
+kept continuous: it is not cut at 0.5 as an inpainting mask is. Before each
+step i of the N steps that run (i >= 1), the latent cells whose change is
+below 1 - i / N are replaced by the image latents noised to that step, with
+the same noise the run started from. So a white pixel (change 1) is plain
+image-to-image, a black one (change 0) keeps the image, and a mid-gray one
+follows the image for the first half of the steps and is free for the rest:
+soft edges, gradients and depth-derived falloffs blend without a seam.
+`--strength` (default 1 with a change map) still truncates the schedule; the
+thresholds are spread over the steps that run. It runs with every
+image-to-image sampler, on the integer timesteps and on the continuous
+sigmas of `--karras-sigmas` (tested: DDIM, Euler, DPM++ 2M Karras, Euler
+Karras).
+
+White means change most here, as the white = regenerate inpainting masks of
+`examples/DiffusionInpainting`. The reference code and the maps of its paper
+and demo use the opposite convention (white = keep); `--invert-change-map`
+reads a map that way. `--mask` is refused: there is no binary inpainting
+option in this example. A horizontal gradient that keeps the left of the
+photo and repaints the right more and more (ImageMagick makes the map):
+
+```
+convert -size 512x512 gradient: -rotate 90 gradient.png
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --init-image photo_512.png --change-map gradient.png \
+  --prompt "a city skyline above the clouds, matte painting" --steps 30
+```
+
+Tested on the pico folder against the reference loop (diffusers float64
+schedulers, its map = 1 - the change map): DDIM at strength 0.6 and 1, Euler
+at 0.6, DPM++ 2M Karras at 0.6 and Euler Karras at 1 on a ramp map, final
+latents below 1e-4 (`TestStableDiffusionDifferentialImg2ImgParity`); an
+all-white map equals plain image-to-image bit for bit and an all-black map
+replaces the latents by the noised image after every step but the last
+(`TestStableDiffusionDifferentialImg2ImgInvariants`). No real checkpoint has
+been run yet.
+
 `--init-image PNG` on a depth folder such as
 `stabilityai/stable-diffusion-2-depth` (whose UNet takes 5 channels: the
 latents and the depth) runs depth-to-image, as diffusers
@@ -1122,6 +1166,11 @@ StableDiffusion [--model DIR] [options]
                     --relight --light: 0.9);
                     runs the last int(steps * S) steps (lcm: all steps over the
                     first int(50 * S) LCM timesteps)
+  --change-map PNG  Differential Diffusion: a gray map of how much to change each
+                    pixel of --init-image (white = change most, black = keep;
+                    any size), instead of one global strength; --strength (default
+                    1) still truncates the schedule
+  --invert-change-map  read --change-map as white = keep (the reference's maps)
   --depth-image PNG depth-to-image: the depth map of --init-image (luma,
                     brighter = nearer; any size) for a 5-channel depth UNet
                     folder, e.g. stabilityai/stable-diffusion-2-depth; without

@@ -778,6 +778,11 @@ function DiffusersSchedulerUsesKarrasSigmas(const ConfigJson: string): boolean;
 // have the same size.
 procedure InpaintBlend(Latents, Known, Mask: TNNetVolume);
 
+// Differential Diffusion before step StepPos of StepCount: Mask (ChangeMap's grid
+// x Channels) is 0 (keep) where 1-change > StepPos/StepCount, else 1; Result: kept cells.
+function DifferentialDiffusionRegenerateMask(ChangeMap: TNNetVolume;
+  StepPos, StepCount, Channels: integer; Mask: TNNetVolume): integer;
+
 // Tile starts along one axis every Stride from 0. Plain: the last tile is
 // clamped to end at Extent. Circular: ceil(Extent/Stride) tiles, wrapping.
 procedure ComputeTileStarts(Extent, TileLen, Stride: integer;
@@ -3658,6 +3663,41 @@ begin
   Latents.Sub(Known);
   TNNetVolume.Mul(Latents.GetRawPtr(0), Mask.GetRawPtr(0), Latents.Size);
   Latents.Add(Known);
+end;
+
+function DifferentialDiffusionRegenerateMask(ChangeMap: TNNetVolume;
+  StepPos, StepCount, Channels: integer; Mask: TNNetVolume): integer;
+var
+  Threshold, MaskValue: TNeuralFloat;
+  CellPos, MaxCellPos, Channel, MaxChannel, MaskPos: integer;
+begin
+  if (ChangeMap.Depth <> 1) or (StepCount < 1) or (StepPos < 0) or
+    (StepPos >= StepCount) or (Channels < 1) then
+    raise Exception.Create('DifferentialDiffusionRegenerateMask: a ' +
+      IntToStr(ChangeMap.Depth) + '-channel change map at step ' +
+      IntToStr(StepPos) + ' of ' + IntToStr(StepCount) + ' for ' +
+      IntToStr(Channels) + ' channels.');
+  // The reference keeps map > i / N, its map being 1 - change.
+  Threshold := StepPos / StepCount;
+  Mask.ReSize(ChangeMap.SizeX, ChangeMap.SizeY, Channels);
+  MaxCellPos := ChangeMap.SizeX * ChangeMap.SizeY - 1;
+  MaxChannel := Channels - 1;
+  MaskPos := 0;
+  Result := 0;
+  for CellPos := 0 to MaxCellPos do
+  begin
+    if 1 - ChangeMap.FData[CellPos] > Threshold then
+    begin
+      MaskValue := 0;
+      Inc(Result);
+    end
+    else MaskValue := 1;
+    for Channel := 0 to MaxChannel do
+    begin
+      Mask.FData[MaskPos] := MaskValue;
+      Inc(MaskPos);
+    end;
+  end;
 end;
 
 procedure TNNetFlowMatchEulerScheduler.ScaleNoise(Noise, Sample: TNNetVolume;

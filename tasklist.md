@@ -847,31 +847,35 @@ rather than acted on.
                 they now invert a TILED encode (a948d626). They refuse
                 panorama windows but not `VaeTileSize`; either refuse it too
                 or pin that the tiled latent inverts acceptably.
-- [ ] Differential Diffusion (Levin & Fried 2024, arXiv:2306.00950; diffusers
-      community `pipeline_stable_diffusion_differential_img2img` /
-      `StableDiffusionDiffImg2ImgPipeline`): per-pixel edit strength from a
-      grayscale CHANGE MAP instead of one global `--strength` and a binary
-      inpaint mask. Today `TStableDiffusionInpainter` binarizes its mask
-      (`DiffusersBinarizeMask`, >= 0.5) and blends the re-noised known latents
-      back in `AfterStep`, so a soft mask (blurred edge, gradient, depth-derived
-      falloff) has a seam and no partial edit.
-      - [ ] A conditioner `TStableDiffusionDifferentialImg2Img` (subclass of
-            `TStableDiffusionImg2Img`, reusing the inpainter's re-noise + blend
-            code by moving it to a shared parent routine rather than copying
-            it): the change map (W, H, 1|3|4, 0..255, white = change most) is
-            resized to the latent grid as a continuous map, not binarized; at
-            step i of N the known (re-noised original) latent is kept wherever
-            map < threshold(i) = 1 - (i + 1) / N, as the reference. Works on a
-            4-channel UNet with every sampler that `TStableDiffusionImg2Img`
-            accepts (DDIM, Euler, DPM++ 2M incl. Karras sigmas).
-      - [ ] Pico parity: diffusers' community pipeline on tests/fixtures
-            tiny SD (~/x venv), fixed seed and a gradient change map, DDIM
-            and Euler; final latents to ~1e-5.
-      - [ ] examples/StableDiffusion `--change-map PNG` (with `--init-image`;
-            refuses `--mask`), README section with a horizontal-gradient
-            example; examples/QwenImage `--change-map` reuses the same
-            threshold schedule over its flow-matching steps (the same blend
-            point as its inpainting).
+- [ ] Differential Diffusion (Levin & Fried 2024, arXiv:2306.00950): the SD
+      1.x/2.x part is DONE (`TStableDiffusionDifferentialImg2Img`, standalone
+      `DifferentialDiffusionRegenerateMask` in neural/neuraldiffusion.pas,
+      examples/StableDiffusion `--change-map` / `--invert-change-map`; pico
+      parity vs exx8 SD2/diff_pipe.py's loop with DDIM, Euler, DPM++ 2M Karras,
+      Euler Karras). The convention is white = change most; the reference's
+      own maps are white = keep (its `map > i / N` keeps the image). Open:
+      - [ ] examples/QwenImage `--change-map PNG` (with its init image;
+            refuses its binary mask): in `TQwenImage21Pipeline.DenoiseAt`
+            (neural/neuralpretrained.pas, the `if IsInpaint then` block right
+            after `FScheduler.Step(Latents, Velocity, StepPos)`) build the mask
+            per step with `DifferentialDiffusionRegenerateMask(ChangeMap,
+            StepPos + 1 - StartStep, StepCount - StartStep, Channels, Mask)`
+            (ChangeMap: (GridW, GridH, 1) change in [0, 1] on the packed latent
+            grid, Mask then reordered to the packed token layout of
+            `MaskLatents` if that differs), skip the blend when it returns 0,
+            and do not blend after the last step (the reference's
+            pipeline_flux_differential_img2img.py blends after step i with
+            masks[i] = map > i / N at timesteps[i + 1]: check which index the
+            Qwen-Image flow reference uses before porting). Only a
+            hand-computed / invariant test is possible unless a diffusers
+            Qwen-Image differential reference exists.
+      - [ ] Real checkpoint run (SD 1.5) on the user's GPU box: a horizontal
+            gradient and a depth-derived map.
+      - [ ] The 4-channel `TStableDiffusionInpainter` blend still refuses the
+            continuous-sigma schedules (`AcceptsSigmaSchedule` = 9-channel
+            only); `AfterStep` now gets the next noise level on both paths
+            (sqrt(ab), sqrt(1-ab)), so it could accept them, after a pico
+            parity vs diffusers' inpaint pipeline with Euler Karras.
 - [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
       Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`):
       `TStableDiffusionICLight` (`Relight`) and examples/StableDiffusion

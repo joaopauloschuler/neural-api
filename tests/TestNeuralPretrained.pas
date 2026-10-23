@@ -59,6 +59,8 @@ type
     FSD15PhaseCounts: array[TStableDiffusionPipelinePhase] of integer;
     // The latents after step 0 (SDCaptureFirstStep).
     FSDFirstStepLatents: TNNetVolume;
+    // The latents after every step (SDCaptureEveryStep).
+    FSDStepLatents: TNNetVolumeList;
     function FixturePath(const FileName: string): string;
     // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
     function LoadSD15PipelineOracle(): TJSONData;
@@ -104,6 +106,13 @@ type
     procedure SD15CountPhase(Phase: TStableDiffusionPipelinePhase);
     procedure SDCaptureFirstStep(StepIndex, StepCount: integer;
       Timestep: double; Latents: TNNetVolume);
+    procedure SDCaptureEveryStep(StepIndex, StepCount: integer;
+      Timestep: double; Latents: TNNetVolume);
+    // Img2Img on tiny_sd15_img2img_io.json's image, sample noise, prompt and
+    // guidance (FSD15Oracle loaded); Initial := its unit noise.
+    procedure SetupSDImg2ImgOracleRun(Pipeline: TStableDiffusionPipeline;
+      Img2Img: TStableDiffusionImg2Img; Embeds, Initial: TNNetVolume;
+      out ImageWidth, ImageHeight: integer);
     // Pipeline's guided DDIM denoise by hand on tiny_sd15: each step runs the
     // whole UNet; a step DeepCache skips then rewrites the cache point and reruns the tail.
     procedure RunSDDeepCacheReference(Pipeline: TStableDiffusionPipeline;
@@ -1435,6 +1444,9 @@ type
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionImg2ImgParity;
     procedure TestStableDiffusionImg2ImgKarrasSigmas;
+    procedure TestDifferentialDiffusionRegenerateMask;
+    procedure TestStableDiffusionDifferentialImg2ImgParity;
+    procedure TestStableDiffusionDifferentialImg2ImgInvariants;
     procedure TestStableDiffusionLCMParity;
     procedure TestStableDiffusionLCMDistilledParity;
     procedure TestStableDiffusion2Config;
@@ -49909,6 +49921,339 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.SetupSDImg2ImgOracleRun(
+  Pipeline: TStableDiffusionPipeline; Img2Img: TStableDiffusionImg2Img;
+  Embeds, Initial: TNNetVolume; out ImageWidth, ImageHeight: integer);
+var
+  SourceImage, ImageNoise: TNNetVolume;
+begin
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Initial);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.SetSampleNoise(ImageNoise);
+    Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
+      0.0);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+  finally
+    ImageNoise.Free;
+    SourceImage.Free;
+  end;
+end;
+
+// The 16x12 change map of the Differential Diffusion tests: a 0..255 ramp
+// along x (17 per pixel), rows 0-2 all 0 and rows 10-11 all 255.
+procedure FillSDDifferentialRampMap(Map: TNNetVolume);
+var
+  X, Y: integer;
+begin
+  Map.ReSize(16, 12, 1);
+  for Y := 0 to 11 do
+    for X := 0 to 15 do
+      if Y <= 2 then Map[X, Y, 0] := 0
+      else if Y >= 10 then Map[X, Y, 0] := 255
+      else Map[X, Y, 0] := 17 * X;
+end;
+
+procedure TTestNeuralPretrained.TestDifferentialDiffusionRegenerateMask;
+var
+  ChangeMap, Mask: TNNetVolume;
+  Channel: integer;
+begin
+  ChangeMap := TNNetVolume.Create(3, 1, 1);
+  Mask := TNNetVolume.Create;
+  try
+    ChangeMap.FData[0] := 0;
+    ChangeMap.FData[1] := 0.6;
+    ChangeMap.FData[2] := 1;
+    // Step 0 keeps every cell short of change 1; the reference's start.
+    AssertEquals('step 0 keeps 2 cells', 2,
+      DifferentialDiffusionRegenerateMask(ChangeMap, 0, 4, 2, Mask));
+    AssertEquals('mask width', 3, Mask.SizeX);
+    AssertEquals('mask channels', 2, Mask.Depth);
+    for Channel := 0 to 1 do
+    begin
+      AssertEquals('step 0, change 0 kept', 0, Mask[0, 0, Channel], 0);
+      AssertEquals('step 0, change 0.6 kept', 0, Mask[1, 0, Channel], 0);
+      AssertEquals('step 0, change 1 follows', 1, Mask[2, 0, Channel], 0);
+    end;
+    // Step 2 of 4: keep where 1 - change > 0.5.
+    AssertEquals('step 2 keeps 1 cell', 1,
+      DifferentialDiffusionRegenerateMask(ChangeMap, 2, 4, 1, Mask));
+    AssertEquals('step 2, change 0 kept', 0, Mask[0, 0, 0], 0);
+    AssertEquals('step 2, change 0.6 follows', 1, Mask[1, 0, 0], 0);
+    AssertEquals('step 2, change 1 follows', 1, Mask[2, 0, 0], 0);
+    // The last step still keeps change 0.
+    DifferentialDiffusionRegenerateMask(ChangeMap, 3, 4, 1, Mask);
+    AssertEquals('step 3, change 0 kept', 0, Mask[0, 0, 0], 0);
+    try
+      DifferentialDiffusionRegenerateMask(ChangeMap, 4, 4, 1, Mask);
+      Fail('step 4 of 4 must be refused');
+    except
+      on E: Exception do ;
+    end;
+  finally
+    Mask.Free;
+    ChangeMap.Free;
+  end;
+end;
+
+// exx8/differential-diffusion SD2/diff_pipe.py's loop (float64 diffusers
+// schedulers, its map = 1 - the ramp map / 255) on tiny_sd15: final latents.
+procedure TTestNeuralPretrained.TestStableDiffusionDifferentialImg2ImgParity;
+type
+  TDiffImg2ImgCase = record
+    Sampler: TNNetSamplerMethod;
+    // -1: Karras sigmas on the pipeline's own scheduler, else this case of
+    // the img2img oracle's scheduler configs.
+    ConfigCase: integer;
+    Strength: double;
+    StepCount: integer;
+    Final: array[0..5] of double;
+    FinalSum, FinalSumSq: double;
+  end;
+const
+  cPicks: array[0..17] of integer = (0, 0, 0, 1, 2, 3, 2, 5, 1, 3, 4, 7,
+    0, 3, 6, 3, 1, 2);
+  cCases: array[0..4] of TDiffImg2ImgCase = (
+    (Sampler: smDPMSolverPP2M; ConfigCase: -1; Strength: 0.6; StepCount: 3;
+     Final: (-0.100200378, 0.492522721, 1.07553543, 4.62086698,
+       2.01239841, -0.278261956);
+     FinalSum: 8.04437714; FinalSumSq: 159.953904),
+    (Sampler: smEuler; ConfigCase: -1; Strength: 1.0; StepCount: 5;
+     Final: (-0.125046646, 0.62778724, 1.98682816, 18.2124933,
+       9.16576934, -0.280091365);
+     FinalSum: 40.382185; FinalSumSq: 1861.27976),
+    (Sampler: smDDIM; ConfigCase: 0; Strength: 0.6; StepCount: 3;
+     Final: (-0.134212054, 0.700863745, 1.02211856, 3.84987412,
+       1.70601729, -0.263197744);
+     FinalSum: 12.7461741; FinalSumSq: 144.121872),
+    (Sampler: smDDIM; ConfigCase: 0; Strength: 1.0; StepCount: 5;
+     Final: (-0.138795252, 0.626198095, 2.38870717, 18.0851809,
+       8.86211383, -0.270630511);
+     FinalSum: 49.0173051; FinalSumSq: 1924.82877),
+    (Sampler: smEuler; ConfigCase: 4; Strength: 0.6; StepCount: 3;
+     Final: (-0.111068805, 0.671938981, 1.01459661, 3.86772373,
+       1.70072368, -0.253091212);
+     FinalSum: 13.9338796; FinalSumSq: 145.197609));
+var
+  Pipeline: TStableDiffusionPipeline;
+  Differential: TStableDiffusionDifferentialImg2Img;
+  ChangeMap, Initial, Embeds, Latents: TNNetVolume;
+  CasePos, ImageWidth, ImageHeight: integer;
+  CaseName: string;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  Differential := TStableDiffusionDifferentialImg2Img.Create();
+  ChangeMap := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    AssertEquals('default strength', 1, Differential.Strength, 0);
+    SetupSDImg2ImgOracleRun(Pipeline, Differential, Embeds, Initial,
+      ImageWidth, ImageHeight);
+    FillSDDifferentialRampMap(ChangeMap);
+    Differential.SetChangeMap(ChangeMap);
+    Pipeline.Conditioner := Differential;
+    for CasePos := 0 to High(cCases) do
+    begin
+      CaseName := 'case ' + IntToStr(CasePos);
+      if cCases[CasePos].ConfigCase < 0 then
+      begin
+        Pipeline.Sampler := cCases[CasePos].Sampler;
+        Pipeline.Scheduler.DPMSolverAlgorithm := dpaDPMSolverPP;
+        Pipeline.KarrasSigmas := true;
+      end
+      else
+      begin
+        Pipeline.SelectSamplerFromConfig(TJSONObject(FSD15Oracle).Arrays[
+          'cases'].Objects[cCases[CasePos].ConfigCase].Objects[
+          'scheduler_config'].AsJSON);
+        AssertTrue(CaseName + ' sampler',
+          Pipeline.Sampler = cCases[CasePos].Sampler);
+        AssertFalse(CaseName + ' no Karras sigmas', Pipeline.KarrasSigmas);
+      end;
+      Differential.Strength := cCases[CasePos].Strength;
+      Latents.ReSize(Initial);
+      Latents.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageWidth, ImageHeight,
+        TJSONObject(FSD15Oracle).Get('steps', 0), Latents);
+      AssertEquals(CaseName + ' guided passes', 2 * cCases[CasePos].StepCount,
+        Pipeline.ImageStats.UNetPassCount);
+      CheckICLightPicks(CaseName + ' result', Latents, cPicks,
+        cCases[CasePos].Final, cCases[CasePos].FinalSum,
+        cCases[CasePos].FinalSumSq);
+    end;
+    // The map on the 8x6 latent grid (torch bilinear of the 16x12 map).
+    AssertEquals('latent map width', 8, Differential.ChangeMap.SizeX);
+    AssertEquals('row 0 keeps', 0, Differential.ChangeMap[3, 0, 0], 1e-6);
+    AssertEquals('row 5 changes', 1, Differential.ChangeMap[3, 5, 0], 1e-6);
+    AssertEquals('ramp cell', 1 - 0.7, Differential.ChangeMap[2, 3, 0], 1e-6);
+    ChangeMap.ReSize(4, 4, 2);
+    try
+      Differential.SetChangeMap(ChangeMap);
+      Fail('a 2-channel change map must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+  finally
+    Latents.Free;
+    Embeds.Free;
+    Initial.Free;
+    ChangeMap.Free;
+    Pipeline.Free;
+    Differential.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// All-white change map = plain img2img; an all-black one replaces the latents
+// by the noised image after every step but the last; the ramp keeps its
+// change-0 rows on that path and ends between the two.
+procedure TTestNeuralPretrained.TestStableDiffusionDifferentialImg2ImgInvariants;
+type
+  TDiffInvariantCase = record
+    Sampler: TNNetSamplerMethod;
+    KarrasSigmas: boolean;
+    Strength: double;
+  end;
+const
+  cCases: array[0..2] of TDiffInvariantCase = (
+    (Sampler: smDPMSolverPP2M; KarrasSigmas: true; Strength: 1.0),
+    (Sampler: smEuler; KarrasSigmas: true; Strength: 0.6),
+    (Sampler: smDDIM; KarrasSigmas: false; Strength: 0.6));
+var
+  Pipeline: TStableDiffusionPipeline;
+  Plain: TStableDiffusionImg2Img;
+  Differential: TStableDiffusionDifferentialImg2Img;
+  ChangeMap, Initial, Embeds, PlainResult, WhiteResult, BlackResult,
+    RampResult: TNNetVolume;
+  BlackSteps, BlackUnguidedSteps, RampSteps: TNNetVolumeList;
+  CasePos, ImageWidth, ImageHeight, StepPos, X, Channel: integer;
+  CaseName: string;
+  GuidanceScale: TNeuralFloat;
+
+  procedure Run(Conditioner: TStableDiffusionImg2Img; Output: TNNetVolume;
+    Steps: TNNetVolumeList);
+  begin
+    Conditioner.Strength := cCases[CasePos].Strength;
+    Pipeline.Conditioner := Conditioner;
+    FSDStepLatents := Steps;
+    if Assigned(Steps) then Pipeline.OnStep := @SDCaptureEveryStep
+    else Pipeline.OnStep := nil;
+    Output.ReSize(Initial);
+    Output.Copy(Initial);
+    try
+      Pipeline.Denoise(Embeds, ImageWidth, ImageHeight,
+        TJSONObject(FSD15Oracle).Get('steps', 0), Output);
+    finally
+      Pipeline.OnStep := nil;
+      FSDStepLatents := nil;
+    end;
+  end;
+
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  Plain := TStableDiffusionImg2Img.Create();
+  Differential := TStableDiffusionDifferentialImg2Img.Create();
+  ChangeMap := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  PlainResult := TNNetVolume.Create;
+  WhiteResult := TNNetVolume.Create;
+  BlackResult := TNNetVolume.Create;
+  RampResult := TNNetVolume.Create;
+  BlackSteps := TNNetVolumeList.Create();
+  BlackUnguidedSteps := TNNetVolumeList.Create();
+  RampSteps := TNNetVolumeList.Create();
+  try
+    SetupSDImg2ImgOracleRun(Pipeline, Plain, Embeds, Initial, ImageWidth,
+      ImageHeight);
+    SetupSDImg2ImgOracleRun(Pipeline, Differential, Embeds, Initial,
+      ImageWidth, ImageHeight);
+    GuidanceScale := Pipeline.GuidanceScale;
+    for CasePos := 0 to High(cCases) do
+    begin
+      CaseName := 'case ' + IntToStr(CasePos);
+      Pipeline.Sampler := cCases[CasePos].Sampler;
+      Pipeline.KarrasSigmas := cCases[CasePos].KarrasSigmas;
+      Pipeline.GuidanceScale := GuidanceScale;
+      Run(Plain, PlainResult, nil);
+      ChangeMap.ReSize(16, 12, 1);
+      ChangeMap.Fill(255);
+      Differential.SetChangeMap(ChangeMap);
+      Run(Differential, WhiteResult, nil);
+      AssertEquals(CaseName + ' white = plain img2img', 0,
+        MaxAbsVolumeDiff(WhiteResult, PlainResult), 0);
+      ChangeMap.Fill(0);
+      Differential.SetChangeMap(ChangeMap);
+      BlackSteps.Clear;
+      Run(Differential, BlackResult, BlackSteps);
+      FillSDDifferentialRampMap(ChangeMap);
+      Differential.SetChangeMap(ChangeMap);
+      RampSteps.Clear;
+      Run(Differential, RampResult, RampSteps);
+      // Without guidance the black path is the same until the last step.
+      Pipeline.GuidanceScale := 1;
+      ChangeMap.Fill(0);
+      Differential.SetChangeMap(ChangeMap);
+      BlackUnguidedSteps.Clear;
+      Run(Differential, WhiteResult, BlackUnguidedSteps);
+      AssertTrue(CaseName + ' two or more steps', BlackSteps.Count >= 2);
+      AssertEquals(CaseName + ' step counts', BlackSteps.Count,
+        BlackUnguidedSteps.Count);
+      for StepPos := 0 to BlackSteps.Count - 2 do
+      begin
+        AssertEquals(CaseName + ' black step ' + IntToStr(StepPos) +
+          ' ignores guidance', 0, MaxAbsVolumeDiff(BlackSteps[StepPos],
+          BlackUnguidedSteps[StepPos]), 0);
+        // Latent row 0 has change 0: the ramp keeps it as the black map does.
+        for X := 0 to BlackSteps[StepPos].SizeX - 1 do
+          for Channel := 0 to BlackSteps[StepPos].Depth - 1 do
+            AssertEquals(CaseName + ' ramp row 0 at step ' + IntToStr(StepPos),
+              BlackSteps[StepPos][X, 0, Channel],
+              RampSteps[StepPos][X, 0, Channel], 0);
+      end;
+      AssertTrue(CaseName + ' guidance moves the last step',
+        MaxAbsVolumeDiff(BlackSteps[BlackSteps.Count - 1],
+        BlackUnguidedSteps[BlackSteps.Count - 1]) > 1e-4);
+      AssertTrue(CaseName + ' black differs from plain',
+        MaxAbsVolumeDiff(BlackResult, PlainResult) > 1e-3);
+      AssertTrue(CaseName + ' ramp differs from black',
+        MaxAbsVolumeDiff(RampResult, BlackResult) > 1e-3);
+      AssertTrue(CaseName + ' ramp differs from plain',
+        MaxAbsVolumeDiff(RampResult, PlainResult) > 1e-3);
+    end;
+  finally
+    Pipeline.OnStep := nil;
+    RampSteps.Free;
+    BlackUnguidedSteps.Free;
+    BlackSteps.Free;
+    RampResult.Free;
+    BlackResult.Free;
+    WhiteResult.Free;
+    PlainResult.Free;
+    Embeds.Free;
+    Initial.Free;
+    ChangeMap.Free;
+    Pipeline.Free;
+    Differential.Free;
+    Plain.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
 // StableDiffusionDepth2ImgPipeline float64 on tiny_sd2_depth (5-channel UNet):
 // DDIM and Euler a at strength 0.6, depth maps upscaled and downscaled.
 procedure TTestNeuralPretrained.TestStableDiffusion2Depth2ImgParity;
@@ -51967,6 +52312,12 @@ procedure TTestNeuralPretrained.SDCaptureFirstStep(StepIndex,
   StepCount: integer; Timestep: double; Latents: TNNetVolume);
 begin
   if StepIndex = 0 then FSDFirstStepLatents.Copy(Latents);
+end;
+
+procedure TTestNeuralPretrained.SDCaptureEveryStep(StepIndex,
+  StepCount: integer; Timestep: double; Latents: TNNetVolume);
+begin
+  FSDStepLatents.Add(TNNetVolume.Create(Latents));
 end;
 
 procedure TTestNeuralPretrained.RunSDDeepCacheReference(

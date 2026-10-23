@@ -12514,10 +12514,11 @@ type
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); virtual;
-    // After the sampler step that reached NextTt (1-based; 0 = clean).
-    procedure AfterStep(Latents: TNNetVolume; NextTt: integer); virtual;
-    // True when the steps may run at continuous sigmas: AfterStep needs no
-    // integer timestep. Base: true.
+    // After every sampler step, at the noise level it reached: NextSqrtAb =
+    // sqrt(ab), NextSqrtOneMinusAb = sqrt(1 - ab) (1, 0 = clean).
+    procedure AfterStep(Latents: TNNetVolume; NextSqrtAb,
+      NextSqrtOneMinusAb: TNeuralFloat); virtual;
+    // True when the steps may run at continuous sigmas. Base: true.
     function AcceptsSigmaSchedule(): boolean; virtual;
     // Frees the nets unless the pipeline keeps its components loaded.
     procedure EndDenoise(); virtual;
@@ -13466,8 +13467,14 @@ type
     FImageSampleNoise: TNNetVolume;
     FHasSampleNoise: boolean;
     FStrength: double;
+    // Scratch: the image latents at one step's noise level.
+    FNoisedImageLatents: TNNetVolume;
     procedure SetStrength(Value: double);
     procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+    // Where Mask is 0, Latents := the image latents noised by the run's unit
+    // noise to SqrtAb, SqrtOneMinusAb (InpaintBlend); 1 keeps Latents.
+    procedure BlendNoisedImageLatents(Latents, Mask: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat);
   public
     constructor Create();
     destructor Destroy(); override;
@@ -13490,8 +13497,8 @@ type
   TStableDiffusionInpainter = class(TStableDiffusionImg2Img)
   private
     FSourceMask: TNNetVolume;
-    // 9 channels: mask | masked-image latents. The re-noised image latents
-    // and the latent mask per channel.
+    // 9 channels: mask | masked-image latents, then the masked-image
+    // latents and the latent mask per channel.
     FMaskAndImageLatents: TNNetVolume;
     FKnownLatents, FMaskLatents: TNNetVolume;
     // The unit Gaussian noise of the masked-image latent sample.
@@ -13514,10 +13521,36 @@ type
     procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
-    procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
+    procedure AfterStep(Latents: TNNetVolume; NextSqrtAb,
+      NextSqrtOneMinusAb: TNeuralFloat); override;
     function AcceptsSigmaSchedule(): boolean; override;
     // True after BeginDenoise saw a 9-channel inpainting UNet.
     property IsConcatUNet: boolean read FIsConcatUNet;
+  end;
+
+  // Differential Diffusion (Levin & Fried 2024; exx8/differential-diffusion
+  // StableDiffusionDiffImg2ImgPipeline): img2img with a per-pixel change map.
+  // Before step i of N the cells with 1 - change > i / N take the image
+  // latents noised to that step (DifferentialDiffusionRegenerateMask), so
+  // change 0 keeps the image and change 1 is plain img2img. Coded by Claude (AI).
+  TStableDiffusionDifferentialImg2Img = class(TStableDiffusionImg2Img)
+  private
+    FSourceChangeMap: TNNetVolume;
+    // (GridX, GridY, 1) change in [0, 1]; the step's blend mask per channel.
+    FChangeMap, FRegenerateMask: TNNetVolume;
+  protected
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+  public
+    // Strength defaults to 1, as the reference.
+    constructor Create();
+    destructor Destroy(); override;
+    // The change map (W, H, 1|3|4) in 0..255, white = change most; gray (PIL
+    // 'L'), resized to the image, then torch bilinear to the latent grid.
+    procedure SetChangeMap(ChangeMap: TNNetVolume);
+    procedure AfterStep(Latents: TNNetVolume; NextSqrtAb,
+      NextSqrtOneMinusAb: TNeuralFloat); override;
+    // The (GridX, GridY, 1) change map of the last BeginDenoise.
+    property ChangeMap: TNNetVolume read FChangeMap;
   end;
 
   // diffusers StableDiffusionInstructPix2PixPipeline (timbrooks/instruct-pix2pix):
@@ -13946,7 +13979,7 @@ type
     FKeepMask, FRegenerateMask: TNNetVolume;
     // masked image latents | keep mask, the UNet's extra input channels.
     FExtraChannels: TNNetVolume;
-    FNoisedImageLatents, FStepNoise: TNNetVolume;
+    FStepNoise: TNNetVolume;
     FOnStepNoise: TStableDiffusionNoiseEvent;
   protected
     // diffusers target_size_center_crop: the centered crop of the latent
@@ -14007,7 +14040,8 @@ type
     procedure PredictGuidedNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
       Pred: TNNetVolume); override;
-    procedure AfterStep(Latents: TNNetVolume; NextTt: integer); override;
+    procedure AfterStep(Latents: TNNetVolume; NextSqrtAb,
+      NextSqrtOneMinusAb: TNeuralFloat); override;
     function AcceptsSigmaSchedule(): boolean; override;
     procedure EndDenoise(); override;
   end;
@@ -104927,20 +104961,33 @@ begin
       end;
       if Assigned(StepNoise) then FOnAncestralNoise(StepPos, StepNoise);
       if UseSigmaSchedule then
+      begin
         FScheduler.StepAtSigma(Latents, Pred, SigmaSchedule.Sigmas[StepPos],
-          SigmaSchedule.Sigmas[StepPos + 1], FSampler, Eta, StepNoise)
+          SigmaSchedule.Sigmas[StepPos + 1], FSampler, Eta, StepNoise);
+        FScheduler.AlphaBarRootsAtSigma(SigmaSchedule.Sigmas[StepPos + 1],
+          SqrtAb, SqrtOneMinusAb);
+        StepConditioner.AfterStep(Latents, SqrtAb, SqrtOneMinusAb);
+      end
       else if IsInversion then
         FScheduler.InverseDDIMStep(Latents, Pred, Schedule[StepPos], StepCount)
       else
       begin
         FScheduler.Step(Latents, Pred, Schedule[StepPos],
           Schedule[StepPos + 1], FSampler, Eta, StepNoise);
-        StepConditioner.AfterStep(Latents, Schedule[StepPos + 1]);
+        if Schedule[StepPos + 1] >= 1 then
+          FScheduler.AlphaBarRootsAt(Schedule[StepPos + 1] - 1, SqrtAb,
+            SqrtOneMinusAb)
+        else
+        begin
+          SqrtAb := 1;
+          SqrtOneMinusAb := 0;
+        end;
+        StepConditioner.AfterStep(Latents, SqrtAb, SqrtOneMinusAb);
         if Assigned(Edit) then
         begin
           FScheduler.Step(EditLatents, EditPred, Schedule[StepPos],
             Schedule[StepPos + 1], FSampler, Eta, StepNoise);
-          StepConditioner.AfterStep(EditLatents, Schedule[StepPos + 1]);
+          StepConditioner.AfterStep(EditLatents, SqrtAb, SqrtOneMinusAb);
         end;
       end;
       if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Timestep, Latents);
@@ -105438,7 +105485,7 @@ begin
 end;
 
 procedure TStableDiffusionConditioner.AfterStep(Latents: TNNetVolume;
-  NextTt: integer);
+  NextSqrtAb, NextSqrtOneMinusAb: TNeuralFloat);
 begin
 end;
 
@@ -106408,14 +106455,12 @@ begin
   FKeepMask := TNNetVolume.Create();
   FRegenerateMask := TNNetVolume.Create();
   FExtraChannels := TNNetVolume.Create();
-  FNoisedImageLatents := TNNetVolume.Create();
   FStepNoise := TNNetVolume.Create();
 end;
 
 destructor TStableDiffusionGLIGENInpainter.Destroy();
 begin
   FStepNoise.Free;
-  FNoisedImageLatents.Free;
   FExtraChannels.Free;
   FRegenerateMask.Free;
   FKeepMask.Free;
@@ -106685,10 +106730,10 @@ begin
 end;
 
 procedure TStableDiffusionMultiConditioner.AfterStep(Latents: TNNetVolume;
-  NextTt: integer);
+  NextSqrtAb, NextSqrtOneMinusAb: TNeuralFloat);
 begin
   if Assigned(FImageConditioner) then
-    FImageConditioner.AfterStep(Latents, NextTt);
+    FImageConditioner.AfterStep(Latents, NextSqrtAb, NextSqrtOneMinusAb);
 end;
 
 function TStableDiffusionMultiConditioner.AcceptsSigmaSchedule(): boolean;
@@ -106801,11 +106846,13 @@ begin
   inherited Create();
   FNoise := TNNetVolume.Create();
   FImageSampleNoise := TNNetVolume.Create();
+  FNoisedImageLatents := TNNetVolume.Create();
   FStrength := 0.8;
 end;
 
 destructor TStableDiffusionImg2Img.Destroy();
 begin
+  FNoisedImageLatents.Free;
   FImageSampleNoise.Free;
   FNoise.Free;
   inherited Destroy();
@@ -106840,6 +106887,7 @@ end;
 procedure TStableDiffusionImg2Img.EncodeImage(VaeImage, Latents: TNNetVolume);
 begin
   FPipeline.EncodeVaeImage(VaeImage, FImageLatents, FImageSampleNoise);
+  FNoisedImageLatents.ReSize(FImageLatents);
 end;
 
 function TStableDiffusionImg2Img.DenoiseStrength(): double;
@@ -106858,6 +106906,16 @@ begin
   Latents.Copy(FImageLatents);
   Latents.Mul(SqrtAb);
   Latents.MulAdd(SqrtOneMinusAb, FNoise);
+end;
+
+procedure TStableDiffusionImg2Img.BlendNoisedImageLatents(Latents,
+  Mask: TNNetVolume; SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+begin
+  // The scratch is the encoded latents' size, so Copy does not reallocate.
+  FNoisedImageLatents.Copy(FImageLatents);
+  FNoisedImageLatents.Mul(SqrtAb);
+  FNoisedImageLatents.MulAdd(SqrtOneMinusAb, FNoise);
+  InpaintBlend(Latents, FNoisedImageLatents, Mask);
 end;
 
 constructor TStableDiffusionInpainter.Create();
@@ -106942,7 +107000,6 @@ begin
         FMaskedImageSampleNoise);
       FMaskAndImageLatents.AddLayers(FMaskLatents, FKnownLatents);
     end
-    else FKnownLatents.ReSize(FImageLatents);
   finally
     KeepMask.Free;
     BinaryMask.Free;
@@ -106961,24 +107018,81 @@ begin
 end;
 
 procedure TStableDiffusionInpainter.AfterStep(Latents: TNNetVolume;
-  NextTt: integer);
+  NextSqrtAb, NextSqrtOneMinusAb: TNeuralFloat);
 begin
-  if FIsConcatUNet then exit;
-  // The kept region at the next step's noise level (the same noise as the
-  // initial latents), or clean after the last step.
-  if NextTt >= 1 then
-  begin
-    FPipeline.Scheduler.AddNoise(FImageLatents, FKnownLatents, NextTt, nil,
-      FNoise);
-    InpaintBlend(Latents, FKnownLatents, FMaskLatents);
-  end
-  else InpaintBlend(Latents, FImageLatents, FMaskLatents);
+  if not FIsConcatUNet then
+    BlendNoisedImageLatents(Latents, FMaskLatents, NextSqrtAb,
+      NextSqrtOneMinusAb);
 end;
 
 function TStableDiffusionInpainter.AcceptsSigmaSchedule(): boolean;
 begin
-  // The 4-channel blend noises the kept region at each integer timestep.
+  // The 4-channel blend is pinned against diffusers on integer timesteps only.
   Result := FIsConcatUNet;
+end;
+
+constructor TStableDiffusionDifferentialImg2Img.Create();
+begin
+  inherited Create();
+  FSourceChangeMap := TNNetVolume.Create();
+  FChangeMap := TNNetVolume.Create();
+  FRegenerateMask := TNNetVolume.Create();
+  FStrength := 1;
+end;
+
+destructor TStableDiffusionDifferentialImg2Img.Destroy();
+begin
+  FRegenerateMask.Free;
+  FChangeMap.Free;
+  FSourceChangeMap.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionDifferentialImg2Img.SetChangeMap(
+  ChangeMap: TNNetVolume);
+begin
+  if (ChangeMap.Depth <> 1) and (ChangeMap.Depth <> 3) and
+    (ChangeMap.Depth <> 4) then
+    ImportError('TStableDiffusionDifferentialImg2Img: the change map has ' +
+      IntToStr(ChangeMap.Depth) + ' channels, expected gray, RGB or RGBA.');
+  FSourceChangeMap.ReSize(ChangeMap);
+  FSourceChangeMap.Copy(ChangeMap);
+end;
+
+procedure TStableDiffusionDifferentialImg2Img.EncodeImage(VaeImage,
+  Latents: TNNetVolume);
+var
+  Gray: TNNetVolume;
+begin
+  if FSourceChangeMap.Size = 0 then
+    ImportError('TStableDiffusionDifferentialImg2Img: call SetImage and ' +
+      'SetChangeMap first.');
+  inherited EncodeImage(VaeImage, Latents);
+  Gray := TNNetVolume.Create();
+  try
+    ConvertAndResizeImagePIL(FSourceChangeMap, Gray, VaeImage.SizeX,
+      VaeImage.SizeY, 1, {ClipToByteRange=}false, 0, 1);
+    ResizeImageBilinearNoAntialias(Gray, FChangeMap, FImageLatents.SizeX,
+      FImageLatents.SizeY);
+  finally
+    Gray.Free;
+  end;
+  FRegenerateMask.ReSize(FImageLatents);
+end;
+
+procedure TStableDiffusionDifferentialImg2Img.AfterStep(Latents: TNNetVolume;
+  NextSqrtAb, NextSqrtOneMinusAb: TNeuralFloat);
+var
+  NextStepPos: integer;
+begin
+  // The reference blends before each step after the first, none after the last.
+  NextStepPos := FPipeline.FStepPos + 1;
+  if NextStepPos >= FPipeline.FStepCount then exit;
+  // With no kept cell the blend is skipped: InpaintBlend's L - K + K rounds.
+  if DifferentialDiffusionRegenerateMask(FChangeMap, NextStepPos,
+    FPipeline.FStepCount, FImageLatents.Depth, FRegenerateMask) > 0 then
+    BlendNoisedImageLatents(Latents, FRegenerateMask, NextSqrtAb,
+      NextSqrtOneMinusAb);
 end;
 
 constructor TStableDiffusionInstructPix2Pix.Create();
