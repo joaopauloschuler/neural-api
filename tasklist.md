@@ -574,9 +574,9 @@ rather than acted on.
             (NoiseImageLatents / AfterStep take an integer timestep, so those
             runs keep integer timesteps), Euler sigma_min / sigma_max
             overrides and final_sigmas_type "sigma_min" (noticed, not done).
-      - [ ] Latent Consistency Models in TStableDiffusionPipeline: 2-8 step
-            SD 1.5 images, about 6-10x fewer UNet passes than 25-50 step
-            sampling.
+      - [ ] Latent Consistency Models follow-ups (LCM-LoRA sampling
+            `--sampler lcm` on TNNetLCMScheduler, 1a31f710; LCM-distilled
+            UNets via time_cond_proj_dim, 0bfbb06b):
         - [ ] Real LCM-LoRA run on the user's GPU box:
               latent-consistency/lcm-lora-sdv1-5 through --lora + --sampler lcm,
               4 steps, guidance 1.0 and 1.5. Check that every LoRA key of that
@@ -765,7 +765,8 @@ rather than acted on.
               fixture is tested; its F32 safetensors / fp16 variants unchecked).
         - [ ] InstructPix2Pix extras: an --edit-image whose
               sides are not a VAE-factor multiple (resize parity, see (6)
-              above), and PAG/SLG-style extra passes through PredictGuidedNoise.
+              above). PAG and SAG are refused with InstructPix2Pix (diffusers
+              has no such pipeline).
       - [ ] FreeU follow-ups (`TNNetFreeUFourierFilter`,
             examples/StableDiffusion `--freeu`):
         - [ ] FreeU follow-up: a with/without image pair from the GPU box on a
@@ -1872,8 +1873,10 @@ rather than acted on.
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
           TNNet.Compute when the last layer ends on the host (these writes
           are the only mid-block waits).
-    - [ ] B1d1 follow-up: SE / CBAM / DiT importers now take this OpenCL path with no
-          OpenCL parity test.
+    - [ ] B1d1 follow-up: the DiT/PixArt/MMDiT/F5/VAR/CogVideoX blocks and the
+          EfficientNet/RegNet SE (and CBAM) importers take this OpenCL path with no
+          OpenCL parity test (the RVM MobileNetV3 SE trunk and the Qwen-Image
+          blocks are covered by TestRVMOpenCLParity / TestQwenImage21*OpenCL*).
     - [ ] B1d2 follow-up: Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
           never fills FNormalized/FInvStd (FInvRMS): backprop reads
           stale values (pre-existing).
@@ -2127,7 +2130,6 @@ rather than acted on.
         kill %1
         ```
         - Open-Jev-2B: sanity check done on the user box 2026-10-19 (`--gpu --int4`, now SUPPORTED); its `--fp32` parity run above is still open.
-        - [ ] Kev-0.8B (and the other Kev sizes, Kev-27B above).
   Follow-ups: Laya (ModernBERT encoder + decision head); AnyJev batch prior, L1, L2; Kev
   `KEV_DATE_FACTS`; `/v1/systemone/permute` and `/separate`; per-question
   `TruncateTo` downloads the resident KV cache on OpenCL (measure first); tokenizer
