@@ -59,8 +59,9 @@ type
     // TNNetSinkAttention (or TNNetDifferentialAttention) on OpenCL vs the CPU.
     procedure CheckSinkOrDifferentialFlashParity(Differential: boolean);
     // Streamed cached decode of Variant (avSDPA, avSink or avDifferential) on
-    // OpenCL vs the CPU (see the tests below).
-    procedure CheckCachedDecodeOpenCLParity(Variant: TNNetAttentionVariant);
+    // OpenCL vs the CPU; GptOssSinks puts TNNetGptOssSinkAttention in avSDPA's place.
+    procedure CheckCachedDecodeOpenCLParity(Variant: TNNetAttentionVariant;
+      GptOssSinks: boolean = false);
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
@@ -603,6 +604,11 @@ type
     // several key splits.
     procedure FusedSDPASinkSplitDecodeOpenCLParity;
     procedure FusedSDPASinkFlashOpenCLParity;
+    // The uncached TNNetFusedSDPA forward on OpenCL (a scratch cache at slot 0)
+    // vs the CPU: causal, windowed and non-causal masks, GQA, sinks with key
+    // splits and a sink change, soft-cap, identity scores, host source, and
+    // the host fallbacks (short host source, non-causal window).
+    procedure FusedSDPAFullForwardOpenCLParity;
     // TNNetScaledDotProductAttention on cai_sdpa_flash vs the CPU, with the
     // residency of the attention, the concat and the out-projection.
     procedure ScaledDotProductAttentionFlashOpenCLParity;
@@ -627,6 +633,9 @@ type
     // The same streamed decode for plain TNNetScaledDotProductAttention, with a
     // sliding window and a soft-cap too, FP32 and int8 KV.
     procedure ScaledDotProductAttentionCachedDecodeOpenCLParity;
+    // The same streamed decode for TNNetGptOssSinkAttention (the base cached
+    // step with its sink logit), FP32 and int8 KV, windows, a sink change.
+    procedure GptOssSinkAttentionCachedDecodeOpenCLParity;
     // AddMultiHeadSelfAttention (RoPE, 3 heads) with avSink / avDifferential:
     // every head on OpenCL with its resident source bound, output vs the CPU.
     procedure SinkAndDifferentialMultiHeadResidentChainOpenCLParity;
@@ -88985,6 +88994,182 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.FusedSDPAFullForwardOpenCLParity;
+{$IFDEF OpenCL}
+const
+  PassCount = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(QHeads, KVHeads, Dk, SeqLen, Window: integer;
+    Causal, HasSinks: boolean; SoftCap: TNeuralFloat; ForcedSplits: integer;
+    HostSource, SkipScores, ExpectOpenCL: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    Input, Logits: TNNetVolume;
+    CpuAttn, GpuAttn: TNNetFusedSDPA;
+    PassCnt, MaxHeadPos, MaxOutputPos: integer;
+    MaxDiff, MaxAbsY: TNeuralFloat;
+    What: string;
+
+    function BuildNet(NN: TNNet): TNNetFusedSDPA;
+    var
+      PackedDepth: integer;
+    begin
+      PackedDepth := (QHeads + 2 * KVHeads) * Dk;
+      NN.AddLayer(TNNetInput.Create(SeqLen, 1, PackedDepth));
+      NN.AddLayer(TNNetPointwiseConvLinear.Create(PackedDepth));
+      if HostSource then NN.AddLayer(THostOnlyMulByConstant.Create(1));
+      Result := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window,
+        SoftCap, {pCachedForwardNonCausal=}false, HasSinks);
+      NN.AddLayer(Result);
+    end;
+
+    procedure ComparePass();
+    var
+      OutputPos: integer;
+      Diff: TNeuralFloat;
+    begin
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      GpuAttn.ForceOutputOnRAM();
+      for OutputPos := 0 to MaxOutputPos do
+      begin
+        Diff := Abs(CpuAttn.Output.FData[OutputPos] -
+          GpuAttn.Output.FData[OutputPos]);
+        if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+        MaxAbsY := Max(MaxAbsY, Abs(CpuAttn.Output.FData[OutputPos]));
+      end;
+    end;
+
+    // Distinct per-head sink logits around the typical score, plus Shift.
+    procedure SetSinks(Shift: TNeuralFloat);
+    var
+      HeadPos: integer;
+    begin
+      for HeadPos := 0 to MaxHeadPos do
+        Logits.FData[HeadPos] := 1.1 - 0.7 * HeadPos + Shift;
+      CpuAttn.SetSinkLogits(Logits);
+      GpuAttn.SetSinkLogits(Logits);
+    end;
+
+  begin
+    What := Format('Hq=%d Hkv=%d Dk=%d T=%d W=%d causal=%s sinks=%s ' +
+      'cap=%.1f splits=%d host=%s identity=%s', [QHeads, KVHeads, Dk, SeqLen,
+      Window, BoolToStr(Causal, true), BoolToStr(HasSinks, true), SoftCap,
+      ForcedSplits, BoolToStr(HostSource, true), BoolToStr(SkipScores, true)]);
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, (QHeads + 2 * KVHeads) * Dk);
+    Logits := TNNetVolume.Create(QHeads, 1, 1);
+    try
+      CpuAttn := BuildNet(NNCpu);
+      GpuAttn := BuildNet(NNGpu);
+      NNGpu.CopyWeights(NNCpu);
+      MaxHeadPos := QHeads - 1;
+      if HasSinks then SetSinks(0);
+      CpuAttn.SkipAttentionScores := SkipScores;
+      GpuAttn.SkipAttentionScores := SkipScores;
+      NNCpu.SetTrainable(False, False);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      if ForcedSplits > 0 then
+        GpuAttn.FusedSDPACL.ForcedFlashSplits := ForcedSplits;
+      NNGpu.LayerProfiling := true;
+      MaxOutputPos := GpuAttn.Output.Size - 1;
+      MaxDiff := 0;
+      MaxAbsY := 0;
+      Input.RandomizeGaussian(1.0);
+      NNCpu.Compute(Input);
+      NNGpu.Compute(Input);
+      NNGpu.ClearTime();
+      for PassCnt := 1 to PassCount do ComparePass();
+      WriteLn('  fused SDPA full forward ', What, ': max|diff|=',
+        MaxDiff:0:9, ' max|y|=', MaxAbsY:0:4, ' gpu=', GpuAttn.ForwardGPUCnt,
+        ' bound=', GpuAttn.ProfiledResidency.SourceBoundCnt);
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+        MaxDiff < 2e-5 * MaxAbsY + 1e-7);
+      AssertEquals(What + ': WillOpenCL', ExpectOpenCL, GpuAttn.WillOpenCL());
+      if not ExpectOpenCL then
+      begin
+        AssertEquals(What + ': host path', 0, GpuAttn.ForwardGPUCnt);
+        AssertFalse(What + ': the host path leaves no resident output',
+          GpuAttn.OutputBindableOnOpenCL());
+        exit;
+      end;
+      AssertEquals(What + ': attention on OpenCL', PassCount,
+        GpuAttn.ForwardGPUCnt);
+      if ForcedSplits > 0 then
+      begin
+        AssertTrue(What + ': flash kernel',
+          GpuAttn.FusedSDPACL.LastPath = sdpaPathFlash);
+        AssertEquals(What + ': key splits', ForcedSplits,
+          GpuAttn.FusedSDPACL.LastFlashSplits);
+      end;
+      AssertEquals(What + ': output resident', PassCount,
+        GpuAttn.ProfiledResidency.OutputResidentCnt);
+      if HostSource then
+        AssertEquals(What + ': source uploaded', PassCount,
+          GpuAttn.ProfiledResidency.ActivationUploadedCnt)
+      else
+      begin
+        AssertEquals(What + ': source bound', PassCount,
+          GpuAttn.ProfiledResidency.SourceBoundCnt);
+        AssertEquals(What + ': source never pulled', 0,
+          GpuAttn.ProfiledResidency.SourcePulledToRAMCnt);
+      end;
+      if not HasSinks then exit;
+      // A changed sink must reach the resident copy on the next forward.
+      SetSinks(-2.5);
+      MaxDiff := 0;
+      ComparePass();
+      AssertTrue(What + ': max|diff| after a sink change ' +
+        FloatToStr(MaxDiff), MaxDiff < 2e-5 * MaxAbsY + 1e-7);
+      AssertEquals(What + ': on OpenCL after a sink change', PassCount + 1,
+        GpuAttn.ForwardGPUCnt);
+    finally
+      Logits.Free;
+      Input.Free;
+      NNGpu.Free;
+      NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261025;
+  // Causal GQA with and without sinks, a sliding window at head dim 10, a
+  // soft-cap, and the non-causal mask.
+  RunCase(4, 2, 16, 40, 0, True, True, 0, 0, False, False, True);
+  RunCase(4, 2, 16, 40, 0, True, False, 0, 0, False, False, True);
+  RunCase(4, 1, 10, 48, 8, True, True, 0, 0, False, False, True);
+  RunCase(2, 1, 16, 40, 0, True, True, 5.0, 0, False, False, True);
+  RunCase(2, 2, 32, 36, 0, False, True, 0, 0, False, False, True);
+  RunCase(2, 2, 32, 36, 0, False, False, 0, 0, False, False, True);
+  // Key splits: the merge adds each sink once per row.
+  RunCase(4, 2, 16, 200, 0, True, True, 0, 3, False, False, True);
+  RunCase(2, 1, 16, 200, 0, False, True, 0, 4, False, False, True);
+  // A short resident source still runs on OpenCL; identity scores too.
+  RunCase(2, 2, 16, 8, 0, True, True, 0, 0, False, False, True);
+  RunCase(4, 2, 16, 40, 0, True, False, 0, 0, False, True, True);
+  // A host source of 40 rows is uploaded; one of 8 rows keeps the host path.
+  RunCase(4, 2, 16, 40, 0, True, True, 0, 0, True, False, True);
+  RunCase(4, 2, 16, 8, 0, True, True, 0, 0, True, False, False);
+  // A non-causal window has no flash mask: the host path runs.
+  RunCase(2, 2, 16, 40, 8, False, True, 0, 0, False, False, False);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 // AddMultiHeadSelfAttention on OpenCL vs the same weights on the CPU; a flash
 // case asserts residency over PassCount profiled forwards. Bound 2e-5|y|.
 // HostSource puts a host layer before the split; Cycle re-arms OpenCL.
@@ -89526,8 +89711,13 @@ begin
   CheckCachedDecodeOpenCLParity(avSDPA);
 end;
 
+procedure TTestNeuralNumerical.GptOssSinkAttentionCachedDecodeOpenCLParity;
+begin
+  CheckCachedDecodeOpenCLParity(avSDPA, {GptOssSinks=}true);
+end;
+
 procedure TTestNeuralNumerical.CheckCachedDecodeOpenCLParity(
-  Variant: TNNetAttentionVariant);
+  Variant: TNNetAttentionVariant; GptOssSinks: boolean);
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
@@ -89541,10 +89731,15 @@ var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
 
-  // NumSinks is the sliding window for avSDPA.
+  // NumSinks is the sliding window for avSDPA and TNNetGptOssSinkAttention.
   function NewAttention(Dk, NumSinks: integer; Lambda,
     SoftCap: TNeuralFloat): TNNetScaledDotProductAttention;
   begin
+    if GptOssSinks then
+    begin
+      Result := TNNetGptOssSinkAttention.Create(Dk, True, NumSinks);
+      exit;
+    end;
     case Variant of
       avDifferential:
         Result := TNNetDifferentialAttention.Create(Dk, True, Lambda);
@@ -89652,9 +89847,10 @@ var
   var
     CheckLen: integer;
   begin
-    What := Format('variant=%d Dk=%d sinks/window=%d int8=%s lambda=%.2f ' +
-      'softcap=%.1f host=%s', [Ord(Variant), Dk, NumSinks,
-      BoolToStr(Int8KV, true), Lambda, SoftCap, BoolToStr(HostSource, true)]);
+    What := Format('variant=%d gpt-oss=%s Dk=%d sinks/window=%d int8=%s ' +
+      'lambda=%.2f softcap=%.1f host=%s', [Ord(Variant),
+      BoolToStr(GptOssSinks, true), Dk, NumSinks, BoolToStr(Int8KV, true),
+      Lambda, SoftCap, BoolToStr(HostSource, true)]);
     CpuPrefill := TNNet.Create();
     GpuPrefill := TNNet.Create();
     CpuStep := TNNet.Create();
@@ -89755,7 +89951,8 @@ var
         if StepPos = 0 then FirstStepUploads := UploadCnt;
         // A restore re-uploads the cache; a sink change re-uploads the sink rows.
         if (StepPos <> 0) and (StepPos <> RestoreStep) and
-           ((StepPos <> WeightChangeStep) or (Variant <> avSink)) then
+           ((StepPos <> WeightChangeStep) or
+            ((Variant <> avSink) and (not GptOssSinks))) then
           Inc(SteadyTransfers, UploadCnt + DownloadCnt);
         AssertEquals(What + ': no download inside a step', 0, DownloadCnt);
         if StepPos = CaptureStep then
@@ -89817,6 +90014,18 @@ begin
     Exit;
   end;
   RandSeed := 20261022;
+  if GptOssSinks then
+  begin
+    // Full attention and a 4-key sliding window; Lambda only tags the case
+    // (ChangeSinkOrDifferentialWeights draws a fresh sink logit).
+    RunCase(8, 0, False, 0.8, False);
+    RunCase(16, 0, True, 0.8, False);
+    RunCase(64, 0, True, 0.5, False);
+    RunCase(16, 4, False, 0.8, False);
+    RunCase(10, 4, True, 0.8, False);
+    RunCase(10, 0, False, 0.8, True);
+    exit;
+  end;
   if Variant = avSDPA then
   begin
     // Full attention, a 4-key sliding window and a soft-cap of 2.

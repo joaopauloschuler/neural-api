@@ -5486,7 +5486,7 @@ type
   ///
   /// Scope v1: causal / sliding-window masks and the Gemma-2 score soft-cap;
   /// NO segment masking, prefix-LM, bidirectional window or tiled forward.
-  /// OpenCL (TNNetFusedSDPACL) runs the cached forward only. Training
+  /// OpenCL (TNNetFusedSDPACL) runs inference only, cached or not. Training
   /// backward IS implemented (per-head mirror of the single-head backward).
   ///
   /// Optional per-query-head sinks (gpt-oss, see TNNetGptOssSinkAttention):
@@ -5563,6 +5563,12 @@ type
     // then the split-row attention and the merge (or the non-causal tiled
     // attention), one launch each, on the helper's one in-order queue.
     procedure ComputeOpenCL();
+    // The append of the input's rows at CacheSlot of a CacheMax-row cache, then
+    // the attention (or the identity scores), result left in OpenCL memory.
+    procedure RunStepOnSource(SourceBuffer: cl_mem; Int8KV: boolean;
+      CacheMax, CacheSlot: integer; Causal: boolean);
+    // WillOpenCL's verdict while the KV cache is off.
+    function FullForwardWillOpenCL(): boolean;
     {$ENDIF}
   protected
     function InputDepthRequired(): integer; override;
@@ -5571,6 +5577,11 @@ type
     function CacheKVHeads(): integer; override;
     // The QHeads sink logits when HasSinks, else nil.
     function SinkLogits(): TNNetVolume; override;
+    {$IFDEF OpenCL}
+    // The uncached forward: the input's rows are a scratch cache at slot 0
+    // (the helper's cache buffers hold no session while the cache is off).
+    procedure RunFlashOnSource(SourceBuffer: cl_mem); override;
+    {$ENDIF}
     // Chunk axis: query heads. ComputeRange computes heads
     // [StartRange..FinRange]; the cache append happens ONCE beforehand in
     // PrepareChunkedForward. Coded by Claude (AI).
@@ -5603,8 +5614,8 @@ type
     {$IFDEF OpenCL}
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     function WillOpenCL(): boolean; override;
-    // The OpenCL kernels a step of TokenCnt rows takes once WillOpenCL's
-    // scope holds; sdpaPathNone when none fits (the host path runs).
+    // The OpenCL kernels a step of TokenCnt rows (the whole input when the
+    // cache is off) takes once WillOpenCL's scope holds; sdpaPathNone = host.
     function OpenCLPathFor(TokenCnt: integer): TFusedSDPAOpenCLPath;
     // K's rows then V's rows (AppendCacheRowsFrom's shapes) in a new buffer
     // in this layer's OpenCL context; the caller releases its Buffer.
@@ -8622,6 +8633,8 @@ type
     function SinkLogits(): TNNetVolume; override;
     {$IFDEF OpenCL}
     function FlashForwardIsExact(): boolean; override;
+    // The base cached step passes SinkLogits, as ComputeIncremental reads them.
+    function CachedStepIsExact(): boolean; override;
     {$ENDIF}
   public
     constructor Create(d_k: integer; pCausalMask: boolean = true;
@@ -38553,6 +38566,11 @@ begin
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
+    if not FCacheEnabled then
+    begin
+      ComputeFlashOpenCL();
+      exit;
+    end;
     StartTime := Now();
     ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -38639,9 +38657,9 @@ procedure TNNetFusedSDPA.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // The inherited arming sets FHasOpenCL and leaves FShouldOpenCL false for
   // this class (its ComputeOpenCL computes single-head attention and would be
-  // wrong here). The cached decode gets its own helper instead, and the helper
-  // is built whatever the size verdict says: what puts this layer on OpenCL is
-  // a source that is already there.
+  // wrong here). Both forwards run on this class's own helper instead, and the
+  // helper is built whatever the size verdict says: what puts this layer on
+  // OpenCL is a source that is already there.
   inherited EnableOpenCL(DotProductKernel);
   if not Assigned(FFusedSDPACL) then
     FFusedSDPACL := TNNetFusedSDPACL.Create(FNN);
@@ -38654,7 +38672,12 @@ begin
   // and going up again, not to win on contraction size. The non-causal and the
   // row-key-end forwards go there with a host source too: their work is every
   // token row times every cache row, which outweighs uploading the rows.
-  Result := Assigned(FFusedSDPACL) and FHasOpenCL and FCacheEnabled
+  if not FCacheEnabled then
+  begin
+    Result := FullForwardWillOpenCL();
+    exit;
+  end;
+  Result := Assigned(FFusedSDPACL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL
                  or ((not FIsTrainable) and
                      (FCachedForwardNonCausal or (Length(FRowKeyEnds) > 0)
@@ -38678,14 +38701,37 @@ begin
   Result := OpenCLPathFor(FPrevLayer.FOutput.SizeX) <> sdpaPathNone;
 end;
 
+function TNNetFusedSDPA.FullForwardWillOpenCL(): boolean;
+var
+  SeqLen: integer;
+begin
+  // The flash masks are causal (with or without a window) and non-causal
+  // without one; a host source pays for its upload from csSDPAOpenCLMinSeqLen
+  // rows on, as in the single-head layer.
+  Result := Assigned(FFusedSDPACL) and FHasOpenCL and (not FIsTrainable)
+    and (Self.ClassType = TNNetFusedSDPA) and Assigned(FPrevLayer)
+    and (not FKeepAttentionWeights)
+    and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
+    and (not FBidirectionalWindow) and (FCausal or (FWindow = 0));
+  if not Result then exit;
+  SeqLen := FPrevLayer.FOutput.SizeX;
+  Result := FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL()
+    or (SeqLen >= csSDPAOpenCLMinSeqLen);
+  if (not Result) or FSkipAttentionScores then exit;
+  Result := OpenCLPathFor(SeqLen) <> sdpaPathNone;
+end;
+
 function TNNetFusedSDPA.OpenCLPathFor(TokenCnt: integer): TFusedSDPAOpenCLPath;
 begin
   // The split decode expresses neither the non-causal nor the row-key-end mask.
-  if Assigned(FFusedSDPACL)
+  if not Assigned(FFusedSDPACL) then Result := sdpaPathNone
+  else if FCacheEnabled
     then Result := FFusedSDPACL.StepPath(TokenCnt, FQHeads, FKVHeads,
       FGroupSize, FDk, FCacheMax, FKVQuantInt8,
       {FlashOnly=}FCachedForwardNonCausal or (Length(FRowKeyEnds) > 0))
-    else Result := sdpaPathNone;
+    else Result := FFusedSDPACL.StepPath(TokenCnt, FQHeads, FKVHeads,
+      FGroupSize, FDk, {CacheMax=}TokenCnt, {Int8KV=}false,
+      {FlashOnly=}not FCausal);
 end;
 
 function TNNetFusedSDPA.NewCacheRowsOnOpenCL(
@@ -38771,7 +38817,7 @@ end;
 function TNNetScaledDotProductAttention.CachedStepIsExact(): boolean;
 begin
   // A subclass inheriting the base host decode may still shape its scores
-  // (ScoreBiasTable, SinkLogits), which RunCachedStepOnSource does not pass.
+  // (ScoreBiasTable), which RunCachedStepOnSource does not pass.
   Result := (Self.ClassType = TNNetScaledDotProductAttention);
 end;
 
@@ -38819,15 +38865,20 @@ procedure TNNetScaledDotProductAttention.RunCachedStepOnSource(
   SourceBuffer: cl_mem);
 var
   PrefixRows, TokenCnt: integer;
+  Sinks: TNNetVolume;
 begin
   // Token row t attends the prefix rows and the cached tokens up to its own.
   PrefixRows := CachePrefixRows();
   TokenCnt := FPrevLayer.FOutput.SizeX;
+  // The sink buffer stays resident; a weight update marks it stale.
+  Sinks := SinkLogits();
   FFusedSDPACL.ComputeStep(FPrevLayer.FOutput, FOutput, FKVQuantInt8,
     CachedStepPath(TokenCnt), {QHeads=}1, {KVHeads=}1, {GroupSize=}1, FDk,
     PrefixRows + FCacheMax, {CacheSlot=}PrefixRows + FCacheLen, {QW=}FDk,
     {KW=}FDk, FWindow, {Causal=}true, [], 0, FInvSqrtDk, FScoreSoftCap,
-    FInvScoreSoftCap, SourceBuffer, {pKeepResultOnOpenCL=}true);
+    FInvScoreSoftCap, SourceBuffer, {pKeepResultOnOpenCL=}true, Sinks,
+    {pSinkLogitsChanged=}FAfterWeightUpdateHasBeenCalled);
+  if Assigned(Sinks) then FAfterWeightUpdateHasBeenCalled := false;
 end;
 
 procedure TNNetScaledDotProductAttention.ComputeCachedStepOpenCL();
@@ -38854,38 +38905,48 @@ end;
 procedure TNNetFusedSDPA.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
-  TokenCnt: integer;
-  Sinks: TNNetVolume;
 begin
   SourceBuffer := SourceBufferOnOpenCL();
   EnsureCacheOnOpenCL();
   FCacheBaseLen := FCacheLen;
-  TokenCnt := FPrevLayer.FOutput.SizeX;
-  // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
-  // inference-only, so no host reader is left behind: anything that wants
-  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
-  // accessors above.
-  if FSkipAttentionScores then
-    FFusedSDPACL.ComputeStepIdentityScores(FPrevLayer.FOutput, FOutput,
-      FKVQuantInt8, FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
-      {CacheSlot=}FCacheLen, FQW, FKW, SourceBuffer,
-      {pKeepResultOnOpenCL=}true)
-  else
-  begin
-    // The sink buffer stays resident; a weight update marks it stale.
-    Sinks := SinkLogits();
-    FFusedSDPACL.ComputeStep(FPrevLayer.FOutput, FOutput, FKVQuantInt8,
-      OpenCLPathFor(TokenCnt), FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
-      {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
-      {Causal=}not FCachedForwardNonCausal, FRowKeyEnds, FRowKeyEndsVersion,
-      FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
-      SourceBuffer, {pKeepResultOnOpenCL=}true, Sinks,
-      {pSinkLogitsChanged=}FAfterWeightUpdateHasBeenCalled);
-    if Assigned(Sinks) then FAfterWeightUpdateHasBeenCalled := false;
-  end;
-  Inc(FCacheLen, TokenCnt);
+  RunStepOnSource(SourceBuffer, FKVQuantInt8, FCacheMax,
+    {CacheSlot=}FCacheLen, {Causal=}not FCachedForwardNonCausal);
+  Inc(FCacheLen, FPrevLayer.FOutput.SizeX);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
+end;
+
+procedure TNNetFusedSDPA.RunFlashOnSource(SourceBuffer: cl_mem);
+begin
+  RunStepOnSource(SourceBuffer, {Int8KV=}false,
+    {CacheMax=}FPrevLayer.FOutput.SizeX, {CacheSlot=}0, FCausal);
+end;
+
+procedure TNNetFusedSDPA.RunStepOnSource(SourceBuffer: cl_mem;
+  Int8KV: boolean; CacheMax, CacheSlot: integer; Causal: boolean);
+var
+  Sinks: TNNetVolume;
+begin
+  // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
+  // inference-only, so no host reader is left behind: anything that wants
+  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from
+  // OpenCLOutputBuffer and OpenCLOutputKernel.
+  if FSkipAttentionScores then
+  begin
+    FFusedSDPACL.ComputeStepIdentityScores(FPrevLayer.FOutput, FOutput,
+      Int8KV, FQHeads, FKVHeads, FGroupSize, FDk, CacheMax, CacheSlot, FQW,
+      FKW, SourceBuffer, {pKeepResultOnOpenCL=}true);
+    exit;
+  end;
+  // The sink buffer stays resident; a weight update marks it stale.
+  Sinks := SinkLogits();
+  FFusedSDPACL.ComputeStep(FPrevLayer.FOutput, FOutput, Int8KV,
+    OpenCLPathFor(FPrevLayer.FOutput.SizeX), FQHeads, FKVHeads, FGroupSize,
+    FDk, CacheMax, CacheSlot, FQW, FKW, FWindow, Causal, FRowKeyEnds,
+    FRowKeyEndsVersion, FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
+    SourceBuffer, {pKeepResultOnOpenCL=}true, Sinks,
+    {pSinkLogitsChanged=}FAfterWeightUpdateHasBeenCalled);
+  if Assigned(Sinks) then FAfterWeightUpdateHasBeenCalled := false;
 end;
 {$ENDIF}
 
@@ -54564,6 +54625,11 @@ begin
   // Compute applies no soft-cap, so a capped instance keeps the host path.
   Result := (Self.ClassType = TNNetGptOssSinkAttention) and
     (FScoreSoftCap = 0);
+end;
+
+function TNNetGptOssSinkAttention.CachedStepIsExact(): boolean;
+begin
+  Result := (Self.ClassType = TNNetGptOssSinkAttention);
 end;
 {$ENDIF}
 

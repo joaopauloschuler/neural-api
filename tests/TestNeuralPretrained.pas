@@ -17069,6 +17069,17 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gpt_oss_logits.json'), Config.MaxPositions,
       Config.VocabSize);
+    // The uncached full forward of every fused layer runs on cai_sdpa_flash.
+    SinkCnt := 0;
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+    begin
+      Sink := NN.Layers[LayerCnt];
+      if Sink.ClassType <> TNNetFusedSDPA then continue;
+      Inc(SinkCnt);
+      AssertTrue('fused layer ' + IntToStr(LayerCnt) + ' on OpenCL',
+        Sink.ForwardGPUCnt > 0);
+    end;
+    AssertEquals('fused sink layers', Config.NumLayers, SinkCnt);
   finally
     NN.Free;
   end;
@@ -17113,11 +17124,23 @@ end;
 {$ENDIF}
 
 // Every decode step of every sink-enabled TNNetFusedSDPA runs on the resident
-// KV cache in OpenCL memory.
+// KV cache in OpenCL memory; so does every per-head TNNetGptOssSinkAttention
+// of the NeuralAllowFusedAttention=false build.
 procedure TTestNeuralPretrained.TestGptOssStreamedDecodeOpenCLParity;
+{$IFDEF OpenCL}
+var
+  SavedAllowFused: boolean;
+{$ENDIF}
 begin
   {$IFDEF OpenCL}
   RunStreamedDecodeOpenCLParity('tiny_gpt_oss', TNNetFusedSDPA);
+  SavedAllowFused := NeuralAllowFusedAttention;
+  NeuralAllowFusedAttention := false;
+  try
+    RunStreamedDecodeOpenCLParity('tiny_gpt_oss', TNNetGptOssSinkAttention);
+  finally
+    NeuralAllowFusedAttention := SavedAllowFused;
+  end;
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
