@@ -53229,7 +53229,7 @@ end;
 
 procedure TNNetSAMVisionAttention.SetRelPos(const RelH, RelW: TNNetVolume);
 var
-  Lh, Lw, hd: integer;
+  Lh, Lw, hd, WinH, WinW, WindowsY, WindowsX: integer;
   W: TNNetVolume;
 begin
   // RelH: (2H-1, HeadDim), RelW: (2W-1, HeadDim). Packed into one neuron:
@@ -53240,13 +53240,20 @@ begin
   Lw := RelW.Size div FHeadDim;
   hd := FHeadDim;
   W := FNeurons[4].FWeights;                   // #7/#9: bind once
+  if Assigned(FPrevLayer) then
+  begin
+    WindowLayout(WinH, WinW, WindowsY, WindowsX);
+    if (Lh <> 2 * WinH - 1) or (Lw <> 2 * WinW - 1) then
+      FErrorProc('TNNetSAMVisionAttention.SetRelPos: tables of ' +
+        IntToStr(Lh) + ' and ' + IntToStr(Lw) + ' rows, the ' + IntToStr(WinH) +
+        'x' + IntToStr(WinW) + ' window needs ' + IntToStr(2 * WinH - 1) +
+        ' and ' + IntToStr(2 * WinW - 1) + '.');
+  end;
   W.ReSize(hd, 1, Lh + Lw);
   // Both source blocks are whole-block contiguous copies (#13/App C): rel_pos_h
   // fills rows [0..Lh-1], rel_pos_w fills rows [Lh..Lh+Lw-1], width hd each.
   Move(RelH.FData[0], W.FData[0], Lh * hd * csNeuralFloatSize);
   Move(RelW.FData[0], W.FData[Lh * hd], Lw * hd * csNeuralFloatSize);
-  // Persist Lh so Compute can locate the rel_pos_w block; Lh = 2H-1.
-  FStruct[4] := Lh;
   AfterWeightUpdate();
 end;
 
@@ -53298,7 +53305,8 @@ begin
   QkvW := FNeurons[0].FWeights; QkvB := FNeurons[1].FWeights;
   ProjW := FNeurons[2].FWeights; ProjB := FNeurons[3].FWeights;
   RelP := FNeurons[4].FWeights;
-  Lh := FStruct[4];
+  // rel_pos_h holds 2*WinH-1 rows (SetRelPos checks it); rel_pos_w follows.
+  if FWindowSize > 0 then Lh := 2 * FWindowSize - 1 else Lh := 2 * H - 1;
   if FWindowSize > 0 then ws := FWindowSize else ws := 0;
   if ws > 0 then
   begin
@@ -53511,7 +53519,6 @@ begin
   // shaped here; SetPrevLayer and SetRelPos only report a mismatch.
   if (FPrevLayer.FOutput.Size <> FOutput.Size) or
     (FPrevLayer.FOutput.Depth <> FChannels) or (FNeurons.Count < 5) or
-    (FStruct[4] <> 2 * WinH - 1) or
     (FNeurons[4].FWeights.Size <> (2 * WinH + 2 * WinW - 2) * FHeadDim) or
     (int64(Planes) * WinTokens * WinTokens >= High(longint)) or
     (int64(FOutput.SizeX) * FOutput.SizeY * 3 * FChannels >= High(longint)) or
@@ -53544,7 +53551,7 @@ begin
   FAfterWeightUpdateHasBeenCalled := false;
   WindowLayout(WinH, WinW, WindowsY, WindowsX);
   FSAMAttentionCL.Attend(FPrevLayer.FOutput, SourceBuffer, FHeads, FHeadDim,
-    WinH, WinW, WindowsX, WindowsY * WindowsX, {RelHRows=}FStruct[4],
+    WinH, WinW, WindowsX, WindowsY * WindowsX, {RelHRows=}2 * WinH - 1,
     FInvSqrtHd);
   // No read back: the result stays in OpenCL memory until a host reader calls
   // ForceOutputOnRAM.
