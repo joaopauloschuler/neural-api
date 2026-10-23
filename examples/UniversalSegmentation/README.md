@@ -18,8 +18,10 @@ cross-attention is restricted to the foreground of the mask predicted by the
 previous layer. Because that feedback loop is dynamic, the decoder is built as
 one sub-net per layer and driven layer-by-layer by `RunMask2FormerSemantic`;
 `DecodeMask2FormerSemantic` then folds the per-query class + mask logits into a
-per-pixel semantic label map (softmax classes, drop the no-object slot, sigmoid
-masks, class-weighted argmax).
+per-pixel semantic label map (bilinear resize of the mask logits to the
+384x384 processed grid, softmax classes, drop the no-object slot, sigmoid
+masks, class-weighted sum, bilinear resize to the target size, argmax), as
+transformers' `post_process_semantic_segmentation`.
 
 `DecodeMask2FormerInstance` and `DecodeMask2FormerPanoptic` port
 transformers' `Mask2FormerImageProcessor.post_process_instance_segmentation`

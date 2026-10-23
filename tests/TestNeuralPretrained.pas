@@ -42410,9 +42410,10 @@ var
   RefRoot: TJSONData;
   RefJson: TStringList;
   Obj: TJSONObject;
-  MaskFeatArr, ClsArr, MaskArr, LvArr, SrcArr2: TJSONArray;
+  MaskFeatArr, ClsArr, MaskArr, LvArr, SrcArr2, MapArr: TJSONArray;
   SrcArr, PosArr: array of TNNetVolume;
   MaskFeatures, ClassLogits, MaskLogits: TNNetVolume;
+  SemanticMap: TMask2FormerLabelMap;
   i, q, c, p, s, NumPix, NumKeys, Hidden, NQ, NL: integer;
   RefVal, GotVal, Diff, MaxClsDiff, MaxMaskDiff: double;
 begin
@@ -42503,6 +42504,15 @@ begin
       FloatToStr(MaxClsDiff) + ' must be < 1e-4', MaxClsDiff < 1e-4);
     AssertTrue('Mask2Former mask logits: max |diff| = ' +
       FloatToStr(MaxMaskDiff) + ' must be < 1e-4', MaxMaskDiff < 1e-4);
+    // semantic map at the mask grid through transformers' 384x384 processed grid.
+    SemanticMap := DecodeMask2FormerSemantic(ClassLogits, MaskLogits, NL,
+      Config.MaskWidth, Config.MaskHeight, Config.MaskWidth, Config.MaskHeight);
+    MapArr := TJSONArray(Obj.Find('semantic_map'));
+    AssertEquals('Mask2Former semantic map length', MapArr.Count,
+      Length(SemanticMap));
+    for p := 0 to NumPix - 1 do
+      AssertEquals('Mask2Former semantic label at ' + IntToStr(p),
+        MapArr.Items[p].AsInteger, SemanticMap[p]);
   finally
     RefRoot.Free;
     RefJson.Free;
@@ -42587,6 +42597,68 @@ const
   csNL: array[0..3] of integer = (4, 2, 3, 1);
   csMW: array[0..3] of integer = (5, 3, 2, 7);
   csMH: array[0..3] of integer = (3, 6, 2, 1);
+
+  // Expected maps from transformers' post_process_semantic_segmentation on
+  // cls[q,c] = 3cos(0.9q+1.7c), mask[q,p] = 4sin(1.3q+0.7p), its 384x384 resize
+  // redirected to the processed grid; Q=4, L=3, 5x3 masks.
+  procedure CheckProcessedGridCases;
+  const
+    csGridQ = 4; csGridL = 3; csGridW = 5; csGridH = 3;
+    csMaskGrid: array[0..14] of integer = (0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0,
+      0, 2, 2);
+    csProcessed: array[0..62] of integer = (0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0,
+      0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 2, 2,
+      2);
+    csProcessedTarget: array[0..23] of integer = (0, 0, 0, 0, 0, 0, 0, 0, 2, 2,
+      2, 0, 2, 2, 2, 0, 0, 0, 2, 2, 0, 0, 0, 2);
+    csMaskGridTarget: array[0..23] of integer = (0, 0, 0, 2, 0, 0, 0, 0, 2, 2,
+      2, 0, 2, 2, 2, 0, 0, 0, 2, 2, 0, 0, 0, 2);
+  var
+    GridClassLogits, GridMaskLogits: TNNetVolume;
+    QueryPos, LabelPos, PixelPos: integer;
+
+    procedure CheckMap(const CaseName: string; const Expected: array of integer;
+      const Actual: TMask2FormerLabelMap);
+    var
+      MapPos: integer;
+    begin
+      AssertEquals(CaseName + ' length', Length(Expected), Length(Actual));
+      for MapPos := 0 to High(Expected) do
+        AssertEquals(CaseName + ' label at ' + IntToStr(MapPos),
+          Expected[MapPos], Actual[MapPos]);
+    end;
+
+  begin
+    GridClassLogits := TNNetVolume.Create(csGridQ, 1, csGridL + 1);
+    GridMaskLogits := TNNetVolume.Create(csGridQ, 1, csGridW * csGridH);
+    try
+      for QueryPos := 0 to csGridQ - 1 do
+      begin
+        for LabelPos := 0 to csGridL do
+          GridClassLogits[QueryPos, 0, LabelPos] :=
+            3 * Cos(0.9 * QueryPos + 1.7 * LabelPos);
+        for PixelPos := 0 to csGridW * csGridH - 1 do
+          GridMaskLogits[QueryPos, 0, PixelPos] :=
+            4 * Sin(1.3 * QueryPos + 0.7 * PixelPos);
+      end;
+      CheckMap('mask grid', csMaskGrid, DecodeMask2FormerSemantic(
+        GridClassLogits, GridMaskLogits, csGridL, csGridW, csGridH, 0, 0,
+        csGridW, csGridH));
+      CheckMap('processed 9x7', csProcessed, DecodeMask2FormerSemantic(
+        GridClassLogits, GridMaskLogits, csGridL, csGridW, csGridH, 0, 0, 9, 7));
+      CheckMap('processed 9x7 target 4x6', csProcessedTarget,
+        DecodeMask2FormerSemantic(GridClassLogits, GridMaskLogits, csGridL,
+        csGridW, csGridH, 4, 6, 9, 7));
+      CheckMap('mask grid target 4x6', csMaskGridTarget,
+        DecodeMask2FormerSemantic(GridClassLogits, GridMaskLogits, csGridL,
+        csGridW, csGridH, 4, 6, csGridW, csGridH));
+    finally
+      GridClassLogits.Free;
+      GridMaskLogits.Free;
+    end;
+  end;
+
 begin
   RandSeed := 987651;
   for ShapeIdx := 0 to 3 do
@@ -42643,7 +42715,8 @@ begin
         Ref[p] := BestC;
       end;
 
-      Got := DecodeMask2FormerSemantic(ClassLogits, MaskLogits, NL, MW, MH);
+      Got := DecodeMask2FormerSemantic(ClassLogits, MaskLogits, NL, MW, MH,
+        0, 0, MW, MH);
       AssertEquals('label map length (shape ' + IntToStr(ShapeIdx) + ')',
         NumPix, Length(Got));
       for p := 0 to NumPix - 1 do
@@ -42654,6 +42727,7 @@ begin
       ClassLogits.Free;
     end;
   end;
+  CheckProcessedGridCases;
 end;
 
 // Hand-built Mask2Former logits (5 queries, 3 labels, 4x3 masks) decoded by

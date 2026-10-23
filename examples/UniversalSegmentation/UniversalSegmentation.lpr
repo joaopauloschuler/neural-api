@@ -234,9 +234,9 @@ begin
 
     if Task = stSemantic then
     begin
-      // Fold the per-query class + mask logits into a per-pixel semantic map.
+      // transformers' 384x384 processed grid, resized back to the mask grid.
       LabelMap := DecodeMask2FormerSemantic(ClassLogits, MaskLogits,
-        Config.NumLabels, W, H);
+        Config.NumLabels, W, H, W, H);
       WriteLn;
       WriteLn('Semantic label map (', W, 'x', H, ', one glyph per class):');
       PrintMap(LabelMap, W, H, 0, {IsSegmentMap=}false);

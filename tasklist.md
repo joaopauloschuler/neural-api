@@ -887,11 +887,6 @@ rather than acted on.
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
           offline (the importer is config-driven and ready).
-      (e) `DecodeMask2FormerSemantic` skips transformers' 384x384 bilinear resize of
-          the mask logits that `post_process_semantic_segmentation` does before the
-          target-size resize (instance/panoptic do it, through
-          `Mask2FormerPixelMajorMasks`); route the semantic path through the same helper
-          and re-pin `TestMask2FormerParity`'s semantic map.
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
