@@ -29,7 +29,9 @@ box (class 0). The person boxes come from:
 - neither: the whole photo is one box.
 
 The output photo (`--output`, default `pose_out.png`) shows each box in green
-and each joint as a red square; the joints are also printed.
+with a `person <score>` tag above it (`DrawBitmapText`,
+`neural/neuralimageresize.pas`) and each joint as a red square; the joints are
+also printed.
 
 ## OpenPose image for ControlNet
 

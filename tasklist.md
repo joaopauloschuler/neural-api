@@ -2222,13 +2222,9 @@ rather than acted on.
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
-      - [ ] `TByteTracker`: no test covers `remove_duplicate_stracks` (a
-            tracked and a lost track with IoU distance < 0.15); add one with
-            hand-derived expectations.
-      - [ ] A reusable text renderer (bitmap font into a `TNNetVolume`, e.g.
-            next to `DrawLineCV2` in neuralimageresize.pas), so labels in
-            ObjectTracking, YoloDetect and PoseEstimation share one routine;
-            then replace the 3x5 digit table local to ObjectTracking.lpr.
+      - [ ] YoloDetect labels boxes with the class id (`DrawBitmapText`): no
+            class names reach `TYoloConfig`; read a `names` / `id2label` map
+            from config.json when present and label with the name.
       - [ ] `TNNet.PermutationAlignReport` (Git Re-Basin weight/activation
             matching, neuralnetwork.pas) still pairs units greedily; switch it
             to `NeuralLinearSumAssignment` (maximize similarity = minimize the

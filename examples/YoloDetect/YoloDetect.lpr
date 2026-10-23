@@ -26,8 +26,8 @@ Coded by Claude (AI).
 // forward pass on ONE image, DECODES the raw head with DecodeYoloDetections
 // (sigmoid the class logits, DFL-decode each box side = softmax the reg_max bins
 // -> expected ltrb distance, convert to xyxy pixels, greedy IoU NMS), DRAWS the
-// surviving boxes as colored rectangle outlines into the image, writes a PPM,
-// and prints the (class, score, box) list.
+// surviving boxes as colored rectangle outlines with a "class score" label
+// into the image, writes a PPM, and prints the (class, score, box) list.
 //
 // Usage:
 //   YoloDetect [model.safetensors] [config.json] [score_threshold] [iou_threshold]
@@ -48,7 +48,7 @@ Coded by Claude (AI).
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Classes, Math, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralpretrained;
+  neuralvolume, neuralnetwork, neuralpretrained, neuralimageresize;
 
 const
   PpmFile = 'yolo_detect.ppm';
@@ -66,7 +66,9 @@ var
   RefJson: TStringList;
   RefRoot: TJSONData;
   InArr: TJSONArray;
-  W, H, NumCh, x, yy, ch, FlatIdx, i, x0, y0, x1, y1: integer;
+  W, H, NumCh, x, yy, ch, FlatIdx, i, x0, y0, x1, y1, TagTop: integer;
+  BoxLabel: string;
+  BoxColor, TextColor: array[0..2] of TNeuralFloat;
   V: TNeuralFloat;
   AnyBad: boolean;
 
@@ -216,6 +218,22 @@ begin
       x1 := Max(0, Min(W - 1, x1)); y1 := Max(0, Min(H - 1, y1));
       DrawBox(Img, x0, y0, x1, y1,
         PaletteR[i mod 6], PaletteG[i mod 6], PaletteB[i mod 6]);
+      // "class score" on a tag of the box colour above the box (inside at the top).
+      BoxColor[0] := PaletteR[i mod 6];
+      BoxColor[1] := PaletteG[i mod 6];
+      BoxColor[2] := PaletteB[i mod 6];
+      if BoxColor[0] + BoxColor[1] + BoxColor[2] >= 510 then
+        TextColor[0] := 0
+      else
+        TextColor[0] := 255;
+      TextColor[1] := TextColor[0];
+      TextColor[2] := TextColor[0];
+      BoxLabel := Format('%d %.2f', [Dets[i].ClassId, Dets[i].Score]);
+      TagTop := y0 - csBitmapFontGlyphHeight - 2;
+      if TagTop < 0 then TagTop := y0;
+      FillRectangleCV2(Img, x0, TagTop, x0 + BitmapTextWidth(BoxLabel) + 1,
+        TagTop + csBitmapFontGlyphHeight + 1, BoxColor);
+      DrawBitmapText(Img, x0 + 1, TagTop + 1, BoxLabel, TextColor);
     end;
     WriteLn('  box-decode self-check OK: all boxes finite, pixel coords ' +
       'clamped to canvas.');

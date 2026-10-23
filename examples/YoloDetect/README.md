@@ -14,7 +14,7 @@ image (ImageSize x ImageSize x NumChannels)
   -> DecodeYoloDetections: sigmoid class logits, DFL-decode each box side
      (softmax the reg_max bins -> expected ltrb distance -> xyxy pixels),
      greedy IoU NMS
-  -> draw colored box outlines -> PPM + (class, score, box) list
+  -> draw colored box outlines + "class score" labels -> PPM + (class, score, box) list
 ```
 
 ## The importer
@@ -58,6 +58,8 @@ pretrained checkpoint produces real detections through the exact same path.
 Prints the config (image size, class count, reg_max, strides), the output-OK
 check, the decoded `(class, score, xyxy)` list and the box self-check, then writes
 the annotated image to `yolo_detect.ppm` (a P6 PPM, min-max stretched so boxes are
-visible). Pure CPU, <1 s on the fixture.
+visible). Each box carries a tag in its colour with the class id and score
+(e.g. `2 0.53`), drawn with `DrawBitmapText` (`neural/neuralimageresize.pas`);
+the config has no class names, so the id stands in for the name. Pure CPU, <1 s on the fixture.
 
 Coded by Claude (AI).

@@ -145,6 +145,25 @@ procedure FillConvexPolygonCV2(Image: TNNetVolume;
 procedure FillCircleCV2(Image: TNNetVolume; CenterX, CenterY, Radius: integer;
   const Color: array of TNeuralFloat);
 
+// cv2.rectangle(Image, (X1, Y1), (X2, Y2), Color, thickness=-1): the corners in
+// any order, both inclusive, clipped.
+procedure FillRectangleCV2(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat);
+
+const
+  // DrawBitmapText glyph size in font pixels; glyphs sit 1 font pixel apart.
+  csBitmapFontGlyphWidth = 5;
+  csBitmapFontGlyphHeight = 7;
+
+// Width in pixels of Text drawn by DrawBitmapText: (6 * Length - 1) * Scale.
+function BitmapTextWidth(const Text: string; Scale: integer = 1): integer;
+
+// Draws Text in a 5x7 font, top-left at (Left, Top), each font pixel Scale x Scale,
+// clipped; lower case as upper case, unknown characters as '?'. Returns the width.
+function DrawBitmapText(Image: TNNetVolume; Left, Top: integer;
+  const Text: string; const Color: array of TNeuralFloat;
+  Scale: integer = 1): integer;
+
 type
   // 2 x 3 affine matrix [a b c; d e f], row major, as cv2: (x, y) -> (ax+by+c, dx+ey+f).
   TImageAffineMatrix = array[0..5] of double;
@@ -1246,6 +1265,107 @@ begin
       Dec(OffsetX);
       Dec(Minus, 2);
     end;
+  end;
+end;
+
+// FillRectangleCV2 without the Color check.
+procedure FillRectangleUnchecked(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat);
+var
+  Swap, Y: integer;
+begin
+  if X2 < X1 then
+  begin
+    Swap := X1; X1 := X2; X2 := Swap;
+  end;
+  if Y2 < Y1 then
+  begin
+    Swap := Y1; Y1 := Y2; Y2 := Swap;
+  end;
+  X1 := Max(X1, 0);
+  Y1 := Max(Y1, 0);
+  X2 := Min(X2, Image.SizeX - 1);
+  Y2 := Min(Y2, Image.SizeY - 1);
+  if X1 > X2 then exit;
+  for Y := Y1 to Y2 do FillImageRowSpan(Image, Y, X1, X2, Color);
+end;
+
+procedure FillRectangleCV2(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat);
+begin
+  CheckDrawColor(Image, Color, 'FillRectangleCV2');
+  FillRectangleUnchecked(Image, X1, Y1, X2, Y2, Color);
+end;
+
+const
+  csBitmapFontCharacters = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ .,:-_%#/()!?+=''';
+  csBitmapFontGlyphCount = Length(csBitmapFontCharacters);
+  csBitmapFontUnknownGlyphPos = 48; // '?'
+  // One byte per glyph row, top row first; bit 4 is the left column.
+  csBitmapFontRows: array[0..csBitmapFontGlyphCount - 1,
+    0..csBitmapFontGlyphHeight - 1] of byte = (
+    ($0E, $11, $13, $15, $19, $11, $0E), ($04, $0C, $04, $04, $04, $04, $0E),
+    ($0E, $11, $01, $02, $04, $08, $1F), ($1F, $02, $04, $02, $01, $11, $0E),
+    ($02, $06, $0A, $12, $1F, $02, $02), ($1F, $10, $1E, $01, $01, $11, $0E),
+    ($06, $08, $10, $1E, $11, $11, $0E), ($1F, $01, $02, $04, $08, $08, $08),
+    ($0E, $11, $11, $0E, $11, $11, $0E), ($0E, $11, $11, $0F, $01, $02, $0C),
+    ($0E, $11, $11, $11, $1F, $11, $11), ($1E, $11, $11, $1E, $11, $11, $1E),
+    ($0E, $11, $10, $10, $10, $11, $0E), ($1C, $12, $11, $11, $11, $12, $1C),
+    ($1F, $10, $10, $1E, $10, $10, $1F), ($1F, $10, $10, $1E, $10, $10, $10),
+    ($0E, $11, $10, $17, $11, $11, $0F), ($11, $11, $11, $1F, $11, $11, $11),
+    ($0E, $04, $04, $04, $04, $04, $0E), ($07, $02, $02, $02, $02, $12, $0C),
+    ($11, $12, $14, $18, $14, $12, $11), ($10, $10, $10, $10, $10, $10, $1F),
+    ($11, $1B, $15, $15, $11, $11, $11), ($11, $11, $19, $15, $13, $11, $11),
+    ($0E, $11, $11, $11, $11, $11, $0E), ($1E, $11, $11, $1E, $10, $10, $10),
+    ($0E, $11, $11, $11, $15, $12, $0D), ($1E, $11, $11, $1E, $14, $12, $11),
+    ($0F, $10, $10, $0E, $01, $01, $1E), ($1F, $04, $04, $04, $04, $04, $04),
+    ($11, $11, $11, $11, $11, $11, $0E), ($11, $11, $11, $11, $11, $0A, $04),
+    ($11, $11, $11, $15, $15, $15, $0A), ($11, $11, $0A, $04, $0A, $11, $11),
+    ($11, $11, $11, $0A, $04, $04, $04), ($1F, $01, $02, $04, $08, $10, $1F),
+    ($00, $00, $00, $00, $00, $00, $00), ($00, $00, $00, $00, $00, $0C, $0C),
+    ($00, $00, $00, $00, $0C, $04, $08), ($00, $0C, $0C, $00, $0C, $0C, $00),
+    ($00, $00, $00, $1F, $00, $00, $00), ($00, $00, $00, $00, $00, $00, $1F),
+    ($18, $19, $02, $04, $08, $13, $03), ($0A, $0A, $1F, $0A, $1F, $0A, $0A),
+    ($00, $01, $02, $04, $08, $10, $00), ($02, $04, $08, $08, $08, $04, $02),
+    ($08, $04, $02, $02, $02, $04, $08), ($04, $04, $04, $04, $00, $00, $04),
+    ($0E, $11, $01, $02, $04, $00, $04), ($00, $04, $04, $1F, $04, $04, $00),
+    ($00, $00, $1F, $00, $1F, $00, $00), ($0C, $04, $08, $00, $00, $00, $00));
+
+function BitmapTextWidth(const Text: string; Scale: integer): integer;
+begin
+  if Scale < 1 then
+    raise EArgumentException.Create('BitmapTextWidth: Scale must be >= 1.');
+  if Text = '' then exit(0);
+  Result := ((csBitmapFontGlyphWidth + 1) * Length(Text) - 1) * Scale;
+end;
+
+function DrawBitmapText(Image: TNNetVolume; Left, Top: integer;
+  const Text: string; const Color: array of TNeuralFloat;
+  Scale: integer): integer;
+var
+  CharPos, GlyphPos, RowPos, ColumnPos, RowBits, GlyphLeft, CellLeft,
+    CellTop: integer;
+begin
+  CheckDrawColor(Image, Color, 'DrawBitmapText');
+  Result := BitmapTextWidth(Text, Scale);
+  GlyphLeft := Left;
+  for CharPos := 1 to Length(Text) do
+  begin
+    GlyphPos := Pos(UpCase(Text[CharPos]), csBitmapFontCharacters) - 1;
+    if GlyphPos < 0 then GlyphPos := csBitmapFontUnknownGlyphPos;
+    for RowPos := 0 to csBitmapFontGlyphHeight - 1 do
+    begin
+      RowBits := csBitmapFontRows[GlyphPos, RowPos];
+      CellTop := Top + RowPos * Scale;
+      for ColumnPos := 0 to csBitmapFontGlyphWidth - 1 do
+        if (RowBits shr (csBitmapFontGlyphWidth - 1 - ColumnPos)) and 1 = 1 then
+        begin
+          CellLeft := GlyphLeft + ColumnPos * Scale;
+          FillRectangleUnchecked(Image, CellLeft, CellTop, CellLeft + Scale - 1,
+            CellTop + Scale - 1, Color);
+        end;
+    end;
+    Inc(GlyphLeft, (csBitmapFontGlyphWidth + 1) * Scale);
   end;
 end;
 

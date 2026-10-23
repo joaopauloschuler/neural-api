@@ -137,6 +137,14 @@ type
     // cv2.erode (0 = 3x3, 2, 4) and cv2.GaussianBlur(k, 0) (3, 9, 11) of a
     // 9x7 float mask.
     procedure TestErodeAndGaussianBlurCV2MatchCV2;
+    // DrawBitmapText of 'A' (3 channels), '1' at scale 2, lower case as upper
+    // case and an unknown character as '?' against hand-drawn 5x7 patterns.
+    procedure TestBitmapTextGlyphPixels;
+    // BitmapTextWidth / the DrawBitmapText result: (6 * Length - 1) * Scale.
+    procedure TestBitmapTextWidth;
+    // Text and FillRectangleCV2 across or far past the image border are
+    // clipped pixel-exactly without exceptions; a wrong Color length raises.
+    procedure TestBitmapTextClipsAtBorder;
   end;
 
 implementation
@@ -1933,6 +1941,142 @@ begin
     RemoveDir(Dir);
   end;
 end;
+
+// '' when every pixel of Image is Color inside the '#' cells of Pattern (font
+// pixels Scale x Scale from (Left, Top)) and 0 elsewhere; else the first mismatch.
+function BitmapPatternMismatch(Image: TNNetVolume; Left, Top, Scale: integer;
+  const Pattern: array of string; const Color: array of TNeuralFloat): string;
+var
+  X, Y, Channel, PatternColumn, PatternRow: integer;
+  Expected: TNeuralFloat;
+begin
+  Result := '';
+  for Y := 0 to Image.SizeY - 1 do
+    for X := 0 to Image.SizeX - 1 do
+      for Channel := 0 to Image.Depth - 1 do
+      begin
+        Expected := 0;
+        if (X >= Left) and (Y >= Top) then
+        begin
+          PatternColumn := (X - Left) div Scale;
+          PatternRow := (Y - Top) div Scale;
+          if (PatternRow <= High(Pattern)) and
+            (PatternColumn < Length(Pattern[PatternRow])) and
+            (Pattern[PatternRow][PatternColumn + 1] = '#') then
+            Expected := Color[Channel];
+        end;
+        if Image[X, Y, Channel] <> Expected then
+          exit(Format('pixel (%d, %d, %d) is %g, expected %g',
+            [X, Y, Channel, Image[X, Y, Channel], Expected]));
+      end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestBitmapTextGlyphPixels;
+const
+  csGlyphA: array[0..6] of string = ('.###.', '#...#', '#...#', '#...#',
+    '#####', '#...#', '#...#');
+  csGlyphOne: array[0..6] of string = ('..#..', '.##..', '..#..', '..#..',
+    '..#..', '..#..', '.###.');
+  csGlyphQuestion: array[0..6] of string = ('.###.', '#...#', '....#',
+    '...#.', '..#..', '.....', '..#..');
+  csRGB: array[0..2] of TNeuralFloat = (10, 20, 30);
+  csWhite: array[0..0] of TNeuralFloat = (255);
+var
+  Image: TNNetVolume;
+begin
+  Image := TNNetVolume.Create(8, 10, 3);
+  try
+    Image.Fill(0);
+    AssertEquals('A width', 5, DrawBitmapText(Image, 1, 2, 'A', csRGB));
+    AssertEquals('A', '', BitmapPatternMismatch(Image, 1, 2, 1, csGlyphA, csRGB));
+    Image.Fill(0);
+    DrawBitmapText(Image, 1, 2, 'a', csRGB);
+    AssertEquals('a as A', '', BitmapPatternMismatch(Image, 1, 2, 1, csGlyphA,
+      csRGB));
+    Image.ReSize(12, 16, 1);
+    Image.Fill(0);
+    AssertEquals('1 width', 10, DrawBitmapText(Image, 1, 1, '1', csWhite, 2));
+    AssertEquals('1 at scale 2', '', BitmapPatternMismatch(Image, 1, 1, 2,
+      csGlyphOne, csWhite));
+    Image.Fill(0);
+    DrawBitmapText(Image, 3, 4, '~', csWhite);
+    AssertEquals('unknown as ?', '', BitmapPatternMismatch(Image, 3, 4, 1,
+      csGlyphQuestion, csWhite));
+  finally
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestBitmapTextWidth;
+const
+  csWhite: array[0..0] of TNeuralFloat = (1);
+var
+  Image: TNNetVolume;
+  HasRaised: boolean;
+begin
+  AssertEquals('empty', 0, BitmapTextWidth(''));
+  AssertEquals('one glyph', 5, BitmapTextWidth('A'));
+  AssertEquals('ID:12 at scale 2', 58, BitmapTextWidth('ID:12', 2));
+  Image := TNNetVolume.Create(4, 4, 1);
+  try
+    AssertEquals('drawn width', 33, DrawBitmapText(Image, 0, 0, 'AB', csWhite, 3));
+    AssertEquals('drawn empty', 0, DrawBitmapText(Image, 0, 0, '', csWhite));
+  finally
+    Image.Free;
+  end;
+  HasRaised := false;
+  try
+    BitmapTextWidth('A', 0);
+  except
+    on EArgumentException do HasRaised := true;
+  end;
+  AssertTrue('scale 0 raises', HasRaised);
+end;
+
+procedure TTestNeuralImagePreprocess.TestBitmapTextClipsAtBorder;
+const
+  csGlyphMinus: array[0..6] of string = ('.....', '.....', '.....', '#####',
+    '.....', '.....', '.....');
+  csAllOn: array[0..0] of string = ('#####');
+  csOne: array[0..0] of TNeuralFloat = (1);
+  csSeven: array[0..0] of TNeuralFloat = (7);
+  csTwoChannels: array[0..1] of TNeuralFloat = (1, 2);
+var
+  Image: TNNetVolume;
+  HasRaised: boolean;
+begin
+  Image := TNNetVolume.Create(4, 4, 1);
+  try
+    Image.Fill(0);
+    DrawBitmapText(Image, -2, -3, '-', csOne);
+    AssertEquals('minus across the top-left corner', '',
+      BitmapPatternMismatch(Image, -2, -3, 1, csGlyphMinus, csOne));
+    Image.Fill(0);
+    DrawBitmapText(Image, 1000, 1000, 'HELLO', csOne);
+    DrawBitmapText(Image, -1000, -1000, 'HELLO', csOne, 50);
+    DrawBitmapText(Image, 3, -1000, 'W%#', csOne, 20);
+    AssertEquals('far outside draws nothing', 0, Image.GetSum(), 0);
+    // W row 3 is #.#.#: at scale 100 its middle cell covers the whole image.
+    DrawBitmapText(Image, -200, -300, 'W', csOne, 100);
+    AssertEquals('one font pixel over all of it', '',
+      BitmapPatternMismatch(Image, -1, -1, 100, csAllOn, csOne));
+    Image.Fill(0);
+    FillRectangleCV2(Image, 5, 3, -2, 1, csSeven);
+    AssertEquals('rectangle rows 1-3', 7 * 12, Image.GetSum(), 0);
+    AssertEquals('rectangle row 0', 0, Image[2, 0, 0], 0);
+    AssertEquals('rectangle row 1', 7, Image[0, 1, 0], 0);
+    HasRaised := false;
+    try
+      DrawBitmapText(Image, 0, 0, 'A', csTwoChannels);
+    except
+      on EArgumentException do HasRaised := true;
+    end;
+    AssertTrue('colour per channel', HasRaised);
+  finally
+    Image.Free;
+  end;
+end;
+
 
 initialization
   RegisterTest(TTestNeuralImagePreprocess);

@@ -43,11 +43,6 @@ const
     $FFB21D, $CFD231, $48F90A, $92CC17, $3DDB86, $1A9334, $00D4BB, $2C99A8,
     $00C2FF, $344593, $6473FF, $0018EC, $8438FF, $520085, $CB38FF, $FF95C8,
     $FF37C7);
-  // 3x5 digit glyphs, one row per entry, bit 2 = left column.
-  csDigitGlyphs: array[0..9, 0..4] of byte = (
-    (7, 5, 5, 5, 7), (2, 6, 2, 2, 7), (7, 1, 7, 4, 7), (7, 1, 7, 1, 7),
-    (5, 5, 7, 1, 1), (7, 4, 7, 1, 7), (7, 4, 7, 5, 7), (7, 1, 1, 1, 1),
-    (7, 5, 7, 5, 7), (7, 5, 7, 1, 7));
 
 type
   TObjectTrackingOptions = record
@@ -205,52 +200,18 @@ begin
   SetLength(Dets, KeptCount);
 end;
 
-// Paints the clipped rectangle [X1, X2] x [Y1, Y2] of Image with Color.
-procedure FillRectangle(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
-  const Color: array of TNeuralFloat);
-var
-  Y: integer;
-begin
-  for Y := Y1 to Y2 do
-    DrawLineCV2(Image, X1, Y, X2, Y, Color);
-end;
-
-// Draws the decimal Number with its top-left corner at (Left, Top), each glyph
-// pixel PixelSize x PixelSize; returns the width drawn.
-function DrawNumber(Image: TNNetVolume; Left, Top, PixelSize, Number: integer;
-  const Color: array of TNeuralFloat): integer;
-var
-  Digits: string;
-  DigitPos, Row, Column, Digit, CellX, CellY: integer;
-begin
-  Digits := IntToStr(Number);
-  for DigitPos := 1 to Length(Digits) do
-  begin
-    Digit := Ord(Digits[DigitPos]) - Ord('0');
-    for Row := 0 to 4 do
-      for Column := 0 to 2 do
-        if (csDigitGlyphs[Digit, Row] shr (2 - Column)) and 1 = 1 then
-        begin
-          CellX := Left + (4 * (DigitPos - 1) + Column) * PixelSize;
-          CellY := Top + Row * PixelSize;
-          FillRectangle(Image, CellX, CellY, CellX + PixelSize - 1,
-            CellY + PixelSize - 1, Color);
-        end;
-  end;
-  Result := (4 * Length(Digits) - 1) * PixelSize;
-end;
-
 // Draws every track box of Tracks into Image (RGB 0..255): a 2 px outline in
 // the colour of its id and the id on a filled tag above the top-left corner.
 procedure DrawTracks(Image: TNNetVolume; const Tracks: TByteTrackedBoxArray);
 var
   TrackPos, MaxTrackPos, X1, Y1, X2, Y2, PixelSize, TagWidth, TagHeight,
     TagTop: integer;
+  TrackLabel: string;
   RGB: cardinal;
   BoxColor, TextColor: array[0..2] of TNeuralFloat;
 begin
-  PixelSize := Max(1, Min(Image.SizeX, Image.SizeY) div 160);
-  TagHeight := 7 * PixelSize;
+  PixelSize := Max(1, Min(Image.SizeX, Image.SizeY) div 240);
+  TagHeight := (csBitmapFontGlyphHeight + 2) * PixelSize;
   MaxTrackPos := High(Tracks);
   for TrackPos := 0 to MaxTrackPos do
   begin
@@ -280,11 +241,12 @@ begin
     // The tag sits above the box, or inside it when the box touches the top.
     TagTop := Y1 - TagHeight;
     if TagTop < 0 then TagTop := Y1;
-    TagWidth := (4 * Length(IntToStr(Tracks[TrackPos].TrackId)) + 1) * PixelSize;
-    FillRectangle(Image, X1, TagTop, X1 + TagWidth - 1, TagTop + TagHeight - 1,
+    TrackLabel := IntToStr(Tracks[TrackPos].TrackId);
+    TagWidth := BitmapTextWidth(TrackLabel, PixelSize) + 2 * PixelSize;
+    FillRectangleCV2(Image, X1, TagTop, X1 + TagWidth - 1, TagTop + TagHeight - 1,
       BoxColor);
-    DrawNumber(Image, X1 + PixelSize, TagTop + PixelSize, PixelSize,
-      Tracks[TrackPos].TrackId, TextColor);
+    DrawBitmapText(Image, X1 + PixelSize, TagTop + PixelSize, TrackLabel,
+      TextColor, PixelSize);
   end;
 end;
 

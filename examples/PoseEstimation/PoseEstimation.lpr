@@ -23,7 +23,8 @@ program PoseEstimation;
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
-  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
+  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained,
+  neuralimageresize;
 
 type
   TPoseOptions = record
@@ -140,41 +141,46 @@ begin
        Pose.Joints[Joint].Score]));
 end;
 
-procedure PlotSquare(Image: TNNetVolume; CenterX, CenterY, Radius: integer;
-  Red, Green, Blue: TNeuralFloat);
-var
-  X, Y: integer;
-begin
-  for Y := Max(0, CenterY - Radius) to Min(Image.SizeY - 1, CenterY + Radius) do
-    for X := Max(0, CenterX - Radius) to Min(Image.SizeX - 1, CenterX + Radius) do
-    begin
-      Image[X, Y, 0] := Red;
-      Image[X, Y, 1] := Green;
-      Image[X, Y, 2] := Blue;
-    end;
-end;
-
-// Draws each box outline in green and each joint as a red square.
+// Draws each box outline in green with a "person score" tag above it and each
+// joint as a red square.
 procedure DrawPoses(Image: TNNetVolume; const Poses: TPoseKeypointsArray);
+const
+  csBoxColor: array[0..2] of TNeuralFloat = (0, 255, 0);
+  csTextColor: array[0..2] of TNeuralFloat = (0, 0, 0);
+  csJointColor: array[0..2] of TNeuralFloat = (255, 0, 0);
 var
-  PersonPos, Joint, Pos, Radius: integer;
+  PersonPos, Joint, Radius, TextScale, TagHeight, TagTop, X1, Y1, X2, Y2,
+    JointX, JointY: integer;
+  BoxLabel: string;
 begin
   Radius := Max(1, Min(Image.SizeX, Image.SizeY) div 200);
+  TextScale := Max(1, Min(Image.SizeX, Image.SizeY) div 240);
+  TagHeight := (csBitmapFontGlyphHeight + 2) * TextScale;
   for PersonPos := 0 to High(Poses) do
   begin
-    for Pos := Round(Poses[PersonPos].X1) to Round(Poses[PersonPos].X2) do
-    begin
-      PlotSquare(Image, Pos, Round(Poses[PersonPos].Y1), 0, 0, 255, 0);
-      PlotSquare(Image, Pos, Round(Poses[PersonPos].Y2), 0, 0, 255, 0);
-    end;
-    for Pos := Round(Poses[PersonPos].Y1) to Round(Poses[PersonPos].Y2) do
-    begin
-      PlotSquare(Image, Round(Poses[PersonPos].X1), Pos, 0, 0, 255, 0);
-      PlotSquare(Image, Round(Poses[PersonPos].X2), Pos, 0, 0, 255, 0);
-    end;
+    X1 := Round(Poses[PersonPos].X1);
+    Y1 := Round(Poses[PersonPos].Y1);
+    X2 := Round(Poses[PersonPos].X2);
+    Y2 := Round(Poses[PersonPos].Y2);
+    DrawLineCV2(Image, X1, Y1, X2, Y1, csBoxColor);
+    DrawLineCV2(Image, X1, Y2, X2, Y2, csBoxColor);
+    DrawLineCV2(Image, X1, Y1, X1, Y2, csBoxColor);
+    DrawLineCV2(Image, X2, Y1, X2, Y2, csBoxColor);
+    BoxLabel := Format('person %.2f', [Poses[PersonPos].BoxScore]);
+    TagTop := Y1 - TagHeight;
+    if TagTop < 0 then TagTop := Y1;
+    FillRectangleCV2(Image, X1, TagTop,
+      X1 + BitmapTextWidth(BoxLabel, TextScale) + 2 * TextScale - 1,
+      TagTop + TagHeight - 1, csBoxColor);
+    DrawBitmapText(Image, X1 + TextScale, TagTop + TextScale, BoxLabel,
+      csTextColor, TextScale);
     for Joint := 0 to High(Poses[PersonPos].Joints) do
-      PlotSquare(Image, Round(Poses[PersonPos].Joints[Joint].X),
-        Round(Poses[PersonPos].Joints[Joint].Y), Radius, 255, 0, 0);
+    begin
+      JointX := Round(Poses[PersonPos].Joints[Joint].X);
+      JointY := Round(Poses[PersonPos].Joints[Joint].Y);
+      FillRectangleCV2(Image, JointX - Radius, JointY - Radius, JointX + Radius,
+        JointY + Radius, csJointColor);
+    end;
   end;
 end;
 
