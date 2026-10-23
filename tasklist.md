@@ -780,7 +780,7 @@ rather than acted on.
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close.
-- [ ] GLIGEN: skip the fuser branch once its gates close (it now still runs and
+- [X] GLIGEN: skip the fuser branch once its gates close (it now still runs and
       adds zeros for the last `(1 - beta) * steps` steps).
 - [ ] GLIGEN text-image variant (`gligen-1-4-generation-text-image-box`:
       `linears_text` / `linears_image`, CLIP image embeddings as grounding).

@@ -212,7 +212,8 @@ the visual tokens attend over themselves plus the object tokens, and a GEGLU
 feed-forward follows; both are added through `tanh(alpha)` gates.
 `--gligen-beta B` (default 0.3, diffusers `gligen_scheduled_sampling_beta`)
 runs the fusers for the first `int(B * steps)` steps only; after that the
-pipeline sets their gates to 0, so the UNet is the plain one. The unguided
+forward skips every fuser layer (`TNNetLayer.ForwardSkipped`), so the
+remaining steps cost what the plain UNet costs. The unguided
 half of CFG fills every object slot with the learned null features, as
 diffusers does.
 
@@ -222,7 +223,7 @@ position_net tensors (`TestStableDiffusionGLIGENPositionNetParity`,
 CFG with beta 0.5 and no CFG with beta 0.3, max |diff| below 2e-5). No real
 GLIGEN checkpoint has been run yet. The text-image variant
 (`gligen-1-4-generation-text-image-box`) and GLIGEN inpainting are not
-supported. The fuser still runs after its gates close; it just adds zeros.
+supported.
 
 `--init-image PNG [--strength S]` turns the run into image-to-image, as
 diffusers `StableDiffusionImg2ImgPipeline` (`TStableDiffusionImg2Img`). The

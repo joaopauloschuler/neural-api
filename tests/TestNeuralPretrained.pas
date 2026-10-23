@@ -1367,7 +1367,8 @@ type
     procedure TestStableDiffusionIPAdapterParity;
     procedure TestStableDiffusionIPAdapterScaleZero;
     // diffusers GLIGEN text-box (tiny_sd15_gligen_io.json): pooler_output and
-    // position_net objs (prompt and all-null), then one gated UNet call.
+    // position_net objs (prompt and all-null), then one gated UNet call;
+    // skipped fuser branches must equal closed gates.
     procedure TestStableDiffusionGLIGENPositionNetParity;
     procedure TestStableDiffusionGLIGENUNetParity;
     // StableDiffusionGLIGENPipeline steps + image for CFG / no CFG and two
@@ -47136,6 +47137,8 @@ begin
 end;
 
 procedure TTestNeuralPretrained.TestStableDiffusionGLIGENUNetParity;
+const
+  csSentinel = 12345;
 var
   Pipeline: TStableDiffusionPipeline;
   Reader, GLIGENReader: TNNetSafeTensorsReader;
@@ -47144,7 +47147,7 @@ var
   Net: TNNet;
   Oracle, UNetCheck: TJSONObject;
   Embeds, Initial, Objects, Noise, Expected: TNNetVolume;
-  GatePos: integer;
+  GatePos, LayerPos: integer;
   MaxDiff: double;
 begin
   FSD15Oracle := LoadSD15Fixture('tiny_sd15_gligen_io.json');
@@ -47189,6 +47192,24 @@ begin
       Objects);
     AssertTrue('the fusers move the output', MaxAbsVolumeDiff(Noise,
       Objects) > 1e-3);
+    // Skipping the fuser branches reproduces the closed gates without running
+    // a branch layer (each keeps its sentinel output).
+    AssertTrue('fuser branch layers found', Length(Inputs.GLIGENBranchLayers) >
+      Length(Inputs.GLIGENGates));
+    for LayerPos := 0 to High(Inputs.GLIGENBranchLayers) do
+    begin
+      Inputs.GLIGENBranchLayers[LayerPos].ForwardSkipped := true;
+      Inputs.GLIGENBranchLayers[LayerPos].Output.Fill(csSentinel);
+    end;
+    SDUNetDenoise(Net, Config, Initial, Embeds, UNetCheck.Get('timestep', 0),
+      Expected);
+    MaxDiff := MaxAbsVolumeDiff(Expected, Objects);
+    AssertTrue('skipped vs closed fusers max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff = 0);
+    for LayerPos := 0 to High(Inputs.GLIGENBranchLayers) do
+      AssertTrue('skipped fuser layer ' + IntToStr(LayerPos) + ' ran',
+        (Inputs.GLIGENBranchLayers[LayerPos].Output.GetMin() = csSentinel) and
+        (Inputs.GLIGENBranchLayers[LayerPos].Output.GetMax() = csSentinel));
   finally
     Expected.Free;
     Noise.Free;

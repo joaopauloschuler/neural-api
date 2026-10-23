@@ -12139,6 +12139,9 @@ type
     // The GLIGEN object tokens and every fuser's two TNNetGatedResidual gates.
     GLIGENObjects: TNNetLayer;
     GLIGENGates: array of TNNetLayer;
+    // Every fuser layer but the two residual TNNetSums: with all of them
+    // ForwardSkipped, each fuser outputs its input (diffusers enable_fuser(False)).
+    GLIGENBranchLayers: TNNetLayerRefArr;
     // One per down block (SDUNetAdapterFeatureCount).
     Adapter: array of TNNetLayer;
     // SDUNetControlDownCount skip inputs, in build order, then the mid one.
@@ -13505,8 +13508,8 @@ type
 
   // diffusers StableDiffusionGLIGENPipeline (text-box): phrases placed in
   // boxes through the fusers of a GLIGEN UNet file; the first
-  // Trunc(ScheduledSamplingBeta * steps) steps run them, the rest close their
-  // gates. Passes without sdpiPrompt (CFG's unconditional one) see all slots null.
+  // Trunc(ScheduledSamplingBeta * steps) steps run them, the rest skip them.
+  // Passes without sdpiPrompt (CFG's unconditional one) see all slots null.
   TStableDiffusionGLIGEN = class(TStableDiffusionConditioner)
   private
     FWeightsFile: string;
@@ -13518,13 +13521,12 @@ type
     FPositionNet, FBoxFourierNet: TNNet;
     FNullPositive, FNullPosition: TNNetVolume;
     FPooled, FPositionInput, FPromptObjects, FUncondObjects: TNNetVolume;
-    // While the gates are closed: the gate layers and their tanh(alpha).
-    FClosedGates: array of TNNetLayer;
-    FClosedGateValues: TNeuralFloatDynArr;
+    // While the gates are closed: the fuser layers the forward skips.
+    FSkippedBranchLayers: TNNetLayerRefArr;
     // Objects := position_net of the phrases (WithPhrases) or of null slots.
     procedure ProjectObjects(WithPhrases: boolean; Objects: TNNetVolume);
-    procedure CloseGates(const Gates: array of TNNetLayer);
-    procedure ReopenGates();
+    procedure SetBranchLayersSkipped(const BranchLayers: TNNetLayerRefArr;
+      IsSkipped: boolean);
   protected
     procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
       Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
@@ -78685,6 +78687,50 @@ begin
   Result := SDUNetNthInput(Net, 2);
 end;
 
+// AddGLIGENFuser appends each fuser as consecutive layers from its object-token
+// Linear to its FfGate; all but the TNNetSum after the AttnGate are the branch.
+function SDUNetGLIGENBranchLayers(Net: TNNet; Objects: TNNetLayer;
+  const Gates: array of TNNetLayer): TNNetLayerRefArr;
+var
+  LayerPos, MaxLayerPos, FuserCnt, BranchCnt, AttnSumIdx: integer;
+begin
+  Result := nil;
+  FuserCnt := 0;
+  BranchCnt := 0;
+  MaxLayerPos := Net.GetLastLayerIdx();
+  LayerPos := 0;
+  while LayerPos <= MaxLayerPos do
+  begin
+    if Net.Layers[LayerPos].PrevLayer <> Objects then
+    begin
+      Inc(LayerPos);
+      continue;
+    end;
+    if 2 * FuserCnt + 1 > High(Gates) then
+      ImportError('SDUNetGLIGENBranchLayers: more fusers than gate pairs.');
+    AttnSumIdx := Gates[2 * FuserCnt].LayerIdx + 1;
+    if (AttnSumIdx > MaxLayerPos) or
+      not (Net.Layers[AttnSumIdx] is TNNetSum) or
+      (Gates[2 * FuserCnt + 1].LayerIdx <= AttnSumIdx) then
+      ImportError('SDUNetGLIGENBranchLayers: fuser ' + IntToStr(FuserCnt) +
+        ' is not laid out as AddGLIGENFuser builds it.');
+    SetLength(Result, BranchCnt + Gates[2 * FuserCnt + 1].LayerIdx - LayerPos);
+    while LayerPos <= Gates[2 * FuserCnt + 1].LayerIdx do
+    begin
+      if LayerPos <> AttnSumIdx then
+      begin
+        Result[BranchCnt] := Net.Layers[LayerPos];
+        Inc(BranchCnt);
+      end;
+      Inc(LayerPos);
+    end;
+    Inc(FuserCnt);
+  end;
+  if 2 * FuserCnt <> Length(Gates) then
+    ImportError('SDUNetGLIGENBranchLayers: ' + IntToStr(FuserCnt) +
+      ' fusers for ' + IntToStr(Length(Gates)) + ' gates.');
+end;
+
 function SDUNetConditioningInputs(Net: TNNet; const Config: TSDUNetConfig;
   WithIPAdapter, WithAdapter, WithControl: boolean;
   WithGLIGEN: boolean = false): TSDUNetConditioningInputs;
@@ -78719,6 +78765,7 @@ begin
   InputCount := 0;
   GateCount := 0;
   Result.GLIGENGates := nil;
+  Result.GLIGENBranchLayers := nil;
   MaxLayerPos := Net.CountLayers() - 1;
   for LayerPos := 0 to MaxLayerPos do
     if Net.Layers[LayerPos] is TNNetInput then
@@ -78757,6 +78804,8 @@ begin
   begin
     Result.GLIGENObjects := Inputs[NextInput];
     Inc(NextInput);
+    Result.GLIGENBranchLayers := SDUNetGLIGENBranchLayers(Net,
+      Result.GLIGENObjects, Result.GLIGENGates);
   end;
   SetLength(Result.Adapter, AdapterCount);
   TakeInputs(Result.Adapter);
@@ -102423,7 +102472,7 @@ begin
   inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
   if BoxCount() = 0 then
     ImportError('TStableDiffusionGLIGEN: call AddBox first.');
-  FClosedGates := nil;
+  FSkippedBranchLayers := nil;
   if not Assigned(FPositionNet) or (FNetEpoch <> Pipeline.ComponentEpoch) then
   begin
     StartLoadPhase();
@@ -102469,34 +102518,14 @@ begin
   end;
 end;
 
-procedure TStableDiffusionGLIGEN.CloseGates(const Gates: array of TNNetLayer);
+procedure TStableDiffusionGLIGEN.SetBranchLayersSkipped(
+  const BranchLayers: TNNetLayerRefArr; IsSkipped: boolean);
 var
-  GatePos, MaxGatePos: integer;
+  LayerPos, MaxLayerPos: integer;
 begin
-  if Length(FClosedGates) > 0 then exit;
-  MaxGatePos := High(Gates);
-  SetLength(FClosedGates, MaxGatePos + 1);
-  SetLength(FClosedGateValues, MaxGatePos + 1);
-  for GatePos := 0 to MaxGatePos do
-  begin
-    FClosedGates[GatePos] := Gates[GatePos];
-    FClosedGateValues[GatePos] := Gates[GatePos].Neurons[0].Weights.FData[0];
-    Gates[GatePos].Neurons[0].Weights.Fill(0);
-    Gates[GatePos].FlushWeightCache();
-  end;
-end;
-
-procedure TStableDiffusionGLIGEN.ReopenGates();
-var
-  GatePos, MaxGatePos: integer;
-begin
-  MaxGatePos := High(FClosedGates);
-  for GatePos := 0 to MaxGatePos do
-  begin
-    FClosedGates[GatePos].Neurons[0].Weights.Fill(FClosedGateValues[GatePos]);
-    FClosedGates[GatePos].FlushWeightCache();
-  end;
-  FClosedGates := nil;
+  MaxLayerPos := High(BranchLayers);
+  for LayerPos := 0 to MaxLayerPos do
+    BranchLayers[LayerPos].ForwardSkipped := IsSkipped;
 end;
 
 procedure TStableDiffusionGLIGEN.FillUNetInputs(
@@ -102506,8 +102535,12 @@ const
   csWhat = 'TStableDiffusionGLIGEN: object tokens';
 begin
   // diffusers enable_fuser(False) from step int(beta * steps) on.
-  if FPipeline.FStepPos >= Trunc(FScheduledSamplingBeta * FPipeline.FStepCount) then
-    CloseGates(UNetInputs.GLIGENGates);
+  if (Length(FSkippedBranchLayers) = 0) and (FPipeline.FStepPos >=
+    Trunc(FScheduledSamplingBeta * FPipeline.FStepCount)) then
+  begin
+    FSkippedBranchLayers := UNetInputs.GLIGENBranchLayers;
+    SetBranchLayersSkipped(FSkippedBranchLayers, true);
+  end;
   if sdpiPrompt in Inputs then
     SDUNetWriteInput(UNetInputs.GLIGENObjects, FPromptObjects, false, csWhat)
   else
@@ -102516,7 +102549,8 @@ end;
 
 procedure TStableDiffusionGLIGEN.EndDenoise();
 begin
-  ReopenGates();
+  SetBranchLayersSkipped(FSkippedBranchLayers, false);
+  FSkippedBranchLayers := nil;
   if not FPipeline.ComponentsLoaded then
   begin
     FreeAndNil(FPositionNet);

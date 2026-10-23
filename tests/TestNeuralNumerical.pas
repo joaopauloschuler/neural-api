@@ -642,6 +642,9 @@ type
     // Sweeps 2, 3 and 5 sources: the last one exercises the accumulate branch
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
+    // ForwardSkipped branches: serial, parallel and OpenCL forwards leave them
+    // untouched and the TNNetSum counts them as zero (one source left: a copy).
+    procedure TestSumForwardSkippedSources;
     procedure TestCellMulByCellOpenCLParity;
     // AddSingleHeadSelfAttention(NoForward=true): both TNNetDotProducts (masked
     // Q.K, unmasked ValueT.W) run in OpenCL, binding Q and K. Coded by Claude (AI).
@@ -73202,6 +73205,101 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+procedure TTestNeuralNumerical.TestSumForwardSkippedSources;
+const
+  csSentinel = 12345;
+var
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  InputLayer: TNNetLayer;
+  SumLayer: TNNetSum;
+  Branches: array[0..2] of TNNetLayer;
+  BranchPos, i, PassPos: integer;
+  {$IFDEF OpenCL}
+  GPUCnt: integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+
+  // Forward with Branches[0..SkippedCount-1] skipped, against the sum of the rest.
+  procedure CheckSkipped(SkippedCount: integer; Parallel: boolean;
+    const What: string);
+  var
+    MaxDiff: TNeuralFloat;
+    BranchPos, i: integer;
+  begin
+    for BranchPos := 0 to 2 do Branches[BranchPos].ForwardSkipped := false;
+    NN.Compute(Input);
+    Expected.Fill(0);
+    for BranchPos := SkippedCount to 2 do
+    begin
+      Branches[BranchPos].ForceOutputOnRAM();
+      Expected.Add(Branches[BranchPos].Output);
+    end;
+    for BranchPos := 0 to SkippedCount - 1 do
+    begin
+      Branches[BranchPos].ForwardSkipped := true;
+      Branches[BranchPos].ForceOutputOnRAM();
+      Branches[BranchPos].Output.Fill(csSentinel);
+    end;
+    NN.Compute(Input, 0, Parallel);
+    MaxDiff := 0;
+    for i := 0 to Expected.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(Expected.Raw[i] - SumLayer.Output.Raw[i]));
+    AssertTrue(What + ': max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    for BranchPos := 0 to SkippedCount - 1 do
+      AssertTrue(What + ': skipped branch ' + IntToStr(BranchPos) + ' ran',
+        (Branches[BranchPos].Output.GetMin() = csSentinel) and
+        (Branches[BranchPos].Output.GetMax() = csSentinel));
+  end;
+
+begin
+  RandSeed := 424245;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 8);
+  Expected := TNNetVolume.Create(6, 6, 8);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+    for BranchPos := 0 to 2 do
+      Branches[BranchPos] := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+    SumLayer := TNNetSum.Create(Branches);
+    NN.AddLayer(SumLayer);
+    NN.SetTrainable(False, False);
+    NN.SchedulerMinGain := 0;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.05 * i - 0.3;
+    for PassPos := 0 to 1 do
+    begin
+      CheckSkipped(1, PassPos = 1, 'one skipped, parallel ' + IntToStr(PassPos));
+      CheckSkipped(2, PassPos = 1, 'two skipped, parallel ' + IntToStr(PassPos));
+    end;
+    {$IFDEF OpenCL}
+    if AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        GPUCnt := SumLayer.ForwardGPUCnt;
+        CheckSkipped(1, false, 'OpenCL one skipped');
+        AssertTrue('two sources left: the sum runs on the device',
+          SumLayer.ForwardGPUCnt > GPUCnt + 1);
+        GPUCnt := SumLayer.ForwardGPUCnt;
+        CheckSkipped(2, false, 'OpenCL two skipped');
+        AssertTrue('one source left: the device copies it',
+          SumLayer.ForwardGPUCnt > GPUCnt + 1);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+    end;
+    {$ENDIF}
+  finally
+    Expected.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
 
 // TNNet.LayerProfiling on OpenCL, with shared and with private kernels: a
 // layer on OpenCL counts one profiled forward per pass, and the input layer

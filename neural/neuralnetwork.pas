@@ -616,6 +616,8 @@ type
       FLayerIdx: integer;
       // Output sharing by liveness (TNNet) never shares this layer's output.
       FOutputPinned: boolean;
+      // See ForwardSkipped.
+      FForwardSkipped: boolean;
       {$IFDEF OpenCL}
       FHasOpenCL: boolean;
       FShouldOpenCL: boolean;
@@ -1143,6 +1145,9 @@ type
       // Set before arming and the first forward when a caller reads this output
       // after the forward: output sharing by liveness then keeps it private.
       property OutputPinned: boolean read FOutputPinned write SetOutputPinned;
+      // Inference only: TNNet's forward does not run this layer and its output
+      // goes stale; a TNNetSum counts it as zero. Nothing else may read it.
+      property ForwardSkipped: boolean read FForwardSkipped write FForwardSkipped;
   end;
 
   TNNetLayerClass = class of TNNetLayer;
@@ -90809,6 +90814,9 @@ begin
 end;
 
 function TNNetSum.WillOpenCL(): boolean;
+var
+  Source: TNNetLayer;
+  SourcePos, MaxSourcePos, ActiveCount: integer;
 begin
   Result := false;
   // Forward only: this path leaves the output on the device, and the backward
@@ -90818,19 +90826,29 @@ begin
   // EnableOpenCL sized FOutputBuffer for the output of that moment; a wider
   // output would overrun it, so such a forward stays on the host.
   if FOutput.Size > FOutputBufSize then exit;
-  // A single source is a copy, not a sum: nothing to win on the device.
+  // A single source is a copy, not a sum: nothing to win on the device. A sum
+  // left with one source by skipped ones copies there to keep its residency.
   if FPrevOutput.Count < 2 then exit;
-  Result := SourcesReadyOnOpenCL(FOutputKernel);
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  ActiveCount := 0;
+  for SourcePos := 0 to MaxSourcePos do
+  begin
+    Source := FPrevLayerList[SourcePos];
+    if Source.FForwardSkipped then continue;
+    if not Source.OutputBindableOnOpenCL() then exit;
+    Inc(ActiveCount);
+  end;
+  Result := ActiveCount > 0;
 end;
 
 procedure TNNetSum.ComputeOpenCL();
 var
+  Source: TNNetLayer;
   Kern: cl_kernel;
   MaxSourcePos, SourcePos, SlotCnt, SlotPos: integer;
   iSize, iCount, iAccumulate: longint;
   SlotBuffer: array[0..3] of cl_mem;
 begin
-  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
   Kern := FOutputKernel.Kernel;
   iSize := FOutput.Size;
   MaxSourcePos := FPrevLayerList.Count - 1;
@@ -90843,10 +90861,14 @@ begin
     SlotCnt := 0;
     while (SlotCnt < 4) and (SourcePos <= MaxSourcePos) do
     begin
-      SlotBuffer[SlotCnt] := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
-      Inc(SlotCnt);
+      Source := FPrevLayerList[SourcePos];
       Inc(SourcePos);
+      if Source.FForwardSkipped then continue;
+      Source.OpenCLWaitOutputIfAnotherQueue(FOutputKernel);
+      SlotBuffer[SlotCnt] := Source.OpenCLOutputBuffer();
+      Inc(SlotCnt);
     end;
+    if SlotCnt = 0 then break;
     for SlotPos := SlotCnt to 3 do SlotBuffer[SlotPos] := SlotBuffer[0];
     iCount := SlotCnt;
     clSetKernelArg(Kern, 0, csLongintSize, @iSize);
@@ -90877,6 +90899,7 @@ var
   MaxPrevOutputPos: integer;
   LayerCnt: integer;
   StartTime: double;
+  IsOutputSet: boolean;
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
@@ -90888,19 +90911,25 @@ begin
     exit;
   end;
   Inc(FForwardCPUCnt);
-  FPrevLayerList.ForceOutputOnRAM();
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
-  FOutput.Copy(FPrevOutput[0]);
-  if FPrevOutput.Count > 1 then
+  IsOutputSet := false;
+  MaxPrevOutputPos := FPrevOutput.Count - 1;
+  for LayerCnt := 0 to MaxPrevOutputPos do
   begin
-    MaxPrevOutputPos := FPrevOutput.Count - 1;
-    for LayerCnt := 1 to MaxPrevOutputPos do
+    if FPrevLayerList[LayerCnt].FForwardSkipped then continue;
+    {$IFDEF OpenCL}
+    FPrevLayerList[LayerCnt].ForceOutputOnRAM();
+    {$ENDIF}
+    if IsOutputSet then FOutput.Add(FPrevOutput[LayerCnt])
+    else
     begin
-      FOutput.Add(FPrevOutput[LayerCnt]);
+      FOutput.Copy(FPrevOutput[LayerCnt]);
+      IsOutputSet := true;
     end;
   end;
+  if not IsOutputSet then FOutput.Fill(0);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -144837,6 +144866,7 @@ begin
     if HasQueueDrains and FDrainOpenCLQueueBefore[LayerCnt] then
       DrainOpenCLQueue();
     {$ENDIF}
+    if FLayers[LayerCnt].FForwardSkipped then continue;
     if RunLayersProfiled
       then FLayers[LayerCnt].RunProfiled({ChunkPrep=}false)
       else FLayers[LayerCnt].Compute();
@@ -145089,6 +145119,13 @@ begin
   if (pLayerIdx < Length(FDrainOpenCLQueueBefore)) and
     FDrainOpenCLQueueBefore[pLayerIdx] then DrainOpenCLQueue();
   {$ENDIF}
+  // A skipped layer completes as whole-layer work that computes nothing.
+  if L.FForwardSkipped then
+  begin
+    WorkQueuePush(FSchedWork, Ord(wkLayer), pLayerIdx, 0, 0);
+    if FSchedWakeOnEnqueue then FSchedWake.SetEvent;
+    exit;
+  end;
   if L.WillOpenCL() then
   begin
     // The verdict is read once, here, after every dependency has completed - so
@@ -145323,9 +145360,12 @@ begin
     begin
       // wkLayer: whole-layer compute (ordinary CPU layer or an OpenCL device
       // layer routed to worker 0).
-      if RunLayersProfiled
-        then L.RunProfiled({ChunkPrep=}false)
-        else L.Compute();
+      if not L.FForwardSkipped then
+      begin
+        if RunLayersProfiled
+          then L.RunProfiled({ChunkPrep=}false)
+          else L.Compute();
+      end;
       RunEpilogue(W.LayerIdx);
     end;
     NeuralAtomicDecrement(FSchedInFlight);
