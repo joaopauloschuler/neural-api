@@ -25,7 +25,8 @@ overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
 /images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
-/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S,
+/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off,
+/change-map FILE|off, /invert-change-map on|off, /strength S,
 /upscale FILE|off, /fbc X|off, /panorama WxH|off, /negative-prompt
 TEXT|off, /guidance-scale W, /pag W|off, /profile on|off, /stats on|off,
 /quit.
@@ -71,6 +72,14 @@ cell) into the image; the inpaint path then regenerates the mask at strength 1
 unless --strength is given. The output is the canvas itself (--width and
 --height do not apply), cropped to the requested size, and the original pixels
 outside the overlap band are pasted back unchanged (diffusers apply_overlay).
+Differential Diffusion (--init-image FILE --change-map FILE, or /change-map in
+the REPL; Levin & Fried 2024): a gray map sets how much each 16x16 latent cell
+may change (white = change most, black = keep; --invert-change-map reads the
+reference's white = keep maps). It is resized to the output size like a mask
+but not binarized; after run step i of the N that run (all but the last) the
+cells with 1 - change > i / N are reset to the init image's latents at the
+next noise level (the diffusers community Flux differential img2img blend).
+Strength 1 unless --strength is given. Not with --mask or --outpaint.
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
@@ -120,7 +129,8 @@ USAGE
             [--repeat N] [--image FILE ... |
              --init-image FILE [--mask FILE [--mask-blur R]
              [--padding-mask-crop N] |
-             --outpaint L,T,R,B [--outpaint-overlap 16]] [--strength 0.6]]
+             --outpaint L,T,R,B [--outpaint-overlap 16] |
+             --change-map FILE [--invert-change-map]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--lora FILE[:SCALE] ...] [--upscale FILE [--upscale-tile 32]]
             [--fbc-threshold X]
@@ -589,6 +599,15 @@ begin
     'extended side that are regenerated');
   WriteLn('                       too, so the seam blends (default ',
     csDefaultOutpaintOverlap, ')');
+  WriteLn('  --change-map FILE    with --init-image: Differential Diffusion; ',
+    'a gray map of how much each');
+  WriteLn('                       16x16 cell may change (white = most, black ',
+    '= keep; stretched to the');
+  WriteLn('                       output size, not binarized). Strength 1 ',
+    'unless --strength is given.');
+  WriteLn('                       Not with --mask or --outpaint.');
+  WriteLn('  --invert-change-map  read --change-map as white = keep (the ',
+    'reference''s maps)');
   WriteLn('  --strength S         img2img noise strength in (0, 1] (default ',
     csDefaultStrength:0:1, '): runs only the last');
   WriteLn('                       part of the schedule (18 steps at 0.6: the ',
@@ -756,6 +775,12 @@ begin
   WriteLn('  /outpaint L,T,R,B [OVERLAP]  outpaint the init image, as ',
     '--outpaint (and --outpaint-overlap);');
   WriteLn('                       /outpaint off returns to img2img');
+  WriteLn('  /change-map FILE     Differential Diffusion change map for the ',
+    'init image (white = change');
+  WriteLn('                       most), as --change-map; /change-map off ',
+    'returns to img2img');
+  WriteLn('  /invert-change-map on|off  read change maps as white = keep; ',
+    'reloads the current map');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
   WriteLn('  /upscale FILE        upscale the next images, as --upscale; ',
@@ -1021,6 +1046,13 @@ var
   PaddingMaskCrop: integer;
   InpaintCrop: TRect;
   InpaintFullMask, InpaintCropImage, InpaintCropMask: TNNetVolume;
+  // Differential Diffusion: the change map as read (0..255, inverted when
+  // InvertChangeMap) and its latents, encoded at ChangeLatentsWidth x
+  // ChangeLatentsHeight (0: not encoded yet); applies with an init image.
+  HasChangeMap, InvertChangeMap: boolean;
+  ChangeMapFile: string;
+  ChangeMapImage, ChangeLatents: TNNetVolume;
+  ChangeLatentsWidth, ChangeLatentsHeight: integer;
   // The crop region the image latents were encoded from (empty: no crop).
   ImageLatentsCrop: TRect;
   // Outpainting: the pixels added per side of the init image and the seam
@@ -1412,6 +1444,51 @@ var
     else Result := nil;
   end;
 
+  // Loads FileName as the change map (any size: it is stretched to the
+  // output size), inverted when InvertChangeMap; otherwise returns what is wrong.
+  function LoadChangeMap(const FileName: string): string;
+  var
+    Loaded: TNNetVolume;
+  begin
+    Result := '';
+    Loaded := TNNetVolume.Create();
+    try
+      try
+        if not LoadImageFromFileIntoVolume(FileName, Loaded, false) then
+          Result := 'could not read ' + FileName + '.';
+      except
+        on E: Exception do Result := 'could not read ' + FileName + ': ' +
+          E.Message;
+      end;
+      if Result <> '' then exit;
+      if InvertChangeMap then
+      begin
+        Loaded.Mul(-1);
+        Loaded.Add(255);
+      end;
+      ChangeMapImage.Copy(Loaded);
+    finally
+      Loaded.Free;
+    end;
+    HasChangeMap := true;
+    ChangeMapFile := FileName;
+    ChangeLatentsWidth := 0;
+    ChangeLatentsHeight := 0;
+  end;
+
+  // An init image and a change map are set (Differential Diffusion).
+  function IsDifferential(): boolean;
+  begin
+    Result := HasInitImage and HasChangeMap;
+  end;
+
+  // The change map latents for GenerateFromEmbeds: nil unless differential.
+  function ActiveChangeLatents(): TNNetVolume;
+  begin
+    if IsDifferential() then Result := ChangeLatents
+    else Result := nil;
+  end;
+
   // Inpainting with --padding-mask-crop.
   function IsCropInpainting(): boolean;
   begin
@@ -1577,6 +1654,15 @@ var
         Pipeline.EncodeMask(MaskImage, OutputWidth, OutputHeight, MaskLatents);
       MaskLatentsWidth := OutputWidth;
       MaskLatentsHeight := OutputHeight;
+    end
+    else if IsDifferential() and ((ChangeLatentsWidth <> OutputWidth) or
+      (ChangeLatentsHeight <> OutputHeight)) then
+    begin
+      ChangeLatentsWidth := 0;
+      Pipeline.EncodeChangeMap(ChangeMapImage, OutputWidth, OutputHeight,
+        ChangeLatents);
+      ChangeLatentsWidth := OutputWidth;
+      ChangeLatentsHeight := OutputHeight;
     end;
     if (ImageLatentsWidth = OutputWidth) and
       (ImageLatentsHeight = OutputHeight) then exit;
@@ -1745,6 +1831,10 @@ var
         WriteLn('Mask blur  : Gaussian sigma ', FloatToStr(MaskBlurRadius,
           PointFormat()), ' pixels');
     end;
+    if IsDifferential() then
+      WriteLn('Change map : ', ChangeMapFile, ' (', ChangeMapImage.SizeX, 'x',
+        ChangeMapImage.SizeY, '), Differential Diffusion, white = change ',
+        'most', BoolToStr(InvertChangeMap, ' (inverted on load)', ''));
   end;
 
   // Profiling counts transfers too (TNNet.LayerProfiling turns the counting
@@ -1795,7 +1885,7 @@ var
     if HasInitImage then
       Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
         StepCount, Seed, Image, nil, ImageLatents, Strength,
-        ActiveMaskLatents())
+        ActiveMaskLatents(), ActiveChangeLatents())
     else if IsEditing() then
       Pipeline.GenerateEditFromEmbeds(PromptEmbeds, TextLengths, OutputWidth,
         OutputHeight, StepCount, Seed, Image)
@@ -1873,6 +1963,7 @@ var
     if IsOutpainting() then ModeText := 'outpaint'
     else if IsCropInpainting() then ModeText := 'inpaint (mask crop)'
     else if IsInpainting() then ModeText := 'inpaint'
+    else if IsDifferential() then ModeText := 'differential img2img'
     else ModeText := 'img2img';
     if HasInitImage then
       StepText := Format('%s strength %s, the last %d of %d steps',
@@ -2160,6 +2251,8 @@ var
       end
       else if HasOutpaint then
         WriteLn('[/mask: outpainting is on; /outpaint off first]')
+      else if HasChangeMap then
+        WriteLn('[/mask: a change map is set; /change-map off first]')
       else
       begin
         Problem := LoadMask(Argument);
@@ -2175,6 +2268,72 @@ var
             MaskImage.SizeY, '): inpainting ', InitImageFile, ']')
         else WriteLn('[mask ', MaskFile, ' (', MaskImage.SizeX, 'x',
           MaskImage.SizeY, '): applies once /init-image sets an init image]');
+      end;
+    end
+    else if Command = 'change-map' then
+    begin
+      if Argument = '' then
+        WriteLn('[/change-map: expected /change-map FILE or /change-map off]')
+      else if LowerCase(Argument) = 'off' then
+      begin
+        HasChangeMap := false;
+        ChangeLatentsWidth := 0;
+        if not HasStrengthArg then Strength := csDefaultStrength;
+        if HasInitImage then
+          WriteLn('[change map off: img2img, strength ',
+            StrengthText(Strength), ']')
+        else WriteLn('[change map off]');
+      end
+      else if HasMask then
+        WriteLn('[/change-map: a mask is set; /mask off first]')
+      else if HasOutpaint then
+        WriteLn('[/change-map: outpainting is on; /outpaint off first]')
+      else
+      begin
+        Problem := LoadChangeMap(Argument);
+        if Problem <> '' then
+        begin
+          if HasChangeMap then
+            WriteLn('[/change-map: ', Problem, ' - the change map ',
+              ChangeMapFile, ' stays active]')
+          else WriteLn('[/change-map: ', Problem, ' - no change map is set]');
+        end
+        else
+        begin
+          if not HasStrengthArg then Strength := 1;
+          if HasInitImage then
+            WriteLn('[change map ', ChangeMapFile, ' (', ChangeMapImage.SizeX,
+              'x', ChangeMapImage.SizeY, '): Differential Diffusion on ',
+              InitImageFile, ', strength ', StrengthText(Strength), ']')
+          else WriteLn('[change map ', ChangeMapFile, ' (',
+            ChangeMapImage.SizeX, 'x', ChangeMapImage.SizeY, '): applies ',
+            'once /init-image sets an init image]');
+        end;
+      end;
+    end
+    else if Command = 'invert-change-map' then
+    begin
+      if (LowerCase(Argument) <> 'on') and (LowerCase(Argument) <> 'off') then
+        WriteLn('[/invert-change-map: expected on or off]')
+      else
+      begin
+        InvertChangeMap := LowerCase(Argument) = 'on';
+        if not HasChangeMap then
+          WriteLn('[invert change map ', LowerCase(Argument), ' for the next ',
+            '/change-map]')
+        else
+        begin
+          Problem := LoadChangeMap(ChangeMapFile);
+          if Problem <> '' then
+          begin
+            // The map in memory keeps its orientation, so the flag does too.
+            InvertChangeMap := not InvertChangeMap;
+            WriteLn('[/invert-change-map: ', Problem, ' - ', ChangeMapFile,
+              ' keeps its previous orientation]');
+          end
+          else WriteLn('[invert change map ', LowerCase(Argument), ': ',
+            ChangeMapFile, ' reloaded]');
+        end;
       end;
     end
     else if Command = 'mask-blur' then
@@ -2249,6 +2408,8 @@ var
       end
       else if HasMask then
         WriteLn('[/outpaint: a mask is set; /mask off first]')
+      else if HasChangeMap then
+        WriteLn('[/outpaint: a change map is set; /change-map off first]')
       else
       begin
         SpacePos := Pos(' ', Argument);
@@ -2429,7 +2590,8 @@ var
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
       '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
-      '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, /strength S, ',
+      '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, ',
+      '/change-map FILE|off, /invert-change-map on|off, /strength S, ',
       '/upscale FILE|off, /fbc X|off, /negative-prompt TEXT|off, ',
       '/guidance-scale W, /pag W|off, /profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
@@ -2489,6 +2651,11 @@ begin
   MaskBlurRadius := 0;
   MaskLatentsWidth := 0;
   PaddingMaskCrop := -1;
+  HasChangeMap := false;
+  InvertChangeMap := false;
+  ChangeMapFile := '';
+  ChangeLatentsWidth := 0;
+  ChangeLatentsHeight := 0;
   InpaintCrop := Rect(0, 0, 0, 0);
   ImageLatentsCrop := Rect(0, 0, 0, 0);
   MaskLatentsHeight := 0;
@@ -2570,6 +2737,8 @@ begin
     end
     else if Arg = '--init-image' then InitImageFile := NextArg()
     else if Arg = '--mask' then MaskFile := NextArg()
+    else if Arg = '--change-map' then ChangeMapFile := NextArg()
+    else if Arg = '--invert-change-map' then InvertChangeMap := true
     else if Arg = '--mask-blur' then
     begin
       ArgProblem := ParseMaskBlurRadius(NextArg(), MaskBlurRadius);
@@ -2814,6 +2983,25 @@ begin
     WriteLn('--mask needs --init-image (the image it keeps).');
     Halt(2);
   end;
+  if ChangeMapFile <> '' then
+  begin
+    if (MaskFile <> '') or (OutpaintText <> '') then
+    begin
+      WriteLn('--change-map is exclusive with --mask and --outpaint.');
+      Halt(2);
+    end;
+    if (InitImageFile = '') and (HasPrompt or (TokenList <> '')) then
+    begin
+      WriteLn('--change-map needs --init-image (the image it keeps).');
+      Halt(2);
+    end;
+    if not HasStrengthArg then Strength := 1;
+  end
+  else if InvertChangeMap and (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--invert-change-map needs --change-map.');
+    Halt(2);
+  end;
   if (PaddingMaskCrop >= 0) and (MaskFile = '') and
     (HasPrompt or (TokenList <> '')) then
   begin
@@ -2904,6 +3092,8 @@ begin
   InpaintCropImage := TNNetVolume.Create();
   InpaintCropMask := TNNetVolume.Create();
   MaskLatents := TNNetVolume.Create();
+  ChangeMapImage := TNNetVolume.Create();
+  ChangeLatents := TNNetVolume.Create();
   OutpaintCanvas := TNNetVolume.Create();
   OutpaintMask := TNNetVolume.Create();
   {$IFDEF OpenCL}
@@ -3000,6 +3190,14 @@ begin
       if InitImageFile = '' then
         WriteLn('[--mask applies once /init-image sets an init image]');
     end;
+    if ChangeMapFile <> '' then
+    begin
+      ArgProblem := LoadChangeMap(ChangeMapFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--change-map: ' + ArgProblem);
+      if InitImageFile = '' then
+        WriteLn('[--change-map applies once /init-image sets an init image]');
+    end;
     for ArgPos := 0 to ImageArgFiles.Count - 1 do
     begin
       ArgProblem := AddConditionImage(ImageArgFiles[ArgPos]);
@@ -3069,6 +3267,8 @@ begin
     {$ENDIF}
     OutpaintMask.Free;
     OutpaintCanvas.Free;
+    ChangeLatents.Free;
+    ChangeMapImage.Free;
     MaskLatents.Free;
     InpaintCropMask.Free;
     InpaintCropImage.Free;

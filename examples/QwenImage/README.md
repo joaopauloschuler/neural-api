@@ -153,6 +153,8 @@ follow:
 | `/mask-blur R` | mask blur sigma in pixels (as `--mask-blur`); reloads the current mask with it |
 | `/padding-mask-crop N` | inpaint only the mask's box plus N pixels (as `--padding-mask-crop`); `/padding-mask-crop off` clears it |
 | `/outpaint L,T,R,B [OVERLAP]` | outpaint the init image (as `--outpaint` and `--outpaint-overlap`); sets strength 1 unless `--strength` or `/strength` set it; `/outpaint off` goes back to img2img |
+| `/change-map FILE` | Differential Diffusion change map for the init image (as `--change-map`); sets strength 1 unless `--strength` or `/strength` set it; `/change-map off` goes back to img2img |
+| `/invert-change-map on\|off` | read change maps as white = keep (as `--invert-change-map`); reloads the current map |
 | `/strength S` | img2img strength for the next images, in (0, 1], as `--strength` |
 | `/upscale FILE` | upscale the next images with this Real-ESRGAN checkpoint, as `--upscale`; `/upscale` alone shows the current one, `/upscale off` stops upscaling |
 | `/repeat N PROMPT` | N images of PROMPT (1..1000) with consecutive seeds, each to the next numbered file; the text encoder runs once. Everything after N is the prompt. An image that fails is skipped and the rest of the batch runs |
@@ -428,6 +430,47 @@ bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --init-image beach.png \
 32..8192 pixels. `TestQwenImage21OutpaintKeepsOriginal` runs these steps on
 the pico checkpoint; a real outpaint on the GPU box is still pending (user
 run).
+
+### Differential Diffusion (`--change-map`)
+
+`--change-map FILE` with `--init-image FILE` (or `/change-map FILE` in the
+REPL) gives every latent cell its own strength instead of one global
+`--strength`: Differential Diffusion (Levin & Fried 2024, arXiv:2306.00950),
+with the blend of the diffusers community
+`pipeline_flux_differential_img2img.py` (the flow-matching port of
+[exx8/differential-diffusion](https://github.com/exx8/differential-diffusion)):
+
+```
+convert -size 1024x1024 gradient: -rotate 90 gradient.png
+bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --init-image photo.png \
+  --change-map gradient.png -p "a city skyline above the clouds" \
+  --output skyline.png
+```
+
+1. The map is read as grayscale (alpha ignored), stretched to the output size
+   (Lanczos) and taken per 16x16-pixel latent cell (each cell's top-left
+   pixel, as torch's nearest resize), like an [inpaint](#inpainting) mask,
+   but it stays continuous: it is not cut at 50%.
+2. After run step i of the N steps that run, except the last, the cells
+   whose change is below 1 - i / N are reset to the init image's latents
+   noised to the next sigma with the run's own initial noise. So a white
+   cell (change 1) is plain img2img, a black one (change 0) follows the init
+   image until the last step, and a mid-gray one follows it for about the
+   first half of the steps and is free afterwards: gradients and soft edges
+   blend without a seam. The last step is never blended, as in the
+   reference (unlike inpainting, nothing is pasted back exactly).
+3. The strength is 1 unless `--strength` is given; a lower strength still
+   truncates the schedule, and the thresholds spread over the steps that run.
+
+White means change most, as the inpaint masks' white = regenerate; the
+reference code and the maps of its paper and demo use white = keep, which
+`--invert-change-map` (or `/invert-change-map on`) reads. `--change-map` is
+exclusive with `--mask` and `--outpaint`. `TestQwenImage21ChangeMap` checks
+on the pico checkpoint that an all-white map gives plain img2img bit for bit,
+that an all-black map and a 4-level ramp reset exactly the cells the
+threshold keeps after every step but the last, and the map's cell values; no
+diffusers Qwen-Image differential pipeline exists to compare against, and a
+real run is still pending.
 
 ### LoRA adapters
 
@@ -785,7 +828,9 @@ and `--fp32`, the last one given wins.
 | `--padding-mask-crop N` | with `--mask`: generate only the mask's bounding box plus N pixels (grown to the output aspect) at the output size and paste it back into the init image, which keeps its size; see [Mask crop](#mask-crop---padding-mask-crop-n) | off |
 | `--outpaint L,T,R,B` | with `--init-image`: add L, T, R, B pixels on the left, top, right and bottom and generate them; see [Outpainting](#outpainting). Not with `--mask` | — |
 | `--outpaint-overlap N` | pixels of the init image along each extended side that are regenerated too | 16 |
-| `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 (1 with `--outpaint`) |
+| `--change-map FILE` | with `--init-image`: Differential Diffusion, a gray map of how much each cell may change (white = most); see [Differential Diffusion](#differential-diffusion---change-map). Not with `--mask` or `--outpaint` | — |
+| `--invert-change-map` | read `--change-map` as white = keep (the reference's maps) | off |
+| `--strength S` | img2img strength in (0, 1]: how much of the schedule runs (1 = from pure noise) | 0.6 (1 with `--outpaint` or `--change-map`) |
 | `--upscale FILE` | upscale each image with this Real-ESRGAN / ESRGAN RRDBNet checkpoint before the save; see [Upscaling](#upscaling---upscale-file) | off |
 | `--upscale-tile N` | upscaler tile in input pixels, 0 = the whole image; each tile adds 10 context pixels per side | 32 |
 | `--fbc-threshold X` | First-Block Cache: skip transformer blocks 1..N-1 on steps whose block-0 residual changed by at most X; see [First-Block Cache](#first-block-cache---fbc-threshold-x) | 0 (off) |
@@ -1015,7 +1060,7 @@ in `tests/fixtures/tiny_qwenimage21/` (generated by
 (`TestQwenImage21Inpaint*`: the mask latents, the kept latents bit for bit
 after every step, and the step latents against diffusers' blend);
 `TestQwenImage21OutpaintKeepsOriginal` runs the outpaint canvas, crop and
-paste. `TestLoRAMergeImageAdapter*` write pico adapters in the diffusers and
+paste; `TestQwenImage21ChangeMap` the change map's thresholds (no oracle). `TestLoRAMergeImageAdapter*` write pico adapters in the diffusers and
 kohya layouts at test time and check the merged tensors against
 W + scale * (B @ A); `TestQwenImage21TransformerLoRA` checks that a
 zero-scale adapter leaves the velocity unchanged. The edit tests

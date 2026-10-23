@@ -9933,6 +9933,10 @@ const
 // channel of a token takes that token's value.
 procedure QwenImage21MaskToLatents(Mask: TNNetVolume; Width, Height,
   Channels: integer; MaskLatents: TNNetVolume);
+// Change map (W, H, 1|3|4) in 0..255, white = change most -> ChangeLatents
+// (tokens, 1, 1) in [0, 1], as QwenImage21MaskToLatents without the 50% cut.
+procedure QwenImage21ChangeMapToLatents(ChangeMap: TNNetVolume; Width,
+  Height: integer; ChangeLatents: TNNetVolume);
 // diffusers calculate_dimensions: Width/Height ~ AspectRatio, Width*Height ~
 // TargetArea, each side rounded to a multiple of 32 (at least 32).
 procedure QwenImage21SizeForAspect(TargetArea, AspectRatio: double;
@@ -9986,8 +9990,9 @@ type
     PanoramaWindowCount: integer;
     TransformerOnOpenCL, VaeOnOpenCL: boolean;
     // The image started from EncodeImage's latents (img2img), and kept
-    // them outside EncodeMask's hole (inpainting).
-    UsedInitImage, UsedMask: boolean;
+    // them outside EncodeMask's hole (inpainting), or by EncodeChangeMap's
+    // per-token strength (Differential Diffusion).
+    UsedInitImage, UsedMask, UsedChangeMap: boolean;
     // Condition images of an edit (EncodeConditionImages); 0 otherwise.
     ConditionImageCount: integer;
     // OpenCL bytes the transformer held after the last step, and the largest
@@ -10120,13 +10125,13 @@ type
     // EncodeConditionImages' N images.
     procedure GenerateFromEmbedsAt(PromptEmbeds: TNNetVolume;
       const TextLengths: array of integer; Width, Height, StepCount: integer;
-      Seed: cardinal; Image, InitialLatents, ImageLatents,
-      MaskLatents: TNNetVolume; Strength: double);
+      Seed: cardinal; Image, InitialLatents, ImageLatents, MaskLatents,
+      ChangeLatents: TNNetVolume; Strength: double);
     // Denoise; TextLengths as in GenerateFromEmbedsAt.
     procedure DenoiseAt(PromptEmbeds: TNNetVolume;
       const TextLengths: array of integer; Width, Height, StepCount: integer;
       Latents: TNNetVolume; StartStep: integer;
-      ImageLatents, MaskLatents: TNNetVolume);
+      ImageLatents, MaskLatents, ChangeLatents: TNNetVolume);
     // Raises when ComponentsLoaded: Setting would not reach loaded weights.
     procedure RefuseWhileLoaded(const Setting: string);
     // TMultiDiffusionPredictEvent of Denoise's panorama windows.
@@ -10182,10 +10187,13 @@ type
     // (img2img). MaskLatents <> nil (EncodeMask, needs ImageLatents) inpaints:
     // after each step the kept region (mask 0) is reset to ImageLatents noised
     // with the same noise to the next sigma, and to ImageLatents itself after
-    // the last (diffusers QwenImageInpaintPipeline's blend).
+    // the last (diffusers QwenImageInpaintPipeline's blend). ChangeLatents
+    // (EncodeChangeMap, img2img without a mask): after run step i < N-1 of N,
+    // tokens with 1 - change > i / N take that re-noise (Flux differential).
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume; StartStep: integer = 0;
-      ImageLatents: TNNetVolume = nil; MaskLatents: TNNetVolume = nil);
+      ImageLatents: TNNetVolume = nil; MaskLatents: TNNetVolume = nil;
+      ChangeLatents: TNNetVolume = nil);
     // Image (W, H, 3|4) in 0..255 at Width x Height -> normalised posterior
     // mean ImageLatents (tokens, 1, z_dim); untiled, on the CPU.
     procedure EncodeImage(Image: TNNetVolume; Width, Height: integer;
@@ -10194,6 +10202,10 @@ type
     // Height -> MaskLatents of 0/1 in the latent layout (QwenImage21MaskToLatents).
     procedure EncodeMask(Mask: TNNetVolume; Width, Height: integer;
       MaskLatents: TNNetVolume);
+    // Change map (W, H, 1|3|4) in 0..255, white = change most, at Width x
+    // Height -> ChangeLatents (QwenImage21ChangeMapToLatents).
+    procedure EncodeChangeMap(ChangeMap: TNNetVolume; Width, Height: integer;
+      ChangeLatents: TNNetVolume);
     // Edit: each (W,H,3|4) 0..255 image at its aspect x TargetArea through the
     // vision tower and the VAE encoder (CPU, untiled); kept until replaced.
     procedure EncodeConditionImages(const Images: array of TNNetVolume;
@@ -10226,10 +10238,13 @@ type
     // img2img: the same from ImageLatents (EncodeImage at this size, required)
     // at Strength, running only the steps Img2ImgStartStep leaves. MaskLatents
     // (EncodeMask at this size) inpaints: only the mask's white region changes.
+    // ChangeLatents (EncodeChangeMap at this size) instead sets how much each
+    // token changes (Differential Diffusion).
     procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Seed: cardinal; Image: TNNetVolume;
       InitialLatents, ImageLatents: TNNetVolume; Strength: double;
-      MaskLatents: TNNetVolume = nil); overload;
+      MaskLatents: TNNetVolume = nil;
+      ChangeLatents: TNNetVolume = nil); overload;
     // Edit: the same with the condition images in the transformer prefix;
     // PromptEmbeds and TextLengths from EncodeEditTokenIds.
     procedure GenerateEditFromEmbeds(PromptEmbeds: TNNetVolume;
@@ -109330,6 +109345,34 @@ begin
   end;
 end;
 
+procedure QwenImage21ChangeMapToLatents(ChangeMap: TNNetVolume; Width,
+  Height: integer; ChangeLatents: TNNetVolume);
+var
+  Gray: TNNetVolume;
+begin
+  if (Width < csQwenImage21PixelsPerLatent) or
+    (Height < csQwenImage21PixelsPerLatent) or
+    (Width mod csQwenImage21PixelsPerLatent <> 0) or
+    (Height mod csQwenImage21PixelsPerLatent <> 0) then
+    ImportError('QwenImage21ChangeMapToLatents: ' + IntToStr(Width) + 'x' +
+      IntToStr(Height) + ' is not a latent grid of ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + '-pixel cells.');
+  if (ChangeMap.Depth <> 1) and (ChangeMap.Depth <> 3) and
+    (ChangeMap.Depth <> 4) then
+    ImportError('QwenImage21ChangeMapToLatents: the change map has ' +
+      IntToStr(ChangeMap.Depth) + ' channels, expected gray, RGB or RGBA.');
+  Gray := TNNetVolume.Create();
+  try
+    ConvertAndResizeImagePIL(ChangeMap, Gray, Width, Height, 1,
+      {ClipToByteRange=}false, 0, 1);
+    DiffusersMaskToLatentGrid(Gray, csQwenImage21PixelsPerLatent, 1,
+      ChangeLatents);
+    ChangeLatents.ReSize(ChangeLatents.SizeX * ChangeLatents.SizeY, 1, 1);
+  finally
+    Gray.Free;
+  end;
+end;
+
 procedure QwenImage21SizeForAspect(TargetArea, AspectRatio: double;
   out Width, Height: integer);
 var
@@ -109848,22 +109891,31 @@ end;
 
 procedure TQwenImage21Pipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
   Height, StepCount: integer; Latents: TNNetVolume; StartStep: integer;
-  ImageLatents, MaskLatents: TNNetVolume);
+  ImageLatents, MaskLatents, ChangeLatents: TNNetVolume);
 begin
   DenoiseAt(PromptEmbeds, [], Width, Height, StepCount, Latents, StartStep,
-    ImageLatents, MaskLatents);
+    ImageLatents, MaskLatents, ChangeLatents);
 end;
 
 procedure TQwenImage21Pipeline.DenoiseAt(PromptEmbeds: TNNetVolume;
   const TextLengths: array of integer; Width, Height, StepCount: integer;
   Latents: TNNetVolume; StartStep: integer;
-  ImageLatents, MaskLatents: TNNetVolume);
+  ImageLatents, MaskLatents, ChangeLatents: TNNetVolume);
 var
   Transformer: TQwenImage21Transformer;
-  Velocity, Noise, Known: TNNetVolume;
+  Velocity, Noise, Known, ChangeMask: TNNetVolume;
   GridH, GridW, StepPos, MaxStepPos, RunStepCount, WindowPos, MaxWindowPos,
     ShiftSeqLen, GuidanceCount, LayerPos, MaxLayerPos: integer;
-  IsInpaint: boolean;
+  IsInpaint, IsDifferential: boolean;
+
+  // Where Mask is 0, Latents := ImageLatents noised to Sigma[NextStep] with
+  // the run's initial noise.
+  procedure BlendNoisedImageLatents(Mask: TNNetVolume; NextStep: integer);
+  begin
+    Known.Copy(Noise);
+    FScheduler.ScaleNoise(Known, ImageLatents, NextStep);
+    InpaintBlend(Latents, Known, Mask);
+  end;
 
   procedure EncodeBranchPrefix(Embeds: TNNetVolume;
     const BranchTextLengths: array of integer);
@@ -109917,6 +109969,17 @@ begin
       IntToStr(MaskLatents.Size) + ' mask values for ' +
       IntToStr(Latents.Size) + ' latent values (encode the mask at ' +
       IntToStr(Width) + 'x' + IntToStr(Height) + ').');
+  IsDifferential := Assigned(ChangeLatents);
+  if IsDifferential and (IsInpaint or not Assigned(ImageLatents)) then
+    ImportError('TQwenImage21Pipeline.Denoise: a change map needs the image ' +
+      'latents it keeps and no inpaint mask.');
+  if IsDifferential and ((ChangeLatents.Depth <> 1) or
+    (ChangeLatents.Size * Latents.Depth <> Latents.Size)) then
+    ImportError('TQwenImage21Pipeline.Denoise: ' +
+      IntToStr(ChangeLatents.Size) + ' change map values (depth ' +
+      IntToStr(ChangeLatents.Depth) + ') for ' + IntToStr(Latents.SizeX) +
+      ' latent tokens (encode the change map at ' + IntToStr(Width) + 'x' +
+      IntToStr(Height) + ').');
   if Assigned(ImageLatents) then
   begin
     if ImageLatents.Size <> Latents.Size then
@@ -109925,10 +109988,10 @@ begin
         IntToStr(Latents.Size) + ' noise values (encode the image at ' +
         IntToStr(Width) + 'x' + IntToStr(Height) + ').');
   end;
-  if IsInpaint and (FPanoramaWindowWidth > 0) and
+  if (IsInpaint or IsDifferential) and (FPanoramaWindowWidth > 0) and
      (FPanoramaWindowHeight > 0) then
-    ImportError('TQwenImage21Pipeline.Denoise: inpainting does not run ' +
-      'with panorama windows.');
+    ImportError('TQwenImage21Pipeline.Denoise: inpainting and change maps ' +
+      'do not run with panorama windows.');
   GridH := Height div csQwenImage21PixelsPerLatent;
   GridW := Width div csQwenImage21PixelsPerLatent;
   // mu from the token count the transformer sees, as the diffusers pipeline
@@ -109944,17 +110007,23 @@ begin
   FTransformerProfileReport := '';
   Noise := nil;
   Known := nil;
+  ChangeMask := nil;
   Velocity := TNNetVolume.Create();
   Transformer := FTransformer;
   try
     // Inpainting re-noises the kept region with this same noise every step,
     // and ScaleNoise overwrites it, so a copy is kept first.
-    if IsInpaint then
+    if IsInpaint or IsDifferential then
     begin
       Noise := TNNetVolume.Create();
       Noise.Copy(Latents);
       Known := TNNetVolume.Create();
       Known.Copy(Latents);
+    end;
+    if IsDifferential then
+    begin
+      ChangeMask := TNNetVolume.Create();
+      ChangeMask.ReSize(Latents);
     end;
     if Assigned(ImageLatents) then
       FScheduler.ScaleNoise(Latents, ImageLatents, StartStep);
@@ -110043,13 +110112,15 @@ begin
       if IsInpaint then
       begin
         // The kept region at the next step's noise level; clean at the end.
-        if StepPos < MaxStepPos then
-        begin
-          Known.Copy(Noise);
-          FScheduler.ScaleNoise(Known, ImageLatents, StepPos + 1);
-          InpaintBlend(Latents, Known, MaskLatents);
-        end
+        if StepPos < MaxStepPos then BlendNoisedImageLatents(MaskLatents, StepPos + 1)
         else InpaintBlend(Latents, ImageLatents, MaskLatents);
+      end
+      else if IsDifferential and (StepPos < MaxStepPos) then
+      begin
+        // Run step i of N keeps 1 - change > i / N; no blend when none is kept.
+        if DifferentialDiffusionRegenerateMask(ChangeLatents,
+          StepPos - StartStep, RunStepCount, Latents.Depth, ChangeMask) > 0 then
+          BlendNoisedImageLatents(ChangeMask, StepPos + 1);
       end;
       if Assigned(FOnStep) then
         FOnStep(StepPos - StartStep, RunStepCount,
@@ -110082,6 +110153,7 @@ begin
     if Assigned(FTransformer) then FTransformer.ReleasePasses()
     else Transformer.Free;
     Velocity.Free;
+    ChangeMask.Free;
     Known.Free;
     Noise.Free;
     MaxWindowPos := Length(FPanoramaCaches) - 1;
@@ -110297,6 +110369,13 @@ begin
   CheckImageSize(Width, Height);
   QwenImage21MaskToLatents(Mask, Width, Height, FTransformerConfig.InChannels,
     MaskLatents);
+end;
+
+procedure TQwenImage21Pipeline.EncodeChangeMap(ChangeMap: TNNetVolume; Width,
+  Height: integer; ChangeLatents: TNNetVolume);
+begin
+  CheckImageSize(Width, Height);
+  QwenImage21ChangeMapToLatents(ChangeMap, Width, Height, ChangeLatents);
 end;
 
 function TQwenImage21Pipeline.VisionProcessorConfigFile(): string;
@@ -110589,19 +110668,19 @@ procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
   InitialLatents: TNNetVolume);
 begin
   GenerateFromEmbedsAt(PromptEmbeds, [], Width, Height, StepCount, Seed, Image,
-    InitialLatents, nil, nil, 1);
+    InitialLatents, nil, nil, nil, 1);
 end;
 
 procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
   Width, Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume;
   InitialLatents, ImageLatents: TNNetVolume; Strength: double;
-  MaskLatents: TNNetVolume);
+  MaskLatents, ChangeLatents: TNNetVolume);
 begin
   if not Assigned(ImageLatents) then
     ImportError('TQwenImage21Pipeline.GenerateFromEmbeds: img2img needs ' +
       'the image latents of EncodeImage.');
   GenerateFromEmbedsAt(PromptEmbeds, [], Width, Height, StepCount, Seed,
-    Image, InitialLatents, ImageLatents, MaskLatents, Strength);
+    Image, InitialLatents, ImageLatents, MaskLatents, ChangeLatents, Strength);
 end;
 
 procedure TQwenImage21Pipeline.GenerateEditFromEmbeds(
@@ -110618,13 +110697,13 @@ begin
       IntToStr(ConditionImageCount) + ' condition images (EncodeEditTokenIds ' +
       'after the last EncodeConditionImages gives N+1).');
   GenerateFromEmbedsAt(PromptEmbeds, TextLengths, Width, Height, StepCount,
-    Seed, Image, InitialLatents, nil, nil, 1);
+    Seed, Image, InitialLatents, nil, nil, nil, 1);
 end;
 
 procedure TQwenImage21Pipeline.GenerateFromEmbedsAt(PromptEmbeds: TNNetVolume;
   const TextLengths: array of integer; Width, Height, StepCount: integer;
-  Seed: cardinal; Image, InitialLatents, ImageLatents,
-  MaskLatents: TNNetVolume; Strength: double);
+  Seed: cardinal; Image, InitialLatents, ImageLatents, MaskLatents,
+  ChangeLatents: TNNetVolume; Strength: double);
 var
   Latents: TNNetVolume;
   RoundedWidth, RoundedHeight, StartStep: integer;
@@ -110650,6 +110729,8 @@ begin
   FImageStats := Default(TQwenImage21ImageStats);
   FImageStats.UsedInitImage := Assigned(ImageLatents);
   FImageStats.UsedMask := Assigned(ImageLatents) and Assigned(MaskLatents);
+  FImageStats.UsedChangeMap := Assigned(ImageLatents) and
+    Assigned(ChangeLatents);
   if Length(TextLengths) > 0 then
     FImageStats.ConditionImageCount := ConditionImageCount;
   for Phase in KeptPhases do
@@ -110667,7 +110748,7 @@ begin
     if Assigned(InitialLatents) then Latents.Copy(InitialLatents)
     else MakeInitialLatents(RoundedWidth, RoundedHeight, Seed, Latents);
     DenoiseAt(PromptEmbeds, TextLengths, RoundedWidth, RoundedHeight,
-      StepCount, Latents, StartStep, ImageLatents, MaskLatents);
+      StepCount, Latents, StartStep, ImageLatents, MaskLatents, ChangeLatents);
     DecodeLatents(Latents, RoundedWidth, RoundedHeight, Image);
   finally
     Latents.Free;

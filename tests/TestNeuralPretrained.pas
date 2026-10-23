@@ -1242,6 +1242,9 @@ type
     procedure TestQwenImage21Img2ImgKeepLoaded;
     procedure TestQwenImage21InpaintMaskLatents;
     procedure TestQwenImage21InpaintKeepsKnown;
+    // Differential Diffusion (--change-map) on the pico pipeline: white =
+    // plain img2img bit for bit, black and a ramp keep tokens per threshold.
+    procedure TestQwenImage21ChangeMap;
     // Outpaint on the pico pipeline as examples/QwenImage runs it: canvas
     // grown to multiples of 32, decode, crop, paste; kept pixels are exact.
     procedure TestQwenImage21OutpaintKeepsOriginal;
@@ -38512,6 +38515,236 @@ begin
     Noise.Free;
     Mask.Free;
     MaskLatents.Free;
+    ImageLatents.Free;
+    InitImage.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    EmbedsRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Change maps on the pico pipeline (4 steps at strength 0.75: run steps
+// i = 0, 1, 2 of N = 3). After run step i < N - 1 the tokens with 1 - change
+// > i / N equal the image latents noised to the next sigma bit for bit, the
+// others are the sampler's; the last step is never blended. All white is
+// plain img2img bit for bit. Plus EncodeChangeMap's values and the refusals.
+procedure TTestNeuralPretrained.TestQwenImage21ChangeMap;
+const
+  StepCount = 4;
+  Strength = 0.75;
+  Side = 64;
+  GridSide = Side div 16;
+  // Gray level per latent column of the ramp: change 0, 0.8, 1 and 0.6.
+  RampLevels: array[0..GridSide - 1] of integer = (0, 204, 255, 153);
+var
+  RefJson: TStringList;
+  EmbedsRoot: TJSONData;
+  Pipeline: TQwenImage21Pipeline;
+  Embeds, InitImage, ImageLatents, ChangeMap, ChangeLatents, MaskLatents,
+    Noise, Known, Latents, Image, PlainImage: TNNetVolume;
+  PlainSteps: array of TNNetVolume;
+  StartStep, RunStepCount, StepPos, RecordPos, TokenPos, ChannelPos,
+    ValuePos, X, Y, Channels, KeptCount, FreeCount: integer;
+  Change: TNeuralFloat;
+  IsKept, AllEqual: boolean;
+
+  procedure ClearSteps();
+  var
+    StepIdx: integer;
+  begin
+    for StepIdx := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[StepIdx].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+  end;
+
+  procedure FillMap(Level: integer);
+  begin
+    ChangeMap.ReSize(Side, Side, 3);
+    ChangeMap.Fill(Level);
+  end;
+
+  procedure RunChangeMap();
+  begin
+    ClearSteps();
+    Pipeline.EncodeChangeMap(ChangeMap, Side, Side, ChangeLatents);
+    Pipeline.GenerateFromEmbeds(Embeds, Side, Side, StepCount, {Seed=}0,
+      Image, Noise, ImageLatents, Strength, nil, ChangeLatents);
+  end;
+
+  function IsDenoiseRefused(ImageLatentsArg, MaskArg,
+    ChangeArg: TNNetVolume): boolean;
+  begin
+    Result := false;
+    Latents.Copy(Noise);
+    try
+      Pipeline.Denoise(Embeds, Side, Side, StepCount, Latents, 0,
+        ImageLatentsArg, MaskArg, ChangeArg);
+    except
+      on EPretrainedImportError do Result := true;
+    end;
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  EmbedsRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  InitImage := TNNetVolume.Create;
+  ImageLatents := TNNetVolume.Create;
+  ChangeMap := TNNetVolume.Create;
+  ChangeLatents := TNNetVolume.Create;
+  MaskLatents := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Known := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  PlainImage := TNNetVolume.Create;
+  PlainSteps := nil;
+  SetLength(FQwenImage21Phases, 0);
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_pipeline_64_io.json'));
+    EmbedsRoot := GetJSON(RefJson.Text);
+    LoadOracleTokenTensor(EmbedsRoot, 'prompt_embeds', Embeds);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Pipeline.OnStep := @RecordQwenImage21Step;
+    FillQwenImage21FormulaImage(InitImage, Side, Side, 3);
+    InitImage.Add(1);
+    InitImage.Mul(127.5);
+    Pipeline.EncodeImage(InitImage, Side, Side, ImageLatents);
+    Channels := Pipeline.TransformerConfig.InChannels;
+    Pipeline.MakeInitialLatents(Side, Side, 7, Noise);
+    StartStep := TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount,
+      Strength);
+    RunStepCount := StepCount - StartStep;
+    AssertEquals('run steps', 3, RunStepCount);
+
+    // Plain img2img.
+    Pipeline.GenerateFromEmbeds(Embeds, Side, Side, StepCount, {Seed=}0,
+      PlainImage, Noise, ImageLatents, Strength);
+    AssertFalse('stats: no change map', Pipeline.ImageStats.UsedChangeMap);
+    PlainSteps := FQwenImage21StepLatents;
+    FQwenImage21StepLatents := nil;
+
+    // All white: no token is ever kept.
+    FillMap(255);
+    RunChangeMap();
+    AssertTrue('stats: change map', Pipeline.ImageStats.UsedChangeMap);
+    AssertFalse('stats: no mask', Pipeline.ImageStats.UsedMask);
+    AssertEquals('white change latents', GridSide * GridSide,
+      ChangeLatents.Size);
+    AssertEquals('white = plain img2img image', 0,
+      MaxAbsVolumeDiff(Image, PlainImage), 0);
+    for RecordPos := 0 to RunStepCount - 1 do
+      AssertEquals('white = plain img2img step ' + IntToStr(RecordPos), 0,
+        MaxAbsVolumeDiff(FQwenImage21StepLatents[RecordPos],
+        PlainSteps[RecordPos]), 0);
+
+    // All black and the ramp: per token, kept or the sampler's.
+    for X := 0 to 1 do
+    begin
+      if X = 0 then FillMap(0)
+      else
+      begin
+        ChangeMap.ReSize(Side, Side, 3);
+        for Y := 0 to Side - 1 do
+          for TokenPos := 0 to Side - 1 do
+            for ChannelPos := 0 to 2 do
+              ChangeMap[TokenPos, Y, ChannelPos] :=
+                RampLevels[TokenPos div 16];
+      end;
+      RunChangeMap();
+      for TokenPos := 0 to GridSide * GridSide - 1 do
+      begin
+        if X = 0 then Change := 0
+        else Change := RampLevels[TokenPos mod GridSide] / 255;
+        AssertEquals('change of token ' + IntToStr(TokenPos), Change,
+          ChangeLatents.FData[TokenPos], 1e-6);
+      end;
+      for RecordPos := 0 to RunStepCount - 2 do
+      begin
+        StepPos := StartStep + RecordPos;
+        Known.Copy(Noise);
+        Pipeline.Scheduler.ScaleNoise(Known, ImageLatents, StepPos + 1);
+        KeptCount := 0;
+        FreeCount := 0;
+        for TokenPos := 0 to GridSide * GridSide - 1 do
+        begin
+          IsKept := 1 - ChangeLatents.FData[TokenPos] >
+            RecordPos / RunStepCount;
+          AllEqual := true;
+          for ChannelPos := 0 to Channels - 1 do
+          begin
+            ValuePos := TokenPos * Channels + ChannelPos;
+            if FQwenImage21StepLatents[RecordPos].FData[ValuePos] <>
+              Known.FData[ValuePos] then AllEqual := false;
+            // Step 0 ran from the plain run's input: free tokens match it up
+            // to InpaintBlend's (L - K) * 1 + K rounding.
+            if (not IsKept) and (RecordPos = 0) then
+              AssertEquals('map ' + IntToStr(X) + ' step 0 free token ' +
+                IntToStr(TokenPos), PlainSteps[0].FData[ValuePos],
+                FQwenImage21StepLatents[0].FData[ValuePos], 1e-6);
+          end;
+          if IsKept then
+          begin
+            Inc(KeptCount);
+            AssertTrue('map ' + IntToStr(X) + ' step ' + IntToStr(RecordPos) +
+              ' kept token ' + IntToStr(TokenPos), AllEqual);
+          end
+          else
+          begin
+            Inc(FreeCount);
+            AssertFalse('map ' + IntToStr(X) + ' step ' + IntToStr(RecordPos) +
+              ' free token ' + IntToStr(TokenPos) + ' is not reset', AllEqual);
+          end;
+        end;
+        if X = 0 then
+          AssertEquals('black keeps every token', GridSide * GridSide,
+            KeptCount)
+        else if RecordPos = 0 then
+          AssertEquals('ramp step 0 keeps all but the white column',
+            3 * GridSide, KeptCount)
+        else
+          AssertEquals('ramp step 1 keeps the 0 and 0.6 columns',
+            2 * GridSide, KeptCount);
+      end;
+      // The last step is the sampler's, not the image latents.
+      AssertTrue('map ' + IntToStr(X) + ': last step not blended',
+        MaxAbsVolumeDiff(FQwenImage21StepLatents[RunStepCount - 1],
+        ImageLatents) > 1e-3);
+      AssertTrue('map ' + IntToStr(X) + ' differs from plain img2img',
+        MaxAbsVolumeDiff(Image, PlainImage) > 1e-4);
+    end;
+
+    // Refusals: with a mask, without image latents, at another size.
+    Pipeline.EncodeMask(ChangeMap, Side, Side, MaskLatents);
+    AssertTrue('a change map with a mask is refused',
+      IsDenoiseRefused(ImageLatents, MaskLatents, ChangeLatents));
+    AssertTrue('a change map without image latents is refused',
+      IsDenoiseRefused(nil, nil, ChangeLatents));
+    Pipeline.EncodeChangeMap(ChangeMap, Side, Side div 2, ChangeLatents);
+    AssertTrue('a change map of another size is refused',
+      IsDenoiseRefused(ImageLatents, nil, ChangeLatents));
+    ChangeMap.ReSize(Side, Side, 2);
+    try
+      Pipeline.EncodeChangeMap(ChangeMap, Side, Side, ChangeLatents);
+      Fail('a two-channel change map is refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+  finally
+    ClearSteps();
+    for RecordPos := 0 to High(PlainSteps) do PlainSteps[RecordPos].Free;
+    PlainImage.Free;
+    Image.Free;
+    Latents.Free;
+    Known.Free;
+    Noise.Free;
+    MaskLatents.Free;
+    ChangeLatents.Free;
+    ChangeMap.Free;
     ImageLatents.Free;
     InitImage.Free;
     Embeds.Free;

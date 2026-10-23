@@ -854,21 +854,23 @@ rather than acted on.
       parity vs exx8 SD2/diff_pipe.py's loop with DDIM, Euler, DPM++ 2M Karras,
       Euler Karras). The convention is white = change most; the reference's
       own maps are white = keep (its `map > i / N` keeps the image). Open:
-      - [ ] examples/QwenImage `--change-map PNG` (with its init image;
-            refuses its binary mask): in `TQwenImage21Pipeline.DenoiseAt`
-            (neural/neuralpretrained.pas, the `if IsInpaint then` block right
-            after `FScheduler.Step(Latents, Velocity, StepPos)`) build the mask
-            per step with `DifferentialDiffusionRegenerateMask(ChangeMap,
-            StepPos + 1 - StartStep, StepCount - StartStep, Channels, Mask)`
-            (ChangeMap: (GridW, GridH, 1) change in [0, 1] on the packed latent
-            grid, Mask then reordered to the packed token layout of
-            `MaskLatents` if that differs), skip the blend when it returns 0,
-            and do not blend after the last step (the reference's
-            pipeline_flux_differential_img2img.py blends after step i with
-            masks[i] = map > i / N at timesteps[i + 1]: check which index the
-            Qwen-Image flow reference uses before porting). Only a
-            hand-computed / invariant test is possible unless a diffusers
-            Qwen-Image differential reference exists.
+      - QwenImage DONE: `TQwenImage21Pipeline.EncodeChangeMap` /
+        `Denoise(..., ChangeLatents)`, examples/QwenImage `--change-map`,
+        `--invert-change-map`, `/change-map`, `/invert-change-map`; the
+        threshold index follows the Flux differential reference (after run
+        step i blend with 1 - change > i / N, never after the last step);
+        invariants in `TestQwenImage21ChangeMap`. Open:
+        - [ ] Real Qwen-Image-2.1 run on the user's GPU box (horizontal
+              gradient at strength 1 and 0.6).
+        - [ ] Optional pico parity: an ad hoc ~/x venv loop of
+              QwenImage21Pipeline img2img plus the Flux reference's blend
+              (feeding our FPC noise), hardcoded into a test; today only
+              invariants pin the QwenImage side.
+        - [ ] SD and QwenImage use different step indices (SD: the exx8 SD2
+              before-step-i convention, threshold (i+1)/N after step i;
+              QwenImage: Flux's i/N) and different latent resizes (SD
+              bilinear, QwenImage nearest as Flux): keep or unify only after
+              a real side-by-side run.
       - [ ] Real checkpoint run (SD 1.5) on the user's GPU box: a horizontal
             gradient and a depth-derived map.
       - [ ] The 4-channel `TStableDiffusionInpainter` blend still refuses the
