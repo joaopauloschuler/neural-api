@@ -793,25 +793,6 @@ rather than acted on.
             2022, arXiv:2208.01626). Edits a generated or real image by changing
             words in its prompt while the layout stays fixed: today img2img /
             InstructPix2Pix are the only edit routes, and both redraw the layout.
-        - [x] DDIM inversion (b8a04763): `TNNetDiffusionScheduler.
-              BuildInversionSchedule` / `InverseDDIMStep` (diffusers
-              `DDIMInverseScheduler`, eta 0, `set_alpha_to_one`, `steps_offset`),
-              `TStableDiffusionPipeline.InvertImage` / `InvertLatents`,
-              `--invert-image` / `--invert-steps` / `--invert-guidance`;
-              TestInverseDDIMVsDiffusers, TestStableDiffusionDDIMInversionParity.
-        - [x] Cross- and self-attention control (9d6f7b7c):
-              `TSDPromptToPromptEdit` (swap / refine / reweight over refine),
-              `TStableDiffusionPipeline.DenoiseEdit` / `GenerateEditFromEmbeds`
-              / `CreatePromptToPromptEdit`, the `OnAttentionProbabilities` hook
-              on `TNNetScaledDotProductAttention` and `TNNetCrossAttention`, the
-              seq_aligner mappers (`SDPromptWordSwapMapper`,
-              `SDPromptRefinementMapper`, `SDPromptWordTokenPositions`,
-              `SDPromptTokenScales`); TestStableDiffusionPromptToPromptParity
-              vs diffusers float64 (ad hoc controller run).
-        - [x] Prompt-to-Prompt CLI (9d6f7b7c): `--edit-prompt`, `--edit-mode
-              swap|refine|reweight`, `--cross-replace`, `--self-replace`,
-              `--reweight` in examples/StableDiffusion, with `--invert-image`
-              for real images; README section.
         - [ ] Null-text inversion (Mokady et al. 2022) for
               TStableDiffusionPipeline: per-step optimized unconditional
               embeds on top of `InvertImage`, so a real image reconstructs
@@ -902,8 +883,6 @@ rather than acted on.
           memory levels with level_embed + sine pos) into ONE forward — v1 takes the
           pixel-decoder outputs as PRECOMPUTED TNNetInput feature maps (mirroring Mask
           R-CNN v1's FPN-input stance); the masked-attention decoder + heads are complete;
-      (b) DONE c8384fd4: instance + panoptic post-processing (DecodeMask2FormerInstance /
-          DecodeMask2FormerPanoptic, examples/UniversalSegmentation --task);
       (c) multi-head cross-attention beyond the pico 1-head fixture is wired generically
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
@@ -2373,9 +2352,6 @@ rather than acted on.
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
-      - [x] ObjectTracking `--classes` takes ids or names, mixed and
-            case-insensitive, resolved after the config loads through the new
-            `YoloClassIdOfLabel`; unknown names list close matches (aace686a).
       - [ ] The pico YOLO fixture config has no `names`, so the example smoke
             runs only show ids; the named path is covered by the unit test only.
       - [ ] Optional: BoT-SORT / OC-SORT style camera-motion compensation is
@@ -2658,11 +2634,6 @@ cannot pay for its own transfer.
       (both CPU-only today); when this lands, add `TNNetConvolution` to the
       device-backward list at the top of "OpenCL forward coverage".
 
-- [x] `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` lone-channel row FFTs use the
-      new N/2-point `RealFFTForward` / `RealFFTInverse` (`TRealFFTPlan`,
-      neuralvolume.pas); also wired into `TNNetForwardSTFT`'s lone frame,
-      `TNNetInverseSTFT`'s FFT path and `ComputeMusicgenMelodyChroma` (fc67be70).
-      1x256x256 AVX2: rfft2 forward ~2.3 -> ~1.75 ms, irfft2 ~2.6 -> ~1.9 ms.
 - [ ] Real-input FFTs that still run a full complex FFT with Im = 0 and are not
       a drop-in for `RealFFTForward` / `RealFFTInverse`:
       - `TNNetCirculantLinear` FFT path: real kernel, input and error; would need
