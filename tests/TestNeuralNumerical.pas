@@ -229,6 +229,8 @@ type
     // Input + weight gradients of strided and dilated depthwise convolutions.
     procedure TestDepthwiseConvStridedGradientCheck;
     procedure TestDepthwiseConvDilatedGradientCheck;
+    // Input + weight gradients of the dilated TNNetConvolution (torch dilation).
+    procedure TestConvolutionDilatedGradientCheck;
     procedure TestPointwiseConvNumerical;
     procedure TestSeparableConvNumerical;
     
@@ -456,6 +458,9 @@ type
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
     procedure TestDepthwiseConvDilatedOpenCLParity;
+    // Dilated TNNetConvolution in OpenCL: implicit GEMM, cai_im2col and the
+    // int8 forward, from a host and a resident source, vs the CPU forward.
+    procedure TestConvolutionDilatedOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
     // TNNetEmbedding -> TNNetDepthwiseConv1D -> TNNetSiLU with ForceOpenCL off:
     // the conv's own size verdict is False, so only a source already in OpenCL
@@ -8500,7 +8505,8 @@ procedure LayerInputAndWeightGradientCheck(ATestCase: TTestCase;
   ALayer: TNNetLayer; const AName: string;
   ASizeX, ASizeY, ASizeD: integer;
   ATolerance: TNeuralFloat = 1e-2;
-  AUseDoubleAccumulator: boolean = false);
+  AUseDoubleAccumulator: boolean = false;
+  AFlushWeightCache: boolean = false);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
@@ -8586,10 +8592,13 @@ begin
       begin
         saved := ALayer.Neurons[n].Weights.Raw[w];
         ALayer.Neurons[n].Weights.Raw[w] := saved + epsilon;
+        if AFlushWeightCache then ALayer.FlushWeightCache();
         lossPlus := ComputeLoss(Input);
         ALayer.Neurons[n].Weights.Raw[w] := saved - epsilon;
+        if AFlushWeightCache then ALayer.FlushWeightCache();
         lossMinus := ComputeLoss(Input);
         ALayer.Neurons[n].Weights.Raw[w] := saved;
+        if AFlushWeightCache then ALayer.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
 
         NN.Compute(Input);
@@ -8632,6 +8641,22 @@ begin
   LayerInputAndWeightGradientCheck(Self,
     TNNetDepthwiseConvLinear.Create(1, 3, 0, 2, 2),
     'DepthwiseConv(dilation 2, stride 2)', 8, 7, 3, 0.05, true);
+end;
+
+procedure TTestNeuralNumerical.TestConvolutionDilatedGradientCheck;
+begin
+  RandSeed := 31337;
+  // Same-size padding (K div 2) * D at stride 1 and 2, and no padding. The
+  // forward reads the concatenated weights, so each perturbation flushes them.
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetConvolutionLinear.Create(3, 3, 2, 1, 0, 2),
+    'Convolution(dilation 2, pad 2)', 6, 5, 2, 0.05, true, true);
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetConvolutionLinear.Create(3, 3, 2, 2, 0, 2),
+    'Convolution(dilation 2, pad 2, stride 2)', 7, 6, 2, 0.05, true, true);
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetConvolutionLinear.Create(2, 3, 0, 1, 0, 3),
+    'Convolution(dilation 3)', 8, 7, 2, 0.05, true, true);
 end;
 
 procedure TTestNeuralNumerical.TestMinChannelGradientCheck;
@@ -71101,6 +71126,125 @@ procedure TTestNeuralNumerical.TestDepthwiseConvDilatedOpenCLParity;
 begin
   DepthwiseConvOpenCLParityCheck(Self, 2, 3, 2, 1, 2);
   DepthwiseConvOpenCLParityCheck(Self, 1, 3, 0, 2, 2);
+end;
+
+// Input(9,8,5) -> [identity pointwise source] -> TNNetConvolutionLinear(6,
+// 3x3, Padding, Stride, dilation); OpenCL output vs the CPU output.
+procedure ConvolutionDilatedOpenCLParityCheck(ATestCase: TTestCase;
+  Padding, Stride, Dilation: integer; HostSource, Quantize: boolean);
+{$IFDEF OpenCL}
+const
+  InX = 9; InY = 8; InD = 5;
+var
+  NN: TNNet;
+  Source: TNNetLayer;
+  Conv: TNNetConvolutionLinear;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ElementPos, NeuronPos, ImplicitBefore: integer;
+  ImplicitConvWasEnabled, Implicit: boolean;
+  MaxDiff, Tolerance: TNeuralFloat;
+  Tag: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    ATestCase.AssertTrue('no OpenCL device: SKIP', true);
+    exit;
+  end;
+  ImplicitConvWasEnabled := OpenCLImplicitConvEnabled();
+  RandSeed := 424242;
+  Input := TNNetVolume.Create(InX, InY, InD);
+  OutCPU := TNNetVolume.Create();
+  NN := TNNet.Create();
+  try
+    Input.RandomizeGaussian(1);
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD, 1));
+    if HostSource then
+      Source := NN.AddLayer(TNNetIdentity.Create())
+    else
+    begin
+      // Leaves its output in OpenCL memory, so the gather binds it.
+      Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(InD).
+        SetTrainable(False, False));
+      for NeuronPos := 0 to Source.Neurons.Count - 1 do
+      begin
+        Source.Neurons[NeuronPos].Weights.Fill(0);
+        Source.Neurons[NeuronPos].Weights.Raw[NeuronPos] := 1;
+        Source.Neurons[NeuronPos].BiasWeight := 0;
+      end;
+      Source.FlushWeightCache();
+    end;
+    Conv := TNNetConvolutionLinear.Create(6, 3, Padding, Stride, 0, Dilation);
+    NN.AddLayer(Conv);
+    for NeuronPos := 0 to Conv.Neurons.Count - 1 do
+    begin
+      Conv.Neurons[NeuronPos].Weights.RandomizeGaussian(1);
+      Conv.Neurons[NeuronPos].BiasWeight := 0.1 * NeuronPos;
+    end;
+    Conv.FlushWeightCache();
+    Conv.SetTrainable(False, False);
+    if Quantize then TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    if Quantize then Tolerance := 1e-2 * OutCPU.GetMaxAbs() else Tolerance := 1e-4;
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      // The int8 forward has no implicit GEMM: one pass covers it.
+      for Implicit := Quantize to true do
+      begin
+        Tag := 'pad=' + IntToStr(Padding) + ' stride=' + IntToStr(Stride) +
+          ' dilation=' + IntToStr(Dilation) + ' host=' +
+          BoolToStr(HostSource, true) + ' int8=' + BoolToStr(Quantize, true) +
+          ' implicit=' + BoolToStr(Implicit and not Quantize, true);
+        SetOpenCLImplicitConv(Implicit and not Quantize);
+        ImplicitBefore := Conv.OpenCLImplicitConvLaunchCount();
+        NN.Compute(Input);
+        NN.Compute(Input);
+        ATestCase.AssertTrue(Tag + ': the convolution ran in OpenCL',
+          Conv.OutputBindableOnOpenCL());
+        if Implicit and not Quantize then
+          ATestCase.AssertEquals(Tag + ': implicit GEMM launches', 2,
+            Conv.OpenCLImplicitConvLaunchCount() - ImplicitBefore);
+        ATestCase.AssertEquals(Tag + ': output size', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        MaxDiff := 0;
+        for ElementPos := 0 to OutCPU.Size - 1 do
+          MaxDiff := Max(MaxDiff,
+            Abs(OutCPU.Raw[ElementPos] - NN.GetLastLayer.Output.Raw[ElementPos]));
+        WriteLn('  dilated conv OpenCL parity (', Tag, '): max|diff|=',
+          MaxDiff:0:9);
+        ATestCase.AssertTrue(Tag + ': OpenCL vs CPU max |diff| = ' +
+          FloatToStr(MaxDiff), MaxDiff < Tolerance);
+      end;
+    finally
+      NN.ForceOpenCL(False);
+      SetOpenCLImplicitConv(ImplicitConvWasEnabled);
+    end;
+  finally
+    NN.Free;
+    OutCPU.Free;
+    Input.Free;
+  end;
+end;
+{$ELSE}
+begin
+  ATestCase.AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvolutionDilatedOpenCLParity;
+var
+  HostSource: boolean;
+begin
+  for HostSource := false to true do
+  begin
+    ConvolutionDilatedOpenCLParityCheck(Self, 2, 1, 2, HostSource, false);
+    ConvolutionDilatedOpenCLParityCheck(Self, 2, 2, 2, HostSource, false);
+    ConvolutionDilatedOpenCLParityCheck(Self, 0, 1, 3, HostSource, false);
+  end;
+  ConvolutionDilatedOpenCLParityCheck(Self, 2, 1, 2, true, true);
 end;
 
 procedure TTestNeuralNumerical.TestChannelMulByLayerOpenCLParity;

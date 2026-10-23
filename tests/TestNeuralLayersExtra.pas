@@ -214,7 +214,17 @@ type
     procedure TestDepthwiseConvDilatedInt8ForwardMatchesFP32;
     // The dilation survives save/load; a file without it loads as dilation 1.
     procedure TestDepthwiseConvDilationSaveLoad;
+    // Dilated TNNetConvolution[Linear|ReLU] (torch Conv2d dilation) vs a naive
+    // padded reference at stride 1 and 2; int8 weights and int8 x int8 inputs.
+    procedure TestConvolutionDilatedForwardMatchesReference;
+    procedure TestConvolutionDilatedInt8ForwardMatchesFP32;
+    // Save/load round trip; old files load as dilation 1; classes with their
+    // own forward refuse a dilation.
+    procedure TestConvolutionDilationSaveLoad;
   private
+    // Naive per-tap reference for a padded dilated convolution.
+    procedure AssertConvolutionDilatedMatchesReference(Padding, Stride,
+      Dilation: integer; UseReLU: boolean);
     // Naive per-tap depthwise reference used by the forward tests above.
     procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer;
       Dilation: integer = 1);
@@ -9126,6 +9136,212 @@ begin
     NN.Free;
     Input.Free;
     Reference.Free;
+  end;
+end;
+
+// Input(11,9,4) -> TNNetConvolution[Linear|ReLU](5 features, 3x3, Padding,
+// Stride, dilation) with random weights and biases, recomputed by a naive tap
+// loop that reads zero outside the input. Non-square so an X/Y swap shows.
+procedure TTestNeuralLayersExtra.AssertConvolutionDilatedMatchesReference(
+  Padding, Stride, Dilation: integer; UseReLU: boolean);
+const
+  InX = 11; InY = 9; InD = 4; FeatureSize = 3; NumFeatures = 5;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  W, Output: TNNetVolume;
+  NeuronCnt, ox, oy, d, fx, fy, ix, iy: integer;
+  Expected, Extent: integer;
+  Sum: TNeuralFloat;
+  Tag: string;
+begin
+  Tag := 'pad=' + IntToStr(Padding) + ' stride=' + IntToStr(Stride) +
+    ' dilation=' + IntToStr(Dilation) + ' relu=' + BoolToStr(UseReLU, true);
+  Extent := Dilation * (FeatureSize - 1) + 1;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    if UseReLU then
+      Layer := NN.AddLayer(TNNetConvolutionReLU.Create(NumFeatures, FeatureSize,
+        Padding, Stride, 0, Dilation))
+    else
+      Layer := NN.AddLayer(TNNetConvolutionLinear.Create(NumFeatures,
+        FeatureSize, Padding, Stride, 0, Dilation));
+    AssertEquals('DilationX (' + Tag + ')', Dilation,
+      TNNetConvolution(Layer).DilationX);
+    AssertEquals('DilationY (' + Tag + ')', Dilation,
+      TNNetConvolution(Layer).DilationY);
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+    begin
+      Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+      Layer.Neurons[NeuronCnt].BiasWeight := 0.1 * (NeuronCnt - 2);
+    end;
+    Layer.FlushWeightCache();
+    Input.Randomize();
+    NN.Compute(Input);
+    Output := Layer.Output;
+
+    Expected := (InX + 2 * Padding - Extent) div Stride + 1;
+    AssertEquals('output SizeX (' + Tag + ')', Expected, Output.SizeX);
+    Expected := (InY + 2 * Padding - Extent) div Stride + 1;
+    AssertEquals('output SizeY (' + Tag + ')', Expected, Output.SizeY);
+    AssertEquals('output depth (' + Tag + ')', NumFeatures, Output.Depth);
+
+    for NeuronCnt := 0 to NumFeatures - 1 do
+    begin
+      W := Layer.Neurons[NeuronCnt].Weights;
+      for oy := 0 to Output.SizeY - 1 do
+        for ox := 0 to Output.SizeX - 1 do
+        begin
+          Sum := Layer.Neurons[NeuronCnt].BiasWeight;
+          for fy := 0 to FeatureSize - 1 do
+            for fx := 0 to FeatureSize - 1 do
+            begin
+              ix := ox * Stride + fx * Dilation - Padding;
+              iy := oy * Stride + fy * Dilation - Padding;
+              if (ix >= 0) and (ix < InX) and (iy >= 0) and (iy < InY) then
+                for d := 0 to InD - 1 do
+                  Sum := Sum + Input[ix, iy, d] * W[fx, fy, d];
+            end;
+          if UseReLU and (Sum < 0) then Sum := 0;
+          AssertEquals('conv out[' + IntToStr(ox) + ',' + IntToStr(oy) + ',' +
+            IntToStr(NeuronCnt) + '] (' + Tag + ')',
+            Sum, Output[ox, oy, NeuronCnt], 1e-4);
+        end;
+    end;
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestConvolutionDilatedForwardMatchesReference;
+begin
+  AssertConvolutionDilatedMatchesReference(2, 1, 2, false);
+  AssertConvolutionDilatedMatchesReference(2, 2, 2, false);
+  AssertConvolutionDilatedMatchesReference(2, 1, 2, true);
+  AssertConvolutionDilatedMatchesReference(0, 1, 3, false);
+  AssertConvolutionDilatedMatchesReference(1, 2, 1, false);
+end;
+
+// Int8 weights over the FP32 im2col, then int8 weights x int8 input over the
+// byte im2col: both within quantization drift of the FP32 forward.
+procedure TTestNeuralLayersExtra.TestConvolutionDilatedInt8ForwardMatchesFP32;
+const
+  InX = 11; InY = 9; InD = 4;
+var
+  NN: TNNet;
+  Input, Reference: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+  NeuronCnt, i: integer;
+  MaxAbsRef: TNeuralFloat;
+  Pass: integer;
+begin
+  Input := TNNetVolume.Create(InX, InY, InD);
+  Reference := TNNetVolume.Create();
+  try
+    Input.Randomize();
+    for Pass := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+        Conv := TNNetConvolutionLinear.Create(6, 3, 2, 1, 0, 2);
+        NN.AddLayer(Conv);
+        RandSeed := 2718;
+        for NeuronCnt := 0 to Conv.Neurons.Count - 1 do
+          Conv.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+        Conv.FlushWeightCache();
+        NN.SetTrainable(False);
+        NN.Compute(Input);
+        Reference.Copy(Conv.Output);
+        MaxAbsRef := Reference.GetMaxAbs();
+        AssertTrue('FP32 reference is non-trivial', MaxAbsRef > 0.1);
+        TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+        if Pass = 1 then
+        begin
+          Conv.EnableInt8Input();
+          AssertTrue('int8 x int8 forward is taken',
+            Conv.InputPreparedInt8 <> nil);
+        end;
+        NN.Compute(Input);
+        AssertEquals('int8 output size', Reference.Size, Conv.Output.Size);
+        for i := 0 to Reference.Size - 1 do
+          AssertEquals('int8 (pass ' + IntToStr(Pass) + ') element ' +
+            IntToStr(i), Reference.FData[i], Conv.Output.FData[i],
+            0.05 * MaxAbsRef);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Reference.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestConvolutionDilationSaveLoad;
+const
+  InX = 9; InY = 7; InD = 3;
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  Saved, Structure: string;
+  i: integer;
+  Refused: boolean;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    // Padding (K div 2) * D keeps the size, as in the ResNet dilated layer4.
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 2, 1, 0, 2));
+    NN.AddLayer(TNNetConvolution.Create(3, 3, 1, 1));
+    Input.Randomize();
+    NN.Compute(Input);
+    AssertEquals('same-size output X', InX, NN.Layers[1].Output.SizeX);
+    AssertEquals('same-size output Y', InY, NN.Layers[1].Output.SizeY);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', NN.SaveStructureToString(),
+      Loaded.SaveStructureToString());
+    AssertEquals('loaded dilation', 2,
+      TNNetConvolution(Loaded.Layers[1]).DilationY);
+    AssertEquals('undilated layer stays 1', 1,
+      TNNetConvolution(Loaded.Layers[2]).DilationX);
+    Loaded.Compute(Input);
+    AssertEquals('loaded output size', NN.GetLastLayer.Output.Size,
+      Loaded.GetLastLayer.Output.Size);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('loaded output ' + IntToStr(i),
+        NN.GetLastLayer.Output.FData[i], Loaded.GetLastLayer.Output.FData[i], 1e-6);
+    // A structure saved before the dilation slot existed holds 0 in FStruct[6].
+    Structure := NN.SaveStructureToString();
+    AssertTrue('dilation in FStruct[6]',
+      Pos('TNNetConvolutionReLU:4;3;2;1;0;0;2;0', Structure) > 0);
+    Structure := StringReplace(Structure, 'TNNetConvolutionReLU:4;3;2;1;0;0;2;0',
+      'TNNetConvolutionReLU:4;3;2;1;0;0;0;0', []);
+    Loaded.Free;
+    Loaded := TNNet.Create();
+    Loaded.LoadStructureFromString(Structure);
+    AssertEquals('old file loads as dilation 1', 1,
+      TNNetConvolution(Loaded.Layers[1]).DilationX);
+    AssertEquals('old file output size', InX - 2 + 2 * 2,
+      Loaded.Layers[1].Output.SizeX);
+    Refused := false;
+    try
+      TNNetQuaternionConv.Create(4, 3, 2, 1, 0, 2).Free;
+    except
+      on E: Exception do Refused := true;
+    end;
+    AssertTrue('a convolution with its own forward refuses a dilation', Refused);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
   end;
 end;
 

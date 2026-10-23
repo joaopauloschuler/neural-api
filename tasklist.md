@@ -369,11 +369,11 @@ rather than acted on.
   - [ ] Real-checkpoint run on the GPU box (`--gpu`) before README calls it
         supported.
   - [ ] ResNet-50 variant (`rvm_resnet50.pth`): needs the ResNet trunk with
-        f1..f4 taps and a dilation-2 layer4. TNNetDepthwiseConv now has native
-        dilation (pDilation, MobileNetV3/RVM use it: 25 taps instead of a
-        zero-filled 9x9); the full 3x3 convs of layer4 still need a native
-        dilated TNNetConvolution (today only the X-axis FDilationX of the 1-D
-        convs exists; TNNetConvolutionAbstract has FDilationY now).
+        f1..f4 taps and a dilation-2 layer4. Both conv kinds it needs now have
+        native dilation: TNNetDepthwiseConv (pDilation) and
+        TNNetConvolution[Linear|ReLU].Create(Features, K, Padding, Stride,
+        SuppressBias, Dilation) (CPU/AVX, int8, OpenCL im2col + implicit GEMM,
+        backward). Left: the importer itself.
   - [ ] Memory: the real `rvm_mobilenetv3.pth` at 640x480, ratio 0.75 peaked at
         1.7 GB RSS on CPU (dev box). Find which activations dominate (the
         full-res refiner maps?) before 720p/1080p runs; check the low-memory

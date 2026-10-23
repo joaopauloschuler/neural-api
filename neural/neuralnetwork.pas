@@ -16895,6 +16895,9 @@ type
       // constructor BEFORE SetPrevLayer is ever invoked, otherwise the neuron
       // weight count and output geometry are already locked to the square size.
       procedure SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY: integer);
+      // Tap spacing per axis (values below 1 read as 1); like SetFeatureSizeXY,
+      // it must run before SetPrevLayer.
+      procedure SetDilationXY(pDilationX, pDilationY: integer);
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
       property FeatureSizeX: integer read FFeatureSizeX;
@@ -17275,6 +17278,10 @@ type
       // A 3x3 pad-1 stride-1 plain convolution after a nearest-2x TNNetDeMaxPool.
       function UpsampleFoldEligible(): boolean; override;
     public
+      // The 5-argument Create plus torch dilation (taps pDilation apart in X
+      // and Y, FStruct[6]); dilation > 1 only on classes running this forward.
+      constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride,
+        pSuppressBias, pDilation: integer); overload;
       destructor Destroy(); override;
       procedure Compute(); override;
       // True for the plain convolution classes only: the descendants with a
@@ -47725,14 +47732,14 @@ begin
   // The previous forward's blend still reads the gate map this GEMM rewrites.
   WaitIfAnotherQueue(FGRUCL.OutputKernel(), GemmKernel);
   FDotCL.ComputeImplicitConv(FGatesWeightsCL, FPrevLayer.FOutput, FW, RowSpan,
-    {Stride}1, FPad, FPad, {DilationX}1, csActSigmoid, WeightsUpdated,
+    {Stride}1, FPad, FPad, {DilationX}1, {DilationY}1, csActSigmoid, WeightsUpdated,
     FGatesBiasCL, WeightsUpdated, {NewSrc}false, SrcBuffer);
   WaitIfAnotherQueue(GemmKernel, FGRUCL.ResetKernel());
   ResetInputBuffer := FGRUCL.BuildResetInput(FDotCL.ResultBuffer, SrcBuffer,
     FRH, FHiddenC, FInC);
   WaitIfAnotherQueue(FGRUCL.ResetKernel(), GemmKernel);
   FCandidateDotCL.ComputeImplicitConv(FCandidateWeightsCL, FRH, FW, RowSpan,
-    {Stride}1, FPad, FPad, {DilationX}1, csActTanh, WeightsUpdated,
+    {Stride}1, FPad, FPad, {DilationX}1, {DilationY}1, csActTanh, WeightsUpdated,
     FNeurons[5].FWeights, WeightsUpdated, {NewSrc}false, ResetInputBuffer);
   WaitIfAnotherQueue(GemmKernel, FGRUCL.OutputKernel());
   FGRUCL.Blend(FDotCL.ResultBuffer, SrcBuffer, FCandidateDotCL.ResultBuffer,
@@ -63487,6 +63494,8 @@ begin
     FErrorProc('Linked layer to TNNetConvolutionSharedWeights is not a convolution:'+LinkedLayer.ClassName);
   end;
   inherited Create(LinkedLayer.FStruct[0], LinkedLayer.FStruct[1], LinkedLayer.FStruct[2], LinkedLayer.FStruct[3], LinkedLayer.FStruct[4]);
+  SetDilationXY(TNNetConvolution(LinkedLayer).FDilationX,
+    TNNetConvolution(LinkedLayer).FDilationY);
   FStruct[5] := LinkedLayer.LayerIdx;
   FActivationFn := LinkedLayer.FActivationFn;
   FActivationFnDerivative := LinkedLayer.FActivationFnDerivative;
@@ -67300,9 +67309,7 @@ constructor TNNetDepthwiseConv.Create(pMultiplier, pFeatureSize, pInputPadding,
   pStride: integer; pDilation: integer);
 begin
   inherited Create(pFeatureSize, pInputPadding, pStride);
-  FDilationX := Max(pDilation, 1);
-  FDilationY := FDilationX;
-  SetFeatureSizeXY(pFeatureSize, pFeatureSize);
+  SetDilationXY(pDilation, pDilation);
   AddNeurons(pMultiplier);
   SetOutputErrorSize(1, 1, 1);
   FStruct[0] := pMultiplier;
@@ -92002,8 +92009,8 @@ constructor TNNetConv1DLinear.Create(pNumFeatures, pFeatureSize, pPadding,
 begin
   inherited Create(pNumFeatures, pFeatureSize, pPadding, pStride, pSuppressBias);
   FPaddingY := 0;
-  FDilationX := Max(pDilation, 1);
   SetFeatureSizeXY(pFeatureSize, 1);
+  SetDilationXY(pDilation, 1);
   FStruct[5] := 1;
   FStruct[6] := FDilationX;
 end;
@@ -119106,7 +119113,7 @@ begin
     (ClassType = TNNetConvolutionReLU)) and (not FPointwise) and
     (FFeatureSizeX = 3) and (FFeatureSizeY = 3) and (FStride = 1) and
     (FPadding = 1) and (FPaddingY = 1) and (FDilationX = 1) and
-    (FPrevLayer is TNNetDeMaxPool) and
+    (FDilationY = 1) and (FPrevLayer is TNNetDeMaxPool) and
     TNNetDeMaxPool(FPrevLayer).IsNearestUpsample2x() and
     Assigned(FPrevLayer.PrevLayer);
 end;
@@ -119174,12 +119181,12 @@ begin
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FPrevLayer.Output,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
       {RowSpan}FPrevLayer.Output.Depth * FFeatureSizeX, {Stride}FStride,
-      FPadding, FPaddingY, FDilationX, {NewSrc}true, pIm2ColSrcBuffer)
+      FPadding, FPaddingY, FDilationX, FDilationY, {NewSrc}true, pIm2ColSrcBuffer)
   else
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {Stride}FStride,
-      {PaddingX}0, {PaddingY}0, FDilationX, {NewSrc}true, nil);
+      {PaddingX}0, {PaddingY}0, FDilationX, FDilationY, {NewSrc}true, nil);
 end;
 
 procedure TNNetConvolution.ComputeOpenCL();
@@ -119260,7 +119267,8 @@ begin
   begin
     FDotCL.ComputeImplicitConv(InputAVolume, FPrevLayer.Output,
       {OutSizeX}FOutput.SizeX, {RowSpan}FPrevLayer.Output.Depth * FFeatureSizeX,
-      FStride, FPadding, FPaddingY, FDilationX, ActOpcode, {NewVAs}WUpdated, BiasVol,
+      FStride, FPadding, FPaddingY, FDilationX, FDilationY, ActOpcode,
+      {NewVAs}WUpdated, BiasVol,
       {NewVBias}WUpdated, {NewSrc}true, GatherSrcBuffer);
   end
   else
@@ -119491,10 +119499,10 @@ begin
     FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
 
     // #12: across yCount both ends advance by a constant step - the source by
-    // one FInputCopy row, the destination by DepthFSize (an output position's
-    // FFeatureSizeY feature rows are one contiguous run). Seed both per (x,y)
-    // and carry them instead of re-deriving each offset.
-    SrcRowStride := FInputCopy.GetRawPos(0, 1);
+    // FDilationY FInputCopy rows, the destination by DepthFSize (an output
+    // position's FFeatureSizeY feature rows are one contiguous run). Seed both
+    // per (x,y) and carry them instead of re-deriving each offset.
+    SrcRowStride := FInputCopy.GetRawPos(0, FDilationY);
 
     for OutputCntX := 0 to MaxX do
     begin
@@ -119595,7 +119603,7 @@ begin
   MaxOutputXPos := FOutput.SizeX - 1;
   MaxOutputYPos := FOutput.SizeY - 1;
   MaxFeatureYPos := FFeatureSizeY - 1;
-  SrcRowStride := FInputCopyInt8.GetRawPos(0, 1);
+  SrcRowStride := FInputCopyInt8.GetRawPos(0, FDilationY);
   for OutputCntX := 0 to MaxOutputXPos do
   begin
     InputX := OutputCntX * FStride;
@@ -119658,6 +119666,22 @@ begin
   ReleaseIm2ColKernel();
   {$ENDIF}
   inherited Destroy;
+end;
+
+constructor TNNetConvolution.Create(pNumFeatures, pFeatureSize, pInputPadding,
+  pStride, pSuppressBias, pDilation: integer);
+begin
+  // Virtual: the descendant's own 5-argument Create sets its activation.
+  Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias);
+  // Dilation 1 leaves FStruct[6] at 0, so the saved structure is unchanged.
+  if pDilation <= 1 then exit;
+  if not ((ClassType = TNNetConvolution) or
+    (ClassType = TNNetConvolutionLinear) or (ClassType = TNNetConvolutionReLU) or
+    (ClassType = TNNetConvolutionSwish) or (ClassType = TNNetConvolutionHardSwish)) then
+    raise Exception.Create(ClassName + '.Create: dilation ' +
+      IntToStr(pDilation) + ' is not supported by this layer''s forward.');
+  SetDilationXY(pDilation, pDilation);
+  FStruct[6] := FDilationX;
 end;
 
 destructor TNNetConvolution.Destroy();
@@ -119747,7 +119771,7 @@ begin
   Result :=
     (FStruct[7] = 1) and
     (FFeatureSizeX = 3) and (FFeatureSizeY = 3) and
-    (FStride = 1) and
+    (FStride = 1) and (FDilationX = 1) and (FDilationY = 1) and
     (not FQuantInt8) and
     (not FQuantInt4) and
     (not ActiveLowMemory());
@@ -120798,6 +120822,7 @@ var
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
   TapRunCnt, MaxTapRunPos, TapRunSize, TapRunSrcStep: integer;
+  PrevTapRowBytes: integer;
   RowPrevPtr, RowWeightPtr: TNeuralFloatArrPtr;
   // Tiling
   TileXCnt, TileDCnt: integer;
@@ -120821,7 +120846,9 @@ begin
     LocalPrevError := FPrevLayer.OutputError;
   end;
   MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureExtentX;
-  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureSizeY;
+  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureExtentY;
+  // One kernel row down is FDilationY rows of the previous layer's error.
+  PrevTapRowBytes := FPrevSizeXDepthBytes * FDilationY;
   // Each kernel row scatters as runs of adjacent elements, as the im2col
   // gathers them: the whole row at dilation 1, one tap otherwise.
   if FDilationX = 1 then
@@ -120977,10 +121004,10 @@ begin
                           if LocalCntY < FFeatureSizeYMinus1 then
                           begin
                             {$IFDEF FPC}
-                            RowPrevPtr := (pointer(RowPrevPtr) + FPrevSizeXDepthBytes);
+                            RowPrevPtr := (pointer(RowPrevPtr) + PrevTapRowBytes);
                             RowWeightPtr := (pointer(RowWeightPtr) + FSizeXDepthBytes);
                             {$ELSE}
-                            RowPrevPtr := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY + 1);
+                            RowPrevPtr := LocalPrevError.GetRawPtr(PrevX, PrevY + (LocalCntY + 1) * FDilationY);
                             RowWeightPtr := LocalWeight.GetRawPtr(0, LocalCntY + 1);
                             {$ENDIF}
                           end;
@@ -121641,6 +121668,13 @@ begin
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
   FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
   FFeatureExtentY := FDilationY * FFeatureSizeYMinus1 + 1;
+end;
+
+procedure TNNetConvolutionAbstract.SetDilationXY(pDilationX, pDilationY: integer);
+begin
+  FDilationX := Max(pDilationX, 1);
+  FDilationY := Max(pDilationY, 1);
+  SetFeatureSizeXY(FFeatureSizeX, FFeatureSizeY);
 end;
 
 destructor TNNetConvolutionAbstract.Destroy();
@@ -142281,9 +142315,9 @@ begin
       'TNNetMoEExpertBankGateUp' :  Result := TNNetMoEExpertBankGateUp.Create(St[0], St[1], St[2], St[3], St[4] > 0);
       'TNNetMoEExpertBankDown' :    Result := TNNetMoEExpertBankDown.Create(St[0], St[1]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
-      'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
-      'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
-      'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
+      'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
+      'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
       'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
       'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
       'TNNetConv1DLinear' :         Result := TNNetConv1DLinear.Create(St[0], St[1], St[2], St[3], St[6], St[4]);
@@ -142293,8 +142327,8 @@ begin
       'TNNetKANConv' :              Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4], St[6]);
       'TNNetWeightStandardizationConv' : Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]);
       'TNNetSpectralNormConv' :     Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
-      'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]);
-      'TNNetConvolutionHardSwish' : Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
+      'TNNetConvolutionHardSwish' : Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
       'TNNetGroupedConvolutionLinear' : Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetGroupedConvolutionReLU'   : Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
       'TNNetGroupedPointwiseConvLinear'    : Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
@@ -142740,9 +142774,9 @@ begin
       if S[0] = 'TNNetMoEExpertBankGateUp' then Result := TNNetMoEExpertBankGateUp.Create(St[0], St[1], St[2], St[3], St[4] > 0) else
       if S[0] = 'TNNetMoEExpertBankDown' then Result := TNNetMoEExpertBankDown.Create(St[0], St[1]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
-      if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
+      if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
+      if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
       if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConv1DLinear' then Result := TNNetConv1DLinear.Create(St[0], St[1], St[2], St[3], St[6], St[4]) else
@@ -142752,8 +142786,8 @@ begin
       if S[0] = 'TNNetKANConv' then Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4], St[6]) else
       if S[0] = 'TNNetWeightStandardizationConv' then Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]) else
       if S[0] = 'TNNetSpectralNormConv' then Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
-      if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetConvolutionHardSwish' then Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
+      if S[0] = 'TNNetConvolutionHardSwish' then Result := TNNetConvolutionHardSwish.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
       if S[0] = 'TNNetGroupedConvolutionLinear' then Result := TNNetGroupedConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedConvolutionReLU' then Result := TNNetGroupedConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
       if S[0] = 'TNNetGroupedPointwiseConvLinear' then Result := TNNetGroupedPointwiseConvLinear.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
@@ -149284,7 +149318,7 @@ begin
   else
     FPrevLayer.ForceOutputOnRAM();
   FDotCL.ComputeImplicitConv(WeightsInter, FPrevLayer.FOutput, FOutput.SizeX,
-    RowSpan, Stride, PaddingX, PaddingY, DilationX, csActNone,
+    RowSpan, Stride, PaddingX, PaddingY, DilationX, {DilationY}1, csActNone,
     {NewVAs}NewWeights, Bias, {NewVBias}NewWeights,
     {NewSrc}(GatherSrcBuffer = nil), GatherSrcBuffer, OutFrames, FrameStep,
     WindowDepth);

@@ -620,11 +620,11 @@ type
       /// pAxis2Groups work-groups along axis 2 (a 2-D launch when 1).
       procedure RunTiledGrid(pKernel: cl_kernel; pLanes, pRowsPerTile,
         pColsPerTile, pNumBs, pAxis2Groups: longint);
-      /// Binds the 22 arguments of cai_conv_implicit(_tiled) and launches the
+      /// Binds the 23 arguments of cai_conv_implicit(_tiled) and launches the
       /// tiled kernel when the shape allows; err accumulates failures.
       procedure LaunchImplicitConv(AsBuffer, SrcBuffer: cl_mem; NumBs,
         GemmSize, UseBias, OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
-        Stride, PaddingX, PaddingY, DilationX, PixelStride, OutFrames,
+        Stride, PaddingX, PaddingY, DilationX, DilationY, PixelStride, OutFrames,
         FrameStep, UpsampleFold: longint; var err: integer);
       /// The large grid's split count (1 = none): TiledGemmSplitK fitted to
       /// FSize, or AutoTiledGemmSplitCount unless the queue is private.
@@ -676,7 +676,8 @@ type
       /// uploaded and nothing is released here. SrcVol then only carries the
       /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
-        OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY, DilationX: longint;
+        OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY, DilationX,
+        DilationY: longint;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
@@ -692,7 +693,8 @@ type
       /// OutFrames > 1 is the frames-along-depth 3-D conv: each output pixel has
       /// OutFrames columns, frame t's tap window is WindowDepth floats at t*FrameStep.
       procedure ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
-        OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint;
+        OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, DilationY,
+        pActFN: longint;
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil;
         OutFrames: longint = 1; FrameStep: longint = 0; WindowDepth: longint = 0);
@@ -1318,7 +1320,7 @@ end;
 
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
   SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY,
-  DilationX: longint; NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
+  DilationX, DilationY: longint; NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
 var
   k: cl_kernel;
   N, InSizeX, InSizeY, InDepth: longint;
@@ -1357,8 +1359,9 @@ begin
   err := err or clSetKernelArg(k, 8, csLongintSize, @PaddingX);
   err := err or clSetKernelArg(k, 9, csLongintSize, @PaddingY);
   err := err or clSetKernelArg(k, 10, csLongintSize, @DilationX);
-  err := err or clSetKernelArg(k, 11, csCLMemSize, @SrcBuffer);
-  err := err or clSetKernelArg(k, 12, csCLMemSize, @ColsBuffer);
+  err := err or clSetKernelArg(k, 11, csLongintSize, @DilationY);
+  err := err or clSetKernelArg(k, 12, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(k, 13, csCLMemSize, @ColsBuffer);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
@@ -2347,7 +2350,8 @@ begin
 end;
 
 procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
-  OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint; NewVAs: boolean;
+  OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, DilationY,
+  pActFN: longint; NewVAs: boolean;
   VBias: TNNetVolume; NewVBias: boolean; NewSrc: boolean;
   pExternalSrc: cl_mem; OutFrames: longint; FrameStep: longint;
   WindowDepth: longint);
@@ -2390,7 +2394,8 @@ begin
   end;
   LaunchImplicitConv(FInputBufferAs, SrcBuffer, FNumBs, FSize, UseBias,
     OutSizeX, RowSpan, InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY,
-    DilationX, PixelStride, OutFrames, FrameStep, {UpsampleFold=}0, err);
+    DilationX, DilationY, PixelStride, OutFrames, FrameStep, {UpsampleFold=}0,
+    err);
   if err <> CL_SUCCESS then
     ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
       'setting arguments: ' + IntToStr(err));
@@ -2398,7 +2403,7 @@ end;
 
 procedure TDotProductSharedKernel.LaunchImplicitConv(AsBuffer,
   SrcBuffer: cl_mem; NumBs, GemmSize, UseBias, OutSizeX, RowSpan, InSizeX,
-  InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX, PixelStride,
+  InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX, DilationY, PixelStride,
   OutFrames, FrameStep, UpsampleFold: longint; var err: integer);
 var
   K: cl_kernel;
@@ -2426,10 +2431,11 @@ begin
   err := err or clSetKernelArg(K, 15, csLongintSize, @PaddingX);
   err := err or clSetKernelArg(K, 16, csLongintSize, @PaddingY);
   err := err or clSetKernelArg(K, 17, csLongintSize, @DilationX);
-  err := err or clSetKernelArg(K, 18, csLongintSize, @PixelStride);
-  err := err or clSetKernelArg(K, 19, csLongintSize, @OutFrames);
-  err := err or clSetKernelArg(K, 20, csLongintSize, @FrameStep);
-  err := err or clSetKernelArg(K, 21, csLongintSize, @UpsampleFold);
+  err := err or clSetKernelArg(K, 18, csLongintSize, @DilationY);
+  err := err or clSetKernelArg(K, 19, csLongintSize, @PixelStride);
+  err := err or clSetKernelArg(K, 20, csLongintSize, @OutFrames);
+  err := err or clSetKernelArg(K, 21, csLongintSize, @FrameStep);
+  err := err or clSetKernelArg(K, 22, csLongintSize, @UpsampleFold);
   if err <> CL_SUCCESS then exit;
   if UpsampleFold <> 0 then PhaseCount := 4 else PhaseCount := 1;
   if UseTiled
@@ -2593,7 +2599,7 @@ begin
     LaunchImplicitConv(FUpsampleFoldBuffer, SrcBuffer, FNumBs div 4,
       4 * InDepth, UseBias, {OutSizeX}SrcVol.SizeX, {RowSpan}2 * InDepth,
       SrcVol.SizeX, SrcVol.SizeY, InDepth, {Stride}1, {PaddingX}1,
-      {PaddingY}1, {DilationX}1, {PixelStride}InDepth, {OutFrames}1,
+      {PaddingY}1, {DilationX}1, {DilationY}1, {PixelStride}InDepth, {OutFrames}1,
       {FrameStep}0, {UpsampleFold}1, err);
   if err <> CL_SUCCESS then
   begin
@@ -2727,7 +2733,7 @@ begin
     LaunchImplicitConv(FModulatedAsBuffer, SrcBuffer, FNumBs, FSize, UseBias,
       {OutSizeX}SrcVol.SizeX, {RowSpan}FeatureSize * InDepth, SrcVol.SizeX,
       SrcVol.SizeY, InDepth, {Stride}1, Padding, Padding, {DilationX}1,
-      {PixelStride}InDepth, {OutFrames}1, {FrameStep}0, {UpsampleFold}0, err);
+      {DilationY}1, {PixelStride}InDepth, {OutFrames}1, {FrameStep}0, {UpsampleFold}0, err);
   if err <> CL_SUCCESS then
   begin
     ErrorProc('Error: TDotProductSharedKernel.ComputeModulatedConv - failed ' +
