@@ -66,6 +66,12 @@ the mid-block self-attention concentrates.
 (diffusers DDIMInverseScheduler): the image's VAE latents are walked to noise
 with the prompt, then sampled back with DDIM and the prompt; guidance defaults
 to 1, where the round trip reconstructs the image best.
+--edit-prompt TEXT runs Prompt-to-Prompt (Hertz et al. 2022, the
+google/prompt-to-prompt controllers): the prompt and the edit prompt sample
+together from one latent with DDIM, and the edit takes the prompt's
+cross-attention maps (--edit-mode swap|refine|reweight, --cross-replace F) and
+self-attention maps (--self-replace F); both images are written. With
+--invert-image both start from the image's inverted latents.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -79,7 +85,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
-  Classes, SysUtils,
+  Classes, SysUtils, Math,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuraldatasets, neuraldiffusion,
   neuralpretrained;
@@ -119,6 +125,12 @@ type
     InvertImageFile: string;
     InvertSteps: integer;
     InvertGuidanceScale: double;
+    // --edit-prompt ('' for none), --edit-mode, --cross-replace,
+    // --self-replace and the --reweight words and scales.
+    EditPrompt, EditMode: string;
+    CrossReplaceFraction, SelfReplaceFraction: double;
+    ReweightWords: TStringArray;
+    ReweightScales: TNeuralFloatDynArr;
     // --upscale-image ('' for none) and its --noise-level (< 0: default).
     UpscaleImageFile: string;
     NoiseLevel: integer;
@@ -362,6 +374,27 @@ begin
     'default 1.0');
   WriteLn('  --invert-steps N  inversion steps (default: --steps)');
   WriteLn('  --invert-guidance G CFG weight of the inversion (default 1.0)');
+  WriteLn('  --edit-prompt TEXT Prompt-to-Prompt: also sample this prompt from ',
+    'the same latent');
+  WriteLn('                    (DDIM), its attention steered by --prompt''s; ',
+    'writes --output');
+  WriteLn('                    and its _edit twin; with --invert-image both ',
+    'start from the');
+  WriteLn('                    inverted image');
+  WriteLn('  --edit-mode M     swap (word swap, equal word counts), refine ',
+    '(added or changed');
+  WriteLn('                    words keep their own maps; default) or ',
+    'reweight (refine plus');
+  WriteLn('                    --reweight)');
+  WriteLn('  --cross-replace F the edit takes --prompt''s cross-attention for ',
+    'the first');
+  WriteLn('                    int(F * (steps + 1)) steps (default 0.8)');
+  WriteLn('  --self-replace F  ... and its self-attention (maps of <= 16x16 ',
+    'tokens) for the');
+  WriteLn('                    first int(F * steps) steps (default 0.4)');
+  WriteLn('  --reweight W=S[,W=S] scale the edit''s cross-attention to the ',
+    'words W of');
+  WriteLn('                    --edit-prompt by S (any mode)');
   WriteLn('  --noise-level N   noise added to --upscale-image, 0..max_noise_level ',
     '(350;');
   WriteLn('                    default 20); more noise lets the UNet invent ',
@@ -449,6 +482,29 @@ begin
       DefaultFormatSettings);
 end;
 
+// --reweight value: WORD=SCALE pairs separated by commas, appended to Words
+// and Scales.
+procedure ParseReweightSpec(const Spec: string; var Words: TStringArray;
+  var Scales: TNeuralFloatDynArr);
+var
+  Pairs: TStringArray;
+  PairPos, EqualPos: integer;
+begin
+  Pairs := Spec.Split([',']);
+  for PairPos := 0 to High(Pairs) do
+  begin
+    EqualPos := Pos('=', Pairs[PairPos]);
+    if EqualPos <= 1 then
+      raise Exception.Create('--reweight wants WORD=SCALE[,WORD=SCALE], not "' +
+        Spec + '"');
+    SetLength(Words, Length(Words) + 1);
+    SetLength(Scales, Length(Scales) + 1);
+    Words[High(Words)] := Trim(Copy(Pairs[PairPos], 1, EqualPos - 1));
+    Scales[High(Scales)] := StrToFloat(Trim(Copy(Pairs[PairPos], EqualPos + 1,
+      Length(Pairs[PairPos]))), DefaultFormatSettings);
+  end;
+end;
+
 function ParseOptions(out Opt: TStableDiffusionOptions): boolean;
 var
   ArgPos: integer;
@@ -484,6 +540,12 @@ begin
   Opt.InvertImageFile := '';
   Opt.InvertSteps := -1;
   Opt.InvertGuidanceScale := -1;
+  Opt.EditPrompt := '';
+  Opt.EditMode := '';
+  Opt.CrossReplaceFraction := -1;
+  Opt.SelfReplaceFraction := -1;
+  Opt.ReweightWords := nil;
+  Opt.ReweightScales := nil;
   Opt.SamplerName := 'auto';
   Opt.KarrasSigmas := -1;
   Opt.Steps := -1;
@@ -574,6 +636,14 @@ begin
     else if Arg = '--invert-steps' then Opt.InvertSteps := StrToInt(NextArg())
     else if Arg = '--invert-guidance' then
       Opt.InvertGuidanceScale := StrToFloat(NextArg())
+    else if Arg = '--edit-prompt' then Opt.EditPrompt := NextArg()
+    else if Arg = '--edit-mode' then Opt.EditMode := LowerCase(NextArg())
+    else if Arg = '--cross-replace' then
+      Opt.CrossReplaceFraction := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--self-replace' then
+      Opt.SelfReplaceFraction := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--reweight' then
+      ParseReweightSpec(NextArg(), Opt.ReweightWords, Opt.ReweightScales)
     else if Arg = '--freeu' then
     begin
       ParseFreeUSpec(NextArg(), Opt.FreeUFactors);
@@ -674,6 +744,33 @@ begin
     raise Exception.Create('--invert-image samples with ddim');
   if (Opt.InvertImageFile <> '') and (Opt.RepeatCount > 1) then
     raise Exception.Create('--invert-image makes one image; drop --repeat');
+  if (Opt.EditPrompt = '') and ((Opt.EditMode <> '') or
+    (Opt.CrossReplaceFraction >= 0) or (Opt.SelfReplaceFraction >= 0) or
+    (Length(Opt.ReweightWords) > 0)) then
+    raise Exception.Create('--edit-mode, --cross-replace, --self-replace and ' +
+      '--reweight need --edit-prompt');
+  if not ((Opt.EditMode = '') or (Opt.EditMode = 'swap') or
+    (Opt.EditMode = 'refine') or (Opt.EditMode = 'reweight')) then
+    raise Exception.Create('unknown --edit-mode: ' + Opt.EditMode);
+  if (Opt.EditMode = 'reweight') and (Length(Opt.ReweightWords) = 0) then
+    raise Exception.Create('--edit-mode reweight needs --reweight');
+  if (Opt.CrossReplaceFraction > 1) or (Opt.SelfReplaceFraction > 1) then
+    raise Exception.Create('--cross-replace and --self-replace must be in ' +
+      '[0, 1]');
+  if (Opt.EditPrompt <> '') and ((Opt.InitImageFile <> '') or
+    (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '') or
+    (Opt.GLIGENFile <> '') or (Opt.IPAdapterFile <> '')) then
+    raise Exception.Create('--edit-prompt cannot be combined with ' +
+      '--init-image, --edit-image, --upscale-image, --gligen or --ip-adapter');
+  if (Opt.EditPrompt <> '') and ((Opt.DeepCacheInterval > 1) or
+    (Opt.PAGScale > 0) or (Opt.SAGScale > 0)) then
+    raise Exception.Create('--edit-prompt cannot be combined with ' +
+      '--deepcache, --pag-scale or --sag-scale');
+  if (Opt.EditPrompt <> '') and not ((Opt.SamplerName = 'auto') or
+    (Opt.SamplerName = 'ddim')) then
+    raise Exception.Create('--edit-prompt samples with ddim');
+  if (Opt.EditPrompt <> '') and (Opt.RepeatCount > 1) then
+    raise Exception.Create('--edit-prompt makes one image pair; drop --repeat');
 end;
 
 // Splits an --embedding value at its last ':' unless that is a drive letter's
@@ -735,7 +832,7 @@ var
   ImageConditioner: TStableDiffusionImageConditioner;
   Image, PromptEmbeds: TNNetVolume;
   SourceImageFile: string;
-  ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
+  ComputeText, ImageFile, EmbeddingFile, EmbeddingToken, EditText: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
   BoxPos: integer;
   BoxPhrase: string;
@@ -747,6 +844,13 @@ var
   StepCount, Img2ImgStepCount, InvertStepCount: integer;
   InvertGuidanceScale: double;
   InvertImage, InvertedLatents: TNNetVolume;
+  Edit: TSDPromptToPromptEdit;
+  EditMode: TSDPromptEditMode;
+  EditEmbeds, EditedImage, EditInitialLatents: TNNetVolume;
+  EditWords: TStringArray;
+  EditTokenIds, EditTokenLengths: TNeuralIntegerArray;
+  EditImageFile: string;
+  WordPos: integer;
   IsDepthUNet, IsUpscalerUNet: boolean;
   GuidanceScale: double;
   Seed: cardinal;
@@ -770,6 +874,9 @@ begin
   PromptEmbeds := TNNetVolume.Create;
   InvertImage := TNNetVolume.Create;
   InvertedLatents := TNNetVolume.Create;
+  Edit := nil;
+  EditEmbeds := TNNetVolume.Create;
+  EditedImage := TNNetVolume.Create;
   try
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
@@ -851,6 +958,7 @@ begin
         Pipeline.VaeScaleFactor;
       Pipeline.Sampler := smDDIM;
     end;
+    if Opt.EditPrompt <> '' then Pipeline.Sampler := smDDIM;
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
     if Opt.SamplerName <> 'auto' then
@@ -990,6 +1098,35 @@ begin
       WriteLn(Format('Invert image: %s (%dx%d), %d DDIM inversion steps, ' +
         'guidance %.2f', [Opt.InvertImageFile, InvertImage.SizeX,
         InvertImage.SizeY, InvertStepCount, InvertGuidanceScale]));
+    if Opt.EditPrompt <> '' then
+    begin
+      if Opt.EditMode = 'swap' then EditMode := sdpemSwap
+      else EditMode := sdpemRefine;
+      Pipeline.PromptWordTokens(Opt.EditPrompt, EditWords, EditTokenIds,
+        EditTokenLengths);
+      for WordPos := 0 to High(Opt.ReweightWords) do
+        if SDPromptWordTokenPositions(EditWords, EditTokenLengths,
+          Opt.ReweightWords[WordPos]) = nil then
+          raise Exception.Create('--reweight: "' + Opt.ReweightWords[WordPos] +
+            '" is not a word of --edit-prompt');
+      Edit := Pipeline.CreatePromptToPromptEdit(Opt.Prompt, Opt.EditPrompt,
+        EditMode, Opt.ReweightWords, Opt.ReweightScales);
+      if Opt.CrossReplaceFraction >= 0 then
+        Edit.CrossReplaceFraction := Opt.CrossReplaceFraction;
+      if Opt.SelfReplaceFraction >= 0 then
+        Edit.SelfReplaceFraction := Opt.SelfReplaceFraction;
+      if EditMode = sdpemSwap then EditText := 'swap'
+      else if Length(Opt.ReweightWords) > 0 then EditText := 'reweight'
+      else EditText := 'refine';
+      WriteLn('Edit:     "', Opt.EditPrompt, '"');
+      WriteLn(Format('          Prompt-to-Prompt %s; cross-attention for %d, ' +
+        'self-attention for %d of %d steps', [EditText,
+        Min(StepCount, Trunc(Edit.CrossReplaceFraction * (StepCount + 1))),
+        Trunc(Edit.SelfReplaceFraction * StepCount), StepCount]));
+      for WordPos := 0 to High(Opt.ReweightWords) do
+        WriteLn(Format('          reweight "%s" x %.2f',
+          [Opt.ReweightWords[WordPos], Opt.ReweightScales[WordPos]]));
+    end;
     if Assigned(InstructPix2Pix) then
       WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',
         [Opt.EditImageFile, Image.SizeX, Image.SizeY,
@@ -1075,7 +1212,30 @@ begin
       // elsewhere.
       RandSeed := Seed xor $9E3779B9;
       StartTime := Now();
-      if Opt.InvertImageFile <> '' then
+      if Opt.EditPrompt <> '' then
+      begin
+        Pipeline.EncodePrompts([Opt.Prompt, Opt.EditPrompt],
+          [PromptEmbeds, EditEmbeds]);
+        EditInitialLatents := nil;
+        if Opt.InvertImageFile <> '' then
+        begin
+          WriteLn('Inverting:');
+          Pipeline.InvertImage(InvertImage, PromptEmbeds, ImageWidth,
+            ImageHeight, InvertStepCount, InvertGuidanceScale, InvertedLatents);
+          EditInitialLatents := InvertedLatents;
+        end;
+        WriteLn('Sampling the prompt and the edit:');
+        Pipeline.GenerateEditFromEmbeds(PromptEmbeds, EditEmbeds, ImageWidth,
+          ImageHeight, StepCount, Seed, Edit, Image, EditedImage,
+          EditInitialLatents);
+        EditImageFile := ChangeFileExt(ImageFile, '') + '_edit' +
+          ExtractFileExt(ImageFile);
+        EditedImage.Mul(255.0);
+        if not SaveImageFromVolumeIntoFile(EditedImage, EditImageFile) then
+          raise Exception.Create('could not save ' + EditImageFile);
+        WriteLn('Wrote ', EditImageFile);
+      end
+      else if Opt.InvertImageFile <> '' then
       begin
         Pipeline.EncodePrompt(Opt.Prompt, PromptEmbeds);
         WriteLn('Inverting:');
@@ -1112,6 +1272,9 @@ begin
       {$POP}
     end;
   finally
+    EditedImage.Free;
+    EditEmbeds.Free;
+    Edit.Free;
     InvertedLatents.Free;
     InvertImage.Free;
     PromptEmbeds.Free;

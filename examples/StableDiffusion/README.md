@@ -749,6 +749,77 @@ ad hoc diffusers run and are hardcoded in the tests. The pico folder has
 random weights, so its round trip does not reconstruct the image; a real
 checkpoint has not been run with inversion yet.
 
+## Prompt-to-Prompt (`--edit-prompt`)
+
+Prompt-to-Prompt (Hertz et al. 2022, arXiv:2208.01626) edits an image by
+editing its prompt while the layout stays: `--prompt` and `--edit-prompt`
+sample together from the same initial latent with DDIM, and during the first
+steps the edit's UNet pass takes the cross-attention maps (attn2, which text
+token each pixel reads) and the self-attention maps (attn1, the layout) of the
+prompt's pass. This port follows the google/prompt-to-prompt controllers
+(`AttentionReplace`, `AttentionRefine`, `AttentionReweight`; `LocalBlend` is not
+ported). As there, only the guided (text) pass of each step is edited; the
+unconditional pass of CFG runs as usual.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --steps 50 --seed 7 \
+  --prompt "a photo of a cat riding a bicycle" \
+  --edit-prompt "a photo of a dog riding a bicycle" --edit-mode swap --gpu
+```
+
+writes `stable_diffusion.png` (the prompt) and `stable_diffusion_edit.png`
+(the edit). The modes:
+
+* `swap`: word swap. Both prompts must have the same number of words (split
+  at spaces); the changed words' maps move through a token mapper
+  (`seq_aligner.get_replacement_mapper`), spread evenly when the new word has
+  more or fewer tokens.
+* `refine` (the default): a global alignment of the two token sequences
+  (`seq_aligner.get_mapper`, gap 0); tokens the edit adds keep their own maps,
+  the others take the prompt's. Use it to add or change words.
+* `reweight`: `refine` plus `--reweight WORD=SCALE[,WORD=SCALE]`, which scales
+  the edit's cross-attention to those words of `--edit-prompt` (the
+  reference's `get_equalizer` with `AttentionRefine` as `prev_controller`).
+  With the same text in both prompts it only reweights. `--reweight` also
+  works on top of `swap` or `refine`.
+
+`--cross-replace F` (default 0.8): the cross-attention maps are replaced while
+the step index is below `int(F * (steps + 1))`, as the reference's
+`cross_replace_steps`. `--self-replace F` (default 0.4): the self-attention
+maps are replaced while the step index is below `int(F * steps)`, only in the
+attentions of at most 256 query tokens (the reference's `16 ** 2`: the 16x16
+and 8x8 latent levels of a 512x512 SD 1.x image; every level of the 16x16
+pico folder). Lower values let the edit move further from the prompt's
+layout.
+
+With `--invert-image PNG` both prompts start from the image's DDIM-inverted
+latents (inverted with `--prompt`), which edits a real image. Plain DDIM
+inversion only returns close to the image at guidance 1, so that mode defaults
+to guidance 1; at higher guidance the edit drifts, which null-text inversion
+(not ported yet) corrects.
+
+The sampler is always DDIM. `--edit-prompt` does not combine with
+`--init-image`, `--edit-image`, `--upscale-image`, `--gligen`,
+`--ip-adapter`, `--deepcache`, `--pag-scale`, `--sag-scale` or `--repeat`, and
+each prompt must fit one chunk of 75 tokens.
+
+`TStableDiffusionPipeline.CreatePromptToPromptEdit` builds a
+`TSDPromptToPromptEdit` from the two prompts, and `DenoiseEdit` /
+`GenerateEditFromEmbeds` run it. The edit reads the maps through
+`KeepAttentionWeights` and writes them through the
+`OnAttentionProbabilities` hook of `TNNetScaledDotProductAttention` and
+`TNNetCrossAttention` (the hooked heads run off the fused flash OpenCL
+kernel). Tests: the mappers against the reference algorithm on hand-made
+token lists (`TestSDPromptWordTokenPositions`, `TestSDPromptWordSwapMapper`,
+`TestSDPromptRefinementMapper`); swap, refine and reweight on the pico folder
+(4 DDIM steps, guidance 7.5) against a diffusers float64 run with an attention
+processor implementing the controller, within 2e-5 on latents of magnitude
+about 7 (`TestStableDiffusionPromptToPromptParity`; the numbers come from an
+ad hoc run and are hardcoded); with both replace fractions 0 each image equals
+a plain generation of its prompt bit for bit
+(`TestStableDiffusionPromptToPromptNoReplace`). A real checkpoint has not been
+run with Prompt-to-Prompt yet.
+
 ## Usage
 
 ```
@@ -828,6 +899,19 @@ StableDiffusion [--model DIR] [options]
                     default 1.0
   --invert-steps N  inversion steps (default: --steps)
   --invert-guidance G CFG weight of the inversion (default 1.0)
+  --edit-prompt TEXT Prompt-to-Prompt: also sample this prompt from the same
+                    latent (DDIM), its attention steered by --prompt's; writes
+                    --output and its _edit twin; with --invert-image both start
+                    from the inverted image
+  --edit-mode M     swap (word swap, equal word counts), refine (added or
+                    changed words keep their own maps; default) or reweight
+                    (refine plus --reweight)
+  --cross-replace F the edit takes --prompt's cross-attention for the first
+                    int(F * (steps + 1)) steps (default 0.8)
+  --self-replace F  ... and its self-attention (maps of <= 16x16 tokens) for
+                    the first int(F * steps) steps (default 0.4)
+  --reweight W=S[,W=S] scale the edit's cross-attention to the words W of
+                    --edit-prompt by S (any mode)
   --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales S1, S2 and
                     backbone scales B1, B2 of the first two up blocks; presets
                     sd15 (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)

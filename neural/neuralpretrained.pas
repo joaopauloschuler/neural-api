@@ -12193,6 +12193,35 @@ procedure SDSelfAttentionGuidanceMask(const Heads: TNNetLayerRefArr;
 // where the nearest-upsampled Mask is 1, then SqrtAb*X0 + SqrtOneMinusAb*Eps.
 procedure SDSelfAttentionDegrade(X0, Eps, Mask, Blurred: TNNetVolume;
   SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+// The TNNetCrossAttention (attn2) heads of Net in build order; raises unless
+// their count matches Config's attn1 heads (no only_cross_attention block).
+function SDUNetCrossAttentionHeads(Net: TNNet;
+  const Config: TSDUNetConfig): TNNetLayerRefArr;
+
+// prompt-to-prompt get_word_inds: token positions (bos = 0) of word WordPos (or
+// of every word equal to Word) of Words; TokenTextLengths per text token, no bos.
+function SDPromptWordTokenPositions(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  WordPos: integer): TNeuralIntegerArray; overload;
+function SDPromptWordTokenPositions(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  const Word: string): TNeuralIntegerArray; overload;
+// seq_aligner.get_replacement_mapper_ for prompts of equal word counts: Mapper
+// (TokenCount, TokenCount, 1) with X = target token, Y = source token.
+procedure SDPromptWordSwapMapper(const SourceWords, TargetWords: TStringArray;
+  const SourceTokenTextLengths, TargetTokenTextLengths: TNeuralIntegerArray;
+  TokenCount: integer; Mapper: TNNetVolume);
+// seq_aligner.get_mapper: global alignment (gap 0, match 1, mismatch -1) of the
+// ids (bos and eos included); per target token its source position, -1 = added.
+procedure SDPromptRefinementMapper(const SourceIds,
+  TargetIds: TNeuralIntegerArray; TokenCount: integer;
+  out SourcePositions: TNeuralIntegerArray; out Alphas: TNeuralFloatDynArr);
+// prompt-to-prompt get_equalizer: TokenCount ones, Scales[i] at the tokens of
+// every word equal to ScaledWords[i].
+function SDPromptTokenScales(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  const ScaledWords: array of string; const Scales: array of TNeuralFloat;
+  TokenCount: integer): TNeuralFloatDynArr;
 
 // SDXL single-step denoise for a UNet built with addition_embed_type=="text_time"
 // (Config.UseAddEmbedding=true). PooledText is the (AdditionEmbedTextDim) pooled
@@ -12467,6 +12496,82 @@ type
   end;
   TSDPromptSpanArray = array of TSDPromptSpan;
 
+  // How a Prompt-to-Prompt edit maps the source prompt's cross-attention maps
+  // onto the target's tokens: word swap (a token mapper) or refine (an alignment).
+  TSDPromptEditMode = (sdpemSwap, sdpemRefine);
+
+  // Prompt-to-Prompt (Hertz et al. 2022, google/prompt-to-prompt AttentionReplace /
+  // AttentionRefine / AttentionReweight, no LocalBlend) for
+  // TStableDiffusionPipeline.DenoiseEdit: the target prompt's guided pass takes
+  // the source pass's attn2 maps for the first CrossReplaceFraction of the steps
+  // (through SwapMapper, or RefineSourcePositions and RefineAlphas, then times
+  // TokenScales when set) and its attn1 maps for the first SelfReplaceFraction.
+  // Coded by Claude (AI).
+  TSDPromptToPromptEdit = class(TObject)
+  private
+    FMode: TSDPromptEditMode;
+    FTokenCount: integer;
+    FCrossReplaceFraction, FSelfReplaceFraction: double;
+    FSelfReplaceMaxTokens: integer;
+    FSwapMapper: TNNetVolume;
+    FRefineSourcePositions: TNeuralIntegerArray;
+    FRefineAlphas, FTokenScales: TNeuralFloatDynArr;
+    // While attached: SwapMapper's nonzero entries, the attn2 heads and the
+    // attn1 heads it replaces, their source maps, and each head's slot by layer.
+    FSwapSourcePositions, FSwapTargetPositions: TNeuralIntegerArray;
+    FSwapWeights: TNeuralFloatDynArr;
+    FCrossHeads, FSelfHeads: TNNetLayerRefArr;
+    FCrossMaps, FSelfMaps: TNNetVolumeList;
+    FSlotOfLayer: TNeuralIntegerArray;
+    FCrossReplaceStepCount, FSelfReplaceStepCount: integer;
+    FIsCrossStep, FIsSelfStep: boolean;
+    // Finds the heads of Net (a BuildSDUNet net of Config with no
+    // only_cross_attention block) and the replace step counts of StepCount steps.
+    procedure Attach(Net: TNNet; const Config: TSDUNetConfig;
+      StepCount: integer);
+    procedure Detach();
+    procedure BeginStep(StepPos: integer);
+    // After the source prompt's guided pass: keeps the maps this step replaces.
+    procedure CaptureSourceMaps();
+    // Hooks (Value) or unhooks the heads this step edits in the target's pass.
+    procedure SetTargetHooks(Value: boolean);
+    procedure EditCrossProbabilities(Layer: TNNetLayer;
+      Probabilities: TNNetVolume);
+    procedure EditSelfProbabilities(Layer: TNNetLayer;
+      Probabilities: TNNetVolume);
+  public
+    // TokenCount: the text tokens of both prompts' embeds (one chunk: 77).
+    constructor Create(Mode: TSDPromptEditMode; TokenCount: integer);
+    destructor Destroy(); override;
+    property Mode: TSDPromptEditMode read FMode;
+    property TokenCount: integer read FTokenCount;
+    // cross_replace_steps (default 0.8): attn2 replaced while the step index
+    // is below Trunc(CrossReplaceFraction * (StepCount + 1)), as the reference.
+    property CrossReplaceFraction: double read FCrossReplaceFraction
+      write FCrossReplaceFraction;
+    // self_replace_steps (default 0.4): attn1 replaced while the step index
+    // is below Trunc(SelfReplaceFraction * StepCount).
+    property SelfReplaceFraction: double read FSelfReplaceFraction
+      write FSelfReplaceFraction;
+    // attn1 maps of at most this many query tokens are replaced (default 256,
+    // the reference's 16 ** 2: at 512x512 the 16x16 and 8x8 latent levels).
+    property SelfReplaceMaxTokens: integer read FSelfReplaceMaxTokens
+      write FSelfReplaceMaxTokens;
+    // Swap: target map column n := sum over w of source column w times
+    // SwapMapper[n, w] (X = target token, Y = source token).
+    property SwapMapper: TNNetVolume read FSwapMapper;
+    // Refine: column n := source column RefineSourcePositions[n] (-1: none) times
+    // RefineAlphas[n] plus the target's own column times 1 - RefineAlphas[n].
+    property RefineSourcePositions: TNeuralIntegerArray
+      read FRefineSourcePositions write FRefineSourcePositions;
+    property RefineAlphas: TNeuralFloatDynArr read FRefineAlphas
+      write FRefineAlphas;
+    // Reweight (get_equalizer): each edited column n times TokenScales[n];
+    // empty: none.
+    property TokenScales: TNeuralFloatDynArr read FTokenScales
+      write FTokenScales;
+  end;
+
   // Stable Diffusion 1.x / 2.x text-to-image (diffusers StableDiffusionPipeline) over
   // a model_index.json folder: CLIP tokenizer + text encoder, UNet, VAE decoder,
   // classifier-free guidance with an empty (or negative) prompt. Each component
@@ -12551,6 +12656,9 @@ type
     FIsSelfAttentionGuided: boolean;
     FSelfAttentionHeads: TNNetLayerRefArr;
     FSelfAttentionMask: TNNetVolume;
+    // During DenoiseEdit: the edit and whether the target prompt's passes run.
+    FAttentionEdit: TSDPromptToPromptEdit;
+    FIsAttentionEditTarget: boolean;
     // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
     FLoRAFiles: TStringArray;
     FLoRAScales: TNeuralFloatDynArr;
@@ -12624,6 +12732,9 @@ type
     procedure PromptTextIds(const Prompt: string;
       out TextIds: TNeuralIntegerArray; out Weights: TNeuralFloatDynArr;
       out ChunkStarts: TNeuralIntegerArray);
+    // Prompt after ExpandInversionTokens as weighted spans (one span of weight 1
+    // unless PromptWeighting).
+    function PromptSpans(const Prompt: string): TSDPromptSpanArray;
     // NeededChunkCount, at least MinChunkCount, at most
     // Max(MaxChunkCount, MinChunkCount) (< 1: no cap).
     function PromptChunkCount(NeededChunkCount, MinChunkCount,
@@ -12668,9 +12779,12 @@ type
       Value: boolean);
     // The step cache of the passes that see Inputs; nil when DeepCache is off.
     function DeepCacheFor(Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
-    // Denoise, or (IsInversion) InvertLatents at the pipeline's GuidanceScale.
+    // Denoise, or (IsInversion) InvertLatents at the pipeline's GuidanceScale;
+    // Edit set: also DenoiseEdit's target track on EditEmbeds and EditLatents.
     procedure RunSteps(PromptEmbeds: TNNetVolume; Width, Height,
-      StepCount: integer; Latents: TNNetVolume; IsInversion: boolean);
+      StepCount: integer; Latents: TNNetVolume; IsInversion: boolean;
+      Edit: TSDPromptToPromptEdit = nil; EditEmbeds: TNNetVolume = nil;
+      EditLatents: TNNetVolume = nil);
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12749,6 +12863,26 @@ type
     procedure InvertImage(Image, PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; GuidanceScale: TNeuralFloat; Latents: TNNetVolume;
       SampleNoise: TNNetVolume = nil);
+    // Prompt-to-Prompt: Denoise of SourceEmbeds on SourceLatents and of
+    // TargetEmbeds on TargetLatents step by step, Edit steering the target (DDIM).
+    procedure DenoiseEdit(SourceEmbeds, TargetEmbeds: TNNetVolume; Width,
+      Height, StepCount: integer; Edit: TSDPromptToPromptEdit;
+      SourceLatents, TargetLatents: TNNetVolume);
+    // DenoiseEdit from InitialLatents (nil: drawn from Seed) for both prompts,
+    // then DecodeLatents of each.
+    procedure GenerateEditFromEmbeds(SourceEmbeds, TargetEmbeds: TNNetVolume;
+      Width, Height, StepCount: integer; Seed: cardinal;
+      Edit: TSDPromptToPromptEdit; SourceImage, TargetImage: TNNetVolume;
+      InitialLatents: TNNetVolume = nil);
+    // Prompt split at ' ' as tokenized (weights and inversion tokens resolved),
+    // its ids with bos and eos, and each text token's decoded length ('#' stripped).
+    procedure PromptWordTokens(const Prompt: string; out Words: TStringArray;
+      out TokenIds, TokenTextLengths: TNeuralIntegerArray);
+    // A Prompt-to-Prompt edit from SourcePrompt to TargetPrompt (one chunk each),
+    // TokenScales from ScaledWords of TargetPrompt; the caller owns it.
+    function CreatePromptToPromptEdit(const SourcePrompt, TargetPrompt: string;
+      Mode: TSDPromptEditMode; const ScaledWords: array of string;
+      const Scales: array of TNeuralFloat): TSDPromptToPromptEdit;
     // VAE latents of VaeImage (W, H, 3) in [-1, 1], (W, H) / VaeScaleFactor:
     // (mean + std * SampleNoise; nil: mean) * scaling_factor (latent_dist.sample).
     procedure EncodeVaeImage(VaeImage, Latents: TNNetVolume;
@@ -79397,6 +79531,524 @@ begin
   X0.MulAdd(SqrtOneMinusAb, Eps);
 end;
 
+function SDUNetCrossAttentionHeads(Net: TNNet;
+  const Config: TSDUNetConfig): TNNetLayerRefArr;
+var
+  Names: TStringArray;
+  HeadCounts: TNeuralIntegerArray;
+  AttentionPos, MaxAttentionPos, BlockPos, MaxBlockPos, HeadCnt, ResultCnt,
+    LayerPos, MaxLayerPos: integer;
+begin
+  MaxBlockPos := Config.NumBlockOut - 1;
+  for BlockPos := 0 to MaxBlockPos do
+    if Config.OnlyCrossAttention[BlockPos] then
+      ImportError('SDUNetCrossAttentionHeads: down block ' +
+        IntToStr(BlockPos) + ' is only_cross_attention; its attn1 is cross ' +
+        'attention too.');
+  if Config.MidBlockOnlyCrossAttention then
+    ImportError('SDUNetCrossAttentionHeads: the mid block is ' +
+      'only_cross_attention; its attn1 is cross attention too.');
+  SDUNetListSelfAttentions(Config, Names, HeadCounts);
+  HeadCnt := 0;
+  MaxAttentionPos := High(HeadCounts);
+  for AttentionPos := 0 to MaxAttentionPos do
+    Inc(HeadCnt, HeadCounts[AttentionPos]);
+  Result := nil;
+  SetLength(Result, HeadCnt);
+  ResultCnt := 0;
+  MaxLayerPos := Net.GetLastLayerIdx();
+  for LayerPos := 0 to MaxLayerPos do
+    if Net.Layers[LayerPos].ClassType = TNNetCrossAttention then
+    begin
+      if ResultCnt < HeadCnt then Result[ResultCnt] := Net.Layers[LayerPos];
+      Inc(ResultCnt);
+    end;
+  if ResultCnt <> HeadCnt then
+    ImportError('SDUNetCrossAttentionHeads: the net holds ' +
+      IntToStr(ResultCnt) + ' cross-attention heads, the unet config ' +
+      IntToStr(HeadCnt) + ' (IP-Adapter and GLIGEN add their own).');
+end;
+
+// get_word_inds over the words IsSelected marks.
+function SDPromptSelectedWordTokenPositions(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  const IsSelected: array of boolean): TNeuralIntegerArray;
+var
+  TokenPos, MaxTokenPos, WordPos, MaxWordPos, WordLength, ResultCnt: integer;
+begin
+  Result := nil;
+  ResultCnt := 0;
+  WordPos := 0;
+  WordLength := 0;
+  MaxWordPos := Min(High(Words), High(IsSelected));
+  MaxTokenPos := High(TokenTextLengths);
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    // The reference indexes past the last word here and fails.
+    if WordPos > MaxWordPos then break;
+    Inc(WordLength, TokenTextLengths[TokenPos]);
+    if IsSelected[WordPos] then
+    begin
+      SetLength(Result, ResultCnt + 1);
+      Result[ResultCnt] := TokenPos + 1;
+      Inc(ResultCnt);
+    end;
+    if WordLength >= CodePointCount(Words[WordPos]) then
+    begin
+      Inc(WordPos);
+      WordLength := 0;
+    end;
+  end;
+end;
+
+function SDPromptWordTokenPositions(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  WordPos: integer): TNeuralIntegerArray;
+var
+  IsSelected: array of boolean;
+begin
+  Result := nil;
+  if (WordPos < 0) or (WordPos > High(Words)) then exit;
+  SetLength(IsSelected, Length(Words));
+  IsSelected[WordPos] := true;
+  Result := SDPromptSelectedWordTokenPositions(Words, TokenTextLengths,
+    IsSelected);
+end;
+
+function SDPromptWordTokenPositions(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  const Word: string): TNeuralIntegerArray;
+var
+  IsSelected: array of boolean;
+  WordPos, MaxWordPos: integer;
+begin
+  MaxWordPos := High(Words);
+  SetLength(IsSelected, MaxWordPos + 1);
+  for WordPos := 0 to MaxWordPos do
+    IsSelected[WordPos] := Words[WordPos] = Word;
+  Result := SDPromptSelectedWordTokenPositions(Words, TokenTextLengths,
+    IsSelected);
+end;
+
+procedure SDPromptWordSwapMapper(const SourceWords, TargetWords: TStringArray;
+  const SourceTokenTextLengths, TargetTokenTextLengths: TNeuralIntegerArray;
+  TokenCount: integer; Mapper: TNNetVolume);
+var
+  SwappedSource, SwappedTarget: array of TNeuralIntegerArray;
+  WordPos, MaxWordPos, SwappedCnt, SwapPos, SourcePos, TargetPos,
+    SourceTokenPos, TargetTokenPos, PairPos, MaxPairPos, MaxSourceTokenPos,
+    MaxTargetTokenPos: integer;
+  Ratio: TNeuralFloat;
+
+  procedure CheckPositions(const Positions: TNeuralIntegerArray;
+    const Word: string);
+  begin
+    if Length(Positions) = 0 then
+      ImportError('SDPromptWordSwapMapper: the word "' + Word +
+        '" has no token.');
+    if Positions[High(Positions)] >= TokenCount then
+      ImportError('SDPromptWordSwapMapper: the word "' + Word +
+        '" lies past token ' + IntToStr(TokenCount) + '.');
+  end;
+
+begin
+  if Length(SourceWords) <> Length(TargetWords) then
+    ImportError('SDPromptWordSwapMapper: a word swap needs prompts of equal ' +
+      'word counts; the source has ' + IntToStr(Length(SourceWords)) +
+      ' words, the target ' + IntToStr(Length(TargetWords)) + '.');
+  SwappedSource := nil;
+  SwappedTarget := nil;
+  SwappedCnt := 0;
+  MaxWordPos := High(TargetWords);
+  for WordPos := 0 to MaxWordPos do
+    if TargetWords[WordPos] <> SourceWords[WordPos] then
+    begin
+      SetLength(SwappedSource, SwappedCnt + 1);
+      SetLength(SwappedTarget, SwappedCnt + 1);
+      SwappedSource[SwappedCnt] := SDPromptWordTokenPositions(SourceWords,
+        SourceTokenTextLengths, WordPos);
+      SwappedTarget[SwappedCnt] := SDPromptWordTokenPositions(TargetWords,
+        TargetTokenTextLengths, WordPos);
+      CheckPositions(SwappedSource[SwappedCnt], SourceWords[WordPos]);
+      CheckPositions(SwappedTarget[SwappedCnt], TargetWords[WordPos]);
+      Inc(SwappedCnt);
+    end;
+  Mapper.ReSize(TokenCount, TokenCount, 1);
+  Mapper.Fill(0);
+  SourcePos := 0;
+  TargetPos := 0;
+  SwapPos := 0;
+  // Mapper[X = target, Y = source] is the reference's mapper[source, target].
+  while (SourcePos < TokenCount) and (TargetPos < TokenCount) do
+  begin
+    if (SwapPos < SwappedCnt) and (SwappedSource[SwapPos][0] = SourcePos) then
+    begin
+      MaxSourceTokenPos := High(SwappedSource[SwapPos]);
+      MaxTargetTokenPos := High(SwappedTarget[SwapPos]);
+      if MaxSourceTokenPos = MaxTargetTokenPos then
+      begin
+        MaxPairPos := MaxSourceTokenPos;
+        for PairPos := 0 to MaxPairPos do
+          Mapper[SwappedTarget[SwapPos][PairPos],
+            SwappedSource[SwapPos][PairPos], 0] := 1;
+      end
+      else
+      begin
+        Ratio := 1 / (MaxTargetTokenPos + 1);
+        for TargetTokenPos := 0 to MaxTargetTokenPos do
+          for SourceTokenPos := 0 to MaxSourceTokenPos do
+            Mapper[SwappedTarget[SwapPos][TargetTokenPos],
+              SwappedSource[SwapPos][SourceTokenPos], 0] := Ratio;
+      end;
+      Inc(SourcePos, MaxSourceTokenPos + 1);
+      Inc(TargetPos, MaxTargetTokenPos + 1);
+      Inc(SwapPos);
+    end
+    else
+    begin
+      // After the last swapped word the reference maps token j to itself.
+      if SwapPos < SwappedCnt then Mapper[TargetPos, SourcePos, 0] := 1
+      else Mapper[TargetPos, TargetPos, 0] := 1;
+      Inc(SourcePos);
+      Inc(TargetPos);
+    end;
+  end;
+end;
+
+procedure SDPromptRefinementMapper(const SourceIds,
+  TargetIds: TNeuralIntegerArray; TokenCount: integer;
+  out SourcePositions: TNeuralIntegerArray; out Alphas: TNeuralFloatDynArr);
+const
+  // seq_aligner.get_traceback_matrix codes.
+  csFromLeft = 1;
+  csFromUp = 2;
+  csFromDiagonal = 3;
+  csOrigin = 4;
+var
+  Scores, TraceBack: TNeuralIntegerArray;
+  SourceCnt, TargetCnt, RowSize, SourcePos, TargetPos, CellPos, LeftScore,
+    UpScore, DiagonalScore, TokenPos, MaxTokenPos: integer;
+begin
+  SourceCnt := Length(SourceIds);
+  TargetCnt := Length(TargetIds);
+  if TargetCnt > TokenCount then
+    ImportError('SDPromptRefinementMapper: the target holds ' +
+      IntToStr(TargetCnt) + ' tokens, more than ' + IntToStr(TokenCount) + '.');
+  // ScoreParams(gap 0, match 1, mismatch -1): the gap rows start at 0.
+  RowSize := TargetCnt + 1;
+  SetLength(Scores, (SourceCnt + 1) * RowSize);
+  SetLength(TraceBack, (SourceCnt + 1) * RowSize);
+  for TargetPos := 1 to TargetCnt do TraceBack[TargetPos] := csFromLeft;
+  for SourcePos := 1 to SourceCnt do
+    TraceBack[SourcePos * RowSize] := csFromUp;
+  TraceBack[0] := csOrigin;
+  for SourcePos := 1 to SourceCnt do
+    for TargetPos := 1 to TargetCnt do
+    begin
+      CellPos := SourcePos * RowSize + TargetPos;
+      LeftScore := Scores[CellPos - 1];
+      UpScore := Scores[CellPos - RowSize];
+      DiagonalScore := Scores[CellPos - RowSize - 1];
+      if SourceIds[SourcePos - 1] = TargetIds[TargetPos - 1] then
+        Inc(DiagonalScore)
+      else Dec(DiagonalScore);
+      Scores[CellPos] := Max(LeftScore, Max(UpScore, DiagonalScore));
+      if Scores[CellPos] = LeftScore then TraceBack[CellPos] := csFromLeft
+      else if Scores[CellPos] = UpScore then TraceBack[CellPos] := csFromUp
+      else TraceBack[CellPos] := csFromDiagonal;
+    end;
+  SetLength(SourcePositions, TokenCount);
+  SetLength(Alphas, TokenCount);
+  // Tokens past the target map to themselves at alpha 1.
+  MaxTokenPos := TokenCount - 1;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    SourcePositions[TokenPos] := TokenPos;
+    Alphas[TokenPos] := 1;
+  end;
+  SourcePos := SourceCnt;
+  TargetPos := TargetCnt;
+  // get_aligned_sequences: each step left or diagonal emits target TargetPos.
+  while (SourcePos > 0) or (TargetPos > 0) do
+  begin
+    CellPos := SourcePos * RowSize + TargetPos;
+    case TraceBack[CellPos] of
+      csFromDiagonal:
+        begin
+          Dec(SourcePos);
+          Dec(TargetPos);
+          SourcePositions[TargetPos] := SourcePos;
+        end;
+      csFromLeft:
+        begin
+          Dec(TargetPos);
+          SourcePositions[TargetPos] := -1;
+          Alphas[TargetPos] := 0;
+        end;
+      csFromUp: Dec(SourcePos);
+    else
+      break;
+    end;
+  end;
+end;
+
+function SDPromptTokenScales(const Words: TStringArray;
+  const TokenTextLengths: TNeuralIntegerArray;
+  const ScaledWords: array of string; const Scales: array of TNeuralFloat;
+  TokenCount: integer): TNeuralFloatDynArr;
+var
+  Positions: TNeuralIntegerArray;
+  ScalePos, MaxScalePos, PositionPos, MaxPositionPos, TokenPos,
+    MaxTokenPos: integer;
+begin
+  if Length(ScaledWords) <> Length(Scales) then
+    ImportError('SDPromptTokenScales: ' + IntToStr(Length(ScaledWords)) +
+      ' words, ' + IntToStr(Length(Scales)) + ' scales.');
+  Result := nil;
+  SetLength(Result, TokenCount);
+  MaxTokenPos := TokenCount - 1;
+  for TokenPos := 0 to MaxTokenPos do Result[TokenPos] := 1;
+  MaxScalePos := High(ScaledWords);
+  for ScalePos := 0 to MaxScalePos do
+  begin
+    Positions := SDPromptWordTokenPositions(Words, TokenTextLengths,
+      ScaledWords[ScalePos]);
+    MaxPositionPos := High(Positions);
+    for PositionPos := 0 to MaxPositionPos do
+      if Positions[PositionPos] < TokenCount then
+        Result[Positions[PositionPos]] := Scales[ScalePos];
+  end;
+end;
+
+constructor TSDPromptToPromptEdit.Create(Mode: TSDPromptEditMode;
+  TokenCount: integer);
+var
+  TokenPos, MaxTokenPos: integer;
+begin
+  inherited Create();
+  if TokenCount < 1 then
+    ImportError('TSDPromptToPromptEdit: TokenCount must be >= 1.');
+  FMode := Mode;
+  FTokenCount := TokenCount;
+  FCrossReplaceFraction := 0.8;
+  FSelfReplaceFraction := 0.4;
+  FSelfReplaceMaxTokens := 16 * 16;
+  // Identity mappings until the caller sets them: the source maps verbatim.
+  FSwapMapper := TNNetVolume.Create(TokenCount, TokenCount, 1);
+  SetLength(FRefineSourcePositions, TokenCount);
+  SetLength(FRefineAlphas, TokenCount);
+  MaxTokenPos := TokenCount - 1;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    FSwapMapper[TokenPos, TokenPos, 0] := 1;
+    FRefineSourcePositions[TokenPos] := TokenPos;
+    FRefineAlphas[TokenPos] := 1;
+  end;
+  FCrossMaps := TNNetVolumeList.Create();
+  FSelfMaps := TNNetVolumeList.Create();
+end;
+
+destructor TSDPromptToPromptEdit.Destroy();
+begin
+  Detach();
+  FSelfMaps.Free;
+  FCrossMaps.Free;
+  FSwapMapper.Free;
+  inherited Destroy();
+end;
+
+procedure TSDPromptToPromptEdit.Attach(Net: TNNet;
+  const Config: TSDUNetConfig; StepCount: integer);
+var
+  Names: TStringArray;
+  AllSelfIndices: TNeuralIntegerArray;
+  AllSelfHeads: TNNetLayerRefArr;
+  Head: TNNetLayer;
+  Map: TNNetVolume;
+  HeadPos, MaxHeadPos, SelfCnt, LayerPos, MaxLayerPos, TokenPos, MaxTokenPos,
+    EntryCnt, NamePos, MaxNamePos, MapperPos, MaxMapperPos: integer;
+begin
+  Detach();
+  if (FSwapMapper.SizeX <> FTokenCount) or (FSwapMapper.SizeY <> FTokenCount) or
+    (Length(FRefineSourcePositions) <> FTokenCount) or
+    (Length(FRefineAlphas) <> FTokenCount) or
+    ((Length(FTokenScales) <> 0) and (Length(FTokenScales) <> FTokenCount)) then
+    ImportError('TSDPromptToPromptEdit: the mappers and scales must hold ' +
+      IntToStr(FTokenCount) + ' tokens.');
+  MaxTokenPos := FTokenCount - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    if FRefineSourcePositions[TokenPos] >= FTokenCount then
+      ImportError('TSDPromptToPromptEdit: RefineSourcePositions[' +
+        IntToStr(TokenPos) + '] is past the tokens.');
+  FCrossHeads := SDUNetCrossAttentionHeads(Net, Config);
+  Names := SDUNetSelfAttentionNames(Config);
+  MaxNamePos := High(Names);
+  SetLength(AllSelfIndices, MaxNamePos + 1);
+  for NamePos := 0 to MaxNamePos do AllSelfIndices[NamePos] := NamePos;
+  AllSelfHeads := SDUNetSelfAttentionHeads(Net, Config, AllSelfIndices);
+  MaxLayerPos := Net.GetLastLayerIdx();
+  SetLength(FSlotOfLayer, MaxLayerPos + 1);
+  for LayerPos := 0 to MaxLayerPos do FSlotOfLayer[LayerPos] := -1;
+  MaxHeadPos := High(FCrossHeads);
+  for HeadPos := 0 to MaxHeadPos do
+  begin
+    Map := TNNetCrossAttention(FCrossHeads[HeadPos]).AttentionWeights;
+    if Map.SizeX <> FTokenCount then
+      ImportError('TSDPromptToPromptEdit: the unet attends over ' +
+        IntToStr(Map.SizeX) + ' text tokens, the edit maps ' +
+        IntToStr(FTokenCount) + '.');
+    FSlotOfLayer[FCrossHeads[HeadPos].LayerIdx] := HeadPos;
+    FCrossMaps.Add(TNNetVolume.Create(Map));
+  end;
+  SelfCnt := 0;
+  SetLength(FSelfHeads, Length(AllSelfHeads));
+  MaxHeadPos := High(AllSelfHeads);
+  for HeadPos := 0 to MaxHeadPos do
+  begin
+    Head := AllSelfHeads[HeadPos];
+    if Head.Output.SizeX > FSelfReplaceMaxTokens then continue;
+    TNNetScaledDotProductAttention(Head).KeepAttentionWeights := true;
+    FSlotOfLayer[Head.LayerIdx] := SelfCnt;
+    FSelfMaps.Add(TNNetVolume.Create(
+      TNNetScaledDotProductAttention(Head).AttentionWeights));
+    FSelfHeads[SelfCnt] := Head;
+    Inc(SelfCnt);
+  end;
+  SetLength(FSelfHeads, SelfCnt);
+  // SwapMapper is row-major over Y = source token, X = target token.
+  MaxMapperPos := FSwapMapper.Size - 1;
+  EntryCnt := 0;
+  for MapperPos := 0 to MaxMapperPos do
+    if FSwapMapper.FData[MapperPos] <> 0 then Inc(EntryCnt);
+  SetLength(FSwapSourcePositions, EntryCnt);
+  SetLength(FSwapTargetPositions, EntryCnt);
+  SetLength(FSwapWeights, EntryCnt);
+  EntryCnt := 0;
+  for MapperPos := 0 to MaxMapperPos do
+    if FSwapMapper.FData[MapperPos] <> 0 then
+    begin
+      FSwapSourcePositions[EntryCnt] := MapperPos div FTokenCount;
+      FSwapTargetPositions[EntryCnt] := MapperPos mod FTokenCount;
+      FSwapWeights[EntryCnt] := FSwapMapper.FData[MapperPos];
+      Inc(EntryCnt);
+    end;
+  FCrossReplaceStepCount := Trunc(FCrossReplaceFraction * (StepCount + 1));
+  FSelfReplaceStepCount := Trunc(FSelfReplaceFraction * StepCount);
+  FIsCrossStep := false;
+  FIsSelfStep := false;
+end;
+
+procedure TSDPromptToPromptEdit.Detach();
+var
+  HeadPos, MaxHeadPos: integer;
+begin
+  SetTargetHooks(false);
+  MaxHeadPos := High(FSelfHeads);
+  for HeadPos := 0 to MaxHeadPos do
+    TNNetScaledDotProductAttention(FSelfHeads[HeadPos]).
+      KeepAttentionWeights := false;
+  FCrossHeads := nil;
+  FSelfHeads := nil;
+  FSlotOfLayer := nil;
+  if Assigned(FCrossMaps) then FCrossMaps.Clear();
+  if Assigned(FSelfMaps) then FSelfMaps.Clear();
+end;
+
+procedure TSDPromptToPromptEdit.BeginStep(StepPos: integer);
+begin
+  FIsCrossStep := StepPos < FCrossReplaceStepCount;
+  FIsSelfStep := StepPos < FSelfReplaceStepCount;
+end;
+
+procedure TSDPromptToPromptEdit.CaptureSourceMaps();
+var
+  HeadPos, MaxHeadPos: integer;
+begin
+  if FIsCrossStep then
+  begin
+    MaxHeadPos := High(FCrossHeads);
+    for HeadPos := 0 to MaxHeadPos do
+      FCrossMaps[HeadPos].Copy(
+        TNNetCrossAttention(FCrossHeads[HeadPos]).AttentionWeights);
+  end;
+  if FIsSelfStep then
+  begin
+    MaxHeadPos := High(FSelfHeads);
+    for HeadPos := 0 to MaxHeadPos do
+      FSelfMaps[HeadPos].Copy(
+        TNNetScaledDotProductAttention(FSelfHeads[HeadPos]).AttentionWeights);
+  end;
+end;
+
+procedure TSDPromptToPromptEdit.SetTargetHooks(Value: boolean);
+var
+  HeadPos, MaxHeadPos: integer;
+  CrossHook, SelfHook: TNNetAttentionProbabilitiesEvent;
+begin
+  CrossHook := nil;
+  SelfHook := nil;
+  if Value and FIsCrossStep then CrossHook := @EditCrossProbabilities;
+  if Value and FIsSelfStep then SelfHook := @EditSelfProbabilities;
+  MaxHeadPos := High(FCrossHeads);
+  for HeadPos := 0 to MaxHeadPos do
+    TNNetCrossAttention(FCrossHeads[HeadPos]).OnAttentionProbabilities :=
+      CrossHook;
+  MaxHeadPos := High(FSelfHeads);
+  for HeadPos := 0 to MaxHeadPos do
+    TNNetScaledDotProductAttention(FSelfHeads[HeadPos]).
+      OnAttentionProbabilities := SelfHook;
+end;
+
+procedure TSDPromptToPromptEdit.EditCrossProbabilities(Layer: TNNetLayer;
+  Probabilities: TNNetVolume);
+var
+  Source: TNNetVolume;
+  QueryPos, MaxQueryPos, TokenPos, MaxTokenPos, EntryPos, MaxEntryPos,
+    RowPos, SourcePos: integer;
+  Alpha: TNeuralFloat;
+begin
+  Source := FCrossMaps[FSlotOfLayer[Layer.LayerIdx]];
+  MaxQueryPos := Probabilities.SizeY - 1;
+  MaxTokenPos := FTokenCount - 1;
+  MaxEntryPos := High(FSwapWeights);
+  RowPos := 0;
+  for QueryPos := 0 to MaxQueryPos do
+  begin
+    if FMode = sdpemSwap then
+    begin
+      FillChar(Probabilities.FData[RowPos], FTokenCount * csNeuralFloatSize, 0);
+      for EntryPos := 0 to MaxEntryPos do
+        Probabilities.FData[RowPos + FSwapTargetPositions[EntryPos]] :=
+          Probabilities.FData[RowPos + FSwapTargetPositions[EntryPos]] +
+          FSwapWeights[EntryPos] *
+          Source.FData[RowPos + FSwapSourcePositions[EntryPos]];
+    end
+    else
+      for TokenPos := 0 to MaxTokenPos do
+      begin
+        SourcePos := FRefineSourcePositions[TokenPos];
+        Alpha := FRefineAlphas[TokenPos];
+        if SourcePos >= 0 then
+          Probabilities.FData[RowPos + TokenPos] :=
+            Source.FData[RowPos + SourcePos] * Alpha +
+            Probabilities.FData[RowPos + TokenPos] * (1 - Alpha)
+        else
+          Probabilities.FData[RowPos + TokenPos] :=
+            Probabilities.FData[RowPos + TokenPos] * (1 - Alpha);
+      end;
+    if Length(FTokenScales) > 0 then
+      TNNetVolume.Mul(Probabilities.GetRawPtr(RowPos), @FTokenScales[0],
+        FTokenCount);
+    Inc(RowPos, FTokenCount);
+  end;
+end;
+
+procedure TSDPromptToPromptEdit.EditSelfProbabilities(Layer: TNNetLayer;
+  Probabilities: TNNetVolume);
+begin
+  Probabilities.Copy(FSelfMaps[FSlotOfLayer[Layer.LayerIdx]]);
+end;
+
 procedure SDUNetDenoiseSDXL(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates, PooledText: TNNetVolume; t: TNeuralFloat;
   const TimeIds: array of TNeuralFloat; Noise: TNNetVolume);
@@ -102408,6 +103060,96 @@ begin
     1, Result, Weights);
 end;
 
+function TStableDiffusionPipeline.PromptSpans(
+  const Prompt: string): TSDPromptSpanArray;
+begin
+  if FPromptWeighting then
+    Result := ParseSDPromptWeights(ExpandInversionTokens(Prompt))
+  else
+  begin
+    SetLength(Result, 1);
+    Result[0].Text := ExpandInversionTokens(Prompt);
+    Result[0].Weight := 1.0;
+    Result[0].IsChunkBreak := false;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.PromptWordTokens(const Prompt: string;
+  out Words: TStringArray; out TokenIds, TokenTextLengths: TNeuralIntegerArray);
+var
+  Spans: TSDPromptSpanArray;
+  TextIds, ChunkStarts, ChunkIds: TNeuralIntegerArray;
+  Weights, ChunkWeights: TNeuralFloatDynArr;
+  PlainText, TokenText: string;
+  SpanPos, MaxSpanPos, IdPos, MaxIdPos, TrimStart, TrimLength: integer;
+begin
+  PromptTextIds(Prompt, TextIds, Weights, ChunkStarts);
+  if Length(ChunkStarts) > 2 then
+    ImportError('TStableDiffusionPipeline.PromptWordTokens: "' + Prompt +
+      '" takes ' + IntToStr(High(ChunkStarts)) + ' chunks; word alignment ' +
+      'reads one chunk of ' + IntToStr(FMaxTokenCount - 2) + ' tokens.');
+  Spans := PromptSpans(Prompt);
+  PlainText := '';
+  MaxSpanPos := High(Spans);
+  for SpanPos := 0 to MaxSpanPos do
+    if not Spans[SpanPos].IsChunkBreak then
+      PlainText := PlainText + Spans[SpanPos].Text;
+  Words := PlainText.Split([' ']);
+  LayoutPromptChunks(TextIds, nil, nil, 1, ChunkIds, ChunkWeights);
+  TokenIds := Copy(ChunkIds, 0, Length(TextIds) + 2);
+  SetLength(TokenTextLengths, Length(TextIds));
+  MaxIdPos := High(TextIds);
+  for IdPos := 0 to MaxIdPos do
+  begin
+    // tokenizer.decode([id]).strip("#") of the reference.
+    TokenText := Trim(FTokenizer.Decode([TextIds[IdPos]]));
+    TrimStart := 1;
+    TrimLength := Length(TokenText);
+    while (TrimLength > 0) and (TokenText[TrimStart] = '#') do
+    begin
+      Inc(TrimStart);
+      Dec(TrimLength);
+    end;
+    while (TrimLength > 0) and (TokenText[TrimStart + TrimLength - 1] = '#') do
+      Dec(TrimLength);
+    TokenTextLengths[IdPos] := CodePointCount(Copy(TokenText, TrimStart,
+      TrimLength));
+  end;
+end;
+
+function TStableDiffusionPipeline.CreatePromptToPromptEdit(const SourcePrompt,
+  TargetPrompt: string; Mode: TSDPromptEditMode;
+  const ScaledWords: array of string;
+  const Scales: array of TNeuralFloat): TSDPromptToPromptEdit;
+var
+  SourceWords, TargetWords: TStringArray;
+  SourceIds, TargetIds, SourceLengths, TargetLengths,
+    SourcePositions: TNeuralIntegerArray;
+  Alphas: TNeuralFloatDynArr;
+begin
+  PromptWordTokens(SourcePrompt, SourceWords, SourceIds, SourceLengths);
+  PromptWordTokens(TargetPrompt, TargetWords, TargetIds, TargetLengths);
+  Result := TSDPromptToPromptEdit.Create(Mode, FMaxTokenCount);
+  try
+    if Mode = sdpemSwap then
+      SDPromptWordSwapMapper(SourceWords, TargetWords, SourceLengths,
+        TargetLengths, FMaxTokenCount, Result.SwapMapper)
+    else
+    begin
+      SDPromptRefinementMapper(SourceIds, TargetIds, FMaxTokenCount,
+        SourcePositions, Alphas);
+      Result.RefineSourcePositions := SourcePositions;
+      Result.RefineAlphas := Alphas;
+    end;
+    if Length(ScaledWords) > 0 then
+      Result.TokenScales := SDPromptTokenScales(TargetWords, TargetLengths,
+        ScaledWords, Scales, FMaxTokenCount);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
 procedure TStableDiffusionPipeline.PromptTextIds(const Prompt: string;
   out TextIds: TNeuralIntegerArray; out Weights: TNeuralFloatDynArr;
   out ChunkStarts: TNeuralIntegerArray);
@@ -102438,13 +103180,7 @@ var
 
 begin
   EnsureTokenizer();
-  if FPromptWeighting then Spans := ParseSDPromptWeights(ExpandInversionTokens(Prompt))
-  else
-  begin
-    SetLength(Spans, 1);
-    Spans[0].Text := ExpandInversionTokens(Prompt);
-    Spans[0].Weight := 1.0;
-  end;
+  Spans := PromptSpans(Prompt);
   TextIds := nil;
   Weights := nil;
   ChunkStarts := nil;
@@ -102821,16 +103557,81 @@ begin
   InvertLatents(PromptEmbeds, Width, Height, StepCount, GuidanceScale, Latents);
 end;
 
+procedure TStableDiffusionPipeline.DenoiseEdit(SourceEmbeds,
+  TargetEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+  Edit: TSDPromptToPromptEdit; SourceLatents, TargetLatents: TNNetVolume);
+var
+  StepConditioner: TStableDiffusionConditioner;
+begin
+  StepConditioner := ActiveConditioner();
+  if FSampler <> smDDIM then
+    ImportError('TStableDiffusionPipeline.DenoiseEdit: Prompt-to-Prompt ' +
+      'samples with DDIM (Sampler smDDIM); the other samplers carry one ' +
+      'step history or noise per track.');
+  if StepConditioner.StartsFromImage() then
+    ImportError('TStableDiffusionPipeline.DenoiseEdit: a ' +
+      StepConditioner.ClassName + ' starts from its own image; both prompts ' +
+      'start from the given latents.');
+  if (StepConditioner.UNetIPAdapterFile() <> '') or
+    (StepConditioner.UNetGLIGENFile() <> '') then
+    ImportError('TStableDiffusionPipeline.DenoiseEdit: IP-Adapter and GLIGEN ' +
+      'add cross-attention heads the edit does not map.');
+  if (FDeepCacheInterval > 1) or (FSAGScale > 0) or
+    (Assigned(FPerturbedGuidance) and (FPerturbedGuidance.PerturbedScale > 0)) then
+    ImportError('TStableDiffusionPipeline.DenoiseEdit: DeepCache, SAG and PAG ' +
+      'are off during Prompt-to-Prompt.');
+  if (SourceEmbeds.SizeX <> Edit.TokenCount) or
+    (TargetEmbeds.SizeX <> Edit.TokenCount) then
+    ImportError('TStableDiffusionPipeline.DenoiseEdit: the embeds hold ' +
+      IntToStr(SourceEmbeds.SizeX) + ' and ' + IntToStr(TargetEmbeds.SizeX) +
+      ' tokens, the edit maps ' + IntToStr(Edit.TokenCount) + '.');
+  if not SourceLatents.SameSize(TargetLatents) then
+    ImportError('TStableDiffusionPipeline.DenoiseEdit: the source and target ' +
+      'latents differ in size.');
+  RunSteps(SourceEmbeds, Width, Height, StepCount, SourceLatents, false, Edit,
+    TargetEmbeds, TargetLatents);
+end;
+
+procedure TStableDiffusionPipeline.GenerateEditFromEmbeds(SourceEmbeds,
+  TargetEmbeds: TNNetVolume; Width, Height, StepCount: integer; Seed: cardinal;
+  Edit: TSDPromptToPromptEdit; SourceImage, TargetImage: TNNetVolume;
+  InitialLatents: TNNetVolume);
+var
+  SourceLatents, TargetLatents: TNNetVolume;
+begin
+  SourceLatents := TNNetVolume.Create();
+  TargetLatents := TNNetVolume.Create();
+  try
+    if Assigned(InitialLatents) then
+    begin
+      SourceLatents.ReSize(InitialLatents);
+      SourceLatents.Copy(InitialLatents);
+    end
+    else MakeInitialLatents(Width, Height, Seed, SourceLatents);
+    TargetLatents.ReSize(SourceLatents);
+    TargetLatents.Copy(SourceLatents);
+    DenoiseEdit(SourceEmbeds, TargetEmbeds, Width, Height, StepCount, Edit,
+      SourceLatents, TargetLatents);
+    DecodeLatents(SourceLatents, Width, Height, SourceImage);
+    DecodeLatents(TargetLatents, Width, Height, TargetImage);
+    DoPhase(sdphDone);
+  finally
+    TargetLatents.Free;
+    SourceLatents.Free;
+  end;
+end;
+
 procedure TStableDiffusionPipeline.RunSteps(PromptEmbeds: TNNetVolume;
   Width, Height, StepCount: integer; Latents: TNNetVolume;
-  IsInversion: boolean);
+  IsInversion: boolean; Edit: TSDPromptToPromptEdit; EditEmbeds,
+  EditLatents: TNNetVolume);
 var
   StepConfig: TSDUNetConfig;
   Net: TNNet;
   StepConditioner: TStableDiffusionConditioner;
   Schedule: TNeuralIntegerArray;
   SigmaSchedule: TNNetSigmaSchedule;
-  Pred, StepNoise: TNNetVolume;
+  Pred, StepNoise, EditPred: TNNetVolume;
   IsGuided, WithControl, WithAdapter, UseSigmaSchedule: boolean;
   IPAdapterFile, GLIGENFile: string;
   DeepCacheLayout: TSDUNetDeepCacheLayout;
@@ -102886,6 +103687,7 @@ begin
     WithAdapter, IPAdapterFile, GLIGENFile, DeepCacheLayout);
   Pred := TNNetVolume.Create();
   StepNoise := nil;
+  EditPred := nil;
   try
     if FDeepCacheInterval > 1 then
     begin
@@ -102940,6 +103742,7 @@ begin
       NoiseScale := FScheduler.InitialNoiseScale(FSampler,
         FScheduler.ConfigSpacing, Schedule[0]);
       if NoiseScale <> 1 then Latents.Mul(NoiseScale);
+      if (NoiseScale <> 1) and Assigned(Edit) then EditLatents.Mul(NoiseScale);
     end;
     // Euler a injects its full ancestral noise; the others are deterministic.
     if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
@@ -102951,14 +103754,31 @@ begin
     else if IsInversion then MaxStepPos := High(Schedule)
     else MaxStepPos := Length(Schedule) - 2;
     FStepCount := MaxStepPos + 1;
+    if Assigned(Edit) then
+    begin
+      Edit.Attach(Net, FUNetConfig, FStepCount);
+      FAttentionEdit := Edit;
+      EditPred := TNNetVolume.Create();
+    end;
     for StepPos := 0 to MaxStepPos do
     begin
       FStepPos := StepPos;
       // Schedule is 1-based; the UNet takes the diffusers timestep Tt - 1.
       if UseSigmaSchedule then Timestep := SigmaSchedule.ModelTimesteps[StepPos]
       else Timestep := Schedule[StepPos] - 1;
+      if Assigned(Edit) then Edit.BeginStep(StepPos);
       StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
         PromptEmbeds, Timestep, Pred);
+      if Assigned(Edit) then
+      begin
+        FIsAttentionEditTarget := true;
+        try
+          StepConditioner.PredictGuidedNoise(Net, StepConfig, EditLatents,
+            EditEmbeds, Timestep, EditPred);
+        finally
+          FIsAttentionEditTarget := false;
+        end;
+      end;
       if Assigned(StepNoise) then FOnAncestralNoise(StepPos, StepNoise);
       if UseSigmaSchedule then
         FScheduler.StepAtSigma(Latents, Pred, SigmaSchedule.Sigmas[StepPos],
@@ -102970,6 +103790,12 @@ begin
         FScheduler.Step(Latents, Pred, Schedule[StepPos],
           Schedule[StepPos + 1], FSampler, Eta, StepNoise);
         StepConditioner.AfterStep(Latents, Schedule[StepPos + 1]);
+        if Assigned(Edit) then
+        begin
+          FScheduler.Step(EditLatents, EditPred, Schedule[StepPos],
+            Schedule[StepPos + 1], FSampler, Eta, StepNoise);
+          StepConditioner.AfterStep(EditLatents, Schedule[StepPos + 1]);
+        end;
       end;
       if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Timestep, Latents);
     end;
@@ -102987,7 +103813,10 @@ begin
     FPerturbedHeads := nil;
     FIsPerturbed := false;
     PrepareSelfAttentionGuidance(Net, GridX, GridY, false);
+    if Assigned(Edit) then Edit.Detach();
+    FAttentionEdit := nil;
     FUNetInputs := Default(TSDUNetConditioningInputs);
+    EditPred.Free;
     StepNoise.Free;
     Pred.Free;
     ReleaseComponent(Net);
@@ -103129,7 +103958,7 @@ procedure TStableDiffusionConditioner.PredictPass(UNet: TNNet;
   Pred: TNNetVolume);
 var
   Embeds: TNNetVolume;
-  IsPerturbedPass: boolean;
+  IsPerturbedPass, IsEditedPass, IsEditTargetPass: boolean;
 
   procedure SetPerturbedHeads(Value: boolean);
   var
@@ -103147,13 +103976,21 @@ begin
   FPipeline.FillUNetInputs(Latents, Embeds, Timestep, Inputs);
   FPipeline.FPassDeepCache := FPipeline.DeepCacheFor(Inputs);
   IsPerturbedPass := sdpiPerturbed in Inputs;
+  // Prompt-to-Prompt edits the guided pass only, as the reference's cond half.
+  IsEditedPass := Assigned(FPipeline.FAttentionEdit) and
+    (Inputs = [sdpiPrompt, sdpiImage]);
+  IsEditTargetPass := IsEditedPass and FPipeline.FIsAttentionEditTarget;
   if IsPerturbedPass then SetPerturbedHeads(true);
+  if IsEditTargetPass then FPipeline.FAttentionEdit.SetTargetHooks(true);
   try
     PredictNoise(UNet, Config, Latents, Embeds, Timestep, Inputs, Pred);
   finally
     FPipeline.FPassDeepCache := nil;
     if IsPerturbedPass then SetPerturbedHeads(false);
+    if IsEditTargetPass then FPipeline.FAttentionEdit.SetTargetHooks(false);
   end;
+  if IsEditedPass and not IsEditTargetPass then
+    FPipeline.FAttentionEdit.CaptureSourceMaps();
   Inc(FPipeline.FImageStats.UNetPassCount);
 end;
 

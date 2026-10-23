@@ -4525,6 +4525,11 @@ type
     procedure Compute(); override;
   end;
 
+  // Edits an attention layer's post-softmax map in place before the value sum:
+  // Probabilities is X = key, Y = query (OnAttentionProbabilities).
+  TNNetAttentionProbabilitiesEvent = procedure(Layer: TNNetLayer;
+    Probabilities: TNNetVolume) of object;
+
   /// Scaled Dot-Product Attention (single head, parameter-free).
   // Input layout: SizeY = 1, SizeX = sequence length, Depth = 3 * d_k
   // where the depth axis is the concatenation Q | K | V, each of size d_k.
@@ -4602,6 +4607,7 @@ type
     FBlockCausalSeg: boolean;
     FKeepAttentionWeights: boolean; // see KeepAttentionWeights
     FSkipAttentionScores: boolean;  // see SkipAttentionScores
+    FOnAttentionProbabilities: TNNetAttentionProbabilitiesEvent;
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -5038,6 +5044,10 @@ type
     // own V row. Read by this class's uncached forward and by TNNetFusedSDPA.
     property SkipAttentionScores: boolean read FSkipAttentionScores
       write FSkipAttentionScores;
+    // Inference-only, not saved: edits the map before the value sum, off the flash
+    // kernel and the tiled forward; this class's uncached forward reads it.
+    property OnAttentionProbabilities: TNNetAttentionProbabilitiesEvent
+      read FOnAttentionProbabilities write FOnAttentionProbabilities;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
     property Window: integer read FWindow;
@@ -5657,6 +5667,7 @@ type
     FInvSqrtDk: TNeuralFloat;
     FCausal: boolean;
     FKVLayer: TNNetLayer; // explicit Key|Value source (width 2*d_k)
+    FOnAttentionProbabilities: TNNetAttentionProbabilitiesEvent;
     FAttn: TNNetVolume;   // attention weights [X=key j, Y=query i, 1]
     // Per-instance Backpropagate scratch, sized to KVLen (= FKVLayer SeqLen,
     // fixed after SetPrevLayer; no incremental-decode path here so pinned there).
@@ -5699,6 +5710,9 @@ type
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property AttentionWeights: TNNetVolume read FAttn;
+    // Inference-only, not saved: edits the map before the value sum.
+    property OnAttentionProbabilities: TNNetAttentionProbabilitiesEvent
+      read FOnAttentionProbabilities write FOnAttentionProbabilities;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
     property KeyValueSource: TNNetLayer read FKVLayer;
@@ -37143,6 +37157,7 @@ var
 begin
   Result := Assigned(FFusedSDPACL) and FHasOpenCL and FShouldOpenCL
     and (not FIsTrainable) and (not FKeepAttentionWeights)
+    and (not Assigned(FOnAttentionProbabilities))
     and Assigned(FPrevLayer)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow);
@@ -37323,6 +37338,8 @@ begin
     end;
   end;
 
+  if Assigned(FOnAttentionProbabilities) then
+    FOnAttentionProbabilities(Self, FAttn);
   // 4) Value sum O[i,d] = sum_key P[i,key] * V[key,d] on the device. Mapping
   //    A = V (a = depth d, FNumAs = d_k), B = FAttn (b = query, FNumBs = SeqLen),
   //    contraction = SeqLen: Result[b*FNumAs + a] = O[query, d] = FOutput's
@@ -37334,6 +37351,38 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 {$ENDIF}
+
+// Output[i, 0, 0..Output.Depth-1] := sum over key j of Probabilities[j, i] times
+// the Output.Depth values of row j of Values starting at depth ValueStart.
+procedure AttentionValueSum(Probabilities, Values: TNNetVolume;
+  ValueStart: integer; Output: TNNetVolume);
+var
+  QueryPos, MaxQueryPos, KeyPos, MaxKeyPos, ProbabilityPos, ValuePos,
+    RowStride, ValueCount: integer;
+  Probability: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  MaxQueryPos := Probabilities.SizeY - 1;
+  MaxKeyPos := Probabilities.SizeX - 1;
+  RowStride := Values.Depth;
+  ValueCount := Output.Depth;
+  ProbabilityPos := 0;
+  for QueryPos := 0 to MaxQueryPos do
+  begin
+    OutPtr := Output.GetRawPtr(QueryPos, 0);
+    FillChar(OutPtr^, ValueCount * csNeuralFloatSize, 0);
+    ValuePos := ValueStart;
+    for KeyPos := 0 to MaxKeyPos do
+    begin
+      Probability := Probabilities.FData[ProbabilityPos];
+      if Probability <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Values.GetRawPtr(ValuePos), Probability,
+          ValueCount);
+      Inc(ProbabilityPos);
+      Inc(ValuePos, RowStride);
+    end;
+  end;
+end;
 
 procedure TNNetScaledDotProductAttention.Compute();
 const
@@ -37384,7 +37433,8 @@ begin
   // FlashAttention-style tiled online-softmax forward (opt-in, forward-only).
   // Handles the standard-softmax v1 scope; returns false (falls through to the
   // naive path below) for any feature it does not support.
-  if FTiledForward and ComputeTiled() then exit;
+  if FTiledForward and (not Assigned(FOnAttentionProbabilities)) and
+    ComputeTiled() then exit;
   FLastForwardTiled := false;
   Inc(FForwardCPUCnt);
   StartTime := Now();
@@ -37522,6 +37572,11 @@ begin
         TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
       Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
+  end;
+  if Assigned(FOnAttentionProbabilities) then
+  begin
+    FOnAttentionProbabilities(Self, FAttn);
+    AttentionValueSum(FAttn, Prev, TwoFDk, FOutput);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -41335,6 +41390,8 @@ begin
       TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, KVLen);
   end;
 
+  if Assigned(FOnAttentionProbabilities) then
+    FOnAttentionProbabilities(Self, FAttn);
   // 4) Value sum O[i,d] = sum_key P[i,key] * V[key,d] on the device. Mapping
   //    A = V (a = depth d, FNumAs = d_k), B = FAttn (b = query, FNumBs = QLen),
   //    contraction = KVLen: Result[b*FNumAs + a] = O[query, d] = FOutput's
@@ -41428,6 +41485,11 @@ begin
         TNNetVolume.MulAdd(OutPtr, KV.GetRawPtr(posV), A, FDk);
       Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
+  end;
+  if Assigned(FOnAttentionProbabilities) then
+  begin
+    FOnAttentionProbabilities(Self, FAttn);
+    AttentionValueSum(FAttn, KV, FDk, FOutput);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

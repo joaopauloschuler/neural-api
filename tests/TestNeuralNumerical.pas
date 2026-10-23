@@ -43,6 +43,9 @@ type
     // OpenCL parity tests; Cases holds 7 integers per case (see the callers).
     procedure CheckConv1DOpenCLParity(Centred: boolean; const Cases: array of integer);
     procedure CaptureCompileError(const AMessage: string);
+    // OnAttentionProbabilities hook of TestAttentionProbabilitiesHook: one-hot
+    // on the first key.
+    procedure AttentionToFirstKey(Layer: TNNetLayer; Probabilities: TNNetVolume);
     // Shared bodies of the per-channel scan OpenCL tests (TNNetTokenShift,
     // TNNetDiagonalSSM, TNNetWKV): AClass reads InDepth-wide token rows.
     procedure CheckChannelScanResidentChainParity(AClass: TNNetLayerClass;
@@ -1873,6 +1876,9 @@ type
     procedure TestSinusoidalTimeEmbeddingForward;
     procedure TestSinusoidalTimeEmbeddingSerializationRoundTrip;
     procedure TestScaledDotProductAttentionForward;
+    // OnAttentionProbabilities on TNNetScaledDotProductAttention and
+    // TNNetCrossAttention: the edited map drives the output; unhooked = plain.
+    procedure TestAttentionProbabilitiesHook;
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
     procedure TestScaledDotProductAttentionSeqLenStressGradientCheck;
@@ -88703,6 +88709,111 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+procedure TTestNeuralNumerical.AttentionToFirstKey(Layer: TNNetLayer;
+  Probabilities: TNNetVolume);
+var
+  QueryPos, MaxQueryPos: integer;
+begin
+  Probabilities.Fill(0);
+  MaxQueryPos := Probabilities.SizeY - 1;
+  for QueryPos := 0 to MaxQueryPos do
+    Probabilities[0, QueryPos, 0] := 1;
+end;
+
+procedure TTestNeuralNumerical.TestAttentionProbabilitiesHook;
+const
+  cSeqLen = 40;
+  cDk = 4;
+
+  procedure RunCase(UseOpenCL: boolean);
+  var
+    NN: TNNet;
+    Input, SelfPlain, CrossPlain: TNNetVolume;
+    InputLayer, QSlice, KVSlice: TNNetLayer;
+    SelfHead: TNNetScaledDotProductAttention;
+    CrossHead: TNNetCrossAttention;
+    TokenPos, DepthPos, SelfGPUCount, CrossGPUCount: integer;
+    CaseName: string;
+    {$IFDEF OpenCL}
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    {$ENDIF}
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(cSeqLen, 1, 3 * cDk);
+    SelfPlain := TNNetVolume.Create();
+    CrossPlain := TNNetVolume.Create();
+    try
+      CaseName := 'CPU';
+      InputLayer := NN.AddLayer(TNNetInput.Create(cSeqLen, 1, 3 * cDk));
+      SelfHead := TNNetScaledDotProductAttention.Create(cDk, false);
+      NN.AddLayerAfter(SelfHead, InputLayer);
+      QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(0, cDk), InputLayer);
+      KVSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(cDk, 2 * cDk),
+        InputLayer);
+      CrossHead := TNNetCrossAttention.Create(cDk, false, KVSlice);
+      NN.AddLayerAfter(CrossHead, QSlice);
+      {$IFDEF OpenCL}
+      if UseOpenCL then
+      begin
+        if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then exit;
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        CaseName := 'OpenCL';
+      end;
+      {$ENDIF}
+      Input.RandomizeGaussian();
+      NN.Compute(Input);
+      SelfHead.ForceOutputOnRAM();
+      SelfPlain.Copy(SelfHead.Output);
+      CrossPlain.Copy(CrossHead.Output);
+      SelfHead.OnAttentionProbabilities := @AttentionToFirstKey;
+      CrossHead.OnAttentionProbabilities := @AttentionToFirstKey;
+      SelfGPUCount := SelfHead.ForwardGPUCnt;
+      CrossGPUCount := CrossHead.ForwardGPUCnt;
+      NN.Compute(Input);
+      SelfHead.ForceOutputOnRAM();
+      // On OpenCL the hooked heads run the device matmuls around the hook.
+      AssertEquals(CaseName + ' self device forwards', Ord(UseOpenCL),
+        SelfHead.ForwardGPUCnt - SelfGPUCount);
+      AssertEquals(CaseName + ' cross device forwards', Ord(UseOpenCL),
+        CrossHead.ForwardGPUCnt - CrossGPUCount);
+      // Every query reads the first key's value row.
+      for TokenPos := 0 to cSeqLen - 1 do
+        for DepthPos := 0 to cDk - 1 do
+        begin
+          AssertEquals(CaseName + ' self token ' + IntToStr(TokenPos),
+            Input[0, 0, 2 * cDk + DepthPos],
+            SelfHead.Output[TokenPos, 0, DepthPos], 1e-5);
+          AssertEquals(CaseName + ' cross token ' + IntToStr(TokenPos),
+            Input[0, 0, 2 * cDk + DepthPos],
+            CrossHead.Output[TokenPos, 0, DepthPos], 1e-5);
+        end;
+      AssertEquals(CaseName + ' map edited', 1,
+        CrossHead.AttentionWeights[0, cSeqLen - 1, 0], 0);
+      SelfHead.OnAttentionProbabilities := nil;
+      CrossHead.OnAttentionProbabilities := nil;
+      NN.Compute(Input);
+      SelfHead.ForceOutputOnRAM();
+      AssertEquals(CaseName + ' self unhooked', 0,
+        SelfHead.Output.SumDiff(SelfPlain), 0);
+      AssertEquals(CaseName + ' cross unhooked', 0,
+        CrossHead.Output.SumDiff(CrossPlain), 0);
+    finally
+      CrossPlain.Free;
+      SelfPlain.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 20261023;
+  RunCase(false);
+  {$IFDEF OpenCL}
+  RunCase(true);
+  {$ENDIF}
+end;
 
 procedure TTestNeuralNumerical.TestFusedSDPAOpenCLExtremeScores;
 {$IFDEF OpenCL}

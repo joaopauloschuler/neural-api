@@ -1482,6 +1482,16 @@ type
     // guidance 1 and 3, vs diffusers DDIMInverseScheduler float64 (ad hoc run);
     // then DDIM from the guidance-1 latents.
     procedure TestStableDiffusionDDIMInversionParity;
+    // get_word_inds, get_replacement_mapper_ and get_mapper of
+    // google/prompt-to-prompt on hand-made token lengths and ids.
+    procedure TestSDPromptWordTokenPositions;
+    procedure TestSDPromptWordSwapMapper;
+    procedure TestSDPromptRefinementMapper;
+    // DenoiseEdit (swap, refine, reweight over refine) on tiny_sd15 vs a
+    // diffusers float64 run of the prompt-to-prompt controller (ad hoc run).
+    procedure TestStableDiffusionPromptToPromptParity;
+    // Cross and self replace 0: both tracks equal plain Denoise of their prompt.
+    procedure TestStableDiffusionPromptToPromptNoReplace;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     // ControlNetResiduals with fewer down residuals: equal to the full run's,
@@ -51370,6 +51380,296 @@ begin
     Img2Img.Free;
     Pipeline.Free;
     FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSDPromptWordTokenPositions;
+var
+  Positions: TNeuralIntegerArray;
+begin
+  // "cat," is two tokens (3 + 1 characters); positions count bos as 0.
+  Positions := SDPromptWordTokenPositions(['a', 'cat,', 'dog'], [1, 3, 1, 3], 1);
+  AssertEquals('word 1 tokens', 2, Length(Positions));
+  AssertEquals('word 1 first', 2, Positions[0]);
+  AssertEquals('word 1 second', 3, Positions[1]);
+  Positions := SDPromptWordTokenPositions(['a', 'cat,', 'dog'], [1, 3, 1, 3], 2);
+  AssertEquals('word 2 tokens', 1, Length(Positions));
+  AssertEquals('word 2', 4, Positions[0]);
+  Positions := SDPromptWordTokenPositions(['a', 'cat,', 'a'], [1, 3, 1, 1],
+    'a');
+  AssertEquals('every "a"', 2, Length(Positions));
+  AssertEquals('first "a"', 1, Positions[0]);
+  AssertEquals('second "a"', 4, Positions[1]);
+  AssertEquals('no such word', 0, Length(SDPromptWordTokenPositions(['a'],
+    [1], 'b')));
+end;
+
+procedure TTestNeuralPretrained.TestSDPromptWordSwapMapper;
+var
+  Mapper: TNNetVolume;
+  Expected: array of TNeuralFloat;
+  SourcePos, TargetPos: integer;
+  IsRefused: boolean;
+begin
+  Mapper := TNNetVolume.Create();
+  try
+    // "a horse on a horse" -> "a zebra on a cat": horse 1 token, zebra 5, cat
+    // 1 (token lengths below). By the reference algorithm: rows (source) 0, 1
+    // map to 0, 1; horse spreads 1/5 over zebra's 2..6; on, a map to 7, 8;
+    // horse -> cat 9; past the last swap token j maps to j (10..76) and the
+    // source eos (6) maps nowhere.
+    SDPromptWordSwapMapper(['a', 'horse', 'on', 'a', 'horse'],
+      ['a', 'zebra', 'on', 'a', 'cat'], [1, 5, 2, 1, 5],
+      [1, 1, 1, 1, 1, 1, 2, 1, 3], 77, Mapper);
+    AssertEquals('width', 77, Mapper.SizeX);
+    AssertEquals('height', 77, Mapper.SizeY);
+    SetLength(Expected, 77 * 77);
+    Expected[0 * 77 + 0] := 1;
+    Expected[1 * 77 + 1] := 1;
+    for TargetPos := 2 to 6 do Expected[2 * 77 + TargetPos] := 0.2;
+    Expected[3 * 77 + 7] := 1;
+    Expected[4 * 77 + 8] := 1;
+    Expected[5 * 77 + 9] := 1;
+    for TargetPos := 10 to 76 do Expected[TargetPos * 77 + TargetPos] := 1;
+    for SourcePos := 0 to 76 do
+      for TargetPos := 0 to 76 do
+        AssertEquals('mapper ' + IntToStr(SourcePos) + ',' +
+          IntToStr(TargetPos), Expected[SourcePos * 77 + TargetPos],
+          Mapper[TargetPos, SourcePos, 0], 1e-7);
+    IsRefused := false;
+    try
+      SDPromptWordSwapMapper(['a', 'horse'], ['a', 'white', 'horse'], [1, 5],
+        [1, 5, 5], 77, Mapper);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('unequal word counts refused', IsRefused);
+  finally
+    Mapper.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSDPromptRefinementMapper;
+
+  // Expected by the reference get_mapper (gap 0, match 1, mismatch -1) at
+  // max_len 10.
+  procedure CheckCase(const SourceIds, TargetIds: TNeuralIntegerArray;
+    const ExpectedPositions: array of integer;
+    const ExpectedAlphas: array of TNeuralFloat; const CaseName: string);
+  var
+    Positions: TNeuralIntegerArray;
+    Alphas: TNeuralFloatDynArr;
+    TokenPos: integer;
+  begin
+    SDPromptRefinementMapper(SourceIds, TargetIds, 10, Positions, Alphas);
+    AssertEquals(CaseName + ' length', 10, Length(Positions));
+    for TokenPos := 0 to 9 do
+    begin
+      AssertEquals(CaseName + ' position ' + IntToStr(TokenPos),
+        ExpectedPositions[TokenPos], Positions[TokenPos]);
+      AssertEquals(CaseName + ' alpha ' + IntToStr(TokenPos),
+        ExpectedAlphas[TokenPos], Alphas[TokenPos], 0);
+    end;
+  end;
+
+begin
+  // Two added tokens: alpha 0 there; past the target, token n maps to n.
+  CheckCase([1, 2, 3, 4], [1, 2, 9, 9, 3, 4], [0, 1, -1, -1, 2, 3, 6, 7, 8, 9],
+    [1, 1, 0, 0, 1, 1, 1, 1, 1, 1], 'insert');
+  // A substituted token is an insertion plus a deletion at gap 0.
+  CheckCase([1, 2, 3], [1, 5, 3], [0, -1, 2, 3, 4, 5, 6, 7, 8, 9],
+    [1, 0, 1, 1, 1, 1, 1, 1, 1, 1], 'substitute');
+  CheckCase([1, 2, 3, 4, 5], [1, 3, 5], [0, 2, 4, 3, 4, 5, 6, 7, 8, 9],
+    [1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 'delete');
+end;
+
+const
+  // diffusers 0.41 float64, tiny_sd15 with an AttnProcessor running the
+  // google/prompt-to-prompt controller on the cond half of a batch of 2
+  // (AttentionReplace / AttentionRefine / AttentionReweight over AttentionRefine,
+  // cross_replace_steps 0.8, self_replace_steps 0.4), DDIM 4 steps, guidance
+  // 7.5, the tiny_sd15_pag_io.json latents for both prompts (ad hoc run).
+  csPromptToPromptSource = 'a photo of an astronaut riding a horse on mars';
+  csPromptToPromptTargets: array[0..2] of string = (
+    'a photo of an astronaut riding a zebra on mars',
+    'a photo of an astronaut riding a white horse on mars',
+    'a photo of an astronaut riding a white horse on mars');
+  csPromptToPromptPoints: array[0..7, 0..2] of integer = ((5, 0, 0),
+    (2, 5, 0), (7, 1, 1), (4, 6, 1), (1, 3, 2), (6, 7, 2), (3, 4, 3),
+    (0, 1, 0));
+  csPromptToPromptSourceValues: array[0..7] of double = (6.819440052,
+    -4.927400020, -3.451035597, 2.928033168, 3.802819013, -2.542861657,
+    4.913023909, -1.276451844);
+  csPromptToPromptTargetValues: array[0..2, 0..7] of double = (
+    (6.513122571, -4.612332766, -2.917731769, 3.669068768, 4.461320843,
+     -2.288168875, 5.444360011, -1.015863459),
+    (7.837193403, -6.443056494, -2.887957998, 2.598141519, 4.809132522,
+     -2.133490468, 5.388835826, -1.501623460),
+    (7.714764753, -6.969722059, -2.297713100, 2.258399838, 5.088197299,
+     -2.073085760, 5.478742714, -1.562456011));
+  csPromptToPromptSourceMeanAbs = 4.211274626;
+  csPromptToPromptTargetMeanAbs: array[0..2] of double = (4.231055853,
+    4.381717080, 4.452398197);
+
+procedure TTestNeuralPretrained.TestStableDiffusionPromptToPromptParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Edit: TSDPromptToPromptEdit;
+  SourceEmbeds, TargetEmbeds, SourceLatents, TargetLatents: TNNetVolume;
+  CasePos, PointPos, TokenPos: integer;
+  CaseName: string;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_pag_io.json');
+  Pipeline := CreateSD15Pipeline();
+  SourceEmbeds := TNNetVolume.Create;
+  TargetEmbeds := TNNetVolume.Create;
+  SourceLatents := TNNetVolume.Create;
+  TargetLatents := TNNetVolume.Create;
+  Edit := nil;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    for CasePos := 0 to 2 do
+    begin
+      CaseName := 'case ' + IntToStr(CasePos);
+      Pipeline.EncodePrompts([csPromptToPromptSource,
+        csPromptToPromptTargets[CasePos]], [SourceEmbeds, TargetEmbeds]);
+      case CasePos of
+        0: Edit := Pipeline.CreatePromptToPromptEdit(csPromptToPromptSource,
+          csPromptToPromptTargets[CasePos], sdpemSwap, [], []);
+        1: Edit := Pipeline.CreatePromptToPromptEdit(csPromptToPromptSource,
+          csPromptToPromptTargets[CasePos], sdpemRefine, [], []);
+      else
+        Edit := Pipeline.CreatePromptToPromptEdit(csPromptToPromptSource,
+          csPromptToPromptTargets[CasePos], sdpemRefine, ['white'], [3.0]);
+      end;
+      // The reference's mappers: horse (token 8) over zebra's 5 tokens; white's
+      // 5 tokens (8..12) added; white scaled by 3.
+      if CasePos = 0 then
+      begin
+        for TokenPos := 8 to 12 do
+          AssertEquals('swap mapper ' + IntToStr(TokenPos), 0.2,
+            Edit.SwapMapper[TokenPos, 8, 0], 1e-7);
+        AssertEquals('swap mapper on', 0, Edit.SwapMapper[9, 9, 0], 0);
+        AssertEquals('swap mapper 13', 1, Edit.SwapMapper[13, 13, 0], 0);
+      end
+      else
+      begin
+        for TokenPos := 8 to 12 do
+        begin
+          AssertEquals('refine added ' + IntToStr(TokenPos), -1,
+            Edit.RefineSourcePositions[TokenPos]);
+          AssertEquals('refine alpha ' + IntToStr(TokenPos), 0,
+            Edit.RefineAlphas[TokenPos], 0);
+        end;
+        AssertEquals('refine horse', 8, Edit.RefineSourcePositions[13]);
+        AssertEquals('refine eos', 11, Edit.RefineSourcePositions[16]);
+        AssertEquals('refine past target', 17, Edit.RefineSourcePositions[17]);
+      end;
+      if CasePos = 2 then
+      begin
+        AssertEquals('scales', 77, Length(Edit.TokenScales));
+        AssertEquals('scale white', 3, Edit.TokenScales[10], 0);
+        AssertEquals('scale horse', 1, Edit.TokenScales[13], 0);
+      end
+      else AssertEquals('no scales', 0, Length(Edit.TokenScales));
+      LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+        SourceLatents);
+      TargetLatents.ReSize(SourceLatents);
+      TargetLatents.Copy(SourceLatents);
+      Pipeline.DenoiseEdit(SourceEmbeds, TargetEmbeds, 16, 16, 4, Edit,
+        SourceLatents, TargetLatents);
+      FreeAndNil(Edit);
+      AssertEquals(CaseName + ' passes', 16, Pipeline.ImageStats.UNetPassCount);
+      AssertEquals(CaseName + ' source mean abs', csPromptToPromptSourceMeanAbs,
+        SourceLatents.GetSumAbs() / SourceLatents.Size, 2e-5);
+      AssertEquals(CaseName + ' target mean abs',
+        csPromptToPromptTargetMeanAbs[CasePos],
+        TargetLatents.GetSumAbs() / TargetLatents.Size, 2e-5);
+      for PointPos := 0 to 7 do
+      begin
+        AssertEquals(CaseName + ' source ' + IntToStr(PointPos),
+          csPromptToPromptSourceValues[PointPos],
+          SourceLatents[csPromptToPromptPoints[PointPos, 0],
+          csPromptToPromptPoints[PointPos, 1],
+          csPromptToPromptPoints[PointPos, 2]], 5e-5);
+        AssertEquals(CaseName + ' target ' + IntToStr(PointPos),
+          csPromptToPromptTargetValues[CasePos, PointPos],
+          TargetLatents[csPromptToPromptPoints[PointPos, 0],
+          csPromptToPromptPoints[PointPos, 1],
+          csPromptToPromptPoints[PointPos, 2]], 5e-5);
+      end;
+    end;
+  finally
+    Edit.Free;
+    TargetLatents.Free;
+    SourceLatents.Free;
+    TargetEmbeds.Free;
+    SourceEmbeds.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPromptToPromptNoReplace;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Edit: TSDPromptToPromptEdit;
+  SourceEmbeds, TargetEmbeds, Initial, SourceLatents, TargetLatents,
+    Plain: TNNetVolume;
+  IsRefused: boolean;
+begin
+  Pipeline := CreateSD15Pipeline();
+  SourceEmbeds := TNNetVolume.Create;
+  TargetEmbeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  SourceLatents := TNNetVolume.Create;
+  TargetLatents := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;
+  Edit := nil;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.EncodePrompts([csPromptToPromptSource,
+      csPromptToPromptTargets[0]], [SourceEmbeds, TargetEmbeds]);
+    Edit := Pipeline.CreatePromptToPromptEdit(csPromptToPromptSource,
+      csPromptToPromptTargets[0], sdpemSwap, [], []);
+    Edit.CrossReplaceFraction := 0;
+    Edit.SelfReplaceFraction := 0;
+    Pipeline.MakeInitialLatents(16, 16, 11, Initial);
+    SourceLatents.Copy(Initial);
+    TargetLatents.Copy(Initial);
+    Pipeline.DenoiseEdit(SourceEmbeds, TargetEmbeds, 16, 16, 3, Edit,
+      SourceLatents, TargetLatents);
+    Plain.Copy(Initial);
+    Pipeline.Denoise(TargetEmbeds, 16, 16, 3, Plain);
+    AssertEquals('target = plain target prompt', 0,
+      MaxAbsVolumeDiff(TargetLatents, Plain), 0);
+    Plain.Copy(Initial);
+    Pipeline.Denoise(SourceEmbeds, 16, 16, 3, Plain);
+    AssertEquals('source = plain source prompt', 0,
+      MaxAbsVolumeDiff(SourceLatents, Plain), 0);
+    // The edit's hooks are gone after the run.
+    Plain.Copy(Initial);
+    Pipeline.Denoise(TargetEmbeds, 16, 16, 3, Plain);
+    AssertEquals('unhooked after DenoiseEdit', 0,
+      MaxAbsVolumeDiff(TargetLatents, Plain), 0);
+    Pipeline.Sampler := smEuler;
+    IsRefused := false;
+    try
+      Pipeline.DenoiseEdit(SourceEmbeds, TargetEmbeds, 16, 16, 3, Edit,
+        SourceLatents, TargetLatents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('non-DDIM sampler refused', IsRefused);
+  finally
+    Edit.Free;
+    Plain.Free;
+    TargetLatents.Free;
+    SourceLatents.Free;
+    Initial.Free;
+    TargetEmbeds.Free;
+    SourceEmbeds.Free;
+    Pipeline.Free;
   end;
 end;
 
