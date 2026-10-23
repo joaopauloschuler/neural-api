@@ -2183,6 +2183,11 @@ rather than acted on.
       on SD 1.5 with a real multi-person photo; check the `--pose-out` image
       by eye against controlnet_aux DWpose / OpenposeDetector output, then
       mark both READMEs supported.
+      Also check `tools/make_openpose_draw_oracle.py` against the real
+      controlnet_aux source: controlnet_aux was not installed, so its
+      COCO-17 -> OpenPose-18 order, limb colors and DWpose drawing order
+      (all limbs, canvas x0.6, then dots) were written from memory; only the
+      cv2 drawing primitives come from a real OpenCV wheel.
 
 ## OpenCL forward coverage — layers still on the host
 
