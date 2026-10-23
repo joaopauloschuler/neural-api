@@ -1882,6 +1882,24 @@ type
   function NeuralBoxGIoU(AX1, AY1, AX2, AY2,
     BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
 
+type
+  { Caller-owned scratch for NeuralLinearSumAssignment. The solver grows it on
+    demand and never shrinks it; keep one per caller (not thread-safe). }
+  TNeuralAssignmentWork = record
+    RowDual, ColDual, ShortestPathCosts: array of TNeuralFloat;
+    Path, ColForRow, RowForCol, RemainingCols: array of integer;
+    IsRowScanned, IsColScanned: array of boolean;
+  end;
+
+  { Exact min-cost assignment on the row-major Rows x Cols finite Cost matrix (scipy
+    linear_sum_assignment). Fills RowToCol[0..Rows-1] (-1 = unassigned); returns the total. }
+  function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+    Rows, Cols: integer; var RowToCol: array of integer;
+    var Work: TNeuralAssignmentWork): TNeuralFloat; overload;
+  // Same, with scratch allocated per call.
+  function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+    Rows, Cols: integer; var RowToCol: array of integer): TNeuralFloat; overload;
+
   // Quicksorts Order[iLo..iHi] in place so Scores[Order[..]] is descending;
   // no heap allocation, ties in unspecified order.
   procedure QuickSortOrderByScoreDesc(var Order: array of integer;
@@ -5651,6 +5669,149 @@ begin
     Result := IoU - (AreaC - UnionA) / AreaC
   else
     Result := 0;
+end;
+
+function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+  Rows, Cols: integer; var RowToCol: array of integer;
+  var Work: TNeuralAssignmentWork): TNeuralFloat;
+var
+  SolveRows, SolveCols, RowStride, ColStride, MaxRowPos: integer;
+  MaxSolveRowPos, MaxSolveColPos, MaxRemainingPos: integer;
+  CurRow, RowPos, ColPos, Sink, RemainingCount, BestIndex, ScanPos: integer;
+  NextCol, CostRowBase: integer;
+  MinVal, Lowest, Reduced, CurRowDual, PathCost: TNeuralFloat;
+begin
+  Result := 0;
+  MaxRowPos := Rows - 1;
+  for RowPos := 0 to MaxRowPos do RowToCol[RowPos] := -1;
+  if (Rows <= 0) or (Cols <= 0) then Exit;
+  // Shortest augmenting path (Crouse 2016) needs solve rows <= solve cols, so
+  // a tall matrix is solved through a transposed stride view, without a copy.
+  if Rows <= Cols then
+  begin
+    SolveRows := Rows; SolveCols := Cols; RowStride := Cols; ColStride := 1;
+  end
+  else
+  begin
+    SolveRows := Cols; SolveCols := Rows; RowStride := 1; ColStride := Cols;
+  end;
+  if Length(Work.RowDual) < SolveRows then
+  begin
+    SetLength(Work.RowDual, SolveRows);
+    SetLength(Work.ColForRow, SolveRows);
+    SetLength(Work.IsRowScanned, SolveRows);
+  end;
+  if Length(Work.ColDual) < SolveCols then
+  begin
+    SetLength(Work.ColDual, SolveCols);
+    SetLength(Work.ShortestPathCosts, SolveCols);
+    SetLength(Work.Path, SolveCols);
+    SetLength(Work.RowForCol, SolveCols);
+    SetLength(Work.RemainingCols, SolveCols);
+    SetLength(Work.IsColScanned, SolveCols);
+  end;
+  MaxSolveRowPos := SolveRows - 1;
+  MaxSolveColPos := SolveCols - 1;
+  for RowPos := 0 to MaxSolveRowPos do
+  begin
+    Work.RowDual[RowPos] := 0;
+    Work.ColForRow[RowPos] := -1;
+  end;
+  for ColPos := 0 to MaxSolveColPos do
+  begin
+    Work.ColDual[ColPos] := 0;
+    Work.RowForCol[ColPos] := -1;
+  end;
+  for CurRow := 0 to MaxSolveRowPos do
+  begin
+    MinVal := 0;
+    RemainingCount := SolveCols;
+    // Reverse column order reproduces scipy's tie-breaking.
+    for ColPos := 0 to MaxSolveColPos do
+    begin
+      Work.RemainingCols[ColPos] := MaxSolveColPos - ColPos;
+      Work.ShortestPathCosts[ColPos] := Infinity;
+      Work.IsColScanned[ColPos] := False;
+    end;
+    for RowPos := 0 to MaxSolveRowPos do Work.IsRowScanned[RowPos] := False;
+    Sink := -1;
+    RowPos := CurRow;
+    while Sink < 0 do
+    begin
+      Work.IsRowScanned[RowPos] := True;
+      BestIndex := -1;
+      Lowest := Infinity;
+      CostRowBase := RowPos * RowStride;
+      CurRowDual := Work.RowDual[RowPos];
+      MaxRemainingPos := RemainingCount - 1;
+      for ScanPos := 0 to MaxRemainingPos do
+      begin
+        ColPos := Work.RemainingCols[ScanPos];
+        Reduced := MinVal + Cost[CostRowBase + ColPos * ColStride] -
+          CurRowDual - Work.ColDual[ColPos];
+        PathCost := Work.ShortestPathCosts[ColPos];
+        if Reduced < PathCost then
+        begin
+          Work.Path[ColPos] := RowPos;
+          PathCost := Reduced;
+          Work.ShortestPathCosts[ColPos] := PathCost;
+        end;
+        // Among equal distances prefer a free column: it ends the search.
+        if (PathCost < Lowest) or
+          ((PathCost = Lowest) and (Work.RowForCol[ColPos] < 0)) then
+        begin
+          Lowest := PathCost;
+          BestIndex := ScanPos;
+        end;
+      end;
+      if BestIndex < 0 then
+        raise Exception.Create('NeuralLinearSumAssignment: cost matrix must be finite.');
+      MinVal := Lowest;
+      ColPos := Work.RemainingCols[BestIndex];
+      if Work.RowForCol[ColPos] < 0 then
+        Sink := ColPos
+      else
+        RowPos := Work.RowForCol[ColPos];
+      Work.IsColScanned[ColPos] := True;
+      Dec(RemainingCount);
+      Work.RemainingCols[BestIndex] := Work.RemainingCols[RemainingCount];
+    end;
+    Work.RowDual[CurRow] := Work.RowDual[CurRow] + MinVal;
+    for RowPos := 0 to MaxSolveRowPos do
+      if Work.IsRowScanned[RowPos] and (RowPos <> CurRow) then
+        Work.RowDual[RowPos] := Work.RowDual[RowPos] + MinVal -
+          Work.ShortestPathCosts[Work.ColForRow[RowPos]];
+    for ColPos := 0 to MaxSolveColPos do
+      if Work.IsColScanned[ColPos] then
+        Work.ColDual[ColPos] := Work.ColDual[ColPos] - MinVal +
+          Work.ShortestPathCosts[ColPos];
+    // Augment: flip the alternating path from Sink back to CurRow.
+    ColPos := Sink;
+    repeat
+      RowPos := Work.Path[ColPos];
+      Work.RowForCol[ColPos] := RowPos;
+      NextCol := Work.ColForRow[RowPos];
+      Work.ColForRow[RowPos] := ColPos;
+      ColPos := NextCol;
+    until RowPos = CurRow;
+  end;
+  for RowPos := 0 to MaxSolveRowPos do
+  begin
+    ColPos := Work.ColForRow[RowPos];
+    if Rows <= Cols then
+      RowToCol[RowPos] := ColPos
+    else
+      RowToCol[ColPos] := RowPos;
+    Result := Result + Cost[RowPos * RowStride + ColPos * ColStride];
+  end;
+end;
+
+function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+  Rows, Cols: integer; var RowToCol: array of integer): TNeuralFloat;
+var
+  Work: TNeuralAssignmentWork;
+begin
+  Result := NeuralLinearSumAssignment(Cost, Rows, Cols, RowToCol, Work);
 end;
 
 // In-place quicksort of the index array Order so that Scores[Order[0..]] ends

@@ -1685,6 +1685,7 @@ type
     procedure TestEvidentialRegressionLoadFromString;
     procedure TestDETRSetPredictionLossGradient;
     procedure TestDETRSetPredictionLossLoadFromString;
+    procedure TestDETRSetPredictionLossExactVsGreedy;
     procedure TestEvidentialClassificationGradient;
     procedure TestEvidentialClassificationLoadFromString;
     procedure TestLabelSmoothingLossForwardPassthrough;
@@ -54366,6 +54367,63 @@ begin
     NN.Free;
     Input.Free;
     InputPlus.Free;
+    Target.Free;
+  end;
+end;
+
+// A 2x2 box-only cost where greedy and exact matching differ: greedy takes the
+// cheapest cell (q0,g0)=0.1 and is left with (q1,g1)=0.5; the optimum is 0.2+0.2.
+procedure TTestNeuralNumerical.TestDETRSetPredictionLossExactVsGreedy;
+const
+  cNumLabels = 2;
+  cDepth = cNumLabels + 1 + 4;
+var
+  NN, NN2: TNNet;
+  Input, Target: TNNetVolume;
+  DETR: TNNetDETRSetPredictionLoss;
+  BoxBase, q: integer;
+  ExactLoss, GreedyLoss, ClassCE: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  BoxBase := cNumLabels + 1;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(2, 1, cDepth);
+  Target := TNNetVolume.Create(2, 1, cDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, cDepth, 1));
+    // class_cost=0 and giou_cost=0: the matching cost and the box loss are
+    // both plain L1, and equal logits make the class CE matching-independent.
+    DETR := TNNetDETRSetPredictionLoss.Create(cNumLabels, 0.0, 1.0, 0.0, 0.1);
+    NN.AddLayer(DETR);
+    AssertFalse('Exact matching is the default', DETR.GreedyMatching);
+    Input.Fill(0);
+    Target.Fill(0);
+    for q := 0 to 1 do
+    begin
+      Input[q, 0, BoxBase + 2] := 0.1; Input[q, 0, BoxBase + 3] := 0.1;
+      Target[q, 0, BoxBase + 2] := 0.1; Target[q, 0, BoxBase + 3] := 0.1;
+    end;
+    Input[0, 0, BoxBase + 0] := 0.5; Input[0, 0, BoxBase + 1] := 0.6;  // q0
+    Input[1, 0, BoxBase + 0] := 0.3; Input[1, 0, BoxBase + 1] := 0.5;  // q1
+    Target[0, 0, BoxBase + 0] := 0.5; Target[0, 0, BoxBase + 1] := 0.5; // g0
+    Target[1, 0, BoxBase + 0] := 0.5; Target[1, 0, BoxBase + 1] := 0.8; // g1
+    NN.Compute(Input);
+    ExactLoss := DETR.DETRSetPredictionLoss(NN.GetLastLayer.Output, Target);
+    DETR.GreedyMatching := True;
+    GreedyLoss := DETR.DETRSetPredictionLoss(NN.GetLastLayer.Output, Target);
+    // Both queries matched with uniform logits: CE = ln(3) each; loss / M=2.
+    ClassCE := Ln(cNumLabels + 1);
+    AssertEquals('Exact loss = CE + 0.4/2', ClassCE + 0.2, ExactLoss, 1e-4);
+    AssertEquals('Greedy loss = CE + 0.6/2', ClassCE + 0.3, GreedyLoss, 1e-4);
+    // GreedyMatching round-trips through save/load.
+    NN2.LoadFromString(NN.SaveToString());
+    AssertTrue('Reloaded GreedyMatching',
+      (NN2.GetLastLayer as TNNetDETRSetPredictionLoss).GreedyMatching);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
     Target.Free;
   end;
 end;

@@ -84,6 +84,7 @@ type
     procedure TestAssertFiniteDetectsInf;
     procedure TestAssertFiniteNilVolume;
     procedure TestNeuralBoxIoU;
+    procedure TestNeuralLinearSumAssignment;
     procedure TestNeuralGreedyNMS;
     procedure TestLocalResponse2DMatchesReference;
     procedure TestLocalResponseDepthMatchesReference;
@@ -2934,6 +2935,117 @@ begin
   // Degenerate (zero-area) box -> 0.
   AssertEquals('Degenerate box IoU', 0.0,
     NeuralBoxIoU(5, 5, 5, 5, 0, 0, 10, 10), 1e-5);
+end;
+
+procedure TTestNeuralVolume.TestNeuralLinearSumAssignment;
+var
+  Cost: array of TNeuralFloat;
+  RowToCol: array of integer;
+  ColUsed: array of boolean;
+  Work: TNeuralAssignmentWork;
+  Rows, Cols, Trial, RowPos, ColPos, AssignedCount: integer;
+  Total, BruteBest, CheckSum: TNeuralFloat;
+  SizeLabel: string;
+
+  // Exhaustive optimum: every row takes a distinct column, or is skipped when
+  // Rows > Cols (exactly Rows - Cols skips).
+  procedure BruteForce(Row, SkipsLeft: integer; Acc: TNeuralFloat);
+  var
+    Col: integer;
+  begin
+    if Row = Rows then
+    begin
+      if (SkipsLeft = 0) and (Acc < BruteBest) then BruteBest := Acc;
+      Exit;
+    end;
+    for Col := 0 to Cols - 1 do
+      if not ColUsed[Col] then
+      begin
+        ColUsed[Col] := True;
+        BruteForce(Row + 1, SkipsLeft, Acc + Cost[Row * Cols + Col]);
+        ColUsed[Col] := False;
+      end;
+    if SkipsLeft > 0 then BruteForce(Row + 1, SkipsLeft - 1, Acc);
+  end;
+
+  procedure CheckAgainstBruteForce(const What: string);
+  var
+    CellRow, CellCol: integer;
+  begin
+    SetLength(RowToCol, Rows);
+    SetLength(ColUsed, Cols);
+    Total := NeuralLinearSumAssignment(Cost, Rows, Cols, RowToCol, Work);
+    AssignedCount := 0;
+    CheckSum := 0;
+    for CellCol := 0 to Cols - 1 do ColUsed[CellCol] := False;
+    for CellRow := 0 to Rows - 1 do
+      if RowToCol[CellRow] >= 0 then
+      begin
+        AssertTrue(What + ' column in range', RowToCol[CellRow] < Cols);
+        AssertFalse(What + ' column used twice', ColUsed[RowToCol[CellRow]]);
+        ColUsed[RowToCol[CellRow]] := True;
+        Inc(AssignedCount);
+        CheckSum := CheckSum + Cost[CellRow * Cols + RowToCol[CellRow]];
+      end;
+    AssertEquals(What + ' assigned count', Min(Rows, Cols), AssignedCount);
+    AssertEquals(What + ' total = sum of assigned cells', CheckSum, Total, 1e-4);
+    for CellCol := 0 to Cols - 1 do ColUsed[CellCol] := False;
+    BruteBest := MaxSingle;
+    BruteForce(0, Max(0, Rows - Cols), 0);
+    AssertEquals(What + ' total = brute-force optimum', BruteBest, Total, 1e-4);
+  end;
+
+begin
+  RandSeed := 20261023;
+  // Random real-valued (incl. negative) matrices, both N < M and N > M, one
+  // Work reused across all sizes so it grows and is then reused smaller.
+  for Rows := 1 to 6 do
+    for Cols := 1 to 6 do
+      for Trial := 1 to 4 do
+      begin
+        SetLength(Cost, Rows * Cols);
+        for RowPos := 0 to Rows * Cols - 1 do Cost[RowPos] := Random * 10 - 3;
+        SizeLabel := IntToStr(Rows) + 'x' + IntToStr(Cols) + ' #' + IntToStr(Trial);
+        CheckAgainstBruteForce('Random ' + SizeLabel);
+        // Small-integer costs: many ties.
+        for RowPos := 0 to Rows * Cols - 1 do Cost[RowPos] := Random(3);
+        CheckAgainstBruteForce('Ties ' + SizeLabel);
+      end;
+  // All-equal 4x5 matrix: every full assignment is optimal.
+  Rows := 4; Cols := 5;
+  SetLength(Cost, Rows * Cols);
+  for RowPos := 0 to Rows * Cols - 1 do Cost[RowPos] := 1;
+  CheckAgainstBruteForce('All-equal 4x5');
+  AssertEquals('All-equal 4x5 total', 4.0, Total, 1e-6);
+  // Known 3x3 (scipy docs example): rows -> [1, 0, 2], total 5.
+  Rows := 3; Cols := 3;
+  SetLength(Cost, 9);
+  Cost[0] := 4; Cost[1] := 1; Cost[2] := 3;
+  Cost[3] := 2; Cost[4] := 0; Cost[5] := 5;
+  Cost[6] := 3; Cost[7] := 2; Cost[8] := 2;
+  CheckAgainstBruteForce('scipy 3x3');
+  AssertEquals('scipy 3x3 row 0', 1, RowToCol[0]);
+  AssertEquals('scipy 3x3 row 1', 0, RowToCol[1]);
+  AssertEquals('scipy 3x3 row 2', 2, RowToCol[2]);
+  AssertEquals('scipy 3x3 total', 5.0, Total, 1e-6);
+  // 1x1.
+  SetLength(Cost, 1);
+  Cost[0] := -2.5;
+  SetLength(RowToCol, 1);
+  Total := NeuralLinearSumAssignment(Cost, 1, 1, RowToCol);
+  AssertEquals('1x1 assignment', 0, RowToCol[0]);
+  AssertEquals('1x1 total', -2.5, Total, 1e-6);
+  // 0-size: no columns leaves every row unassigned; no rows is a no-op.
+  SetLength(Cost, 0);
+  SetLength(RowToCol, 3);
+  RowToCol[0] := 7; RowToCol[1] := 7; RowToCol[2] := 7;
+  Total := NeuralLinearSumAssignment(Cost, 3, 0, RowToCol, Work);
+  AssertEquals('3x0 total', 0.0, Total, 1e-6);
+  for RowPos := 0 to 2 do
+    AssertEquals('3x0 row unassigned', -1, RowToCol[RowPos]);
+  SetLength(RowToCol, 0);
+  Total := NeuralLinearSumAssignment(Cost, 0, 4, RowToCol, Work);
+  AssertEquals('0x4 total', 0.0, Total, 1e-6);
 end;
 
 procedure TTestNeuralVolume.TestNeuralGreedyNMS;

@@ -2195,16 +2195,18 @@ rather than acted on.
       examples/ObjectTracking (.lpr + .lpi + README.md). Today the library
       detects per image only (`BuildYolo`, `DecodeYoloDetections`,
       examples/YoloDetect) and nothing carries identities across frames.
-      - [ ] `NeuralLinearSumAssignment` in neuralvolume.pas next to
+      - [X] `NeuralLinearSumAssignment` in neuralvolume.pas next to
             `NeuralBoxIoU` / `NeuralBoxGIoU`: rectangular min-cost assignment
-            (Jonker-Volgenant / shortest augmenting path, the algorithm of
-            scipy.optimize.linear_sum_assignment), caller-owned work buffers.
-            Tests: random N x M matrices vs brute force at small sizes and vs
-            a scipy oracle in the ~/x venv; ties and N <> M.
-      - [ ] Use it in the DETR set-criterion matcher (a neuralnetwork.pas
-            comment documents the "v1: GREEDY, not optimal Hungarian" gap):
-            keep greedy selectable, make exact the default, and pin a case
-            where greedy and optimal assignments differ.
+            (shortest augmenting path, the algorithm of
+            scipy.optimize.linear_sum_assignment; Rows > Cols solved through a
+            transposed stride view). Caller-owned `TNeuralAssignmentWork`
+            grows on demand; an overload allocates its own. Tested in
+            `TestNeuralLinearSumAssignment` against brute force (every N x M
+            up to 6 x 6, real and tied costs, 0-size, 1x1, the scipy docs 3x3).
+      - [X] DETR set-criterion matcher (`TNNetDETRSetPredictionLoss`) solves
+            the cost matrix exactly by default; `GreedyMatching` (saved in
+            FStruct[1]) keeps the greedy path. `TestDETRSetPredictionLossExactVsGreedy`
+            pins a 2x2 case where the two differ (L1 0.4 vs 0.6).
       - [ ] `TByteTracker` (a plain class, not a layer) in neuralpretrained.pas
             next to the YOLO helpers: constant-velocity xyah Kalman per
             track (the ByteTrack/SORT 8-state filter), two-stage association

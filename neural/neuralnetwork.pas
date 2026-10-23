@@ -3701,16 +3701,16 @@ type
   /// cxcywh box. A row whose channel-0 value is < 0 (e.g. -1) is PADDING and is
   /// skipped, so a fixed-size target volume can carry a variable object count.
   ///
-  /// MATCHING (v1: GREEDY, not optimal Hungarian). Build the N x M cost matrix
-  /// with the three DETR terms (transformers DetrHungarianMatcher, defaults
-  /// class_cost=1, bbox_cost=5, giou_cost=2, stored in FFloatSt[0..2]):
+  /// MATCHING. Build the N x M cost matrix with the three DETR terms
+  /// (transformers DetrHungarianMatcher, defaults class_cost=1, bbox_cost=5,
+  /// giou_cost=2, stored in FFloatSt[0..2]):
   ///   class: -softmax_prob(query n)[gt class of m]
   ///   L1:    sum |box_n - box_m| in cxcywh
   ///   GIoU:  -NeuralBoxGIoU(corners(box_n), corners(box_m))
-  /// then repeatedly take the globally-smallest unmatched (query,gt) cell until
-  /// every gt is matched (each query and each gt used at most once). Greedy is
-  /// near-optimal at the toy object counts used here and avoids new numerical
-  /// code; an EXACT Hungarian/auction path is a documented follow-up (tasklist).
+  /// then solve it EXACTLY with NeuralLinearSumAssignment (the
+  /// scipy.optimize.linear_sum_assignment call of DetrHungarianMatcher). With
+  /// GreedyMatching (FStruct[1] <> 0) it instead repeatedly takes the
+  /// globally-smallest unmatched (query,gt) cell, which can be suboptimal.
   ///
   /// LOSS / BACKWARD (transformers DetrLoss, normalized by M = #gt):
   ///   classification: softmax cross-entropy over ALL N queries. A matched query
@@ -3751,19 +3751,25 @@ type
     FCost: array of TNeuralFloat;
     FqUsed, FmUsed: array of boolean;
     FqMatch: array of integer;
+    FAssignmentWork: TNeuralAssignmentWork;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    // Greedy bipartite assignment; fills FMatchGT and returns the gt count M.
+    // Exact (or greedy) bipartite assignment; fills FMatchGT, returns gt count M.
     function SolveMatching(pOut: TNNetVolume): integer;
+    function GetGreedyMatching(): boolean;
+    procedure SetGreedyMatching(Value: boolean);
   public
     constructor Create(); overload; override;
     constructor Create(NumLabels: integer); reintroduce; overload;
     constructor Create(NumLabels: integer;
       ClassCost, BBoxCost, GIoUCost, EosCoef: TNeuralFloat); reintroduce; overload;
+    constructor Create(NumLabels: integer;
+      ClassCost, BBoxCost, GIoUCost, EosCoef: TNeuralFloat;
+      pGreedyMatching: boolean); reintroduce; overload;
     destructor Destroy(); override;
     procedure ComputeOutputErrorWith(pOutput: TNNetVolume); override;
     procedure Backpropagate(); override;
     // Scalar DETR set-prediction loss for the given output + GT target (same
-    // layout the layer expects). Self-contained; runs its own greedy match.
+    // layout the layer expects). Self-contained; runs its own match.
     function DETRSetPredictionLoss(pOut, pTarget: TNNetVolume): TNeuralFloat;
     // Config accessors (round-trip diagnostics; mirror TNNetEvidentialRegression).
     function NumLabels(): integer;
@@ -3771,6 +3777,8 @@ type
     function BBoxCost(): TNeuralFloat;
     function GIoUCost(): TNeuralFloat;
     function EosCoef(): TNeuralFloat;
+    // False (default): exact Hungarian matching; True: greedy. Saved in FStruct[1].
+    property GreedyMatching: boolean read GetGreedyMatching write SetGreedyMatching;
   end;
 
   /// VQ-VAE codebook bottleneck (van den Oord et al. 2017, "Neural Discrete
@@ -32296,6 +32304,13 @@ end;
 constructor TNNetDETRSetPredictionLoss.Create(NumLabels: integer;
   ClassCost, BBoxCost, GIoUCost, EosCoef: TNeuralFloat);
 begin
+  Create(NumLabels, ClassCost, BBoxCost, GIoUCost, EosCoef, False);
+end;
+
+constructor TNNetDETRSetPredictionLoss.Create(NumLabels: integer;
+  ClassCost, BBoxCost, GIoUCost, EosCoef: TNeuralFloat;
+  pGreedyMatching: boolean);
+begin
   inherited Create();
   if NumLabels < 1 then
     FErrorProc('TNNetDETRSetPredictionLoss requires NumLabels >= 1.');
@@ -32308,7 +32323,14 @@ begin
   FFloatSt[1] := BBoxCost;
   FFloatSt[2] := GIoUCost;
   FFloatSt[3] := EosCoef;
+  SetGreedyMatching(pGreedyMatching);
 end;
+
+function TNNetDETRSetPredictionLoss.GetGreedyMatching(): boolean;
+begin Result := FStruct[1] <> 0; end;
+
+procedure TNNetDETRSetPredictionLoss.SetGreedyMatching(Value: boolean);
+begin FStruct[1] := Ord(Value); end;
 
 function TNNetDETRSetPredictionLoss.NumLabels(): integer;
 begin Result := FStruct[0]; end;
@@ -32466,6 +32488,11 @@ begin
       end;
       Inc(q);
     end;
+  if FStruct[1] = 0 then
+  begin
+    NeuralLinearSumAssignment(FCost, N, M, FMatchGT, FAssignmentWork);
+    Exit;
+  end;
   // Greedy assignment: repeatedly take the globally-smallest unmatched cell.
   if Length(FqUsed) < N then SetLength(FqUsed, N); // rule #17: grow-only
   if Length(FmUsed) < M then SetLength(FmUsed, M); // rule #17: grow-only
@@ -32503,7 +32530,7 @@ var
   mi, K1, ProbBase: integer;
   OutSizeXM1, OutSizeYM1: integer;
 begin
-  // Self-contained: capture pTarget then run the same greedy match used in
+  // Self-contained: capture pTarget then run the same match used in
   // Backpropagate, so a finite-difference probe sees the identical loss.
   if (pTarget.Size = FTargetGT.Size) then
     FTargetGT.CopyNoChecks(pTarget)
@@ -142553,7 +142580,7 @@ begin
       'TNNetInfoNCELoss' :          Result := TNNetInfoNCELoss.Create(St[0], Ft[0]);
       'TNNetCenterLoss' :           Result := TNNetCenterLoss.Create(St[0], Ft[0]);
       'TNNetLoadBalanceLoss' :      Result := TNNetLoadBalanceLoss.Create(St[0], Ft[0]);
-      'TNNetDETRSetPredictionLoss' : Result := TNNetDETRSetPredictionLoss.Create(St[0], Ft[0], Ft[1], Ft[2], Ft[3]);
+      'TNNetDETRSetPredictionLoss' : Result := TNNetDETRSetPredictionLoss.Create(St[0], Ft[0], Ft[1], Ft[2], Ft[3], St[1] <> 0);
       'TNNetVectorQuantizer' :      Result := TNNetVectorQuantizer.Create(St[0], Ft[0]);
       'TNNetFiniteScalarQuant' :    Result := BuildFiniteScalarQuant(St);
       'TNNetLookupFreeQuant' :      Result := TNNetLookupFreeQuant.Create(St[0], Ft[0], Ft[1]);
@@ -143008,7 +143035,7 @@ begin
       if S[0] = 'TNNetInfoNCELoss' then Result := TNNetInfoNCELoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetCenterLoss' then Result := TNNetCenterLoss.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetLoadBalanceLoss' then Result := TNNetLoadBalanceLoss.Create(St[0], Ft[0]) else
-      if S[0] = 'TNNetDETRSetPredictionLoss' then Result := TNNetDETRSetPredictionLoss.Create(St[0], Ft[0], Ft[1], Ft[2], Ft[3]) else
+      if S[0] = 'TNNetDETRSetPredictionLoss' then Result := TNNetDETRSetPredictionLoss.Create(St[0], Ft[0], Ft[1], Ft[2], Ft[3], St[1] <> 0) else
       if S[0] = 'TNNetVectorQuantizer' then Result := TNNetVectorQuantizer.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetFiniteScalarQuant' then Result := BuildFiniteScalarQuant(St) else
       if S[0] = 'TNNetLookupFreeQuant' then Result := TNNetLookupFreeQuant.Create(St[0], Ft[0], Ft[1]) else
