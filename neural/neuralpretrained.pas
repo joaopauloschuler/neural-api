@@ -12116,11 +12116,18 @@ function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const IPAdapterFile: string = ''): TNNet; overload;
 // The same with LoRA files merged into the UNet weights as they load
 // (SDUNetLoRAStripPrefixes; text encoder keys skipped), LoRAScales[i] each.
+// OffsetFile: an IC-Light offset (TNNetOffsetMergeReader) added under the
+// LoRAs; Config.InChannels must be SDUNetOffsetInChannels(OffsetFile).
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; const LoRAFiles: array of string;
   const LoRAScales: array of TNeuralFloat; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
-  const IPAdapterFile: string = ''): TNNet; overload;
+  const IPAdapterFile: string = ''; const OffsetFile: string = ''): TNNet;
+  overload;
+
+// The UNet input channels of an IC-Light offset file: dim 1 of its
+// conv_in.weight (8 for iclight_sd15_fc, 12 for iclight_sd15_fbc).
+function SDUNetOffsetInChannels(const OffsetFile: string): integer;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
   out Config: TSDUNetConfig; pTrainable: boolean = true;
@@ -12662,6 +12669,9 @@ type
     // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
     FLoRAFiles: TStringArray;
     FLoRAScales: TNeuralFloatDynArr;
+    // UNetOffsetFile and the unet/config.json in_channels it overrides.
+    FUNetOffsetFile: string;
+    FConfigUNetInChannels: integer;
     FVaeGridX, FVaeGridY, FVaeEncoderGridX, FVaeEncoderGridY: integer;
     // Bumped whenever kept nets become stale (OpenCL, int8, unload).
     FComponentEpoch: integer;
@@ -12764,6 +12774,7 @@ type
     function GetLoRACount(): integer;
     // Frees the kept UNet and text encoder and the encoded negative embeds.
     procedure LoRAsChanged();
+    procedure SetUNetOffsetFile(const Value: string);
     // smLCM swaps in a TNNetLCMScheduler of the same scheduler config
     // (diffusers LCMScheduler.from_config).
     procedure SetSampler(Value: TNNetSamplerMethod);
@@ -12956,6 +12967,11 @@ type
       write FConditioner;
     property ComponentEpoch: integer read FComponentEpoch;
     property LoRACount: integer read GetLoRACount;
+    // An IC-Light offset file (iclight_sd15_fc / _fbc.safetensors) added to the
+    // UNet weights as they load, its conv_in widening UNetConfig.InChannels;
+    // '' (default) loads unet/ alone. Setting it drops a kept UNet.
+    property UNetOffsetFile: string read FUNetOffsetFile
+      write SetUNetOffsetFile;
     // Nets built by reading a weights file (text encoder, UNet, VAE, ControlNet,
     // T2I-Adapter, depth estimator); a kept net rebuilt for a new size reads none.
     property WeightFileLoadCount: integer read FWeightFileLoadCount;
@@ -17290,6 +17306,31 @@ type
     property AdaptedTensorCount: integer read GetAdaptedTensorCount;
   end;
 
+  // A tensor reader over a base checkpoint with an offset file of the same
+  // keys added in, in FP32 (IC-Light gradio_demo.py: sd_origin[k] +
+  // sd_offset[k] for every key, strict). A 4-D offset wider in dim 1 than its
+  // base reads as the base widened with zero input channels plus the offset
+  // (conv_in 4 -> 8 or 12 channels). Every base tensor needs an offset of its
+  // shape (or that widening) and every offset tensor a base one.
+  TNNetOffsetMergeReader = class(TNNetSafeTensorsReader)
+  private
+    FBase: TNNetSafeTensorsReader;    // owned
+    FOffset: TNNetSafeTensorsReader;  // owned
+    FSourceNames: array of string;    // base tensor name per entry
+    FIsWidened: array of boolean;     // per entry: base input channels padded
+    FBaseTensor, FOffsetTensor: TNNetVolume;
+    function SourceOf(const pName: string): integer;
+  public
+    // Takes ownership of pBase (also freed when Create raises).
+    constructor Create(pBase: TNNetSafeTensorsReader;
+      const pOffsetFile: string);
+    destructor Destroy; override;
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+    // False: the merged tensors are built whole.
+    function CanStreamTensorRows(const pName: string): boolean; override;
+  end;
+
 const
   // Key prefixes of image-generator LoRA files: diffusers, ComfyUI, kohya.
   DiffusersLoRAStripPrefixes: array[0..2] of string =
@@ -21198,6 +21239,116 @@ begin
     Result := TNNetLoRAMergeReader.CreateFromFile(Result,
       AdapterFiles[FileCnt], StripPrefixes, SkipPrefixes, SkipUnprefixed,
       Scales[FileCnt]);
+end;
+
+{ TNNetOffsetMergeReader }
+
+constructor TNNetOffsetMergeReader.Create(pBase: TNNetSafeTensorsReader;
+  const pOffsetFile: string);
+var
+  SourceCnt, MaxSourcePos, DimCnt, OffsetCnt, MaxOffsetPos: integer;
+  SourceName: string;
+  IsSameShape, IsWidened: boolean;
+begin
+  inherited CreateBare;
+  FBase := pBase; // first: Destroy frees it when anything below raises
+  FBaseTensor := TNNetVolume.Create;
+  FOffsetTensor := TNNetVolume.Create;
+  FFileName := FBase.FileName;
+  if not FileExists(pOffsetFile) then
+    ImportError('Offset merge: offset file ' + pOffsetFile + ' not found.');
+  FOffset := CreatePretrainedTensorReader(pOffsetFile);
+  MaxSourcePos := FBase.Count - 1;
+  SetLength(FTensors, FBase.Count);
+  SetLength(FSourceNames, FBase.Count);
+  SetLength(FIsWidened, FBase.Count);
+  for SourceCnt := 0 to MaxSourcePos do
+  begin
+    SourceName := FBase.TensorName(SourceCnt);
+    if not FOffset.HasTensor(SourceName) then
+      ImportError('Offset merge: base tensor "' + SourceName + '" has no ' +
+        'offset in ' + pOffsetFile + '.');
+    IsSameShape := FOffset.DimCount(SourceName) = FBase.DimCount(SourceName);
+    if IsSameShape then
+      for DimCnt := 0 to FBase.DimCount(SourceName) - 1 do
+        IsSameShape := IsSameShape and (FOffset.DimSize(SourceName, DimCnt) =
+          FBase.DimSize(SourceName, DimCnt));
+    IsWidened := (not IsSameShape) and (FBase.DimCount(SourceName) = 4) and
+      (FOffset.DimCount(SourceName) = 4) and
+      (FOffset.DimSize(SourceName, 0) = FBase.DimSize(SourceName, 0)) and
+      (FOffset.DimSize(SourceName, 1) > FBase.DimSize(SourceName, 1)) and
+      (FOffset.DimSize(SourceName, 2) = FBase.DimSize(SourceName, 2)) and
+      (FOffset.DimSize(SourceName, 3) = FBase.DimSize(SourceName, 3));
+    if not (IsSameShape or IsWidened) then
+      ImportError('Offset merge: "' + SourceName + '" is ' +
+        FBase.ShapeAsString(SourceName) + ' in the base and ' +
+        FOffset.ShapeAsString(SourceName) + ' in ' + pOffsetFile +
+        ' (only dim 1 of a 4-D tensor may grow).');
+    FSourceNames[SourceCnt] := SourceName;
+    FIsWidened[SourceCnt] := IsWidened;
+    FTensors[SourceCnt] := FOffset.GetInfo(SourceName);
+    FTensors[SourceCnt].DType := 'F32'; // served merged, in FP32
+    FTensors[SourceCnt].Shard := SourceCnt;
+  end;
+  InvalidateTensorIndex;
+  MaxOffsetPos := FOffset.Count - 1;
+  for OffsetCnt := 0 to MaxOffsetPos do
+    if not FBase.HasTensor(FOffset.TensorName(OffsetCnt)) then
+      ImportError('Offset merge: offset tensor "' +
+        FOffset.TensorName(OffsetCnt) + '" has no base tensor in ' +
+        FFileName + '.');
+end;
+
+destructor TNNetOffsetMergeReader.Destroy;
+begin
+  FOffsetTensor.Free;
+  FBaseTensor.Free;
+  FOffset.Free;
+  FBase.Free;
+  inherited Destroy;
+end;
+
+function TNNetOffsetMergeReader.SourceOf(const pName: string): integer;
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    raise ESafeTensorsError.CreateFmt('Offset merge: tensor "%s" not found ' +
+      'in %s', [pName, FFileName]);
+  Result := FTensors[Idx].Shard;
+end;
+
+procedure TNNetOffsetMergeReader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  SourceIdx, OutPos, MaxOutPos, BaseRowSize, WideRowSize: integer;
+  SourceName: string;
+begin
+  SourceIdx := SourceOf(pName);
+  SourceName := FSourceNames[SourceIdx];
+  FOffset.LoadTensorFlat(SourceName, FOffsetTensor);
+  if FIsWidened[SourceIdx] then
+  begin
+    FBase.LoadTensorFlat(SourceName, FBaseTensor);
+    MaxOutPos := integer(FBase.DimSize(SourceName, 0)) - 1;
+    BaseRowSize := FBaseTensor.Size div (MaxOutPos + 1);
+    WideRowSize := FOffsetTensor.Size div (MaxOutPos + 1);
+    Dest.ReSize(FOffsetTensor.Size, 1, 1);
+    Dest.Fill(0);
+    // [out, in, kh, kw]: each output row's base inputs come first.
+    for OutPos := 0 to MaxOutPos do
+      Move(FBaseTensor.FData[OutPos * BaseRowSize],
+        Dest.FData[OutPos * WideRowSize], BaseRowSize * SizeOf(TNeuralFloat));
+  end
+  else FBase.LoadTensorFlat(SourceName, Dest);
+  Dest.Add(FOffsetTensor);
+end;
+
+function TNNetOffsetMergeReader.CanStreamTensorRows(
+  const pName: string): boolean;
+begin
+  Result := false;
 end;
 
 procedure SplitLoRASpec(const Spec: string; out FileName: string;
@@ -78979,16 +79130,19 @@ function BuildSDUNetFromSafeTensorsWithLayout(const FileName: string;
   const LoRAScales: array of TNeuralFloat;
   out DeepCacheLayout: TSDUNetDeepCacheLayout; pWithControl,
   pWithAdapter: boolean; const IPAdapterFile: string;
-  pTrainable: boolean = false; const GLIGENFile: string = ''): TNNet;
+  pTrainable: boolean = false; const GLIGENFile: string = '';
+  const OffsetFile: string = ''): TNNet;
 var
   Reader, IPAdapterReader, GLIGENReader: TNNetSafeTensorsReader;
 begin
   IPAdapterReader := nil;
   GLIGENReader := nil;
-  // The chain owns (and on a raise frees) the plain reader.
-  Reader := CreateLoRAMergeChain(CreatePretrainedTensorReader(FileName),
-    LoRAFiles, LoRAScales, SDUNetLoRAStripPrefixes, SDUNetLoRASkipPrefixes,
-    {SkipUnprefixed=}false);
+  Reader := CreatePretrainedTensorReader(FileName);
+  // Each wrapper owns (and on a raise frees) the reader it wraps.
+  if OffsetFile <> '' then
+    Reader := TNNetOffsetMergeReader.Create(Reader, OffsetFile);
+  Reader := CreateLoRAMergeChain(Reader, LoRAFiles, LoRAScales,
+    SDUNetLoRAStripPrefixes, SDUNetLoRASkipPrefixes, {SkipUnprefixed=}false);
   try
     if IPAdapterFile <> '' then
       IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
@@ -79007,13 +79161,31 @@ function BuildSDUNetFromSafeTensorsEx(const FileName: string;
   const Config: TSDUNetConfig; const LoRAFiles: array of string;
   const LoRAScales: array of TNeuralFloat; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
-  const IPAdapterFile: string = ''): TNNet;
+  const IPAdapterFile: string = ''; const OffsetFile: string = ''): TNNet;
 var
   DeepCacheLayout: TSDUNetDeepCacheLayout;
 begin
   Result := BuildSDUNetFromSafeTensorsWithLayout(FileName, Config, LoRAFiles,
     LoRAScales, DeepCacheLayout, pWithControl, pWithAdapter, IPAdapterFile,
-    pTrainable);
+    pTrainable, '', OffsetFile);
+end;
+
+function SDUNetOffsetInChannels(const OffsetFile: string): integer;
+const
+  csConvInWeight = 'conv_in.weight';
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(OffsetFile);
+  try
+    if (not Reader.HasTensor(csConvInWeight)) or
+      (Reader.DimCount(csConvInWeight) <> 4) then
+      ImportError('SDUNetOffsetInChannels: ' + OffsetFile + ' has no 4-D ' +
+        csConvInWeight + '.');
+    Result := integer(Reader.DimSize(csConvInWeight, 1));
+  finally
+    Reader.Free;
+  end;
 end;
 
 function BuildSDUNetFromSafeTensors(const FileName: string;
@@ -102332,6 +102504,7 @@ begin
   FUNetConfig := ReadSDUNetConfigFromJSONFile(ComponentFolder('unet') +
     'config.json');
   FDeepCacheBranch := FUNetConfig.LayersPerBlock;
+  FConfigUNetInChannels := FUNetConfig.InChannels;
   FVaeConfig := ReadVaeDecoderConfigFromJSONFile(ComponentFolder('vae') +
     'config.json');
   if FUNetConfig.UseAddEmbedding then
@@ -102587,7 +102760,7 @@ begin
       ComponentFolder('unet'), 'diffusion_pytorch_model'),
       UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
       DeepCacheLayout, WithControl, WithAdapter, IPAdapterFile,
-      {pTrainable=}false, GLIGENFile));
+      {pTrainable=}false, GLIGENFile, FUNetOffsetFile));
   end;
   IPAdapterReader := nil;
   GLIGENReader := nil;
@@ -102989,6 +103162,23 @@ begin
   FLoRAFiles[LoRAIdx] := FileName;
   FLoRAScales[LoRAIdx] := Scale;
   LoRAsChanged();
+end;
+
+procedure TStableDiffusionPipeline.SetUNetOffsetFile(const Value: string);
+begin
+  if Value = FUNetOffsetFile then exit;
+  if Value = '' then FUNetConfig.InChannels := FConfigUNetInChannels
+  else
+  begin
+    if not FileExists(Value) then
+      ImportError('TStableDiffusionPipeline: UNet offset file ' + Value +
+        ' not found.');
+    FUNetConfig.InChannels := SDUNetOffsetInChannels(Value);
+  end;
+  FUNetOffsetFile := Value;
+  FreeAndNil(FUNet);
+  FreeAndNil(FUNetOwner);
+  Inc(FComponentEpoch);
 end;
 
 procedure TStableDiffusionPipeline.ClearLoRAs();

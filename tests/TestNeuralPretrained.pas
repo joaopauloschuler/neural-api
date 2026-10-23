@@ -198,6 +198,14 @@ type
       pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    // A tiny_sd15/unet IC-Light offset file (conv_in to InChannels) in the
+    // temp folder; the caller deletes it.
+    function WriteICLightOffsetFile(InChannels: integer): string;
+    // Volume[x, y, c] at each (c, y, x) triple of Positions is Expected
+    // (1e-4), and the sum and sum of squares of all its values.
+    procedure CheckICLightPicks(const What: string; Volume: TNNetVolume;
+      const Positions: array of integer; const Expected: array of double;
+      ExpectedSum, ExpectedSumSq: double);
     // Max |diff| of the pico DDColor (weights WeightsFile) vs its float64 torch
     // a*b*; with pRoundTrip a save/load copy must reproduce the output exactly.
     function DDColorParityMaxDiff(const WeightsFile: string;
@@ -1438,6 +1446,7 @@ type
     procedure TestStableDiffusion2LCMParity;
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
+    procedure TestICLightOffsetMerge;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -49680,6 +49689,175 @@ begin
     Pipeline.Free;
     InstructPix2Pix.Free;
     FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+// IC-Light offsets for tiny_sd15/unet: ((i * 7 + n) mod 17 - 8) / 400 at flat
+// index i of every n-element tensor, conv_in.weight widened to InChannels.
+function TTestNeuralPretrained.WriteICLightOffsetFile(
+  InChannels: integer): string;
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Offset: TNNetVolume;
+  Shape: array of Int64;
+  TensorPos, DimPos, ValuePos, MaxValuePos, ElementCount: integer;
+  TensorName: string;
+begin
+  Result := GetTempDir(false) + 'cai_iclight_offset_' + IntToStr(InChannels) +
+    '_' + IntToStr(Random(1000000)) + '.safetensors';
+  Reader := TNNetSafeTensorsReader.Create(FixturePath(
+    'tiny_sd15/unet/diffusion_pytorch_model.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(Result);
+  Offset := TNNetVolume.Create;
+  try
+    for TensorPos := 0 to Reader.Count - 1 do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      SetLength(Shape, Reader.DimCount(TensorName));
+      for DimPos := 0 to High(Shape) do
+        Shape[DimPos] := Reader.DimSize(TensorName, DimPos);
+      if TensorName = 'conv_in.weight' then Shape[1] := InChannels;
+      ElementCount := 1;
+      for DimPos := 0 to High(Shape) do
+        ElementCount := ElementCount * integer(Shape[DimPos]);
+      Offset.ReSize(ElementCount, 1, 1);
+      MaxValuePos := ElementCount - 1;
+      for ValuePos := 0 to MaxValuePos do
+        Offset.FData[ValuePos] := ((ValuePos * 7 + ElementCount) mod 17 - 8) /
+          400.0;
+      Writer.AddTensorFlat(TensorName, Shape, Offset);
+    end;
+    Writer.SaveToFile;
+  finally
+    Offset.Free;
+    Writer.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckICLightPicks(const What: string;
+  Volume: TNNetVolume; const Positions: array of integer;
+  const Expected: array of double; ExpectedSum, ExpectedSumSq: double);
+var
+  PickPos, X, Y, Channel, ValuePos: integer;
+  Sum, SumSq: double;
+begin
+  for PickPos := 0 to High(Expected) do
+  begin
+    Channel := Positions[PickPos * 3];
+    Y := Positions[PickPos * 3 + 1];
+    X := Positions[PickPos * 3 + 2];
+    AssertEquals(What + ' [c ' + IntToStr(Channel) + ', y ' + IntToStr(Y) +
+      ', x ' + IntToStr(X) + ']', Expected[PickPos], Volume[X, Y, Channel],
+      1e-4);
+  end;
+  Sum := 0;
+  SumSq := 0;
+  for ValuePos := 0 to Volume.Size - 1 do
+  begin
+    Sum := Sum + Volume.FData[ValuePos];
+    SumSq := SumSq + Sqr(Volume.FData[ValuePos]);
+  end;
+  AssertEquals(What + ' sum', ExpectedSum, Sum, 1e-3);
+  AssertEquals(What + ' sum of squares', ExpectedSumSq, SumSq,
+    1e-3 + 1e-5 * ExpectedSumSq);
+end;
+
+// TNNetOffsetMergeReader and BuildSDUNetFromSafeTensorsEx(OffsetFile) vs the
+// IC-Light gradio_demo.py merge (conv_in widened to 8 with zeros, then
+// sd_origin + sd_offset) on tiny_sd15: the merged conv_in and one forward of
+// the 8-channel UNet against diffusers float64.
+procedure TTestNeuralPretrained.TestICLightOffsetMerge;
+const
+  cPicks: array[0..17] of integer = (0, 0, 0, 1, 2, 3, 2, 5, 1, 3, 7, 7,
+    0, 4, 6, 3, 1, 2);
+var
+  OffsetFile, PartialFile: string;
+  Reader, PartialReader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Config: TSDUNetConfig;
+  Net: TNNet;
+  Weights, Sample, Embeds, Output: TNNetVolume;
+  X, Y, Channel, IsRefused: integer;
+begin
+  OffsetFile := WriteICLightOffsetFile(8);
+  PartialFile := GetTempDir(false) + 'cai_iclight_partial_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  Net := nil;
+  Weights := TNNetVolume.Create;
+  Sample := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  try
+    AssertEquals('offset in_channels', 8, SDUNetOffsetInChannels(OffsetFile));
+    Reader := TNNetOffsetMergeReader.Create(TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors')),
+      OffsetFile);
+    try
+      AssertEquals('widened conv_in', '[8, 8, 3, 3]',
+        Reader.ShapeAsString('conv_in.weight'));
+      Reader.LoadTensorFlat('conv_in.weight', Weights);
+      AssertEquals('conv_in size', 8 * 8 * 9, Weights.Size);
+      // [out 3, in 1, 2, 0]: base + offset; [5, 6, 1, 2]: a new channel.
+      AssertEquals('base + offset', 0.11378335580229759,
+        Weights.FData[((3 * 8 + 1) * 3 + 2) * 3 + 0], 1e-7);
+      AssertEquals('zero base + offset', -0.0025,
+        Weights.FData[((5 * 8 + 6) * 3 + 1) * 3 + 2], 1e-7);
+    finally
+      Reader.Free;
+    end;
+    // The reference merge is strict: a base tensor without an offset raises.
+    Writer := TNNetSafeTensorsWriter.Create(PartialFile);
+    PartialReader := TNNetSafeTensorsReader.Create(OffsetFile);
+    try
+      PartialReader.LoadTensorFlat('conv_in.bias', Weights);
+      Writer.AddTensorFlat('conv_in.bias', [Weights.Size], Weights);
+      Writer.SaveToFile;
+    finally
+      PartialReader.Free;
+      Writer.Free;
+    end;
+    IsRefused := 0;
+    try
+      TNNetOffsetMergeReader.Create(TNNetSafeTensorsReader.Create(
+        FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors')),
+        PartialFile).Free;
+    except
+      on EPretrainedImportError do IsRefused := 1;
+    end;
+    AssertEquals('partial offset refused', 1, IsRefused);
+
+    Config := ReadSDUNetConfigFromJSONFile(FixturePath(
+      'tiny_sd15/unet/config.json'));
+    Config.InChannels := 8;
+    Config.LatentGrid := 8;
+    Config.LatentGridY := 8;
+    Config.TextSeqLen := 5;
+    Net := BuildSDUNetFromSafeTensorsEx(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config, [], [],
+      {pTrainable=}false, false, false, '', OffsetFile);
+    Sample.ReSize(8, 8, 8);
+    for Y := 0 to 7 do
+      for X := 0 to 7 do
+        for Channel := 0 to 7 do
+          Sample[X, Y, Channel] := ((Channel * 31 + Y * 7 + X * 3) mod 19 - 9) / 9;
+    Embeds.ReSize(5, 1, 32);
+    for X := 0 to 4 do
+      for Channel := 0 to 31 do
+        Embeds[X, 0, Channel] := ((X * 5 + Channel * 3) mod 13 - 6) / 6;
+    SDUNetDenoise(Net, Config, Sample, Embeds, 500, Output);
+    CheckICLightPicks('8-channel unet', Output, cPicks,
+      [-0.000632762885, -0.518493659, -0.896704931, 0.440995721,
+      -0.387215711, -0.444810252], -32.1714241, 42.8011612);
+  finally
+    Output.Free;
+    Embeds.Free;
+    Sample.Free;
+    Weights.Free;
+    Net.Free;
+    DeleteFile(PartialFile);
+    DeleteFile(OffsetFile);
   end;
 end;
 

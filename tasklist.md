@@ -827,13 +827,11 @@ rather than acted on.
       InstructPix2Pix / inpainting latent concat), `TStableDiffusionImg2Img`,
       Karras sigmas and `BiRefNetRemoveBackground` (examples/BackgroundRemoval).
       Steps, each ending green with a commit:
-      - (a) Load: the reference widens the base UNet `conv_in` from 4 to 8
-            input channels (fc) or 12 (fbc), zero weights for the new channels,
-            then loads `base + offset` for EVERY tensor from
-            `iclight_sd15_fc.safetensors` / `iclight_sd15_fbc.safetensors`
-            (diffusers UNet keys; base `stablediffusionapi/realistic-vision-v51`
-            or any SD 1.5). Add this as an offset-merge option of the SD UNet
-            loader, not a copied loader.
+      - [X] (a) Load: `TNNetOffsetMergeReader` (base + offset per tensor, a
+            4-D offset wider in dim 1 widens the base with zero channels;
+            strict both ways) under the LoRA chain of
+            `BuildSDUNetFromSafeTensorsEx(..., OffsetFile)`;
+            `SDUNetOffsetInChannels`; `TStableDiffusionPipeline.UNetOffsetFile`.
       - (b) `TStableDiffusionICLight` conditioner (subclass of
             `TStableDiffusionImageConditioner`): foreground composited on gray
             127 with the matte alpha, VAE-encoded with the latent-dist MODE
@@ -847,7 +845,8 @@ rather than acted on.
             dpaSDEDPMSolverPP` (diffusers `sde-dpmsolver++`, read from
             `algorithm_type`), `--sampler dpm++2m-sde`; TestSDEDPMSolverVsDiffusers.
       - (e) Pico-fixture parity vs diffusers + the reference hook in the ~/x
-            venv (offset merge, 8-channel UNet input, one denoise step),
+            venv (offset merge DONE: TestICLightOffsetMerge; 8-channel UNet
+            input, one denoise step),
             then `--relight` / `--light left|right|top|bottom` /
             `--relight-background FILE` in examples/StableDiffusion and its
             README. The reference mattes with `briaai/RMBG-1.4` (IS-Net, not
