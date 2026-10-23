@@ -17999,6 +17999,9 @@ type
     FRowRe, FRowIm: array of Double;
     FColRe, FColIm: array of Double;
     FSpecRe, FSpecIm: array of Double;
+    // Second channel of a pair: its row spectra come out of the same row FFT.
+    FSpec2Re, FSpec2Im: array of Double;
+    FPairChannelRows: boolean;
     FBinScale: array of Double;
     FGradVol: TNNetVolume;
     // True on TNNetInverseRealFFT2D: selects the irfft2 device launches.
@@ -18033,6 +18036,8 @@ type
     {$ENDIF}
     function GetNorm(): integer;
     property SpatialW: integer read FSpatialW;
+    // Default true: two channels share one complex row FFT; false runs one row FFT per channel.
+    property PairChannelRows: boolean read FPairChannelRows write FPairChannelRows;
     property SpatialH: integer read FSpatialH;
   end;
 
@@ -99673,6 +99678,7 @@ end;
 constructor TNNetRealFFT2DBase.Create();
 begin
   inherited Create();
+  FPairChannelRows := true;
   FGradVol := TNNetVolume.Create();
 end;
 
@@ -99717,133 +99723,232 @@ begin
   SetLength(FColIm, FSpatialH);
   SetLength(FSpecRe, FSpatialH * FHalfW);
   SetLength(FSpecIm, FSpatialH * FHalfW);
+  SetLength(FSpec2Re, FSpatialH * FHalfW);
+  SetLength(FSpec2Im, FSpatialH * FHalfW);
   SetLength(FBinScale, FHalfW);
 end;
 
 procedure TNNetRealFFT2DBase.RealToHalfSpectrum(Src, Dst: TNNetVolume);
 var
-  ChannelCnt, SpatialX, SpatialY, BinCnt: integer;
-  MaxChannelPos, MaxSpatialX, MaxSpatialY, MaxBinPos: integer;
-  SrcPos, SpecPos, DstPos, SrcRowStride, DstDepth, DstRowStride: integer;
-  RowBytes, BinBytes: integer;
-  BinScale: Double;
+  ChannelCnt, SpatialX, SpatialY, BinCnt, MirrorBin: integer;
+  MaxSpatialX, MaxSpatialY, MaxBinPos: integer;
+  SrcPos, SpecPos, RowBytes, BinBytes: integer;
+  ZRe, ZIm, MirrorRe, MirrorIm: Double;
+  HasPair: boolean;
+
+  // Column FFTs of one channel's row spectra into Dst channels 2*Channel, 2*Channel+1.
+  procedure TransformColumns(var SpecRe, SpecIm: array of Double; Channel: integer);
+  var
+    ColBin, ColY, ColSpecPos, DstPos, DstDepth, DstRowStride: integer;
+    BinScale: Double;
+  begin
+    DstDepth := 2 * FChannels;
+    DstRowStride := FHalfW * DstDepth;
+    for ColBin := 0 to MaxBinPos do
+    begin
+      ColSpecPos := ColBin;
+      for ColY := 0 to MaxSpatialY do
+      begin
+        FColRe[ColY] := SpecRe[ColSpecPos];
+        FColIm[ColY] := SpecIm[ColSpecPos];
+        Inc(ColSpecPos, FHalfW);
+      end;
+      FFTPlanExecute(FPlanH, FColRe, FColIm, false);
+      BinScale := FBinScale[ColBin];
+      DstPos := ColBin * DstDepth + 2 * Channel;
+      for ColY := 0 to MaxSpatialY do
+      begin
+        Dst.FData[DstPos] := FColRe[ColY] * BinScale;
+        Dst.FData[DstPos + 1] := FColIm[ColY] * BinScale;
+        Inc(DstPos, DstRowStride);
+      end;
+    end;
+  end;
+
 begin
-  MaxChannelPos := FChannels - 1;
   MaxSpatialX := FSpatialW - 1;
   MaxSpatialY := FSpatialH - 1;
   MaxBinPos := FHalfW - 1;
-  SrcRowStride := FSpatialW * FChannels;
-  DstDepth := 2 * FChannels;
-  DstRowStride := FHalfW * DstDepth;
   RowBytes := FSpatialW * csDoubleSize;
   BinBytes := FHalfW * csDoubleSize;
-  for ChannelCnt := 0 to MaxChannelPos do
+  ChannelCnt := 0;
+  while ChannelCnt < FChannels do
   begin
+    HasPair := FPairChannelRows and (ChannelCnt + 1 < FChannels);
     SrcPos := ChannelCnt;
     SpecPos := 0;
     for SpatialY := 0 to MaxSpatialY do
     begin
-      for SpatialX := 0 to MaxSpatialX do
+      if HasPair then
       begin
-        FRowRe[SpatialX] := Src.FData[SrcPos];
-        Inc(SrcPos, FChannels);
+        for SpatialX := 0 to MaxSpatialX do
+        begin
+          FRowRe[SpatialX] := Src.FData[SrcPos];
+          FRowIm[SpatialX] := Src.FData[SrcPos + 1];
+          Inc(SrcPos, FChannels);
+        end;
+        FFTPlanExecute(FPlanW, FRowRe, FRowIm, false);
+        // Row z = a + i*b: A_k = (Z_k + conj Z_{W-k}) / 2, B_k = (Z_k - conj Z_{W-k}) / 2i.
+        FSpecRe[SpecPos] := FRowRe[0];
+        FSpecIm[SpecPos] := 0;
+        FSpec2Re[SpecPos] := FRowIm[0];
+        FSpec2Im[SpecPos] := 0;
+        MirrorBin := MaxSpatialX;
+        for BinCnt := 1 to MaxBinPos do
+        begin
+          ZRe := FRowRe[BinCnt];
+          ZIm := FRowIm[BinCnt];
+          MirrorRe := FRowRe[MirrorBin];
+          MirrorIm := FRowIm[MirrorBin];
+          FSpecRe[SpecPos + BinCnt] := 0.5 * (ZRe + MirrorRe);
+          FSpecIm[SpecPos + BinCnt] := 0.5 * (ZIm - MirrorIm);
+          FSpec2Re[SpecPos + BinCnt] := 0.5 * (ZIm + MirrorIm);
+          FSpec2Im[SpecPos + BinCnt] := 0.5 * (MirrorRe - ZRe);
+          Dec(MirrorBin);
+        end;
+      end
+      else
+      begin
+        for SpatialX := 0 to MaxSpatialX do
+        begin
+          FRowRe[SpatialX] := Src.FData[SrcPos];
+          Inc(SrcPos, FChannels);
+        end;
+        FillChar(FRowIm[0], RowBytes, 0);
+        FFTPlanExecute(FPlanW, FRowRe, FRowIm, false);
+        Move(FRowRe[0], FSpecRe[SpecPos], BinBytes);
+        Move(FRowIm[0], FSpecIm[SpecPos], BinBytes);
       end;
-      FillChar(FRowIm[0], RowBytes, 0);
-      FFTPlanExecute(FPlanW, FRowRe, FRowIm, false);
-      Move(FRowRe[0], FSpecRe[SpecPos], BinBytes);
-      Move(FRowIm[0], FSpecIm[SpecPos], BinBytes);
       Inc(SpecPos, FHalfW);
     end;
-    for BinCnt := 0 to MaxBinPos do
+    TransformColumns(FSpecRe, FSpecIm, ChannelCnt);
+    if HasPair then
     begin
-      SpecPos := BinCnt;
-      for SpatialY := 0 to MaxSpatialY do
-      begin
-        FColRe[SpatialY] := FSpecRe[SpecPos];
-        FColIm[SpatialY] := FSpecIm[SpecPos];
-        Inc(SpecPos, FHalfW);
-      end;
-      FFTPlanExecute(FPlanH, FColRe, FColIm, false);
-      BinScale := FBinScale[BinCnt];
-      DstPos := BinCnt * DstDepth + 2 * ChannelCnt;
-      for SpatialY := 0 to MaxSpatialY do
-      begin
-        Dst.FData[DstPos] := FColRe[SpatialY] * BinScale;
-        Dst.FData[DstPos + 1] := FColIm[SpatialY] * BinScale;
-        Inc(DstPos, DstRowStride);
-      end;
-    end;
+      TransformColumns(FSpec2Re, FSpec2Im, ChannelCnt + 1);
+      Inc(ChannelCnt, 2);
+    end
+    else
+      Inc(ChannelCnt);
   end;
 end;
 
 procedure TNNetRealFFT2DBase.HalfSpectrumToReal(Src, Dst: TNNetVolume;
   Scale: Double; Hermitian: boolean);
 var
-  ChannelCnt, SpatialX, SpatialY, BinCnt: integer;
-  MaxChannelPos, MaxSpatialX, MaxSpatialY, MaxBinPos, MaxMirrorPos: integer;
-  SrcPos, SpecPos, DstPos, SrcDepth, SrcRowStride: integer;
-  BinBytes, TailBytes: integer;
-  OutScale: Double;
+  ChannelCnt, SpatialX, SpatialY, BinCnt, MirrorBin, NyquistBin: integer;
+  MaxSpatialX, MaxSpatialY, MaxBinPos, MaxMirrorPos: integer;
+  SpecPos, DstPos, BinBytes, TailBytes: integer;
+  OutScale, MirrorScale, XRe, XIm, YRe, YIm: Double;
+  HasPair: boolean;
+
+  // Inverse column FFTs of Src channels 2*Channel, 2*Channel+1 into SpecRe/SpecIm rows.
+  procedure InverseColumns(var SpecRe, SpecIm: array of Double; Channel: integer);
+  var
+    ColBin, ColY, ColSpecPos, SrcPos, SrcDepth, SrcRowStride: integer;
+  begin
+    SrcDepth := 2 * FChannels;
+    SrcRowStride := FHalfW * SrcDepth;
+    for ColBin := 0 to MaxBinPos do
+    begin
+      SrcPos := ColBin * SrcDepth + 2 * Channel;
+      for ColY := 0 to MaxSpatialY do
+      begin
+        FColRe[ColY] := Src.FData[SrcPos];
+        FColIm[ColY] := Src.FData[SrcPos + 1];
+        Inc(SrcPos, SrcRowStride);
+      end;
+      FFTPlanExecute(FPlanH, FColRe, FColIm, true);
+      ColSpecPos := ColBin;
+      for ColY := 0 to MaxSpatialY do
+      begin
+        SpecRe[ColSpecPos] := FColRe[ColY];
+        SpecIm[ColSpecPos] := FColIm[ColY];
+        Inc(ColSpecPos, FHalfW);
+      end;
+    end;
+  end;
+
 begin
-  MaxChannelPos := FChannels - 1;
   MaxSpatialX := FSpatialW - 1;
   MaxSpatialY := FSpatialH - 1;
   MaxBinPos := FHalfW - 1;
   MaxMirrorPos := (FSpatialW - 1) div 2;
-  SrcDepth := 2 * FChannels;
-  SrcRowStride := FHalfW * SrcDepth;
+  if Odd(FSpatialW) then NyquistBin := -1 else NyquistBin := FSpatialW div 2;
   BinBytes := FHalfW * csDoubleSize;
   TailBytes := (FSpatialW - FHalfW) * csDoubleSize;
+  // Re(ifft(S)) = ifft((S_k + conj S_{W-k}) / 2): zero-padded bins k, W-k halve.
+  if Hermitian then MirrorScale := 1.0 else MirrorScale := 0.5;
   // FFTPlanExecute's inverse divides by H and by W; the caller's Scale excludes it.
   OutScale := Scale * FSpatialW * FSpatialH;
-  for ChannelCnt := 0 to MaxChannelPos do
+  ChannelCnt := 0;
+  while ChannelCnt < FChannels do
   begin
-    for BinCnt := 0 to MaxBinPos do
-    begin
-      SrcPos := BinCnt * SrcDepth + 2 * ChannelCnt;
-      for SpatialY := 0 to MaxSpatialY do
-      begin
-        FColRe[SpatialY] := Src.FData[SrcPos];
-        FColIm[SpatialY] := Src.FData[SrcPos + 1];
-        Inc(SrcPos, SrcRowStride);
-      end;
-      FFTPlanExecute(FPlanH, FColRe, FColIm, true);
-      SpecPos := BinCnt;
-      for SpatialY := 0 to MaxSpatialY do
-      begin
-        FSpecRe[SpecPos] := FColRe[SpatialY];
-        FSpecIm[SpecPos] := FColIm[SpatialY];
-        Inc(SpecPos, FHalfW);
-      end;
-    end;
+    HasPair := FPairChannelRows and (ChannelCnt + 1 < FChannels);
+    InverseColumns(FSpecRe, FSpecIm, ChannelCnt);
+    if HasPair then InverseColumns(FSpec2Re, FSpec2Im, ChannelCnt + 1);
     SpecPos := 0;
     DstPos := ChannelCnt;
     for SpatialY := 0 to MaxSpatialY do
     begin
-      Move(FSpecRe[SpecPos], FRowRe[0], BinBytes);
-      Move(FSpecIm[SpecPos], FRowIm[0], BinBytes);
-      Inc(SpecPos, FHalfW);
-      if Hermitian then
+      if HasPair then
       begin
-        // Bins W-k mirror k as conj; Re() below drops Im of DC and Nyquist, as c2r does.
+        // Z = H(X) + i*H(Y), both Hermitian, so ifft(Z) = Re(ifft X) + i*Re(ifft Y).
+        FRowRe[0] := FSpecRe[SpecPos];
+        FRowIm[0] := FSpec2Re[SpecPos];
+        MirrorBin := MaxSpatialX;
         for BinCnt := 1 to MaxMirrorPos do
         begin
-          FRowRe[FSpatialW - BinCnt] := FRowRe[BinCnt];
-          FRowIm[FSpatialW - BinCnt] := -FRowIm[BinCnt];
+          XRe := FSpecRe[SpecPos + BinCnt] * MirrorScale;
+          XIm := FSpecIm[SpecPos + BinCnt] * MirrorScale;
+          YRe := FSpec2Re[SpecPos + BinCnt] * MirrorScale;
+          YIm := FSpec2Im[SpecPos + BinCnt] * MirrorScale;
+          FRowRe[BinCnt] := XRe - YIm;
+          FRowIm[BinCnt] := XIm + YRe;
+          FRowRe[MirrorBin] := XRe + YIm;
+          FRowIm[MirrorBin] := YRe - XIm;
+          Dec(MirrorBin);
+        end;
+        if NyquistBin > 0 then
+        begin
+          FRowRe[NyquistBin] := FSpecRe[SpecPos + NyquistBin];
+          FRowIm[NyquistBin] := FSpec2Re[SpecPos + NyquistBin];
+        end;
+        FFTPlanExecute(FPlanW, FRowRe, FRowIm, true);
+        for SpatialX := 0 to MaxSpatialX do
+        begin
+          Dst.FData[DstPos] := FRowRe[SpatialX] * OutScale;
+          Dst.FData[DstPos + 1] := FRowIm[SpatialX] * OutScale;
+          Inc(DstPos, FChannels);
         end;
       end
-      else if TailBytes > 0 then
+      else
       begin
-        FillChar(FRowRe[FHalfW], TailBytes, 0);
-        FillChar(FRowIm[FHalfW], TailBytes, 0);
+        Move(FSpecRe[SpecPos], FRowRe[0], BinBytes);
+        Move(FSpecIm[SpecPos], FRowIm[0], BinBytes);
+        if Hermitian then
+        begin
+          // Bins W-k mirror k as conj; Re() below drops Im of DC and Nyquist, as c2r does.
+          for BinCnt := 1 to MaxMirrorPos do
+          begin
+            FRowRe[FSpatialW - BinCnt] := FRowRe[BinCnt];
+            FRowIm[FSpatialW - BinCnt] := -FRowIm[BinCnt];
+          end;
+        end
+        else if TailBytes > 0 then
+        begin
+          FillChar(FRowRe[FHalfW], TailBytes, 0);
+          FillChar(FRowIm[FHalfW], TailBytes, 0);
+        end;
+        FFTPlanExecute(FPlanW, FRowRe, FRowIm, true);
+        for SpatialX := 0 to MaxSpatialX do
+        begin
+          Dst.FData[DstPos] := FRowRe[SpatialX] * OutScale;
+          Inc(DstPos, FChannels);
+        end;
       end;
-      FFTPlanExecute(FPlanW, FRowRe, FRowIm, true);
-      for SpatialX := 0 to MaxSpatialX do
-      begin
-        Dst.FData[DstPos] := FRowRe[SpatialX] * OutScale;
-        Inc(DstPos, FChannels);
-      end;
+      Inc(SpecPos, FHalfW);
     end;
+    if HasPair then Inc(ChannelCnt, 2) else Inc(ChannelCnt);
   end;
 end;
 

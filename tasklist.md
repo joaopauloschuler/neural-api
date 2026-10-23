@@ -2598,9 +2598,17 @@ cannot pay for its own transfer.
       (both CPU-only today); when this lands, add `TNNetConvolution` to the
       device-backward list at the top of "OpenCL forward coverage".
 
-- [ ] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
-      (the even/odd split trick) to halve the row cost. Low priority: the FFTs
-      are small next to LaMa's convolutions; do it only if a profile shows them.
+- [X] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
+      (the even/odd split trick) to halve the row cost. DONE (commit "perf(fft):
+      pair channel rows"): `RealToHalfSpectrum` and `HalfSpectrumToReal` pair
+      channels c, c+1 (forward and backward of rfft2 and irfft2; odd C runs a
+      single-channel tail; `PairChannelRows` = false restores one FFT per channel).
+      OpenCL untouched: its kernels are per-element direct DFTs, no row FFT to pair.
+      AVX2 Release, 100-rep min of 5, noisy 1-core VM: rfft2 64x64x16 1.29 -> 1.09 ms,
+      48x48x16 7.01 -> 4.30 ms, 33x32x15 2.49 -> 1.12 ms; irfft2 64x64x16
+      1.92 -> 1.10 ms, 48x48x16 5.72 -> 4.72 ms.
+  - [ ] A lone channel (C = 1, or the odd tail) still runs a full complex row FFT
+        with Im = 0; the N/2 real-FFT packing would halve it too.
 - [ ] Decision for the user: inference-time release of the convolution im2col
       matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
       convolution keeps it after the forward in both memory modes (the FP32

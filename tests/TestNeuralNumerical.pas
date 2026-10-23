@@ -350,6 +350,8 @@ type
     procedure TestRealFFT2DRoundTrip;
     procedure TestRealFFT2DGradientCheck;
     procedure TestRealFFT2DSerializationRoundTrip;
+    // Paired-channel row FFTs (forward and backward of both layers) vs one row FFT per channel.
+    procedure TestRealFFT2DPairedRowsMatchSingleChannel;
     // TNNetFreeUFourierFilter (FreeU skip filter): input gradient, odd, even
     // and 1-wide sides; structure round trip.
     procedure TestFreeUFourierFilterGradientCheck;
@@ -67220,6 +67222,101 @@ begin
   // Weightless, but the scale (FFloatSt[0]) must survive dispatch.
   SerializationRoundTrip(Self, TNNetFreeUFourierFilter.Create(0.2),
     'FreeUFourierFilter', 5, 3, 4, 1e-5);
+end;
+
+// Output and input gradient of a one-layer net on Input, rows paired or one per channel.
+procedure RunRealFFT2DLayer(ALayer: TNNetRealFFT2DBase; Input, Output, InputGrad: TNNetVolume;
+  PairRows: boolean);
+var
+  NN: TNNet;
+  Target: TNNetVolume;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Target := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth, 1));
+    NN.AddLayer(ALayer);
+    ALayer.PairChannelRows := PairRows;
+    NN.Compute(Input);
+    Output.Copy(NN.GetLastLayer.Output);
+    Target.ReSize(Output);
+    for i := 0 to Target.Size - 1 do
+      Target.Raw[i] := Cos(i * 0.29) * 0.6;
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Target);
+    InputGrad.Copy(NN.Layers[0].OutputError);
+  finally
+    Target.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRealFFT2DPairedRowsMatchSingleChannel;
+const
+  // (W, H, C): odd and even channel counts, odd / non-power-of-two / radix-2 widths.
+  cShapes: array[0..6, 0..2] of integer = ((8, 8, 2), (10, 6, 3), (7, 5, 5),
+    (1, 3, 3), (2, 4, 2), (12, 9, 4), (16, 3, 1));
+var
+  Input, PairedOut, SingleOut, PairedGrad, SingleGrad, Expected: TNNetVolume;
+  ShapeCnt, Norm, LayerCnt, i, W, H, C: integer;
+  Diff: Double;
+  LayerName: string;
+
+  function NewLayer(): TNNetRealFFT2DBase;
+  begin
+    if LayerCnt = 0 then Result := TNNetRealFFT2D.Create(Norm)
+    else Result := TNNetInverseRealFFT2D.Create(W, Norm);
+  end;
+
+begin
+  Input := TNNetVolume.Create();
+  PairedOut := TNNetVolume.Create();
+  SingleOut := TNNetVolume.Create();
+  PairedGrad := TNNetVolume.Create();
+  SingleGrad := TNNetVolume.Create();
+  Expected := TNNetVolume.Create();
+  try
+    for ShapeCnt := 0 to High(cShapes) do
+      for Norm := csFFTNormBackward to csFFTNormForward do
+        for LayerCnt := 0 to 1 do
+        begin
+          W := cShapes[ShapeCnt, 0];
+          H := cShapes[ShapeCnt, 1];
+          C := cShapes[ShapeCnt, 2];
+          if LayerCnt = 0 then
+          begin
+            LayerName := 'rfft2';
+            Input.ReSize(W, H, C);
+          end
+          else
+          begin
+            LayerName := 'irfft2';
+            Input.ReSize(W div 2 + 1, H, 2 * C);
+          end;
+          for i := 0 to Input.Size - 1 do
+            Input.Raw[i] := Sin(i * 0.41 + Norm) * 0.9 - 0.07 * (i mod 3);
+          RunRealFFT2DLayer(NewLayer(), Input, PairedOut, PairedGrad, true);
+          RunRealFFT2DLayer(NewLayer(), Input, SingleOut, SingleGrad, false);
+          LayerName := LayerName + ' W=' + IntToStr(W) + ' H=' + IntToStr(H) +
+            ' C=' + IntToStr(C) + ' norm=' + IntToStr(Norm);
+          Diff := MaxScaledDiff(PairedOut, SingleOut);
+          AssertTrue(LayerName + ' paired vs single forward diff=' + FloatToStr(Diff), Diff < 1e-5);
+          Diff := MaxScaledDiff(PairedGrad, SingleGrad);
+          AssertTrue(LayerName + ' paired vs single backward diff=' + FloatToStr(Diff), Diff < 1e-5);
+          if LayerCnt = 0 then NaiveRealFFT2D(Input, Expected, Norm)
+          else NaiveInverseRealFFT2D(Input, Expected, W, Norm);
+          Diff := MaxScaledDiff(PairedOut, Expected);
+          AssertTrue(LayerName + ' paired vs naive DFT diff=' + FloatToStr(Diff), Diff < 1e-5);
+        end;
+  finally
+    Expected.Free;
+    SingleGrad.Free;
+    PairedGrad.Free;
+    SingleOut.Free;
+    PairedOut.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestRealFFT2DSerializationRoundTrip;
