@@ -86297,9 +86297,9 @@ end;
 // Loads torch Conv2d Prefix.weight [OutCh, InCh, K, K] (+ Prefix.bias when
 // present), folding BatchNorm BnPrefix ('' = none). InChannelMap[c] (nil =
 // identity) is the torch input channel that feeds CAI input channel c.
-procedure LoadBiRefNetConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+procedure LoadTorchConvFoldBN(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
   const Prefix, BnPrefix: string; OutCh, InCh, K: integer;
-  const InChannelMap: TNeuralIntegerArray);
+  const InChannelMap: TNeuralIntegerArray; BnEps: TNeuralFloat = 1e-5);
 var
   W, Mapped, Bias, Scale, Shift: TNNetVolume;
   WName: string;
@@ -86307,11 +86307,11 @@ var
 begin
   WName := Prefix + '.weight';
   if not Reader.HasTensor(WName) then
-    ImportError(csBiRefNetImporter + ': missing tensor "' + WName + '".');
+    ImportError('Import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 4) or (Reader.DimSize(WName, 0) <> OutCh) or
      (Reader.DimSize(WName, 1) <> InCh) or (Reader.DimSize(WName, 2) <> K) or
      (Reader.DimSize(WName, 3) <> K) then
-    ImportError(csBiRefNetImporter + ': "' + WName + '" must have shape [' +
+    ImportError('Import: "' + WName + '" must have shape [' +
       IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
       IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
   W := TNNetVolume.Create;
@@ -86342,7 +86342,7 @@ begin
     begin
       Scale := TNNetVolume.Create;
       Shift := TNNetVolume.Create;
-      LoadTorchBatchNormScaleShift(Reader, BnPrefix, OutCh, csBiRefNetBnEps,
+      LoadTorchBatchNormScaleShift(Reader, BnPrefix, OutCh, BnEps,
         Scale, Shift);
     end;
     WriteTorchConvWeights(Layer, W, Bias, Scale, Shift, OutCh, InCh, K);
@@ -86505,13 +86505,13 @@ begin
   end;
   NN.AddLayerAfter(TNNetAvgChannel.Create(), Input);
   PoolConv := NN.AddLayer(TNNetPointwiseConvReLU.Create(AsppCh));
-  LoadBiRefNetConv(Reader, PoolConv, Prefix + 'global_avg_pool.1',
+  LoadTorchConvFoldBN(Reader, PoolConv, Prefix + 'global_avg_pool.1',
     Prefix + 'global_avg_pool.2', AsppCh, InCh, 1, nil);
   Branches[BranchCnt] := NN.AddLayer(TNNetBilinearResize.Create(
     Input.Output.SizeX, Input.Output.SizeY, 1));
   NN.AddLayer(TNNetDeepConcat.Create(Branches));
   Result := NN.AddLayer(TNNetPointwiseConvReLU.Create(InCh));
-  LoadBiRefNetConv(Reader, Result, Prefix + 'conv1', Prefix + 'bn1', InCh,
+  LoadTorchConvFoldBN(Reader, Result, Prefix + 'conv1', Prefix + 'bn1', InCh,
     AsppCh * (BranchCnt + 1), 1, nil);
 end;
 
@@ -86524,13 +86524,13 @@ var
 begin
   ConvIn := NN.AddLayerAfter(TNNetConvolutionReLU.Create(
     Config.DecChannelsInter, 3, 1, 1, 0), Input);
-  LoadBiRefNetConv(Reader, ConvIn, Prefix + 'conv_in', Prefix + 'bn_in',
+  LoadTorchConvFoldBN(Reader, ConvIn, Prefix + 'conv_in', Prefix + 'bn_in',
     Config.DecChannelsInter, InCh, 3, nil);
   Attention := AddBiRefNetASPPDeformable(NN, Reader, ConvIn, Prefix + 'dec_att.',
     Config.DecChannelsInter, Config.AsppChannels);
   Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0),
     Attention);
-  LoadBiRefNetConv(Reader, Result, Prefix + 'conv_out', Prefix + 'bn_out',
+  LoadTorchConvFoldBN(Reader, Result, Prefix + 'conv_out', Prefix + 'bn_out',
     OutCh, Config.DecChannelsInter, 3, nil);
 end;
 
@@ -86564,10 +86564,10 @@ begin
     Tiles := Image;
   Conv1 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(InterCh, 3, 1, 1, 0),
     Tiles);
-  LoadBiRefNetConv(Reader, Conv1, Prefix + 'conv1', '', InterCh, InCh, 3,
+  LoadTorchConvFoldBN(Reader, Conv1, Prefix + 'conv1', '', InterCh, InCh, 3,
     ChannelMap);
   Result := NN.AddLayer(TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0));
-  LoadBiRefNetConv(Reader, Result, Prefix + 'conv_out', '', OutCh, InterCh, 3,
+  LoadTorchConvFoldBN(Reader, Result, Prefix + 'conv_out', '', OutCh, InterCh, 3,
     nil);
 end;
 
@@ -86582,10 +86582,10 @@ begin
   LevelText := IntToStr(Level);
   GdtConv := NN.AddLayerAfter(TNNetConvolutionReLU.Create(GdtCh, 3, 1, 1, 0),
     Features);
-  LoadBiRefNetConv(Reader, GdtConv, 'decoder.gdt_convs_' + LevelText + '.0',
+  LoadTorchConvFoldBN(Reader, GdtConv, 'decoder.gdt_convs_' + LevelText + '.0',
     'decoder.gdt_convs_' + LevelText + '.1', GdtCh, Channels, 3, nil);
   Attention := NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
-  LoadBiRefNetConv(Reader, Attention, 'decoder.gdt_convs_attn_' + LevelText +
+  LoadTorchConvFoldBN(Reader, Attention, 'decoder.gdt_convs_attn_' + LevelText +
     '.0', '', 1, GdtCh, 1, nil);
   Gate := NN.AddLayer(TNNetSigmoid.Create());
   NN.AddLayer(TNNetDeepConcat.Replicate(Channels, Gate));
@@ -86659,7 +86659,7 @@ begin
           MapH[Level - 2]);
         Lateral := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(DecodedCh),
           StageFeatures[Level - 2]);
-        LoadBiRefNetConv(Reader, Lateral, 'decoder.lateral_block' + LevelText +
+        LoadTorchConvFoldBN(Reader, Lateral, 'decoder.lateral_block' + LevelText +
           '.conv', '', DecodedCh, DecodedCh, 1, nil);
         Current := NN.AddLayer(TNNetSum.Create([Current, Lateral]));
       end
@@ -86673,7 +86673,7 @@ begin
       Config.IptInterChannels, PatchCh);
     NN.AddLayer(TNNetDeepConcat.Create([Current, Patches]));
     NN.AddLayer(TNNetPointwiseConvLinear.Create(1));
-    LoadBiRefNetConv(Reader, NN.GetLastLayer(), 'decoder.conv_out1.0', '', 1,
+    LoadTorchConvFoldBN(Reader, NN.GetLastLayer(), 'decoder.conv_out1.0', '', 1,
       CurrentCh + PatchCh, 1, nil);
     NN.AddLayer(TNNetSigmoid.Create());
     if not pTrainable then NN.SetTrainable();
@@ -87526,6 +87526,26 @@ begin
   Result := BuildDINOv3FromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
+// torch F.interpolate(Source, size=(OutY, OutX), mode, align_corners) per
+// channel into Dest; Mode as TNNetResize2D (0 nearest, 1 bilinear, 2 bicubic).
+procedure InterpolateVolume2D(Source, Dest: TNNetVolume;
+  OutX, OutY, Mode, AlignCorners: integer);
+var
+  ResizeNet: TNNet;
+begin
+  ResizeNet := TNNet.Create();
+  try
+    ResizeNet.AddLayer(TNNetInput.Create(Source.SizeX, Source.SizeY,
+      Source.Depth));
+    ResizeNet.AddLayer(TNNetResize2D.Create(OutX, OutY, Mode, AlignCorners));
+    ResizeNet.Compute(Source);
+    Dest.ReSize(OutX, OutY, Source.Depth);
+    Dest.Copy(ResizeNet.GetLastLayer.Output);
+  finally
+    ResizeNet.Free;
+  end;
+end;
+
 // ===========================================================================
 // SEGMENT ANYTHING (SAM) IMAGE-ENCODER IMPORT (facebook/sam-vit-base).
 // The ViT-det image encoder: a bias-free? (HF: biased) patch conv to a
@@ -87621,112 +87641,151 @@ begin
     ' global=[' + GA + '] eps=' + FloatToStr(Config.LayerNormEps);
 end;
 
-// Loads the BIASED patch-embedding conv (SAM's projection has a bias, unlike
-// CLIP's). Weight [hidden, in, P, P], bias [hidden].
-procedure LoadSAMPatchConv(Reader: TNNetSafeTensorsReader;
-  Layer: TNNetLayer; const WName, BName: string;
-  NumChannels, Patch, Hidden: integer);
-var
-  W, B: TNNetVolume;
-  o, c, ky, kx: integer;
-  HiddenM1, PatchM1, NumChM1: integer;
-begin
-  if not Reader.HasTensor(WName) then
-    ImportError('SAM import: missing tensor "' + WName + '".');
-  W := TNNetVolume.Create;
-  B := TNNetVolume.Create;
-  HiddenM1 := Hidden - 1;
-  PatchM1 := Patch - 1;
-  NumChM1 := NumChannels - 1;
-  try
-    Reader.LoadTensorFlat(WName, W);
-    for o := 0 to HiddenM1 do
-    begin
-      for ky := 0 to PatchM1 do
-        for kx := 0 to PatchM1 do
-          for c := 0 to NumChM1 do
-            Layer.FArrNeurons[o].Weights.FData[
-              (ky * Patch + kx) * NumChannels + c] :=
-              W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
-      Layer.FArrNeurons[o].BiasWeight := 0;
-    end;
-    if Reader.HasTensor(BName) then
-    begin
-      Reader.LoadTensorFlat(BName, B);
-      for o := 0 to HiddenM1 do Layer.FArrNeurons[o].BiasWeight := B.FData[o];
-    end;
-  finally
-    B.Free;
-    W.Free;
+type
+  // The layers of one ViTDet transformer block that receive checkpoint weights.
+  TViTDetBlockLayers = record
+    Norm1, Norm2, Fc1, Fc2: TNNetLayer;
+    Attention: TNNetSAMVisionAttention;
   end;
-  Layer.FlushWeightCache();
+
+// Appends one pre-LN ViTDet block (SAM encoder, VitDet backbone): windowed
+// (WindowSize > 0) or global decomposed-rel-pos attention, then an erf-GELU MLP.
+function AddViTDetBlock(NN: TNNet; Hidden, Heads, WindowSize,
+  MlpHidden: integer; LayerNormEps: TNeuralFloat;
+  pTrainable: boolean): TViTDetBlockLayers;
+var
+  Shortcut, AttentionSum: TNNetLayer;
+begin
+  Shortcut := NN.GetLastLayer();
+  Result.Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(LayerNormEps).SetTrainable(pTrainable) );
+  Result.Attention := TNNetSAMVisionAttention(NN.AddLayer(
+    TNNetSAMVisionAttention.Create(Heads, WindowSize, Hidden div Heads, Hidden) ));
+  AttentionSum := NN.AddLayer( TNNetSum.Create([Result.Attention, Shortcut]) );
+  Result.Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(LayerNormEps).SetTrainable(pTrainable) );
+  Result.Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
+  // hidden_act 'gelu' is the exact erf GELU, not the tanh approximation.
+  NN.AddLayer( TNNetGELUErf.Create() );
+  Result.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetSum.Create([Result.Fc2, AttentionSum]) );
 end;
 
-// Loads a bias-free KxK conv [out, in, K, K] into a TNNetConvolutionLinear
-// (neuron o weight layout (ky*K+kx)*in + c). Bias zeroed.
-procedure LoadSAMNeckConv(Reader: TNNetSafeTensorsReader;
-  Layer: TNNetLayer; const WName: string; InCh, K, OutCh: integer);
+// Loads rel-pos table Name ((Rows, HeadDim); zeros when absent) into Table with
+// OutRows rows, resized as get_rel_pos does (F.interpolate linear, no corners).
+procedure LoadViTDetRelPosTable(Reader: TNNetSafeTensorsReader;
+  const Name: string; HeadDim, OutRows: integer; Table: TNNetVolume);
 var
-  W: TNNetVolume;
-  o, c, ky, kx: integer;
-  OutChM1, KM1, InChM1: integer;
+  NativeTable, ResizedTable: TNNetVolume;
+  Rows: integer;
 begin
-  if not Reader.HasTensor(WName) then
-    ImportError('SAM import: missing tensor "' + WName + '".');
-  W := TNNetVolume.Create;
-  OutChM1 := OutCh - 1;
-  KM1 := K - 1;
-  InChM1 := InCh - 1;
-  try
-    Reader.LoadTensorFlat(WName, W);
-    for o := 0 to OutChM1 do
-    begin
-      for ky := 0 to KM1 do
-        for kx := 0 to KM1 do
-          for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
-              W.FData[((o * InCh + c) * K + ky) * K + kx];
-      Layer.FArrNeurons[o].BiasWeight := 0;
-    end;
-  finally
-    W.Free;
+  if not Reader.HasTensor(Name) then
+  begin
+    Table.ReSize(OutRows * HeadDim, 1, 1);
+    Table.Fill(0);
+    exit;
   end;
-  Layer.FlushWeightCache();
+  Reader.LoadTensorFlat(Name, Table);
+  Rows := Table.Size div HeadDim;
+  if (Rows * HeadDim <> Table.Size) or (Rows < 1) then
+    ImportError('ViTDet import: "' + Name + '" must have shape [rows, ' +
+      IntToStr(HeadDim) + '], got ' + Reader.ShapeAsString(Name));
+  if Rows = OutRows then exit;
+  // Row r becomes X = r of a (Rows, 1, HeadDim) volume: the same flat order.
+  NativeTable := TNNetVolume.Create(Rows, 1, HeadDim);
+  ResizedTable := TNNetVolume.Create;
+  try
+    Move(Table.FData[0], NativeTable.FData[0], Table.Size * csNeuralFloatSize);
+    InterpolateVolume2D(NativeTable, ResizedTable, OutRows, 1, {bilinear}1,
+      {AlignCorners=}0);
+    Table.ReSize(OutRows * HeadDim, 1, 1);
+    Move(ResizedTable.FData[0], Table.FData[0], Table.Size * csNeuralFloatSize);
+  finally
+    ResizedTable.Free;
+    NativeTable.Free;
+  end;
+end;
+
+// Loads one AddViTDetBlock block from Prefix + the HF sub-module names. A missing
+// qkv bias or rel-pos table loads as zeros; tables are resized to the window grid.
+procedure LoadViTDetBlock(Reader: TNNetSafeTensorsReader;
+  const Block: TViTDetBlockLayers; const Prefix, Norm1Name, Norm2Name,
+  AttentionName, Fc1Name, Fc2Name: string; Hidden, MlpHidden: integer);
+var
+  QkvW, QkvB, ProjW, ProjB, RelH, RelW: TNNetVolume;
+  WindowRows, WindowCols, HeadDim: integer;
+  AttentionPrefix: string;
+begin
+  LoadLayerNormWeights(Reader, Block.Norm1, Prefix + Norm1Name + '.weight',
+    Prefix + Norm1Name + '.bias', Hidden);
+  LoadLayerNormWeights(Reader, Block.Norm2, Prefix + Norm2Name + '.weight',
+    Prefix + Norm2Name + '.bias', Hidden);
+  if Block.Attention.WindowSize > 0 then
+  begin
+    WindowRows := Block.Attention.WindowSize;
+    WindowCols := Block.Attention.WindowSize;
+  end
+  else
+  begin
+    WindowRows := Block.Attention.Output.SizeY;
+    WindowCols := Block.Attention.Output.SizeX;
+  end;
+  HeadDim := Block.Attention.HeadDim;
+  AttentionPrefix := Prefix + AttentionName + '.';
+  QkvW := TNNetVolume.Create; QkvB := TNNetVolume.Create;
+  ProjW := TNNetVolume.Create; ProjB := TNNetVolume.Create;
+  RelH := TNNetVolume.Create; RelW := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(AttentionPrefix + 'qkv.weight', QkvW);
+    if Reader.HasTensor(AttentionPrefix + 'qkv.bias') then
+      Reader.LoadTensorFlat(AttentionPrefix + 'qkv.bias', QkvB)
+    else
+    begin
+      QkvB.ReSize(3 * Hidden, 1, 1);
+      QkvB.Fill(0);
+    end;
+    Reader.LoadTensorFlat(AttentionPrefix + 'proj.weight', ProjW);
+    Reader.LoadTensorFlat(AttentionPrefix + 'proj.bias', ProjB);
+    LoadViTDetRelPosTable(Reader, AttentionPrefix + 'rel_pos_h', HeadDim,
+      2 * WindowRows - 1, RelH);
+    LoadViTDetRelPosTable(Reader, AttentionPrefix + 'rel_pos_w', HeadDim,
+      2 * WindowCols - 1, RelW);
+    Block.Attention.SetQkvWeight(QkvW);
+    Block.Attention.SetQkvBias(QkvB);
+    Block.Attention.SetProjWeight(ProjW);
+    Block.Attention.SetProjBias(ProjB);
+    Block.Attention.SetRelPos(RelH, RelW);
+  finally
+    QkvW.Free; QkvB.Free; ProjW.Free; ProjB.Free; RelH.Free; RelW.Free;
+  end;
+  LoadLlamaLinearWeights(Reader, Block.Fc1, Prefix + Fc1Name + '.weight',
+    Hidden, MlpHidden, 0, -1, 0, Prefix + Fc1Name + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.Fc2, Prefix + Fc2Name + '.weight',
+    MlpHidden, Hidden, 0, -1, 0, Prefix + Fc2Name + '.bias');
 end;
 
 function BuildSAMVisionTower(Reader: TNNetSafeTensorsReader;
   const Config: TSAMConfig; const Prefix: string;
   pTrainable: boolean): TNNet;
 var
-  LpMax: integer;
   NN: TNNet;
   PatchConv, PosEmb: TNNetLayer;
-  Grid, BlockIdx, HeadDim, ws, MlpHidden, ci, k: integer;
+  Grid, BlockIdx, ws, MlpHidden, k: integer;
   LayersM1, GAHi: integer;
   IsGlobal: boolean;
-  ShortcutA, Norm1, Attn, AttnRes, Norm2, Fc1, Fc2, MlpRes: TNNetLayer;
-  AttnLayers: array of TNNetSAMVisionAttention;
-  Norm1Layers, Norm2Layers, Fc1Layers, Fc2Layers: array of TNNetLayer;
+  Blocks: array of TViTDetBlockLayers;
   Conv1, NeckLN1, Conv2, NeckLN2: TNNetLayer;
-  BPrefix: string;
-  QkvW, QkvB, ProjW, ProjB, RelH, RelW, Pos: TNNetVolume;
+  Pos: TNNetVolume;
 begin
   if (Config.HiddenSize < 1) or (Config.NumHeads < 1) or
      ((Config.HiddenSize mod Config.NumHeads) <> 0) then
     ImportError('SAM import: hidden_size must be divisible by num_heads.');
   if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
     ImportError('SAM import: image_size not a multiple of patch_size.');
-  HeadDim := Config.HiddenSize div Config.NumHeads;
   Grid := Config.ImageSize div Config.PatchSize;
   MlpHidden := Config.MlpDim;
   LayersM1 := Config.NumLayers - 1;
   GAHi := High(Config.GlobalAttnIndexes);
   NN := TNNet.Create();
-  SetLength(AttnLayers, Config.NumLayers);
-  SetLength(Norm1Layers, Config.NumLayers);
-  SetLength(Norm2Layers, Config.NumLayers);
-  SetLength(Fc1Layers, Config.NumLayers);
-  SetLength(Fc2Layers, Config.NumLayers);
+  SetLength(Blocks, Config.NumLayers);
   try
     // ---------------- Patch embedding ----------------
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
@@ -87744,23 +87803,8 @@ begin
       for k := 0 to GAHi do
         if Config.GlobalAttnIndexes[k] = BlockIdx then IsGlobal := true;
       if IsGlobal then ws := 0 else ws := Config.WindowSize;
-
-      ShortcutA := NN.GetLastLayer();
-      Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-      Attn := NN.AddLayer( TNNetSAMVisionAttention.Create(
-        Config.NumHeads, ws, HeadDim, Config.HiddenSize) );
-      AttnRes := NN.AddLayer( TNNetSum.Create([Attn, ShortcutA]) );
-      Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
-      Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden).SetTrainable(pTrainable) );
-      // SAM hidden_act='gelu' is the EXACT erf GELU (not the tanh approximation).
-      NN.AddLayer( TNNetGELUErf.Create() );
-      Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
-      MlpRes := NN.AddLayer( TNNetSum.Create([Fc2, AttnRes]) );
-      AttnLayers[BlockIdx] := TNNetSAMVisionAttention(Attn);
-      Norm1Layers[BlockIdx] := Norm1;
-      Norm2Layers[BlockIdx] := Norm2;
-      Fc1Layers[BlockIdx] := Fc1;
-      Fc2Layers[BlockIdx] := Fc2;
+      Blocks[BlockIdx] := AddViTDetBlock(NN, Config.HiddenSize,
+        Config.NumHeads, ws, MlpHidden, Config.LayerNormEps, pTrainable);
     end;
 
     // ---------------- Neck ----------------
@@ -87773,10 +87817,8 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
-    LoadSAMPatchConv(Reader, PatchConv,
-      Prefix + 'patch_embed.projection.weight',
-      Prefix + 'patch_embed.projection.bias',
-      Config.NumChannels, Config.PatchSize, Config.HiddenSize);
+    LoadTorchConvFoldBN(Reader, PatchConv, Prefix + 'patch_embed.projection',
+      '', Config.HiddenSize, Config.NumChannels, Config.PatchSize, nil);
     // pos_embed: HF shape (1, Grid, Grid, hidden) -> CellBias (Grid, Grid, hid).
     Pos := TNNetVolume.Create;
     try
@@ -87789,51 +87831,19 @@ begin
     finally
       Pos.Free;
     end;
-
-    QkvW := TNNetVolume.Create; QkvB := TNNetVolume.Create;
-    ProjW := TNNetVolume.Create; ProjB := TNNetVolume.Create;
-    RelH := TNNetVolume.Create; RelW := TNNetVolume.Create;
-    try
-      for BlockIdx := 0 to LayersM1 do
-      begin
-        BPrefix := Prefix + 'layers.' + IntToStr(BlockIdx) + '.';
-        LoadLayerNormWeights(Reader, Norm1Layers[BlockIdx],
-          BPrefix + 'layer_norm1.weight', BPrefix + 'layer_norm1.bias',
-          Config.HiddenSize);
-        LoadLayerNormWeights(Reader, Norm2Layers[BlockIdx],
-          BPrefix + 'layer_norm2.weight', BPrefix + 'layer_norm2.bias',
-          Config.HiddenSize);
-        Reader.LoadTensorFlat(BPrefix + 'attn.qkv.weight', QkvW);
-        Reader.LoadTensorFlat(BPrefix + 'attn.qkv.bias', QkvB);
-        Reader.LoadTensorFlat(BPrefix + 'attn.proj.weight', ProjW);
-        Reader.LoadTensorFlat(BPrefix + 'attn.proj.bias', ProjB);
-        Reader.LoadTensorFlat(BPrefix + 'attn.rel_pos_h', RelH);
-        Reader.LoadTensorFlat(BPrefix + 'attn.rel_pos_w', RelW);
-        AttnLayers[BlockIdx].SetQkvWeight(QkvW);
-        AttnLayers[BlockIdx].SetQkvBias(QkvB);
-        AttnLayers[BlockIdx].SetProjWeight(ProjW);
-        AttnLayers[BlockIdx].SetProjBias(ProjB);
-        AttnLayers[BlockIdx].SetRelPos(RelH, RelW);
-        // MLP (HF lin1/lin2 are biased nn.Linear; LoadLlamaLinearWeights loads
-        // weight + optional bias).
-        LoadLlamaLinearWeights(Reader, Fc1Layers[BlockIdx],
-          BPrefix + 'mlp.lin1.weight', Config.HiddenSize, MlpHidden,
-          0, -1, 0, BPrefix + 'mlp.lin1.bias');
-        LoadLlamaLinearWeights(Reader, Fc2Layers[BlockIdx],
-          BPrefix + 'mlp.lin2.weight', MlpHidden, Config.HiddenSize,
-          0, -1, 0, BPrefix + 'mlp.lin2.bias');
-      end;
-    finally
-      QkvW.Free; QkvB.Free; ProjW.Free; ProjB.Free; RelH.Free; RelW.Free;
-    end;
+    for BlockIdx := 0 to LayersM1 do
+      LoadViTDetBlock(Reader, Blocks[BlockIdx],
+        Prefix + 'layers.' + IntToStr(BlockIdx) + '.', 'layer_norm1',
+        'layer_norm2', 'attn', 'mlp.lin1', 'mlp.lin2', Config.HiddenSize,
+        MlpHidden);
 
     // Neck: conv1 1x1 no-bias, LN over channels, conv2 3x3 pad1 no-bias, LN.
-    LoadSAMNeckConv(Reader, Conv1, Prefix + 'neck.conv1.weight',
-      Config.HiddenSize, 1, Config.OutputChannels);
+    LoadTorchConvFoldBN(Reader, Conv1, Prefix + 'neck.conv1', '',
+      Config.OutputChannels, Config.HiddenSize, 1, nil);
     LoadLayerNormWeights(Reader, NeckLN1, Prefix + 'neck.layer_norm1.weight',
       Prefix + 'neck.layer_norm1.bias', Config.OutputChannels);
-    LoadSAMNeckConv(Reader, Conv2, Prefix + 'neck.conv2.weight',
-      Config.OutputChannels, 3, Config.OutputChannels);
+    LoadTorchConvFoldBN(Reader, Conv2, Prefix + 'neck.conv2', '',
+      Config.OutputChannels, Config.OutputChannels, 3, nil);
     LoadLayerNormWeights(Reader, NeckLN2, Prefix + 'neck.layer_norm2.weight',
       Prefix + 'neck.layer_norm2.bias', Config.OutputChannels);
     Result := NN;
@@ -89880,26 +89890,6 @@ begin
     Layer.FlushWeightCache();
   finally
     Bias.Free;
-  end;
-end;
-
-// torch F.interpolate(Source, size=(OutY, OutX), mode, align_corners) per
-// channel into Dest; Mode as TNNetResize2D (0 nearest, 1 bilinear, 2 bicubic).
-procedure InterpolateVolume2D(Source, Dest: TNNetVolume;
-  OutX, OutY, Mode, AlignCorners: integer);
-var
-  ResizeNet: TNNet;
-begin
-  ResizeNet := TNNet.Create();
-  try
-    ResizeNet.AddLayer(TNNetInput.Create(Source.SizeX, Source.SizeY,
-      Source.Depth));
-    ResizeNet.AddLayer(TNNetResize2D.Create(OutX, OutY, Mode, AlignCorners));
-    ResizeNet.Compute(Source);
-    Dest.ReSize(OutX, OutY, Source.Depth);
-    Dest.Copy(ResizeNet.GetLastLayer.Output);
-  finally
-    ResizeNet.Free;
   end;
 end;
 
