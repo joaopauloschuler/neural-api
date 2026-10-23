@@ -62,6 +62,10 @@ of the chosen layers (default mid) replaced by identity attention.
 --sag-scale S turns on Self-Attention Guidance (Hong et al. 2023), as diffusers
 StableDiffusionSAGPipeline: one more UNet pass per step on latents blurred where
 the mid-block self-attention concentrates.
+--invert-image PNG [--invert-steps N] [--invert-guidance G] runs DDIM inversion
+(diffusers DDIMInverseScheduler): the image's VAE latents are walked to noise
+with the prompt, then sampled back with DDIM and the prompt; guidance defaults
+to 1, where the round trip reconstructs the image best.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -110,6 +114,11 @@ type
     // --edit-image ('' for none) and its --image-guidance (< 0: default).
     EditImageFile: string;
     ImageGuidanceScale: double;
+    // --invert-image ('' for none), --invert-steps (< 1: --steps) and
+    // --invert-guidance (< 0: 1.0).
+    InvertImageFile: string;
+    InvertSteps: integer;
+    InvertGuidanceScale: double;
     // --upscale-image ('' for none) and its --noise-level (< 0: default).
     UpscaleImageFile: string;
     NoiseLevel: integer;
@@ -345,6 +354,14 @@ begin
   WriteLn('                    VAE factor x its size (sides rounded down to the ',
     'factor);');
   WriteLn('                    default 75 steps, guidance 9.0');
+  WriteLn('  --invert-image PNG DDIM inversion: walk this image''s latents to ',
+    'noise with the');
+  WriteLn('                    prompt, then sample them back with DDIM; the ',
+    'output takes its');
+  WriteLn('                    size (rounded down to the VAE factor); guidance ',
+    'default 1.0');
+  WriteLn('  --invert-steps N  inversion steps (default: --steps)');
+  WriteLn('  --invert-guidance G CFG weight of the inversion (default 1.0)');
   WriteLn('  --noise-level N   noise added to --upscale-image, 0..max_noise_level ',
     '(350;');
   WriteLn('                    default 20); more noise lets the UNet invent ',
@@ -464,6 +481,9 @@ begin
   Opt.ImageGuidanceScale := -1;
   Opt.UpscaleImageFile := '';
   Opt.NoiseLevel := -1;
+  Opt.InvertImageFile := '';
+  Opt.InvertSteps := -1;
+  Opt.InvertGuidanceScale := -1;
   Opt.SamplerName := 'auto';
   Opt.KarrasSigmas := -1;
   Opt.Steps := -1;
@@ -550,6 +570,10 @@ begin
       Opt.ImageGuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--upscale-image' then Opt.UpscaleImageFile := NextArg()
     else if Arg = '--noise-level' then Opt.NoiseLevel := StrToInt(NextArg())
+    else if Arg = '--invert-image' then Opt.InvertImageFile := NextArg()
+    else if Arg = '--invert-steps' then Opt.InvertSteps := StrToInt(NextArg())
+    else if Arg = '--invert-guidance' then
+      Opt.InvertGuidanceScale := StrToFloat(NextArg())
     else if Arg = '--freeu' then
     begin
       ParseFreeUSpec(NextArg(), Opt.FreeUFactors);
@@ -634,6 +658,22 @@ begin
   if (Opt.SamplerName <> 'auto') and
     (SamplerOptionIndex(Opt.SamplerName) < 0) then
     raise Exception.Create('unknown --sampler: ' + Opt.SamplerName);
+  if ((Opt.InvertSteps <> -1) or (Opt.InvertGuidanceScale >= 0)) and
+    (Opt.InvertImageFile = '') then
+    raise Exception.Create('--invert-steps and --invert-guidance need ' +
+      '--invert-image');
+  if (Opt.InvertSteps < 1) and (Opt.InvertSteps <> -1) then
+    raise Exception.Create('--invert-steps must be >= 1');
+  if (Opt.InvertImageFile <> '') and ((Opt.InitImageFile <> '') or
+    (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '') or
+    (Opt.GLIGENInpaintImageFile <> '')) then
+    raise Exception.Create('--invert-image cannot be combined with ' +
+      '--init-image, --edit-image, --upscale-image or --gligen-inpaint-image');
+  if (Opt.InvertImageFile <> '') and not ((Opt.SamplerName = 'auto') or
+    (Opt.SamplerName = 'ddim')) then
+    raise Exception.Create('--invert-image samples with ddim');
+  if (Opt.InvertImageFile <> '') and (Opt.RepeatCount > 1) then
+    raise Exception.Create('--invert-image makes one image; drop --repeat');
 end;
 
 // Splits an --embedding value at its last ':' unless that is a drive letter's
@@ -704,7 +744,9 @@ var
   SelfAttentionNames: TStringArray;
   PAGLayerIndices: TNeuralIntegerArray;
   PAGLayerPos: integer;
-  StepCount, Img2ImgStepCount: integer;
+  StepCount, Img2ImgStepCount, InvertStepCount: integer;
+  InvertGuidanceScale: double;
+  InvertImage, InvertedLatents: TNNetVolume;
   IsDepthUNet, IsUpscalerUNet: boolean;
   GuidanceScale: double;
   Seed: cardinal;
@@ -726,6 +768,8 @@ begin
   ImageConditioner := nil;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
+  InvertImage := TNNetVolume.Create;
+  InvertedLatents := TNNetVolume.Create;
   try
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
@@ -797,6 +841,16 @@ begin
         ImageHeight);
       Pipeline.Conditioner := ImageConditioner;
     end;
+    if Opt.InvertImageFile <> '' then
+    begin
+      if not LoadImageFromFileIntoVolume(Opt.InvertImageFile, InvertImage) then
+        raise Exception.Create('could not load ' + Opt.InvertImageFile);
+      ImageWidth := InvertImage.SizeX - InvertImage.SizeX mod
+        Pipeline.VaeScaleFactor;
+      ImageHeight := InvertImage.SizeY - InvertImage.SizeY mod
+        Pipeline.VaeScaleFactor;
+      Pipeline.Sampler := smDDIM;
+    end;
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
     if Opt.SamplerName <> 'auto' then
@@ -819,11 +873,21 @@ begin
       if StepCount < 1 then StepCount := 75;
       if GuidanceScale < 0 then GuidanceScale := 9.0;
     end
+    else if Opt.InvertImageFile <> '' then
+    begin
+      // Guidance 1 keeps the inversion and the sampling on the same path.
+      if StepCount < 1 then StepCount := 25;
+      if GuidanceScale < 0 then GuidanceScale := 1.0;
+    end
     else
     begin
       if StepCount < 1 then StepCount := 25;
       if GuidanceScale < 0 then GuidanceScale := 7.5;
     end;
+    InvertStepCount := Opt.InvertSteps;
+    if InvertStepCount < 1 then InvertStepCount := StepCount;
+    InvertGuidanceScale := Opt.InvertGuidanceScale;
+    if InvertGuidanceScale < 0 then InvertGuidanceScale := 1.0;
     Pipeline.GuidanceScale := GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     Pipeline.PromptWeighting := Opt.UsePromptWeighting;
@@ -922,6 +986,10 @@ begin
       else if Assigned(Depth2Img) then
         WriteLn('Depth: estimated by depth_estimator/ (depth-to-image)');
     end;
+    if Opt.InvertImageFile <> '' then
+      WriteLn(Format('Invert image: %s (%dx%d), %d DDIM inversion steps, ' +
+        'guidance %.2f', [Opt.InvertImageFile, InvertImage.SizeX,
+        InvertImage.SizeY, InvertStepCount, InvertGuidanceScale]));
     if Assigned(InstructPix2Pix) then
       WriteLn(Format('Edit image: %s (%dx%d), image guidance %.2f',
         [Opt.EditImageFile, Image.SizeX, Image.SizeY,
@@ -1007,7 +1075,19 @@ begin
       // elsewhere.
       RandSeed := Seed xor $9E3779B9;
       StartTime := Now();
-      if Opt.RepeatCount > 1 then
+      if Opt.InvertImageFile <> '' then
+      begin
+        Pipeline.EncodePrompt(Opt.Prompt, PromptEmbeds);
+        WriteLn('Inverting:');
+        Pipeline.InvertImage(InvertImage, PromptEmbeds, ImageWidth,
+          ImageHeight, InvertStepCount, InvertGuidanceScale, InvertedLatents);
+        WriteLn(Format('Inverted latents: mean abs %.4f',
+          [InvertedLatents.GetSumAbs() / InvertedLatents.Size]));
+        WriteLn('Sampling from the inverted latents:');
+        Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
+          StepCount, Seed, Image, InvertedLatents);
+      end
+      else if Opt.RepeatCount > 1 then
         Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
           StepCount, Seed, Image)
       else
@@ -1032,6 +1112,8 @@ begin
       {$POP}
     end;
   finally
+    InvertedLatents.Free;
+    InvertImage.Free;
     PromptEmbeds.Free;
     Image.Free;
     Pipeline.Free;

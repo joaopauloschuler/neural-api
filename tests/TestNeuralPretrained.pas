@@ -1478,6 +1478,10 @@ type
     // A 32x16 image (16x8 latents): the mask is the 8x4 mid-block grid and
     // matches diffusers bit for bit, as do sampled final latents.
     procedure TestStableDiffusionSAGNonSquareMask;
+    // InvertImage on the tiny_sd15_img2img_io.json image and prompt, 4 steps,
+    // guidance 1 and 3, vs diffusers DDIMInverseScheduler float64 (ad hoc run);
+    // then DDIM from the guidance-1 latents.
+    procedure TestStableDiffusionDDIMInversionParity;
     procedure TestControlNetConfigFromJSONFile;
     procedure TestControlNetParity;
     // ControlNetResiduals with fewer down residuals: equal to the full run's,
@@ -51262,6 +51266,108 @@ begin
       1.0, 8, 4, '10010001011001010101010100001100', csSAGNonSquareSamples,
       'non-square');
   finally
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+const
+  // diffusers 0.41 float64: vae latent_dist.mean * scaling_factor of the
+  // image, DDIMInverseScheduler.from_config(tiny_sd15), 4 steps, CFG with "".
+  csInversionSamples: array[0..1, 0..7] of TSDLatentSample = (
+    ((X: 5; Y: 0; Channel: 0; Value: -0.812594451),
+     (X: 2; Y: 5; Channel: 0; Value: 0.102750368),
+     (X: 7; Y: 1; Channel: 1; Value: 0.230411940),
+     (X: 4; Y: 3; Channel: 1; Value: -0.047695016),
+     (X: 1; Y: 2; Channel: 2; Value: -0.052533197),
+     (X: 6; Y: 4; Channel: 2; Value: -0.558000042),
+     (X: 3; Y: 5; Channel: 3; Value: 0.122460875),
+     (X: 0; Y: 0; Channel: 3; Value: 0.171362870)),
+    ((X: 5; Y: 0; Channel: 0; Value: -0.503565883),
+     (X: 2; Y: 5; Channel: 0; Value: 0.012844383),
+     (X: 7; Y: 1; Channel: 1; Value: 0.192508511),
+     (X: 4; Y: 3; Channel: 1; Value: -0.331437635),
+     (X: 1; Y: 2; Channel: 2; Value: -0.265906563),
+     (X: 6; Y: 4; Channel: 2; Value: -0.793029508),
+     (X: 3; Y: 5; Channel: 3; Value: -0.029426107),
+     (X: 0; Y: 0; Channel: 3; Value: 0.074419065)));
+  csInversionGuidance: array[0..1] of TNeuralFloat = (1.0, 3.0);
+  csInversionMeanAbs: array[0..1] of double = (0.285413332, 0.324992342);
+  // DDIMScheduler, 4 steps, guidance 1, from the guidance-1 inverted latents.
+  csInversionRegenerated: array[0..3] of double = (-0.781485469, 1.896051342,
+    0.137986953, 0.56403419);
+
+procedure TTestNeuralPretrained.TestStableDiffusionDDIMInversionParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Img2Img: TStableDiffusionImg2Img;
+  SourceImage, Embeds, Latents: TNNetVolume;
+  ImageWidth, ImageHeight, CasePos, SamplePos: integer;
+  CaseName: string;
+  IsRefused: boolean;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSD15Pipeline();
+  Img2Img := TStableDiffusionImg2Img.Create();
+  SourceImage := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    ImageWidth := TJSONObject(FSD15Oracle).Get('width', 0);
+    ImageHeight := TJSONObject(FSD15Oracle).Get('height', 0);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    for CasePos := 0 to 1 do
+    begin
+      CaseName := 'guidance ' + FloatToStr(csInversionGuidance[CasePos]);
+      Pipeline.InvertImage(SourceImage, Embeds, ImageWidth, ImageHeight, 4,
+        csInversionGuidance[CasePos], Latents);
+      AssertEquals(CaseName + ' guidance restored', 7.5,
+        Pipeline.GuidanceScale, 0);
+      AssertEquals(CaseName + ' passes', 4 * (CasePos + 1),
+        Pipeline.ImageStats.UNetPassCount);
+      AssertEquals(CaseName + ' latent width', 8, Latents.SizeX);
+      AssertEquals(CaseName + ' latent height', 6, Latents.SizeY);
+      AssertEquals(CaseName + ' latent depth', 4, Latents.Depth);
+      AssertEquals(CaseName + ' mean abs', csInversionMeanAbs[CasePos],
+        Latents.GetSumAbs() / Latents.Size, 2e-5);
+      for SamplePos := 0 to 7 do
+        AssertEquals(CaseName + ' latent ' + IntToStr(SamplePos),
+          csInversionSamples[CasePos, SamplePos].Value,
+          Latents[csInversionSamples[CasePos, SamplePos].X,
+          csInversionSamples[CasePos, SamplePos].Y,
+          csInversionSamples[CasePos, SamplePos].Channel], 5e-5);
+      if CasePos = 0 then
+      begin
+        Pipeline.GuidanceScale := 1.0;
+        Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 4, Latents);
+        Pipeline.GuidanceScale := 7.5;
+        for SamplePos := 0 to 3 do
+          AssertEquals('regenerated latent ' + IntToStr(SamplePos),
+            csInversionRegenerated[SamplePos],
+            Latents[csInversionSamples[0, SamplePos].X,
+            csInversionSamples[0, SamplePos].Y,
+            csInversionSamples[0, SamplePos].Channel], 1e-4);
+      end;
+    end;
+    Img2Img.SetImage(SourceImage);
+    Pipeline.Conditioner := Img2Img;
+    IsRefused := false;
+    try
+      Pipeline.InvertImage(SourceImage, Embeds, ImageWidth, ImageHeight, 4,
+        1.0, Latents);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('img2img conditioner refused', IsRefused);
+  finally
+    Pipeline.Conditioner := nil;
+    Latents.Free;
+    Embeds.Free;
+    SourceImage.Free;
+    Img2Img.Free;
     Pipeline.Free;
     FreeAndNil(FSD15Oracle);
   end;

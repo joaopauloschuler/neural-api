@@ -132,6 +132,9 @@ type
     procedure TestZeroTerminalSNRDDPMVEndpoint;
     procedure TestDDPMFirstStepPosteriorMean;
     procedure TestSchedulerFromDiffusersConfig;
+    // BuildInversionSchedule + InverseDDIMStep vs diffusers DDIMInverseScheduler
+    // (SD 1.5 betas, steps_offset 1, both set_alpha_to_one, eps and v).
+    procedure TestInverseDDIMVsDiffusers;
   end;
 
 implementation
@@ -2845,6 +2848,115 @@ begin
         kA * Xt.FData[i] - kX0 * V.FData[i], Got.FData[i], 1e-5);
   finally
     Sched.Free; Xt.Free; V.Free; Got.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestInverseDDIMVsDiffusers;
+const
+  csConfig = '{"_class_name": "DDIMScheduler", "beta_end": 0.012, ' +
+    '"beta_schedule": "scaled_linear", "beta_start": 0.00085, ' +
+    '"clip_sample": false, "num_train_timesteps": 1000, ' +
+    '"prediction_type": "%s", "set_alpha_to_one": %s, "steps_offset": 1, ' +
+    '"timestep_spacing": "%s"}';
+  // diffusers DDIMInverseScheduler, 4 steps, x = (i - 4)*0.3, two steps (t = 1,
+  // 251) with model output 0.1*cos(i) + 0.001*t: set_alpha_to_one false/true
+  // by epsilon/v_prediction.
+  cExpected: array[0..3, 0..cN - 1] of double = (
+    (-0.794143508, -0.573306575, -0.379724799, -0.165150798, 0.099362657,
+      0.396848692, 0.680025593, 0.914767399),
+    (-0.821309347, -0.593705640, -0.393347473, -0.172004488, 0.099260328,
+      0.403486087, 0.693407762, 0.934911434),
+    (-0.791309901, -0.571676840, -0.380486817, -0.167389650, 0.097823515,
+      0.397446325, 0.682136357, 0.916280315),
+    (-0.818040649, -0.591763104, -0.393951388, -0.174214975, 0.097679194,
+      0.404010579, 0.695397221, 0.936197290));
+  cLeading: array[0..3] of integer = (2, 252, 502, 752);
+  cTrailing: array[0..3] of integer = (250, 500, 750, 1000);
+var
+  FileName, CaseName: string;
+  Lines: TStringList;
+  Sched: TNNetDiffusionScheduler;
+  X, Pred: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
+  CasePos, StepPos, i: integer;
+  IsRefused: boolean;
+  SqrtAb1, SqrtAb2, Eps, Expected: double;
+
+  function CreateScheduler(const Prediction, AlphaToOne,
+    Spacing: string): TNNetDiffusionScheduler;
+  begin
+    Lines.Text := Format(csConfig, [Prediction, AlphaToOne, Spacing]);
+    Lines.SaveToFile(FileName);
+    Result := TNNetDiffusionScheduler.CreateFromDiffusersConfig(FileName);
+  end;
+
+begin
+  FileName := GetTempDir(false) + 'cai_ddim_inverse_config.json';
+  Lines := TStringList.Create;
+  X := TNNetVolume.Create(cN, 1, 1);
+  Pred := TNNetVolume.Create(cN, 1, 1);
+  Sched := nil;
+  try
+    Sched := CreateScheduler('epsilon', 'false', 'trailing');
+    Schedule := Sched.BuildInversionSchedule(4, tsTrailing);
+    AssertEquals('trailing count', 4, Length(Schedule));
+    for StepPos := 0 to 3 do
+      AssertEquals('trailing ' + IntToStr(StepPos), cTrailing[StepPos],
+        Schedule[StepPos]);
+    IsRefused := false;
+    try
+      Sched.BuildInversionSchedule(4, tsUniform);
+    except
+      IsRefused := true;
+    end;
+    AssertTrue('linspace refused', IsRefused);
+    FreeAndNil(Sched);
+    for CasePos := 0 to 3 do
+    begin
+      CaseName := IntToStr(CasePos);
+      if CasePos >= 2 then
+        Sched := CreateScheduler(BoolToStr(Odd(CasePos), 'v_prediction',
+          'epsilon'), 'true', 'leading')
+      else Sched := CreateScheduler(BoolToStr(Odd(CasePos), 'v_prediction',
+        'epsilon'), 'false', 'leading');
+      Schedule := Sched.BuildInversionSchedule(4, Sched.ConfigSpacing);
+      for StepPos := 0 to 3 do
+        AssertEquals(CaseName + ' leading ' + IntToStr(StepPos),
+          cLeading[StepPos], Schedule[StepPos]);
+      for i := 0 to cN - 1 do X.FData[i] := (i - 4) * 0.3;
+      for StepPos := 0 to 1 do
+      begin
+        for i := 0 to cN - 1 do
+          Pred.FData[i] := 0.1 * Cos(i) + 0.001 * (Schedule[StepPos] - 1);
+        Sched.InverseDDIMStep(X, Pred, Schedule[StepPos], 4);
+      end;
+      for i := 0 to cN - 1 do
+        AssertEquals(CaseName + ' @ ' + IntToStr(i), cExpected[CasePos, i],
+          X.FData[i], 2e-6);
+      FreeAndNil(Sched);
+    end;
+    // First step by hand: eps from alphas_cumprod[0] (diffusers t = -249) to t = 1.
+    Sched := CreateScheduler('epsilon', 'false', 'leading');
+    SqrtAb1 := Sqrt(Sched.AlphaBar[1]);
+    SqrtAb2 := Sqrt(Sched.AlphaBar[2]);
+    for i := 0 to cN - 1 do
+    begin
+      X.FData[i] := (i - 4) * 0.3;
+      Pred.FData[i] := 0.1 * Cos(i);
+    end;
+    Sched.InverseDDIMStep(X, Pred, 2, 4);
+    for i := 0 to cN - 1 do
+    begin
+      Eps := 0.1 * Cos(i);
+      Expected := SqrtAb2 * ((i - 4) * 0.3 - Sqrt(1 - Sqr(SqrtAb1)) * Eps) /
+        SqrtAb1 + Sqrt(1 - Sqr(SqrtAb2)) * Eps;
+      AssertEquals('first step @ ' + IntToStr(i), Expected, X.FData[i], 1e-6);
+    end;
+  finally
+    Sched.Free;
+    Pred.Free;
+    X.Free;
+    Lines.Free;
   end;
 end;
 

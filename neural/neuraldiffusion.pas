@@ -232,6 +232,11 @@ type
       KX, AbNext: TNeuralFloat);
     // np.interp of the sigma table at a fractional 0-based timestep.
     function InterpolatedSigma(ModelTimestep: double): double;
+    // DDIM eta-0 move as XtCoef*x_t + PredCoef*RawPred: sqrt(ab_to)*x0 +
+    // DirCoef*eps, with x0 and eps of RawPred at the source alpha bar.
+    procedure DDIMMoveCoefficients(SqrtAbFrom, SqrtOneMinusAbFrom,
+      InvSqrtAbFrom, SqrtAbTo, DirCoef: TNeuralFloat;
+      out XtCoef, PredCoef: TNeuralFloat);
   protected
     // Convert a raw model prediction (eps or v) at timestep Tt into eps.
     procedure ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
@@ -261,6 +266,13 @@ type
     function BuildImg2ImgSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
       Strength: double): TNeuralIntegerArray; virtual;
+    // diffusers DDIMInverseScheduler.set_timesteps: the NumSteps 1-based model
+    // timesteps, ascending (tsLeading or tsTrailing; others raise).
+    function BuildInversionSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+    // diffusers DDIMInverseScheduler.step (eta 0) in place: Xt moves up from
+    // Tt - T div NumSteps (FinalAlphaBar below 1) to Tt; RawPred is the model at Tt.
+    procedure InverseDDIMStep(Xt, RawPred: TNNetVolume; Tt, NumSteps: integer);
     // diffusers SD img2img/inpaint get_timesteps: the first schedule entry that
     // runs at Strength, N - min(int(N * Strength), N); raises when no step runs.
     class function Img2ImgStartStep(NumSteps: integer;
@@ -1574,20 +1586,9 @@ begin
           else
             sigma := 0;
           dirCoef := Sqrt(Max(0.0, 1.0 - abPrev - sigma * sigma));
-          somabT := FSqrtOneMinusAlphaBar[Tt];
-          // #5/#13: the update is kA*x_t + cE*RawPred (+ sigma*z). For v,
-          //   x0 = sqrt(ab_t)*x_t - somab_t*v, eps = somab_t*x_t + sqrt(ab_t)*v,
-          // which has no 1/sqrt(ab_t) and so stays exact at ab_t = 0.
-          if FPrediction = dpV then
-          begin
-            kA := sqrtAbPrev * FSqrtAlphaBar[Tt] + dirCoef * somabT;
-            cE := dirCoef * FSqrtAlphaBar[Tt] - sqrtAbPrev * somabT;
-          end
-          else
-          begin
-            kA := sqrtAbPrev * FInvSqrtAlphaBar[Tt];
-            cE := dirCoef - kA * somabT;
-          end;
+          // #5/#13: the update is kA*x_t + cE*RawPred (+ sigma*z).
+          DDIMMoveCoefficients(FSqrtAlphaBar[Tt], FSqrtOneMinusAlphaBar[Tt],
+            FInvSqrtAlphaBar[Tt], sqrtAbPrev, dirCoef, kA, cE);
           if sigma > 0 then
           begin
             for i := 0 to XtSizeM1 do
@@ -1912,6 +1913,77 @@ begin
   Result := BuildSamplerSchedule(NumSteps, Spacing, Method);
   StartStep := Img2ImgStartStep(NumSteps, Strength);
   Result := Copy(Result, StartStep, Length(Result) - StartStep);
+end;
+
+function TNNetDiffusionScheduler.BuildInversionSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
+var
+  Descending: TNeuralIntegerArray;
+  StepPos, MaxStepPos: integer;
+begin
+  if NumSteps < 1 then
+    raise Exception.Create('BuildInversionSchedule: NumSteps must be >= 1.');
+  if NumSteps > FT then
+    raise Exception.Create('BuildInversionSchedule: ' + IntToStr(NumSteps) +
+      ' steps exceed the ' + IntToStr(FT) + ' training timesteps.');
+  if not (Spacing in [tsLeading, tsTrailing]) then
+    raise Exception.Create('BuildInversionSchedule: DDIM inversion needs ' +
+      'leading or trailing timestep spacing.');
+  // The forward DDIM timesteps reversed, without the clean-image anchor.
+  Descending := BuildTimestepSchedule(NumSteps, Spacing);
+  SetLength(Result, NumSteps);
+  MaxStepPos := NumSteps - 1;
+  for StepPos := 0 to MaxStepPos do
+    Result[StepPos] := Descending[MaxStepPos - StepPos];
+end;
+
+procedure TNNetDiffusionScheduler.DDIMMoveCoefficients(SqrtAbFrom,
+  SqrtOneMinusAbFrom, InvSqrtAbFrom, SqrtAbTo, DirCoef: TNeuralFloat;
+  out XtCoef, PredCoef: TNeuralFloat);
+begin
+  // For v, x0 = sqrt(ab)*x_t - sqrt(1-ab)*v and eps = sqrt(1-ab)*x_t +
+  // sqrt(ab)*v have no 1/sqrt(ab), so they stay exact at ab = 0.
+  if FPrediction = dpV then
+  begin
+    XtCoef := SqrtAbTo * SqrtAbFrom + DirCoef * SqrtOneMinusAbFrom;
+    PredCoef := DirCoef * SqrtAbFrom - SqrtAbTo * SqrtOneMinusAbFrom;
+  end
+  else
+  begin
+    XtCoef := SqrtAbTo * InvSqrtAbFrom;
+    PredCoef := DirCoef - XtCoef * SqrtOneMinusAbFrom;
+  end;
+end;
+
+procedure TNNetDiffusionScheduler.InverseDDIMStep(Xt, RawPred: TNNetVolume;
+  Tt, NumSteps: integer);
+var
+  FromTt: integer;
+  SqrtAbFrom, SqrtOneMinusAbFrom, InvSqrtAbFrom: TNeuralFloat;
+  XtCoef, PredCoef: TNeuralFloat;
+begin
+  if (NumSteps < 1) or (Tt < 1) or (Tt > FT) then
+    raise Exception.Create('InverseDDIMStep: timestep ' + IntToStr(Tt) +
+      ' of ' + IntToStr(NumSteps) + ' steps is out of range.');
+  // diffusers: the source is min(t - T div N, T - 1); below 0 it reads
+  // initial_alpha_cumprod (set_alpha_to_one: 1, else alphas_cumprod[0]).
+  FromTt := Min(Tt - FT div NumSteps, FT);
+  if FromTt >= 1 then
+  begin
+    SqrtAbFrom := FSqrtAlphaBar[FromTt];
+    SqrtOneMinusAbFrom := FSqrtOneMinusAlphaBar[FromTt];
+    InvSqrtAbFrom := FInvSqrtAlphaBar[FromTt];
+  end
+  else
+  begin
+    SqrtAbFrom := Sqrt(FFinalAlphaBar);
+    SqrtOneMinusAbFrom := Sqrt(1 - FFinalAlphaBar);
+    InvSqrtAbFrom := 1 / SqrtAbFrom;
+  end;
+  DDIMMoveCoefficients(SqrtAbFrom, SqrtOneMinusAbFrom, InvSqrtAbFrom,
+    FSqrtAlphaBar[Tt], FSqrtOneMinusAlphaBar[Tt], XtCoef, PredCoef);
+  Xt.Mul(XtCoef);
+  Xt.MulAdd(PredCoef, RawPred);
 end;
 
 class function TNNetDiffusionScheduler.Img2ImgStartStep(NumSteps: integer;

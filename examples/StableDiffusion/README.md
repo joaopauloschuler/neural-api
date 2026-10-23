@@ -709,6 +709,46 @@ reference numbers come from an ad hoc diffusers run and are hardcoded in the
 tests, because the committed fixture generator has no SAG mode. A real
 checkpoint has not been run with SAG yet.
 
+## DDIM inversion (`--invert-image`)
+
+DDIM inversion (Song et al. 2020, eta 0; diffusers `DDIMInverseScheduler`)
+runs the deterministic DDIM update backwards: the image's VAE latents (the
+latent mean, encoded as img2img does) walk from x0 up to x_T with the prompt.
+Sampling from that x_T with plain DDIM and the same prompt runs the walk back
+and returns close to the image. This is the starting point of
+Prompt-to-Prompt and null-text inversion edits.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --steps 50 \
+  --invert-image photo.png --prompt "a photo of a cat on a sofa" --gpu
+```
+
+`--invert-steps N` sets the inversion steps (default `--steps`) and
+`--invert-guidance G` its CFG weight (default 1.0). Both directions default to
+guidance 1: with CFG the walk drifts and the round trip no longer returns the
+image, which is what null-text inversion corrects. The sampler is always
+DDIM; `--invert-image` does not combine with `--init-image`, `--edit-image`,
+`--upscale-image`, `--gligen-inpaint-image` or `--repeat`.
+
+The timesteps follow diffusers `DDIMInverseScheduler`: ascending, `leading`
+spacing `k * (T div N) + steps_offset` (SD 1.5: 1, 21, 41, ... for 50 steps)
+or `trailing`. Each step moves from `t - T div N` to `t` with the UNet
+evaluated at `t`; the first step starts from `alphas_cumprod[0]`, or from 1
+when the scheduler config sets `set_alpha_to_one`.
+
+`TStableDiffusionPipeline.InvertImage` (image to inverted latents) and
+`InvertLatents` (latents in place) are the API, on top of
+`TNNetDiffusionScheduler.BuildInversionSchedule` and `InverseDDIMStep`. Tests:
+the scheduler against diffusers `DDIMInverseScheduler` (timesteps, two steps
+with epsilon and `v_prediction`, both `set_alpha_to_one`;
+`TestInverseDDIMVsDiffusers`), and on the pico folder the inverted latents of a
+16x12 image at guidance 1 and 3 against diffusers float64, within 5e-5 (mean
+absolute value about 1e-7 off), plus DDIM sampling back from them
+(`TestStableDiffusionDDIMInversionParity`). The reference numbers come from an
+ad hoc diffusers run and are hardcoded in the tests. The pico folder has
+random weights, so its round trip does not reconstruct the image; a real
+checkpoint has not been run with inversion yet.
+
 ## Usage
 
 ```
@@ -782,6 +822,12 @@ StableDiffusion [--model DIR] [options]
                     factor); default 75 steps, guidance 9.0
   --noise-level N   noise added to --upscale-image, 0..max_noise_level (350;
                     default 20); more noise lets the UNet invent more detail
+  --invert-image PNG DDIM inversion: walk this image's latents to noise with the
+                    prompt, then sample them back with DDIM; the output takes
+                    its size (rounded down to the VAE factor); guidance
+                    default 1.0
+  --invert-steps N  inversion steps (default: --steps)
+  --invert-guidance G CFG weight of the inversion (default 1.0)
   --freeu S1,S2,B1,B2 FreeU (diffusers enable_freeu): skip scales S1, S2 and
                     backbone scales B1, B2 of the first two up blocks; presets
                     sd15 (0.9,0.2,1.5,1.6) and sd21 (0.9,0.2,1.4,1.6)

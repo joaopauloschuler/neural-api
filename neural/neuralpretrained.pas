@@ -12668,6 +12668,9 @@ type
       Value: boolean);
     // The step cache of the passes that see Inputs; nil when DeepCache is off.
     function DeepCacheFor(Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
+    // Denoise, or (IsInversion) InvertLatents at the pipeline's GuidanceScale.
+    procedure RunSteps(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Latents: TNNetVolume; IsInversion: boolean);
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12737,6 +12740,15 @@ type
     // OnAncestralNoise or the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
+    // DDIM inversion (diffusers DDIMInverseScheduler, eta 0) in place: clean
+    // Latents walked to x_T over StepCount steps, CFG at GuidanceScale (1: none).
+    procedure InvertLatents(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; GuidanceScale: TNeuralFloat; Latents: TNNetVolume);
+    // InvertLatents of Image (W, H, 3|4, 0..255) resized to Width x Height and
+    // VAE-encoded as img2img does (SampleNoise nil: the latent mean).
+    procedure InvertImage(Image, PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; GuidanceScale: TNeuralFloat; Latents: TNNetVolume;
+      SampleNoise: TNNetVolume = nil);
     // VAE latents of VaeImage (W, H, 3) in [-1, 1], (W, H) / VaeScaleFactor:
     // (mean + std * SampleNoise; nil: mean) * scaling_factor (latent_dist.sample).
     procedure EncodeVaeImage(VaeImage, Latents: TNNetVolume;
@@ -102773,6 +102785,45 @@ end;
 
 procedure TStableDiffusionPipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
   Height, StepCount: integer; Latents: TNNetVolume);
+begin
+  RunSteps(PromptEmbeds, Width, Height, StepCount, Latents, false);
+end;
+
+procedure TStableDiffusionPipeline.InvertLatents(PromptEmbeds: TNNetVolume;
+  Width, Height, StepCount: integer; GuidanceScale: TNeuralFloat;
+  Latents: TNNetVolume);
+var
+  SavedGuidanceScale: TNeuralFloat;
+begin
+  SavedGuidanceScale := FGuidanceScale;
+  FGuidanceScale := GuidanceScale;
+  try
+    RunSteps(PromptEmbeds, Width, Height, StepCount, Latents, true);
+  finally
+    FGuidanceScale := SavedGuidanceScale;
+  end;
+end;
+
+procedure TStableDiffusionPipeline.InvertImage(Image,
+  PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+  GuidanceScale: TNeuralFloat; Latents: TNNetVolume; SampleNoise: TNNetVolume);
+var
+  VaeImage: TNNetVolume;
+begin
+  VaeImage := TNNetVolume.Create();
+  try
+    ConvertAndResizeImagePIL(Image, VaeImage, Width, Height, 3,
+      {ClipToByteRange=}false, -1, 1);
+    EncodeVaeImage(VaeImage, Latents, SampleNoise);
+  finally
+    VaeImage.Free;
+  end;
+  InvertLatents(PromptEmbeds, Width, Height, StepCount, GuidanceScale, Latents);
+end;
+
+procedure TStableDiffusionPipeline.RunSteps(PromptEmbeds: TNNetVolume;
+  Width, Height, StepCount: integer; Latents: TNNetVolume;
+  IsInversion: boolean);
 var
   StepConfig: TSDUNetConfig;
   Net: TNNet;
@@ -102789,6 +102840,10 @@ var
 begin
   LatentGridFor(Width, Height, GridX, GridY);
   StepConditioner := ActiveConditioner();
+  if IsInversion and StepConditioner.StartsFromImage() then
+    ImportError('TStableDiffusionPipeline.InvertLatents: a ' +
+      StepConditioner.ClassName + ' starts from its own image; invert with ' +
+      'no image conditioner.');
   if not StepConditioner.AcceptsUNetInChannels(FUNetConfig.InChannels,
     FVaeConfig.LatentChannels) then
     ImportError('TStableDiffusionPipeline.Denoise: a ' +
@@ -102853,7 +102908,8 @@ begin
     DoPhase(sdphDenoise);
     // diffusers Euler / Euler a (linspace: fractional timesteps) and Karras
     // sigmas sample at continuous sigmas; image starts keep integer timesteps.
-    UseSigmaSchedule := StepConditioner.AcceptsSigmaSchedule() and
+    UseSigmaSchedule := (not IsInversion) and
+      StepConditioner.AcceptsSigmaSchedule() and
       (((FSampler in [smEuler, smEulerAncestral]) and (FKarrasSigmas or
       (FScheduler.ConfigSpacing = tsUniform))) or
       ((FSampler = smDPMSolverPP2M) and FKarrasSigmas));
@@ -102865,6 +102921,9 @@ begin
         FScheduler.ConfigSpacing, SigmaSchedule.Sigmas[0]);
       if NoiseScale <> 1 then Latents.Mul(NoiseScale);
     end
+    else if IsInversion then
+      Schedule := FScheduler.BuildInversionSchedule(StepCount,
+        FScheduler.ConfigSpacing)
     else if StepConditioner.StartsFromImage() then
     begin
       // Start from the image latents noised to the first timestep of the
@@ -102884,9 +102943,12 @@ begin
     end;
     // Euler a injects its full ancestral noise; the others are deterministic.
     if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
-    if (FSampler in [smEulerAncestral, smLCM]) and Assigned(FOnAncestralNoise) then
+    if (not IsInversion) and (FSampler in [smEulerAncestral, smLCM]) and
+      Assigned(FOnAncestralNoise) then
       StepNoise := TNNetVolume.Create(Latents);
     if UseSigmaSchedule then MaxStepPos := High(SigmaSchedule.ModelTimesteps)
+    // The inversion schedule has no clean-image anchor to step to.
+    else if IsInversion then MaxStepPos := High(Schedule)
     else MaxStepPos := Length(Schedule) - 2;
     FStepCount := MaxStepPos + 1;
     for StepPos := 0 to MaxStepPos do
@@ -102901,6 +102963,8 @@ begin
       if UseSigmaSchedule then
         FScheduler.StepAtSigma(Latents, Pred, SigmaSchedule.Sigmas[StepPos],
           SigmaSchedule.Sigmas[StepPos + 1], FSampler, Eta, StepNoise)
+      else if IsInversion then
+        FScheduler.InverseDDIMStep(Latents, Pred, Schedule[StepPos], StepCount)
       else
       begin
         FScheduler.Step(Latents, Pred, Schedule[StepPos],
