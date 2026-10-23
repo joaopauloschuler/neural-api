@@ -374,24 +374,22 @@ rather than acted on.
         CPU 1.2e-7 (208/228 layers forced on OpenCL); the real
         `rvm_mobilenetv3.pth` matched the official model.py to 2.9e-6 on a
         128x96 frame at ratio 0.5 over 3 frames (one-off check, not a test).
-  - [ ] examples/VideoMatting: read a numbered PNG/JPG frame folder, build
-        `BuildRVMFromSafeTensors(File, W, H, Ratio, Config)` from the first
-        frame's size, wrap it in `TRVMMatting`, call `Step` per frame and write
-        RGBA PNGs (alpha = channel 3), a green-screen composite
-        (fgr*alpha + green*(1-alpha)) and an optional `--gif` (neuralgif.pas).
-        `--ratio` default per the RVM README table (portrait: 0.25 at 1080p,
-        0.375 at 720p, 1 up to 512x512; check the table); exact torch parity needs W*ratio and H*ratio integral
-        (the net's resize maps In/Out, torch maps 1/ratio). Frames of a
-        different size need a new net (state resets). With no arguments, run a
-        <1 s smoke on tests/fixtures/tiny_rvm_mobilenetv3.pth. List cthreads
-        first in uses. Then a real-checkpoint run on the GPU box (`--gpu`)
-        before README calls it supported.
+  - [x] examples/VideoMatting landed: mattes a frame folder (PNG/JPEG,
+        natural sort) into `<frame>_rgba.png` + `<frame>_green.png` and an
+        optional `--gif`; `--ratio` defaults to the RVM README portrait
+        column (1 up to 512 px, else 480 / longest side); a frame of another
+        size rebuilds the net and resets the state; `--gpu` OpenCL; no
+        arguments = <1 s pico smoke at ratio 0.5. Real `rvm_mobilenetv3.pth`
+        on CPU, 640x480 at ratio 0.75, one core: ~1.3-1.4 s/frame after the
+        first, 1.7 GB RSS, clean subject matte.
+  - [ ] Real-checkpoint run on the GPU box (`--gpu`) before README calls it
+        supported.
   - [ ] ResNet-50 variant (`rvm_resnet50.pth`): needs the ResNet trunk with
-        f1..f4 taps and a dilation-2 layer4. 2-D dilation is emulated today by
-        a zero-filled (K-1)*D+1 kernel (LoadMobileNetDepthwiseFoldBN); for
-        layer4's full 3x3 convs that is a 5x5 conv, so a native dilated conv
-        would pay off first. The MobileNetV3 path also pays 81 vs 25 taps in
-        its three dilated 5x5 depthwise blocks at 1/16 resolution.
+        f1..f4 taps and a dilation-2 layer4. TNNetDepthwiseConv now has native
+        dilation (pDilation, MobileNetV3/RVM use it: 25 taps instead of a
+        zero-filled 9x9); the full 3x3 convs of layer4 still need a native
+        dilated TNNetConvolution (today only the X-axis FDilationX of the 1-D
+        convs exists; TNNetConvolutionAbstract has FDilationY now).
   - [ ] fast_guided_filter refiner (TNNetBoxFilter) and segmentation_pass
         (project_seg) are not wired; the importer rejects a checkpoint
         without `refiner.box_filter.weight` when the ratio is < 1.
