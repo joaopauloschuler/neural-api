@@ -57941,7 +57941,7 @@ end;
 // EXACT NAFBlock math. Exercises the new parameter-free TNNetSimpleGate
 // (split-depth GLU), Simplified Channel Attention (AvgChannel -> 1x1 conv ->
 // channelwise multiply), per-pixel LayerNorm2d (TNNetTokenLayerNorm), depthwise
-// 3x3 conv, stride-2 down conv, PixelShuffle up via TNNetDepthToSpace, the
+// 3x3 conv, stride-2 down conv, torch-order PixelShuffle up (TNNetPixelShuffle), the
 // per-channel beta/gamma residual scales and the global input skip. Asserts
 // < 1e-4 on the FULL restored (ImgChannel, InputSize, InputSize) image. The
 // output is the SAME spatial size as the input (restoration, not upscaling).
@@ -59105,13 +59105,13 @@ end;
 // SwinIR transformer image-restoration (classical SR) parity test.
 // tests/fixtures/tiny_swinir.* is a pico random-init SwinIR (img 4, window 2,
 // embed_dim 6, 1 RSTB of 2 Swin layers, 2 heads, upscale 2). The fixture
-// (tools/swinir_tiny_fixture.py) is a self-contained float64 numpy oracle that
-// mirrors the importer's forward path EXACTLY. The 2-layer RSTB exercises the
+// (tools/swinir_tiny_fixture.py) is a self-contained float64 numpy oracle of the
+// official forward. The 2-layer RSTB exercises the
 // full shifted-window path: layer 0 is W-MSA, layer 1 is SW-MSA (cyclic shift +
 // attention mask). Asserts the upscaled (img*upscale, img*upscale, in_chans)
 // restored image matches the oracle < 1e-4 - exercising TNNetWindowAttention
 // (rel-pos bias + shift mask), TNNetGatherTokens (window partition/reverse),
-// the RSTB residual conv, and the TNNetDepthToSpace pixel-shuffle tail. The
+// the RSTB residual conv, and the torch-order TNNetPixelShuffle tail. The
 // config has no "upsampler" key, so this also covers the key-based auto-detect.
 procedure TTestNeuralPretrained.TestSwinIRParity;
 var

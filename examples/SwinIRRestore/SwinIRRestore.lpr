@@ -18,7 +18,7 @@ SimpleGate-CNN NAFNet denoiser: this is transformer restoration. The window /
 shifted-window attention REUSES the landed Swin building blocks
 (TNNetWindowAttention + relative_position_bias + cyclic-shift mask,
 TNNetGatherTokens partition/reverse); the new pieces are the conv stem, the RSTB
-residual conv, and the TNNetDepthToSpace pixel-shuffle upsample.
+residual conv, and the TNNetPixelShuffle pixel-shuffle upsample.
 
 NO NETWORK ACCESS / SELF-CONTAINED: the official SwinIR checkpoints are large and
 not obtainable offline, so -- exactly like the repo's RRDBNet / NAFNet pico

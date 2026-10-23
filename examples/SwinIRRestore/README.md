@@ -23,7 +23,7 @@ Architecturally distinct from the CNN-only RRDBNet/ESRGAN SR path and the
 SimpleGate-CNN NAFNet denoiser. The window / shifted-window attention reuses the
 landed Swin building blocks (`TNNetWindowAttention` + relative_position_bias +
 cyclic-shift mask, `TNNetGatherTokens` partition/reverse); the new pieces are the
-conv stem, the RSTB residual conv, and the `TNNetDepthToSpace` pixel-shuffle
+conv stem, the RSTB residual conv, and the `TNNetPixelShuffle` pixel-shuffle
 upsample.
 
 ## Build / run

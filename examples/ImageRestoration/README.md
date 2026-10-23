@@ -20,7 +20,7 @@ restores (denoise / deblur / dejpeg) at the **same resolution** (Chen et al.
 
 Everything else reuses landed layers: 1×1 / 3×3 conv, depthwise 3×3 conv,
 per-pixel LayerNorm2d (`TNNetTokenLayerNorm`), stride-2 down conv, PixelShuffle
-up via `TNNetDepthToSpace`, and residual adds with learnable per-channel
+up via `TNNetPixelShuffle`, and residual adds with learnable per-channel
 `beta`/`gamma` scales.
 
 ## Architecture

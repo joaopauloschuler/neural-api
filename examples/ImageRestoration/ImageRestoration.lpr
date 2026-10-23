@@ -13,7 +13,7 @@ The new primitive the importer needs is the parameter-free SimpleGate
 a GLU with no activation. Simplified Channel Attention (SCA) reuses landed
 global pooling + a 1x1 conv + a channelwise multiply. Everything else (1x1/3x3
 conv, depthwise conv, per-pixel LayerNorm, pixel-shuffle up via
-TNNetDepthToSpace, stride-2 down conv, residual adds) reuses landed layers.
+TNNetPixelShuffle, stride-2 down conv, residual adds) reuses landed layers.
 
 NO NETWORK ACCESS / SELF-CONTAINED: the official NAFNet checkpoints are large
 and not obtainable offline, so -- exactly like the repo's RRDBNet / VAE-decoder

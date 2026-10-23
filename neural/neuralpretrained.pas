@@ -15070,7 +15070,7 @@ type
 // a GLU with no activation. Simplified Channel Attention (SCA) reuses landed
 // global pooling + a 1x1 conv + a channelwise multiply. Everything else (1x1 /
 // 3x3 conv, depthwise conv, per-pixel LayerNorm via TNNetTokenLayerNorm,
-// pixel-shuffle up via TNNetDepthToSpace, stride-2 down conv, residual adds)
+// pixel-shuffle up via TNNetPixelShuffle, stride-2 down conv, residual adds)
 // reuses landed layers.
 //
 // NAFBlock(C):
@@ -15081,7 +15081,7 @@ type
 //        -> conv5(1x1,C->C)
 //   out = y + gamma .* x2
 // U-Net: intro 3x3 -> enc stages (NAFBlocks then stride-2 down conv, 2x ch)
-//        -> middle NAFBlocks -> dec stages (1x1 conv 2x ch + DepthToSpace(2)
+//        -> middle NAFBlocks -> dec stages (1x1 conv 2x ch + PixelShuffle(2)
 //        up, ADD the encoder skip, then NAFBlocks) -> ending 3x3, global skip.
 // ---------------------------------------------------------------------------
 type
@@ -15261,14 +15261,14 @@ procedure RIFEInterpolateFrames(NN: TNNet; const Config: TRIFEConfig;
 // per-head relative_position_bias_table and cyclic-shift mask). The genuinely
 // new pieces are the shallow conv stem, the Residual Swin Transformer Blocks
 // (RSTB = depth Swin layers + a 3x3 conv + a residual over the block) and the
-// pixel-shuffle (TNNetDepthToSpace) upsample tail.
+// pixel-shuffle (TNNetPixelShuffle) upsample tail.
 //
 // Pipeline:  conv_first 3x3 -> token seq over the HxW grid
 //   RSTB[L]: depth Swin layers (W-MSA/SW-MSA + MLP) -> map -> conv 3x3 ->
 //            tokens, + RSTB input (residual)
 //   token LayerNorm (norm) -> map -> conv_after_body 3x3, + conv_first map
 //   tail by upsampler: 'pixelshuffle' = conv_before_upsample 3x3 ->
-//     LeakyReLU(0.01) -> upsample.0 3x3 (Eup -> 4*Eup) -> DepthToSpace ->
+//     LeakyReLU(0.01) -> upsample.0 3x3 (Eup -> 4*Eup) -> PixelShuffle ->
 //     conv_last; 'nearest+conv' = conv_before_upsample -> LeakyReLU(0.01) ->
 //     per x2: nearest x2 -> conv_up1/conv_up2 -> LeakyReLU(0.2), then conv_hr ->
 //     LeakyReLU(0.2) -> conv_last; '' (upscale 1) = input + conv_last(feat).
@@ -69892,6 +69892,26 @@ begin
   end;
 end;
 
+// Source neuron of each conv neuron feeding a pixel shuffle: TNNetPixelShuffle(r)
+// reads channel c*r*r + dx*r + dy where torch PixelShuffle(r) reads c*r*r + dy*r + dx.
+function TorchPixelShuffleNeurons(OutCh, Factor: integer): TNeuralIntegerArray;
+var
+  ChannelPos, MaxChannelPos, dx, dy, MaxOffset, ChannelBase, FactorSquared: integer;
+begin
+  Result := nil;
+  FactorSquared := Factor * Factor;
+  SetLength(Result, FactorSquared * OutCh);
+  MaxChannelPos := OutCh - 1;
+  MaxOffset := Factor - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+  begin
+    ChannelBase := ChannelPos * FactorSquared;
+    for dx := 0 to MaxOffset do
+      for dy := 0 to MaxOffset do
+        Result[ChannelBase + dx * Factor + dy] := ChannelBase + dy * Factor + dx;
+  end;
+end;
+
 type
   // Tensor names of HF transformers ('convnext.encoder.stages.S.layers.B...')
   // or of the original facebookresearch repo ('stages.S.B...').
@@ -84872,12 +84892,12 @@ begin
     for lvl := NumLevelsM1 downto 0 do
     begin
       // Up (NAFNet PixelShuffle upsample): 1x1 conv C -> 2C, then
-      // DepthToSpace(2) divides channels by 4 and doubles each spatial axis,
+      // PixelShuffle(2) divides channels by 4 and doubles each spatial axis,
       // so 2C -> C/2 channels at 2x resolution. Mirrors the encoder's stride-2
       // down conv (C -> 2C at H/2) to land back on the skip's (C/2, H) shape.
       UpConvs[lvl] := NN.AddLayer(
         TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0).SetTrainable(pTrainable));
-      NN.AddLayer(TNNetDepthToSpace.Create(2));  // 2C -> C/2, spatial x2
+      NN.AddLayer(TNNetPixelShuffle.Create(2));  // 2C -> C/2, spatial x2
       C := C div 2;
       Up := NN.GetLastLayer();
       // Add encoder skip (same channel count C and spatial size).
@@ -84919,6 +84939,7 @@ begin
       LoadVaeConv(Reader, UpConvs[lvl],
         'ups.' + IntToStr(lvl) + '.weight',
         'ups.' + IntToStr(lvl) + '.bias', 2 * ChUp, ChUp, 1);
+      PermuteLayerNeurons(UpConvs[lvl], TorchPixelShuffleNeurons(ChUp div 2, 2));
       C := C div 2;
       DecBlkM1 := Config.DecBlkNums[lvl] - 1;
       for b := 0 to DecBlkM1 do
@@ -85727,10 +85748,10 @@ begin
     end;
     if Resolved.Upsampler = 'pixelshuffle' then
     begin
-      // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, DepthToSpace.
+      // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, PixelShuffle.
       UpConv := NN.AddLayer( TNNetConvolutionLinear.Create(
         Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
-      NN.AddLayer( TNNetDepthToSpace.Create(Config.Upscale) );
+      NN.AddLayer( TNNetPixelShuffle.Create(Config.Upscale) );
       ConvLast := NN.AddLayer(
         TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
     end
@@ -85787,8 +85808,12 @@ begin
       LoadVaeConv(Reader, ConvBeforeUp, 'conv_before_upsample.0.weight',
         'conv_before_upsample.0.bias', Config.NumFeat, Dim, 3);
       if UpConv <> nil then
+      begin
         LoadVaeConv(Reader, UpConv, 'upsample.0.weight', 'upsample.0.bias',
           Config.Upscale * Config.Upscale * Config.NumFeat, Config.NumFeat, 3);
+        PermuteLayerNeurons(UpConv, TorchPixelShuffleNeurons(Config.NumFeat,
+          Config.Upscale));
+      end;
       if ConvUp1 <> nil then
         LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias',
           Config.NumFeat, Config.NumFeat, 3);
@@ -86082,26 +86107,6 @@ begin
     for dy := 0 to 1 do
       for dx := 0 to 1 do
         Result[ChannelPos * 4 + dy * 2 + dx] := (dx * 2 + dy) * C + ChannelPos;
-end;
-
-// Source neuron of each conv neuron feeding a pixel shuffle: TNNetPixelShuffle(r)
-// reads channel c*r*r + dx*r + dy where torch PixelShuffle(r) reads c*r*r + dy*r + dx.
-function TorchPixelShuffleNeurons(OutCh, Factor: integer): TNeuralIntegerArray;
-var
-  ChannelPos, MaxChannelPos, dx, dy, MaxOffset, ChannelBase, FactorSquared: integer;
-begin
-  Result := nil;
-  FactorSquared := Factor * Factor;
-  SetLength(Result, FactorSquared * OutCh);
-  MaxChannelPos := OutCh - 1;
-  MaxOffset := Factor - 1;
-  for ChannelPos := 0 to MaxChannelPos do
-  begin
-    ChannelBase := ChannelPos * FactorSquared;
-    for dx := 0 to MaxOffset do
-      for dy := 0 to MaxOffset do
-        Result[ChannelBase + dx * Factor + dy] := ChannelBase + dy * Factor + dx;
-  end;
 end;
 
 // Source of each channel when the two halves of Count channels swap places.

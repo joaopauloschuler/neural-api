@@ -73,19 +73,6 @@ rather than acted on.
 
 ## Bugs
 
-- [ ] Probable defect (not fixed, awaits user decision; found during the
-      Restormer importer): `BuildNAFNet` and `BuildSwinIRFromSafeTensors` load
-      the conv before their `TNNetDepthToSpace` upsample unpermuted, but torch
-      `nn.PixelShuffle` reads channel `c*r*r + sy*r + sx` while DepthToSpace
-      reads `(sx*r + sy)*C + c`. Their parity tests do not see it because
-      tools/nafnet_tiny_fixture.py and tools/swinir_tiny_fixture.py implement
-      the CAI DepthToSpace order on purpose ("NOT nn.PixelShuffle"), so the
-      oracle mirrors the importer. A real NAFNet / SwinIR checkpoint would get
-      scrambled sub-pixels after every up step. Fix route: `PermuteLayerNeurons`
-      on the up convs (as `BuildRestormerFromSafeTensors` does for
-      `TNNetPixelShuffle`), and regenerate both fixtures from the real torch
-      PixelShuffle order.
-
 - [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
       (neural/neuralvolume.pas) calls `ReSize` only when `Size` differs,
       so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
@@ -964,8 +951,7 @@ rather than acted on.
       pico parity TestNAFNetParity < 1e-4 vs a numpy float64 oracle;
       examples/ImageRestoration end-to-end CPU denoise):
   - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
-        weights are large / not redistributable). Needs the PixelShuffle
-        channel-order fix under "Bugs" first.
+        weights are large / not redistributable).
   - [ ] NAFBlock dropout + the wider official width/block configs are wired by
         config but only the small pico shape is parity-pinned.
 - [ ] SwinIR transformer image-restoration importer follow-ups
@@ -977,15 +963,13 @@ rather than acted on.
       upscale-1 denoise tails are pinned by TestSwinIRNearestConvParity and
       TestSwinIRDenoiseParity):
   - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
-        not obtainable offline). The `pixelshuffle` tail needs the PixelShuffle
-        channel-order fix under "Bugs" first; the `nearest+conv` real-world
-        x4 checkpoint (003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth) and the
-        denoise checkpoints do not, so they can run now. They would also confirm
+        not obtainable offline). Every tail can run now, e.g. the `nearest+conv`
+        real-world x4 checkpoint (003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth)
+        and the denoise checkpoints. They would also confirm
         d6d3c6d2's LeakyReLU 0.01 (conv_before_upsample) and erf-GELU changes.
   - [ ] Lightweight-SR `pixelshuffledirect` tail (UpsampleOneStep: one 3x3
         conv embed_dim -> upscale^2*out_ch + PixelShuffle) not wired; the
-        importer rejects it (TestSwinIRRejectsPixelShuffleDirect). Waits on
-        the PixelShuffle channel-order fix under "Bugs".
+        importer rejects it (TestSwinIRRejectsPixelShuffleDirect).
 - [ ] Restormer image-restoration follow-ups (`TNNetTransposedChannelAttention`,
       7ded244f; `BuildRestormerFromSafeTensors[Ex]` + `TRestormerConfig` +
       examples/Restormer, c7363ab4; pico parity `TestRestormerParity`,
