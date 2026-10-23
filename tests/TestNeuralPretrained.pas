@@ -1493,6 +1493,12 @@ type
     // circular windows and Euler a stay finite (one canvas noise per step);
     // the refused combinations raise.
     procedure TestStableDiffusionPanoramaTwoWindows;
+    // The per-window hint crop (ControlNet Tile upscaling): on the 24x16
+    // two-window canvas a ControlNet and a T2I-Adapter see each window's crop
+    // of the image-size hint, so one guided DDIM step equals each window run
+    // alone with its crop as the hint (mean in the overlap); img2img plus a
+    // ControlNet whose hint is the image runs over the windows.
+    procedure TestStableDiffusionPanoramaHintCrop;
     // VaeTileSize: a tile covering the image is the plain decode; a smaller one
     // runs TiledVaeDecode at the image size.
     procedure TestStableDiffusionVaeTiling;
@@ -49263,6 +49269,135 @@ begin
     Embeds.Free;
     Windows.Free;
     Pipeline.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionPanoramaHintCrop;
+const
+  CanvasWidth = 24;
+  Side = 16;
+  GridW = 12;
+  GridH = 8;
+  WindowCells = 8;
+  StrideCells = 4;
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNet: TStableDiffusionControlNet;
+  Adapter: TStableDiffusionT2IAdapter;
+  Img2Img: TStableDiffusionImg2Img;
+  Multi: TStableDiffusionMultiConditioner;
+  LatentWindows, PixelWindows: TMultiDiffusionWindows;
+  Embeds, Initial, Latents, Crop, Hint, HintCrop: TNNetVolume;
+  Alone: array[0..1] of TNNetVolume;
+  ValuePos: integer;
+  MaxDiff: double;
+
+  // Each window alone (its hint crop set by SetHint), then the canvas with the
+  // whole Hint; returns the canvas against the windows alone.
+  function CanvasVsWindowsAlone(Conditioner: TStableDiffusionConditioner;
+    Channels: integer): double;
+  var
+    WindowPos: integer;
+
+    procedure SetHint(Image: TNNetVolume);
+    begin
+      if Conditioner = ControlNet then ControlNet.SetControlImage(Image)
+      else Adapter.SetHintImage(Image);
+    end;
+
+  begin
+    FillSDTestPattern(Hint, CanvasWidth, Side, Channels);
+    Pipeline.Conditioner := Conditioner;
+    Pipeline.PanoramaWindowWidth := 0;
+    Pipeline.PanoramaWindowHeight := 0;
+    for WindowPos := 0 to 1 do
+    begin
+      LatentWindows.GatherWindow(Initial, WindowPos, Crop);
+      PixelWindows.GatherWindow(Hint, WindowPos, HintCrop);
+      SetHint(HintCrop);
+      Pipeline.Denoise(Embeds, Side, Side, 1, Crop);
+      Alone[WindowPos].Copy(Crop);
+    end;
+    SetHint(Hint);
+    Pipeline.PanoramaWindowWidth := Side;
+    Pipeline.PanoramaWindowHeight := Side;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, CanvasWidth, Side, 1, Latents);
+    AssertEquals(Conditioner.ClassName + ': two windows', 2,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    Result := SDTwoWindowCanvasDiff(Latents, Alone[0], Alone[1], WindowCells,
+      StrideCells);
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  ControlNet := TStableDiffusionControlNet.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_controlnet/config.json')));
+  Adapter := TStableDiffusionT2IAdapter.Create(ExtractFileDir(
+    FixturePath('tiny_sd15_t2i_adapter/config.json')));
+  Img2Img := TStableDiffusionImg2Img.Create();
+  Multi := TStableDiffusionMultiConditioner.Create();
+  LatentWindows := TMultiDiffusionWindows.Create();
+  PixelWindows := TMultiDiffusionWindows.Create();
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Crop := TNNetVolume.Create;
+  Hint := TNNetVolume.Create;
+  HintCrop := TNNetVolume.Create;
+  Alone[0] := TNNetVolume.Create;
+  Alone[1] := TNNetVolume.Create;
+  try
+    Pipeline.GuidanceScale := 7.5;
+    Pipeline.PanoramaStride := StrideCells * Pipeline.VaeScaleFactor;
+    Pipeline.EncodePrompt('a tiled stone wall', Embeds);
+    Pipeline.MakeInitialLatents(CanvasWidth, Side, 4, Initial);
+    LatentWindows.Plan(GridW, GridH, WindowCells, WindowCells, StrideCells,
+      StrideCells);
+    PixelWindows.Plan(CanvasWidth, Side, Side, Side, 2 * StrideCells,
+      2 * StrideCells);
+    ControlNet.ConditioningScale := 0.5;
+    MaxDiff := CanvasVsWindowsAlone(ControlNet, 3);
+    AssertTrue('controlnet: windows alone vs canvas max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    Adapter.ConditioningScale := 0.8;
+    MaxDiff := CanvasVsWindowsAlone(Adapter, 1);
+    AssertTrue('t2i-adapter: windows alone vs canvas max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    // Tile upscaling: img2img of the image, the image as the ControlNet hint.
+    FillSDTestPattern(Hint, CanvasWidth, Side, 3);
+    Img2Img.SetImage(Hint);
+    Img2Img.Strength := 0.5;
+    ControlNet.SetControlImage(Hint);
+    Multi.Add(Img2Img);
+    Multi.Add(ControlNet);
+    Pipeline.Conditioner := Multi;
+    Latents.Copy(Initial);
+    Pipeline.Denoise(Embeds, CanvasWidth, Side, 4, Latents);
+    AssertEquals('tile upscale: two windows', 2,
+      Pipeline.ImageStats.PanoramaWindowCount);
+    // 2 of 4 steps at strength 0.5, a CFG pair per window.
+    AssertEquals('tile upscale: passes', 2 * 2 * 2,
+      Pipeline.ImageStats.UNetPassCount);
+    for ValuePos := 0 to Latents.Size - 1 do
+      AssertFalse('finite latents', IsNan(Latents.FData[ValuePos]) or
+        IsInfinite(Latents.FData[ValuePos]));
+  finally
+    Alone[1].Free;
+    Alone[0].Free;
+    HintCrop.Free;
+    Hint.Free;
+    Crop.Free;
+    Latents.Free;
+    Initial.Free;
+    Embeds.Free;
+    PixelWindows.Free;
+    LatentWindows.Free;
+    Pipeline.Free;
+    Multi.Free;
+    Img2Img.Free;
+    Adapter.Free;
+    ControlNet.Free;
   end;
 end;
 

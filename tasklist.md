@@ -659,22 +659,30 @@ rather than acted on.
                 the image with diffusers.
           - [ ] diffusers' upscale pipeline takes a batch of images and
                 num_images_per_prompt; the conditioner takes one image.
-      - [ ] SD tiled upscaling over MultiDiffusion + ControlNet Tile: today only
-            TQwenImage21Pipeline drives `TMultiDiffusionWindows`
-            (neuraldiffusion.pas); TStableDiffusionPipeline denoises one
-            latent window, so img2img above the UNet's trained size costs
-            quadratic attention and loses coherence. Route the SD
-            Denoise / img2img loop through `TMultiDiffusionWindows.Plan` (the
-            same window averaging, no new blending code), so `--panorama WxH`
-            and a new `--tile-upscale N` (bicubic-upscale the input image,
-            img2img at a low strength, per-window CFG) work on SD 1.x / 2.x.
-            Feed each window's matching crop of the upscaled image to
-            BuildControlNetFromSafeTensors as the hint for
-            lllyasviel/control_v11f1e_sd15_tile, and decode with the existing
-            `TiledVaeDecode`. Parity: a one-window canvas must equal plain img2img
-            bit-for-bit; a two-window pico canvas against diffusers
-            StableDiffusionPanoramaPipeline; README section in
-            examples/StableDiffusion.
+      - [ ] SD MultiDiffusion follow-ups (`PanoramaWindowWidth/Height`,
+            `PanoramaStride`, `PanoramaCircular`, `VaeTileSize` over
+            `TMultiDiffusionWindows`; examples/StableDiffusion `--panorama`,
+            `--tile-upscale`, `--controlnet`; covered by
+            TestStableDiffusionPanoramaOneWindowParity / TwoWindows /
+            HintCrop and TestStableDiffusionVaeTiling):
+        - [ ] diffusers StableDiffusionPanoramaPipeline oracle on a two-window
+              pico canvas (needs a new fixture script; ask before adding
+              Python). Same views when the stride divides side - window;
+              diffusers steps the scheduler per view (equal for the linear
+              samplers) and draws ancestral noise per view (here: once per
+              canvas).
+        - [ ] Real SD 1.5 runs on the user's GPU box: a 2048x512 panorama
+              (default stride 64 vs 128 / 256, with and without
+              `--panorama-wrap`) and a 512 -> 1024 / 2048 `--tile-upscale`
+              with lllyasviel/control_v11f1e_sd15_tile (quality, time, peak
+              memory); README outputs.
+        - [ ] Tiled VAE encode: img2img encodes the whole canvas at once,
+              which bounds `--tile-upscale` by the encoder's memory.
+        - [ ] Refused with windows today: DeepCache over several windows (one
+              cache set per window), GLIGEN (boxes in image coordinates mapped
+              per window), Prompt-to-Prompt, DDIM / null-text inversion.
+        - [ ] T2I-Adapter over several windows reruns the adapter per window
+              and step; keep per-window features if it shows in a profile.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
             pooled vector and time ids into SDUNetDenoiseSDXL; scaling 0.13025;
             the pipeline refuses addition_embed_type "text_time" today.

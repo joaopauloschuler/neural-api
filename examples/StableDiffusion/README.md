@@ -997,6 +997,51 @@ window covers a cell and their mean where both do
 and Euler a and checks the refusals). No diffusers panorama oracle and no
 real checkpoint run yet.
 
+## Tile upscaling (`--tile-upscale`)
+
+`--tile-upscale N --init-image PNG` makes an N times larger image with an
+ordinary SD 1.x / 2.x folder, the MultiDiffusion + ControlNet Tile upscaling
+recipe (as in A1111's Tiled Diffusion extension):
+
+1. the image is resized to N times its size with PIL bicubic
+   (`ResizeImagePIL`, sides rounded down to the VAE factor);
+2. image-to-image runs on it at a low `--strength` (default 0.35: the last
+   35% of the steps) over MultiDiffusion windows of `--width` x `--height`
+   (default the checkpoint's size) every half window (`--panorama-stride`
+   overrides it; diffusers' panorama default of 64 pixels would make 625
+   windows of 512x512 on a 2048x2048 canvas), so the UNet repaints the detail
+   at the size it was trained on and the windows agree on the seams;
+3. the canvas is decoded with `TiledVaeDecode` in window-size tiles
+   (`--vae-tile` overrides it).
+
+`--controlnet DIR` with a tile ControlNet such as
+`lllyasviel/control_v11f1e_sd15_tile` (a normal diffusers ControlNet folder,
+`TStableDiffusionControlNet`) takes the upscaled image itself as its hint:
+each window's passes see that window's crop of it, which keeps the repainted
+detail on the image's content, so `--strength` can go higher before the
+picture changes. `--controlnet-scale` sets its conditioning
+scale. The prompt describes the image; a generic one ("best quality, highly
+detailed") also works.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 \
+  --init-image photo_512.png --tile-upscale 2 \
+  --controlnet ~/models/control_v11f1e_sd15_tile --strength 0.5 \
+  --prompt "a photo of a harbour at sunset, highly detailed" --gpu
+```
+
+`--controlnet DIR --control-image PNG` also adds a ControlNet (canny, depth,
+pose, ...) to the other runs, panoramas included: the hint is resized to the
+output size and each window sees its crop.
+
+Tested on the pico folder (`TestStableDiffusionPanoramaHintCrop`): on a 24x16
+canvas of two 16x16 windows, one guided DDIM step with a ControlNet, then
+with a T2I-Adapter, equals each window run alone with its crop of the hint as
+the hint (the mean where the windows overlap), and img2img with a ControlNet
+whose hint is the image runs over the windows. No real checkpoint run yet.
+The VAE encoder runs on the whole upscaled image at once (there is no tiled
+encode yet), which bounds the canvas by the encoder's memory.
+
 ## Usage
 
 ```
@@ -1136,6 +1181,15 @@ StableDiffusion [--model DIR] [options]
                     panorama, diffusers circular_padding)
   --vae-tile N      VAE-decode images larger than N pixels in overlapping N x N tiles
                     (diffusers enable_vae_tiling; default 0 = one decode)
+  --tile-upscale N  upscale --init-image N times (PIL bicubic), then image-to-image
+                    over --width x --height windows every half window (--panorama-stride)
+                    at --strength (default 0.35), VAE-decoded in window-size tiles
+                    (--vae-tile)
+  --controlnet DIR  a diffusers ControlNet folder; under --tile-upscale (e.g.
+                    lllyasviel/control_v11f1e_sd15_tile) its hint is the upscaled image,
+                    each window seeing its own crop; else give --control-image
+  --control-image PNG the --controlnet hint (resized to the output size)
+  --controlnet-scale S ControlNet conditioning scale (default 1.0)
   --int8            UNet and text encoder weights in int8 (default FP32)
   --stats           after each image, a stage table (wall ms; with --gpu also
                     the host<->OpenCL MB of each stage)

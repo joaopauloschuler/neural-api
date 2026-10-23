@@ -83,6 +83,12 @@ WxH canvas every --panorama-stride pixels (default 64, diffusers' 8 latent
 cells), averages the predictions where windows overlap and steps the whole
 canvas once; --panorama-wrap wraps the windows in X for a 360-degree panorama.
 --vae-tile N decodes in N-pixel tiles (diffusers enable_vae_tiling).
+--tile-upscale N --init-image PNG upscales the image N times: PIL bicubic to N
+times its size, then image-to-image at a low --strength (default 0.35) over
+--panorama windows every half window, decoded with --vae-tile; --controlnet DIR
+(a ControlNet folder such as lllyasviel/control_v11f1e_sd15_tile) takes the
+upscaled image as its hint, each window its own crop of it. --controlnet DIR
+--control-image PNG adds a ControlNet to any other run.
 --edit-prompt TEXT runs Prompt-to-Prompt (Hertz et al. 2022, the
 google/prompt-to-prompt controllers): the prompt and the edit prompt sample
 together from one latent with DDIM, and the edit takes the prompt's
@@ -105,7 +111,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuraldatasets, neuraldiffusion,
-  neuralpretrained;
+  neuralimageresize, neuralpretrained;
 
 const
   PicoModelFolder = '../../tests/fixtures/tiny_sd15';
@@ -213,6 +219,12 @@ type
     PanoramaWrap: boolean;
     // --vae-tile pixels (0: one decode).
     VaeTileSize: integer;
+    // --tile-upscale factor (0: off).
+    TileUpscale: double;
+    // --controlnet folder ('' for none), --control-image ('' under
+    // --tile-upscale: the upscaled image) and --controlnet-scale.
+    ControlNetFolder, ControlImageFile: string;
+    ControlNetScale: double;
   end;
 
   // Prints the pipeline's stages and steps as they run.
@@ -527,6 +539,22 @@ begin
     'overlapping N x N tiles');
   WriteLn('                    (diffusers enable_vae_tiling; default 0 = one ',
     'decode)');
+  WriteLn('  --tile-upscale N  upscale --init-image N times (PIL bicubic), then ',
+    'image-to-image');
+  WriteLn('                    over --width x --height windows every half ',
+    'window (--panorama-stride)');
+  WriteLn('                    at --strength (default 0.35), VAE-decoded in ',
+    'window-size tiles');
+  WriteLn('                    (--vae-tile)');
+  WriteLn('  --controlnet DIR  a diffusers ControlNet folder; under ',
+    '--tile-upscale (e.g.');
+  WriteLn('                    lllyasviel/control_v11f1e_sd15_tile) its hint is ',
+    'the upscaled image,');
+  WriteLn('                    each window seeing its own crop; else give ',
+    '--control-image');
+  WriteLn('  --control-image PNG the --controlnet hint (resized to the output ',
+    'size)');
+  WriteLn('  --controlnet-scale S ControlNet conditioning scale (default 1.0)');
   WriteLn('  --int8            UNet and text encoder weights in int8 ',
     '(default FP32)');
   WriteLn('  --stats           after each image, a stage table (wall ms; ',
@@ -732,6 +760,10 @@ begin
   Opt.PanoramaStride := 0;
   Opt.PanoramaWrap := false;
   Opt.VaeTileSize := 0;
+  Opt.TileUpscale := 0;
+  Opt.ControlNetFolder := '';
+  Opt.ControlImageFile := '';
+  Opt.ControlNetScale := 1.0;
   SetLength(Opt.Embeddings, 0);
   Result := true;
   ArgPos := 1;
@@ -849,6 +881,12 @@ begin
       Opt.PanoramaStride := StrToInt(NextArg())
     else if Arg = '--panorama-wrap' then Opt.PanoramaWrap := true
     else if Arg = '--vae-tile' then Opt.VaeTileSize := StrToInt(NextArg())
+    else if Arg = '--tile-upscale' then
+      Opt.TileUpscale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--controlnet' then Opt.ControlNetFolder := NextArg()
+    else if Arg = '--control-image' then Opt.ControlImageFile := NextArg()
+    else if Arg = '--controlnet-scale' then
+      Opt.ControlNetScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--no-prompt-weighting' then Opt.UsePromptWeighting := false
     else if Arg = '--max-prompt-chunks' then
       Opt.MaxPromptChunkCount := StrToInt(NextArg())
@@ -895,6 +933,24 @@ begin
     (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '')) then
     raise Exception.Create('--gligen-inpaint-image cannot be combined with ' +
       '--init-image, --edit-image or --upscale-image');
+  if (Opt.TileUpscale <> 0) and (Opt.TileUpscale < 1) then
+    raise Exception.Create('--tile-upscale must be >= 1');
+  if (Opt.TileUpscale > 0) and ((Opt.InitImageFile = '') or
+    (Opt.DepthImageFile <> '') or (Opt.PanoramaWidth > 0)) then
+    raise Exception.Create('--tile-upscale upscales --init-image (no ' +
+      '--depth-image) and sets the canvas itself; drop --panorama');
+  if (Opt.ControlNetFolder = '') and ((Opt.ControlImageFile <> '') or
+    (Opt.ControlNetScale <> 1.0)) then
+    raise Exception.Create('--control-image and --controlnet-scale need ' +
+      '--controlnet');
+  if (Opt.ControlNetFolder <> '') and (Opt.ControlImageFile = '') and
+    (Opt.TileUpscale = 0) then
+    raise Exception.Create('--controlnet needs --control-image (or ' +
+      '--tile-upscale, whose hint is the upscaled image)');
+  if (Opt.ControlNetFolder <> '') and ((Opt.EditPrompt <> '') or
+    (Opt.InvertImageFile <> '') or (Opt.RelightImageFile <> '')) then
+    raise Exception.Create('--controlnet cannot be combined with ' +
+      '--edit-prompt, --invert-image or --relight');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') and
     (Opt.RelightImageFile = '') then
     raise Exception.Create('--strength needs --init-image or --relight');
@@ -999,13 +1055,14 @@ begin
     raise Exception.Create('--vae-tile must be >= 0');
   // The windows share one latent canvas and one sampler; these keep a
   // second track, a per-pass cache or image coordinates.
-  if (Opt.PanoramaWidth > 0) and ((Opt.EditPrompt <> '') or
+  if ((Opt.PanoramaWidth > 0) or (Opt.TileUpscale > 0)) and
+    ((Opt.EditPrompt <> '') or
     (Opt.InvertImageFile <> '') or (Opt.GLIGENFile <> '') or
     (Opt.DeepCacheInterval > 1) or (Opt.UpscaleImageFile <> '') or
     (Opt.RelightImageFile <> '')) then
-    raise Exception.Create('--panorama cannot be combined with ' +
-      '--edit-prompt, --invert-image, --gligen, --deepcache, --upscale-image ' +
-      'or --relight');
+    raise Exception.Create('--panorama and --tile-upscale cannot be combined ' +
+      'with --edit-prompt, --invert-image, --gligen, --deepcache, ' +
+      '--upscale-image or --relight');
 end;
 
 // Splits an --embedding value at its last ':' unless that is a drive letter's
@@ -1057,6 +1114,7 @@ var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
   IPAdapter: TStableDiffusionIPAdapter;
+  ControlNet: TStableDiffusionControlNet;
   GLIGEN: TStableDiffusionGLIGEN;
   Multi: TStableDiffusionMultiConditioner;
   Img2Img: TStableDiffusionImg2Img;
@@ -1091,7 +1149,9 @@ var
   EditImageFile: string;
   WordPos: integer;
   IsDepthUNet, IsUpscalerUNet: boolean;
-  WindowWidth, WindowHeight, PanoramaStride: integer;
+  WindowWidth, WindowHeight, PanoramaStride, CanvasWidth, CanvasHeight,
+    SourceWidth, SourceHeight: integer;
+  UpscaledImage: TNNetVolume;
   PanoramaText: string;
   GuidanceScale: double;
   Seed: cardinal;
@@ -1125,6 +1185,7 @@ begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
   IPAdapter := nil;
+  ControlNet := nil;
   GLIGEN := nil;
   Multi := nil;
   Img2Img := nil;
@@ -1142,6 +1203,9 @@ begin
   EditEmbeds := TNNetVolume.Create;
   EditedImage := TNNetVolume.Create;
   NegativeEmbeds := TNNetVolume.Create;
+  UpscaledImage := TNNetVolume.Create;
+  SourceWidth := 0;
+  SourceHeight := 0;
   try
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
@@ -1185,7 +1249,9 @@ begin
       Img2Img := TStableDiffusionImg2Img.Create();
     if Assigned(Img2Img) then
     begin
-      if Opt.Strength >= 0 then Img2Img.Strength := Opt.Strength;
+      if Opt.Strength >= 0 then Img2Img.Strength := Opt.Strength
+      // Tile upscaling keeps the image and repaints its detail.
+      else if Opt.TileUpscale > 0 then Img2Img.Strength := 0.35;
       ImageConditioner := Img2Img;
       SourceImageFile := Opt.InitImageFile;
     end
@@ -1247,6 +1313,21 @@ begin
     begin
       if not LoadImageFromFileIntoVolume(SourceImageFile, Image) then
         raise Exception.Create('could not load ' + SourceImageFile);
+      if Opt.TileUpscale > 0 then
+      begin
+        // PIL bicubic to N times the size, sides down to the VAE factor.
+        SourceWidth := Image.SizeX;
+        SourceHeight := Image.SizeY;
+        CanvasWidth := Trunc(SourceWidth * Opt.TileUpscale);
+        CanvasHeight := Trunc(SourceHeight * Opt.TileUpscale);
+        CanvasWidth := CanvasWidth - CanvasWidth mod Pipeline.VaeScaleFactor;
+        CanvasHeight := CanvasHeight - CanvasHeight mod Pipeline.VaeScaleFactor;
+        if (CanvasWidth < 1) or (CanvasHeight < 1) then
+          raise Exception.Create('--tile-upscale: the image is too small');
+        ResizeImagePIL(Image, UpscaledImage, CanvasWidth, CanvasHeight,
+          irfBicubic);
+        Image.Copy(UpscaledImage);
+      end;
       ImageConditioner.SetImage(Image);
       ImageConditioner.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth,
         ImageHeight);
@@ -1265,7 +1346,7 @@ begin
     if Opt.EditPrompt <> '' then Pipeline.Sampler := smDDIM;
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
-    if Opt.PanoramaWidth > 0 then
+    if (Opt.PanoramaWidth > 0) or (Opt.TileUpscale > 0) then
     begin
       // --width x --height (default the checkpoint's) are the windows.
       if Opt.ImageWidth >= 1 then WindowWidth := Opt.ImageWidth
@@ -1276,10 +1357,27 @@ begin
       Pipeline.PanoramaWindowHeight := WindowHeight;
       Pipeline.PanoramaStride := Opt.PanoramaStride;
       Pipeline.PanoramaCircular := Opt.PanoramaWrap;
-      ImageWidth := Opt.PanoramaWidth;
-      ImageHeight := Opt.PanoramaHeight;
+      if Opt.TileUpscale > 0 then
+      begin
+        // diffusers' 8-cell stride over a 4x canvas is hundreds of windows;
+        // half a window keeps the seams overlapped at a quarter of the passes.
+        if Opt.PanoramaStride = 0 then
+          Pipeline.PanoramaStride := Max(Pipeline.VaeScaleFactor,
+            (Min(WindowWidth, WindowHeight) div 2) -
+            (Min(WindowWidth, WindowHeight) div 2) mod Pipeline.VaeScaleFactor);
+        ImageWidth := UpscaledImage.SizeX;
+        ImageHeight := UpscaledImage.SizeY;
+      end
+      else
+      begin
+        ImageWidth := Opt.PanoramaWidth;
+        ImageHeight := Opt.PanoramaHeight;
+      end;
     end;
     Pipeline.VaeTileSize := Opt.VaeTileSize;
+    if (Opt.TileUpscale > 0) and (Opt.VaeTileSize = 0) then
+      Pipeline.VaeTileSize := Min(Pipeline.PanoramaWindowWidth,
+        Pipeline.PanoramaWindowHeight);
     if Opt.SamplerName <> 'auto' then
       Pipeline.SelectSampler(
         SamplerOptionMethods[SamplerOptionIndex(Opt.SamplerName)],
@@ -1404,18 +1502,23 @@ begin
     if Opt.SAGScale > 0 then
       WriteLn(Format('SAG:      scale %.2f, mid-block self-attention mask',
         [Opt.SAGScale]));
-    if Opt.PanoramaWidth > 0 then
+    if Opt.TileUpscale > 0 then
+      WriteLn(Format('Tile upscale: %s %dx%d x %g -> %dx%d (PIL bicubic)',
+        [Opt.InitImageFile, SourceWidth, SourceHeight, Opt.TileUpscale,
+         ImageWidth, ImageHeight]));
+    if (Opt.PanoramaWidth > 0) or (Opt.TileUpscale > 0) then
     begin
       PanoramaText := '';
       if Opt.PanoramaWrap then PanoramaText := ', wrapping in X';
-      PanoramaStride := Opt.PanoramaStride;
+      PanoramaStride := Pipeline.PanoramaStride;
       if PanoramaStride = 0 then PanoramaStride := 8 * Pipeline.VaeScaleFactor;
       WriteLn(Format('Panorama: %dx%d windows every %d pixels%s',
         [Pipeline.PanoramaWindowWidth, Pipeline.PanoramaWindowHeight,
          PanoramaStride, PanoramaText]));
     end;
-    if Opt.VaeTileSize > 0 then
-      WriteLn(Format('VAE:      decoded in %d-pixel tiles', [Opt.VaeTileSize]));
+    if Pipeline.VaeTileSize > 0 then
+      WriteLn(Format('VAE:      decoded in %d-pixel tiles',
+        [Pipeline.VaeTileSize]));
     for EmbeddingPos := 0 to High(Opt.Embeddings) do
     begin
       SplitEmbeddingSpec(Opt.Embeddings[EmbeddingPos], EmbeddingFile,
@@ -1558,19 +1661,43 @@ begin
           Image.SizeY]));
       end;
     end;
-    if Assigned(IPAdapter) or Assigned(GLIGEN) then
+    if Opt.ControlNetFolder <> '' then
+    begin
+      ControlNet := TStableDiffusionControlNet.Create(Opt.ControlNetFolder);
+      // Tile upscaling: the hint is the upscaled image itself; each window's
+      // passes see its own crop of it.
+      if Opt.ControlImageFile <> '' then
+      begin
+        if not LoadImageFromFileIntoVolume(Opt.ControlImageFile, Image) then
+          raise Exception.Create('could not load ' + Opt.ControlImageFile);
+        ControlNet.SetControlImage(Image);
+        WriteLn(Format('ControlNet: %s, hint %s (%dx%d), scale %.2f',
+          [Opt.ControlNetFolder, Opt.ControlImageFile, Image.SizeX,
+           Image.SizeY, Opt.ControlNetScale]));
+      end
+      else
+      begin
+        ControlNet.SetControlImage(UpscaledImage);
+        WriteLn(Format('ControlNet: %s, hint the upscaled image, scale %.2f',
+          [Opt.ControlNetFolder, Opt.ControlNetScale]));
+      end;
+      ControlNet.ConditioningScale := Opt.ControlNetScale;
+    end;
+    if Assigned(IPAdapter) or Assigned(GLIGEN) or Assigned(ControlNet) then
     begin
       if Ord(Assigned(ImageConditioner)) + Ord(Assigned(IPAdapter)) +
-        Ord(Assigned(GLIGEN)) > 1 then
+        Ord(Assigned(GLIGEN)) + Ord(Assigned(ControlNet)) > 1 then
       begin
         Multi := TStableDiffusionMultiConditioner.Create();
         if Assigned(ImageConditioner) then Multi.Add(ImageConditioner);
         if Assigned(IPAdapter) then Multi.Add(IPAdapter);
         if Assigned(GLIGEN) then Multi.Add(GLIGEN);
+        if Assigned(ControlNet) then Multi.Add(ControlNet);
         Pipeline.Conditioner := Multi;
       end
       else if Assigned(IPAdapter) then Pipeline.Conditioner := IPAdapter
-      else Pipeline.Conditioner := GLIGEN;
+      else if Assigned(GLIGEN) then Pipeline.Conditioner := GLIGEN
+      else Pipeline.Conditioner := ControlNet;
     end;
     if Opt.RepeatCount > 1 then
     begin
@@ -1578,7 +1705,7 @@ begin
         'keep them in memory.');
       StartTime := Now();
       // The UNet runs at the window size; the VAE builds for the image later.
-      if Opt.PanoramaWidth > 0 then
+      if Pipeline.PanoramaWindowWidth > 0 then
         Pipeline.LoadComponents(Pipeline.PanoramaWindowWidth,
           Pipeline.PanoramaWindowHeight)
       else Pipeline.LoadComponents(ImageWidth, ImageHeight);
@@ -1666,6 +1793,7 @@ begin
       {$POP}
     end;
   finally
+    UpscaledImage.Free;
     NegativeEmbeds.Free;
     EditedImage.Free;
     EditEmbeds.Free;
@@ -1678,6 +1806,7 @@ begin
     Pipeline.Free;
     Multi.Free;
     GLIGEN.Free;
+    ControlNet.Free;
     IPAdapter.Free;
     ImageConditioner.Free;
     Reporter.Free;
