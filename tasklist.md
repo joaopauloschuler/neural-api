@@ -832,21 +832,20 @@ rather than acted on.
             strict both ways) under the LoRA chain of
             `BuildSDUNetFromSafeTensorsEx(..., OffsetFile)`;
             `SDUNetOffsetInChannels`; `TStableDiffusionPipeline.UNetOffsetFile`.
-      - (b) `TStableDiffusionICLight` conditioner (subclass of
-            `TStableDiffusionImageConditioner`): foreground composited on gray
-            127 with the matte alpha, VAE-encoded with the latent-dist MODE
-            times the scaling factor, concatenated in depth at every step (fc:
-            foreground; fbc: foreground | background latents). Light direction
-            left/right/top/bottom = a 255->0 gradient image used as the
-            img2img init at strength 0.9 (steps / strength rounded), none = txt2img.
-      - (c) The reference's highres pass: decode, resize by 1.5 to multiples
-            of 64, re-encode, img2img at strength 0.5 with the same concat.
+      - [X] (b) `TStableDiffusionICLight` (a `TStableDiffusionImg2Img`):
+            RGBA cut-out or RGB + `SetMatte`, `SetBackground` (fbc),
+            `LightDirection` gradient start at `Strength` 0.9,
+            `ICLightStepCount`; concat on every pass, both CFG branches.
+      - [X] (c) `TStableDiffusionICLight.Relight`: low-res pass, then decode,
+            `ICLightHighResSide` (x1.5, multiple of 64), `EncodeInitImage`,
+            img2img at `HighResStrength` 0.5 with the concat re-encoded.
       - [X] (d) Sampler: `TNNetDiffusionScheduler.DPMSolverAlgorithm =
             dpaSDEDPMSolverPP` (diffusers `sde-dpmsolver++`, read from
             `algorithm_type`), `--sampler dpm++2m-sde`; TestSDEDPMSolverVsDiffusers.
-      - (e) Pico-fixture parity vs diffusers + the reference hook in the ~/x
-            venv (offset merge DONE: TestICLightOffsetMerge; 8-channel UNet
-            input, one denoise step),
+      - (e) [X] Pico-fixture parity vs diffusers + the reference hook
+            (TestICLightOffsetMerge, TestStableDiffusionICLightParity,
+            TestStableDiffusionICLightBackgroundParity,
+            TestStableDiffusionICLightHighRes, numbers hardcoded);
             then `--relight` / `--light left|right|top|bottom` /
             `--relight-background FILE` in examples/StableDiffusion and its
             README. The reference mattes with `briaai/RMBG-1.4` (IS-Net, not

@@ -206,6 +206,10 @@ type
     procedure CheckICLightPicks(const What: string; Volume: TNNetVolume;
       const Positions: array of integer; const Expected: array of double;
       ExpectedSum, ExpectedSumSq: double);
+    // The IC-Light parity inputs: 20x14 foreground and matte, 16x16
+    // background, (8, 8, 4) noise.
+    procedure FillICLightImages(Foreground, Matte, Background,
+      Noise: TNNetVolume);
     // Max |diff| of the pico DDColor (weights WeightsFile) vs its float64 torch
     // a*b*; with pRoundTrip a save/load copy must reproduce the output exactly.
     function DDColorParityMaxDiff(const WeightsFile: string;
@@ -1447,6 +1451,9 @@ type
     procedure TestSDUNetTimeCondProjDimParity;
     procedure TestStableDiffusionInstructPix2PixParity;
     procedure TestICLightOffsetMerge;
+    procedure TestStableDiffusionICLightParity;
+    procedure TestStableDiffusionICLightBackgroundParity;
+    procedure TestStableDiffusionICLightHighRes;
     procedure TestStableDiffusionTextualInversionTokens;
     procedure TestStableDiffusionTextualInversionEmbeds;
     procedure TestStableDiffusionTextualInversionRejects;
@@ -49764,6 +49771,36 @@ begin
     1e-3 + 1e-5 * ExpectedSumSq);
 end;
 
+procedure TTestNeuralPretrained.FillICLightImages(Foreground, Matte,
+  Background, Noise: TNNetVolume);
+var
+  X, Y, Channel: integer;
+begin
+  Foreground.ReSize(20, 14, 3);
+  Matte.ReSize(20, 14, 1);
+  for Y := 0 to 13 do
+    for X := 0 to 19 do
+    begin
+      Foreground[X, Y, 0] := (X * 13 + Y * 7) mod 256;
+      Foreground[X, Y, 1] := (X * 5 + Y * 17 + 40) mod 256;
+      Foreground[X, Y, 2] := (X * 11 + Y * 3 + 90) mod 256;
+      Matte[X, Y, 0] := Min(255, (X + Y) * 17);
+    end;
+  Background.ReSize(16, 16, 3);
+  for Y := 0 to 15 do
+    for X := 0 to 15 do
+    begin
+      Background[X, Y, 0] := (X * 3 + Y * 19 + 10) mod 256;
+      Background[X, Y, 1] := (X * 23 + Y * 2) mod 256;
+      Background[X, Y, 2] := (X * 9 + Y * 9 + 200) mod 256;
+    end;
+  Noise.ReSize(8, 8, 4);
+  for Y := 0 to 7 do
+    for X := 0 to 7 do
+      for Channel := 0 to 3 do
+        Noise[X, Y, Channel] := ((Channel * 11 + Y * 5 + X * 7) mod 23 - 11) / 6;
+end;
+
 // TNNetOffsetMergeReader and BuildSDUNetFromSafeTensorsEx(OffsetFile) vs the
 // IC-Light gradio_demo.py merge (conv_in widened to 8 with zeros, then
 // sd_origin + sd_offset) on tiny_sd15: the merged conv_in and one forward of
@@ -49857,6 +49894,238 @@ begin
     Weights.Free;
     Net.Free;
     DeleteFile(PartialFile);
+    DeleteFile(OffsetFile);
+  end;
+end;
+
+// TStableDiffusionICLight on tiny_sd15 with an fc offset vs diffusers float64
+// and the gradio_demo.py UNet hook (concat on both CFG passes, guidance 2,
+// DDIM): the foreground latents (matte composite on gray 127, cover-resize and
+// crop of a 20x14 image), the left-light start latents and the first step at
+// strength 0.9 over ICLightStepCount(9, 0.9) = 10 steps, then txt2img.
+procedure TTestNeuralPretrained.TestStableDiffusionICLightParity;
+const
+  cPicks: array[0..17] of integer = (0, 0, 0, 1, 2, 3, 2, 5, 1, 3, 7, 7,
+    0, 4, 6, 3, 1, 2);
+var
+  OffsetFile: string;
+  Pipeline: TStableDiffusionPipeline;
+  ICLight: TStableDiffusionICLight;
+  Foreground, Matte, Background, Noise, Embeds, Latents, RGBA,
+    FirstConcat: TNNetVolume;
+  X, Y, Channel: integer;
+begin
+  OffsetFile := WriteICLightOffsetFile(8);
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  ICLight := TStableDiffusionICLight.Create();
+  Foreground := TNNetVolume.Create;
+  Matte := TNNetVolume.Create;
+  Background := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  RGBA := TNNetVolume.Create;
+  FirstConcat := TNNetVolume.Create;
+  FSDFirstStepLatents := TNNetVolume.Create;
+  try
+    AssertEquals('ICLightStepCount', 10, ICLightStepCount(9, 0.9));
+    AssertEquals('reference default steps at 0.9', 28, ICLightStepCount(25, 0.9));
+    FillICLightImages(Foreground, Matte, Background, Noise);
+    Pipeline.Conditioner := ICLight;
+    Pipeline.GuidanceScale := 2;
+    Pipeline.EncodePrompt('a red cube', Embeds);
+    // The 4-channel unet refuses the conditioner.
+    ICLight.SetImage(Foreground);
+    AssertFalse('4-channel unet', ICLight.AcceptsUNetInChannels(
+      Pipeline.UNetConfig.InChannels, 4));
+    Pipeline.UNetOffsetFile := OffsetFile;
+    AssertEquals('offset in_channels', 8, Pipeline.UNetConfig.InChannels);
+    ICLight.SetMatte(Matte);
+    ICLight.LightDirection := sdlLeft;
+    Pipeline.OnStep := @SDCaptureFirstStep;
+    Latents.Copy(Noise);
+    Pipeline.Denoise(Embeds, 16, 16, ICLightStepCount(9, ICLight.Strength),
+      Latents);
+    AssertEquals('img2img passes', 2 * 9, Pipeline.ImageStats.UNetPassCount);
+    CheckICLightPicks('foreground latents', ICLight.ConcatLatents, cPicks,
+      [-0.00847897624, -0.00351400741, -0.0441017148, 0.0247327881,
+      0.0340011403, 0.00683078968], 2.92812723, 0.615519193);
+    CheckICLightPicks('left light latents', ICLight.StartLatents, cPicks,
+      [-0.0222996682, -0.0836227382, -0.000518815918, 0.0140410962,
+      0.0916068318, 0.122413262], 4.00484063, 0.787020288);
+    CheckICLightPicks('light first step', FSDFirstStepLatents, cPicks,
+      [-2.55831512, 1.67223824, -0.709051172, -2.19405241, 1.47025467,
+      -1.23680987], 18.5378256, 701.194656);
+    FirstConcat.Copy(ICLight.ConcatLatents);
+    // No light: txt2img from the noise, 3 steps.
+    ICLight.LightDirection := sdlNone;
+    Latents.Copy(Noise);
+    Pipeline.Denoise(Embeds, 16, 16, 3, Latents);
+    AssertEquals('txt2img passes', 2 * 3, Pipeline.ImageStats.UNetPassCount);
+    AssertEquals('no start latents', 0, ICLight.StartLatents.Size);
+    CheckICLightPicks('txt2img first step', FSDFirstStepLatents, cPicks,
+      [-3.70109746, 2.28833417, -1.02879815, -3.33327422, 2.59602321,
+      -2.06868472], 52.3829053, 1772.21557);
+    // An RGBA cut-out composites as RGB plus the same matte.
+    RGBA.ReSize(Foreground.SizeX, Foreground.SizeY, 4);
+    for Y := 0 to Foreground.SizeY - 1 do
+      for X := 0 to Foreground.SizeX - 1 do
+      begin
+        for Channel := 0 to 2 do
+          RGBA[X, Y, Channel] := Foreground[X, Y, Channel];
+        RGBA[X, Y, 3] := Matte[X, Y, 0];
+      end;
+    ICLight.SetImage(RGBA);
+    ICLight.SetMatte(nil);
+    Latents.Copy(Noise);
+    Pipeline.Denoise(Embeds, 16, 16, 1, Latents);
+    AssertEquals('RGBA foreground latents', 0,
+      MaxAbsVolumeDiff(FirstConcat, ICLight.ConcatLatents), 1e-7);
+  finally
+    FreeAndNil(FSDFirstStepLatents);
+    FirstConcat.Free;
+    RGBA.Free;
+    Latents.Free;
+    Embeds.Free;
+    Noise.Free;
+    Background.Free;
+    Matte.Free;
+    Foreground.Free;
+    ICLight.Free;
+    Pipeline.Free;
+    DeleteFile(OffsetFile);
+  end;
+end;
+
+// fbc (gradio_demo_bg.py): a 12-channel offset UNet sees latents | foreground
+// | background latents; the background latents and the first txt2img step vs
+// diffusers float64 with the reference hook.
+procedure TTestNeuralPretrained.TestStableDiffusionICLightBackgroundParity;
+const
+  cPicks: array[0..17] of integer = (0, 0, 0, 1, 2, 3, 2, 5, 1, 3, 7, 7,
+    0, 4, 6, 3, 1, 2);
+var
+  OffsetFile: string;
+  Pipeline: TStableDiffusionPipeline;
+  ICLight: TStableDiffusionICLight;
+  Foreground, Matte, Background, Noise, Embeds, Latents,
+    BackgroundLatents: TNNetVolume;
+begin
+  OffsetFile := WriteICLightOffsetFile(12);
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  ICLight := TStableDiffusionICLight.Create();
+  Foreground := TNNetVolume.Create;
+  Matte := TNNetVolume.Create;
+  Background := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  BackgroundLatents := TNNetVolume.Create;
+  FSDFirstStepLatents := TNNetVolume.Create;
+  try
+    FillICLightImages(Foreground, Matte, Background, Noise);
+    Pipeline.UNetOffsetFile := OffsetFile;
+    AssertEquals('fbc in_channels', 12, Pipeline.UNetConfig.InChannels);
+    Pipeline.Conditioner := ICLight;
+    Pipeline.GuidanceScale := 2;
+    Pipeline.EncodePrompt('a red cube', Embeds);
+    ICLight.SetImage(Foreground);
+    ICLight.SetMatte(Matte);
+    AssertFalse('fc conditioner on an fbc unet',
+      ICLight.AcceptsUNetInChannels(12, 4));
+    ICLight.SetBackground(Background);
+    AssertTrue('fbc', ICLight.AcceptsUNetInChannels(12, 4));
+    Pipeline.OnStep := @SDCaptureFirstStep;
+    Latents.Copy(Noise);
+    Pipeline.Denoise(Embeds, 16, 16, 3, Latents);
+    AssertEquals('concat depth', 8, ICLight.ConcatLatents.Depth);
+    BackgroundLatents.CopyChannels(ICLight.ConcatLatents, [4, 5, 6, 7]);
+    CheckICLightPicks('background latents', BackgroundLatents, cPicks,
+      [0.000166640142, -0.10094306, 0.0034150281, -0.0117434733,
+      0.0218523941, 0.0324448167], 2.25123687, 0.585030381);
+    CheckICLightPicks('fbc first step', FSDFirstStepLatents, cPicks,
+      [-3.72179721, 2.27259159, -1.07743379, -3.44826752, 2.3946953,
+      -2.03282263], 52.5130851, 1768.88587);
+    // Clearing the offset restores the 4-channel unet.
+    Pipeline.UNetOffsetFile := '';
+    AssertEquals('base in_channels', 4, Pipeline.UNetConfig.InChannels);
+  finally
+    FreeAndNil(FSDFirstStepLatents);
+    BackgroundLatents.Free;
+    Latents.Free;
+    Embeds.Free;
+    Noise.Free;
+    Background.Free;
+    Matte.Free;
+    Foreground.Free;
+    ICLight.Free;
+    Pipeline.Free;
+    DeleteFile(OffsetFile);
+  end;
+end;
+
+// The highres pass: ICLightHighResSide as the reference rounds it,
+// EncodeInitImage (Lanczos byte resize without crop, / 127 - 1, latent mode)
+// vs diffusers float64, then a whole Relight at 48x48 -> 64x64.
+procedure TTestNeuralPretrained.TestStableDiffusionICLightHighRes;
+const
+  cPicks: array[0..17] of integer = (0, 0, 0, 1, 2, 3, 2, 5, 1, 3, 9, 11,
+    0, 4, 6, 3, 1, 2);
+var
+  OffsetFile: string;
+  Pipeline: TStableDiffusionPipeline;
+  ICLight: TStableDiffusionICLight;
+  Foreground, Matte, Background, Noise, Embeds, Image: TNNetVolume;
+begin
+  AssertEquals('48 * 1.5', 64, ICLightHighResSide(48, 1.5, 64));
+  AssertEquals('512 * 1.5', 768, ICLightHighResSide(512, 1.5, 64));
+  AssertEquals('640 * 1.5', 960, ICLightHighResSide(640, 1.5, 64));
+  AssertEquals('40 * 1.5', 64, ICLightHighResSide(40, 1.5, 64));
+  AssertEquals('104 * 1.5', 128, ICLightHighResSide(104, 1.5, 64));
+  AssertEquals('highres steps', 50, ICLightStepCount(25, 0.5));
+  OffsetFile := WriteICLightOffsetFile(8);
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  ICLight := TStableDiffusionICLight.Create();
+  Foreground := TNNetVolume.Create;
+  Matte := TNNetVolume.Create;
+  Background := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    FillICLightImages(Foreground, Matte, Background, Noise);
+    ICLight.EncodeInitImage(Pipeline, Background, 24, 20);
+    AssertEquals('init grid x', 12, ICLight.InitLatents.SizeX);
+    AssertEquals('init grid y', 10, ICLight.InitLatents.SizeY);
+    CheckICLightPicks('highres init latents', ICLight.InitLatents, cPicks,
+      [-0.000846983612, -0.0650652871, 0.0315996552, 0.00241632325,
+      0.0408501556, 0.0291074844], 4.70183112, 1.06302712);
+    ICLight.SetInitLatents(nil);
+    Pipeline.UNetOffsetFile := OffsetFile;
+    Pipeline.GuidanceScale := 2;
+    Pipeline.EncodePrompt('a red cube', Embeds);
+    ICLight.SetImage(Foreground);
+    ICLight.SetMatte(Matte);
+    ICLight.LightDirection := sdlTop;
+    ICLight.Relight(Pipeline, Embeds, 48, 48, 2, 7, Image);
+    AssertEquals('highres width', 64, Image.SizeX);
+    AssertEquals('highres height', 64, Image.SizeY);
+    AssertEquals('channels', 3, Image.Depth);
+    AssertTrue('in [0, 1]', (Image.GetMin() >= 0) and (Image.GetMax() <= 1));
+    // ICLightStepCount(2, 0.5) = 4 steps at 0.5: 2 guided steps.
+    AssertEquals('highres passes', 2 * 2, Pipeline.ImageStats.UNetPassCount);
+    AssertTrue('conditioner restored', Pipeline.Conditioner = nil);
+    AssertEquals('init latents cleared', 0, ICLight.InitLatents.Size);
+    AssertEquals('strength restored', 0.9, ICLight.Strength, 1e-12);
+  finally
+    Image.Free;
+    Embeds.Free;
+    Noise.Free;
+    Background.Free;
+    Matte.Free;
+    Foreground.Free;
+    ICLight.Free;
+    Pipeline.Free;
     DeleteFile(OffsetFile);
   end;
 end;

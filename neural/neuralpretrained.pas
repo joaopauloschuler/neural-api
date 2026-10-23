@@ -13204,6 +13204,12 @@ procedure DiffusersMaskToLatentGrid(BinaryMask: TNNetVolume;
 // GridY, 1), torch bicubic resize then 2 * (d - min) / (max - min) - 1.
 procedure DiffusersDepthToLatentGrid(Depth: TNNetVolume; GridX, GridY: integer;
   DepthLatents: TNNetVolume);
+// IC-Light's img2img step count: int(round(StepCount / Strength)), so that
+// about StepCount steps run at Strength.
+function ICLightStepCount(StepCount: integer; Strength: double): integer;
+// IC-Light's highres side: int(round(Side * Scale / Multiple)) * Multiple.
+function ICLightHighResSide(Side: integer; Scale: double;
+  Multiple: integer): integer;
 
 type
   // diffusers StableDiffusionControlNetPipeline: a ControlNetModel folder
@@ -13405,6 +13411,77 @@ type
     // diffusers image_guidance_scale (1.5): the pull toward the input image.
     property ImageGuidanceScale: TNeuralFloat read FImageGuidanceScale
       write FImageGuidanceScale;
+  end;
+
+  // IC-Light's light direction (gradio_demo.py BGSource): a 255 -> 0 gradient
+  // from that side is the image the steps start from; sdlNone runs txt2img.
+  TSDLightDirection = (sdlNone, sdlLeft, sdlRight, sdlTop, sdlBottom);
+
+  // IC-Light relighting (lllyasviel/IC-Light gradio_demo.py; with SetBackground
+  // gradio_demo_bg.py) on a UNet with Pipeline.UNetOffsetFile: every pass sees
+  // latents | foreground (| background) latents, each image's VAE latent mode
+  // times scaling_factor at v / 127 - 1. Coded by Claude (AI).
+  TStableDiffusionICLight = class(TStableDiffusionImg2Img)
+  private
+    FMatte, FBackground: TNNetVolume;
+    FConcatLatents, FInitLatents: TNNetVolume;
+    FHasInitLatents: boolean;
+    FLightDirection: TSDLightDirection;
+    FHighResScale, FHighResStrength: double;
+    FHighResMultiple: integer;
+    procedure SetHighResStrength(Value: double);
+  protected
+    // The foreground on gray 127 by its matte, resize_and_center_crop, / 127 - 1.
+    procedure ResizeSourceImage(Latents, VaeImage: TNNetVolume); override;
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+  public
+    constructor Create();
+    destructor Destroy(); override;
+    // The foreground (SetImage) is an RGBA cut-out, or RGB with this matte
+    // (W, H, 1) in 0..255, or (neither) RGB already on gray 127. nil clears.
+    procedure SetMatte(Matte: TNNetVolume);
+    // The background image (W, H, 3|4) in 0..255 of an fbc UNet; nil clears.
+    procedure SetBackground(Background: TNNetVolume);
+    // Latents (grid, latent channels) the steps start from, ahead of the light
+    // direction (diffusers img2img given 4-channel latents); nil clears.
+    procedure SetInitLatents(Latents: TNNetVolume);
+    // SetInitLatents of Image (W, H, 3) in 0..255 PIL-Lanczos resized (no crop)
+    // to Width x Height, / 127 - 1, VAE latent mode times scaling_factor.
+    procedure EncodeInitImage(Pipeline: TStableDiffusionPipeline;
+      Image: TNNetVolume; Width, Height: integer);
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    // Strength (default 0.9) when StartsFromImage, else 1.
+    function DenoiseStrength(): double; override;
+    // True with init latents or a light direction.
+    function StartsFromImage(): boolean; override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
+    // The reference process(): the Width x Height pass, then the highres one;
+    // Image (W, H, 3) in [0, 1]. Noise from Seed (highres: Seed + 1).
+    procedure Relight(Pipeline: TStableDiffusionPipeline;
+      PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+      Seed: cardinal; Image: TNNetVolume);
+    property LightDirection: TSDLightDirection read FLightDirection
+      write FLightDirection;
+    // The concatenated latents and the latents the steps started from (empty
+    // for txt2img) of the last BeginDenoise.
+    property ConcatLatents: TNNetVolume read FConcatLatents;
+    property StartLatents: TNNetVolume read FImageLatents;
+    // SetInitLatents / EncodeInitImage's latents; empty when cleared.
+    property InitLatents: TNNetVolume read FInitLatents;
+    // highres_scale (1.5; <= 0 skips the pass): each side becomes
+    // ICLightHighResSide(side, HighResScale, HighResMultiple).
+    property HighResScale: double read FHighResScale write FHighResScale;
+    // highres_denoise (0.5), the strength of the highres pass.
+    property HighResStrength: double read FHighResStrength
+      write SetHighResStrength;
+    // The side multiple of the highres pass (64: SD 1.5's latent multiple of 8).
+    property HighResMultiple: integer read FHighResMultiple
+      write FHighResMultiple;
   end;
 
   // diffusers StableDiffusionDepth2ImgPipeline (stabilityai/stable-diffusion-2-depth):
@@ -104816,6 +104893,131 @@ begin
   DepthLatents.Add(-1);
 end;
 
+function ICLightStepCount(StepCount: integer; Strength: double): integer;
+begin
+  if not ((Strength > 0) and (Strength <= 1)) then
+    ImportError('ICLightStepCount: strength ' + FloatToStr(Strength) +
+      ' is outside (0, 1].');
+  // Python round and Pascal Round both round half to even.
+  Result := Round(StepCount / Strength);
+end;
+
+function ICLightHighResSide(Side: integer; Scale: double;
+  Multiple: integer): integer;
+begin
+  if Multiple < 1 then
+    ImportError('ICLightHighResSide: multiple ' + IntToStr(Multiple) +
+      ' must be positive.');
+  Result := Round(Side * Scale / Multiple) * Multiple;
+  if Result < Multiple then
+    ImportError('ICLightHighResSide: ' + IntToStr(Side) + ' times ' +
+      FloatToStr(Scale) + ' rounds to no multiple of ' + IntToStr(Multiple) +
+      '.');
+end;
+
+// IC-Light run_rmbg: 127 + (Image - 127) * alpha, clipped and truncated to
+// bytes, Dest (W, H, 3); alpha = Matte (W, H, 1) / 255, else Image's 4th
+// channel / 255, else 1.
+procedure ICLightCompositeOnGray(Image, Matte, Dest: TNNetVolume);
+const
+  csByteMax: TNeuralFloat = 255;
+  csGray: TNeuralFloat = 127;
+var
+  PixelPos, MaxPixelPos, Channel, ImageDepth, ImagePos, DestPos: integer;
+  Alpha, Value: TNeuralFloat;
+  HasMatte: boolean;
+begin
+  ImageDepth := Image.Depth;
+  if (ImageDepth <> 3) and (ImageDepth <> 4) then
+    ImportError('TStableDiffusionICLight: the foreground has ' +
+      IntToStr(ImageDepth) + ' channels, not 3 or 4.');
+  HasMatte := Matte.Size > 0;
+  if HasMatte and ((Matte.SizeX <> Image.SizeX) or
+    (Matte.SizeY <> Image.SizeY) or (Matte.Depth <> 1)) then
+    ImportError('TStableDiffusionICLight: the matte is ' +
+      IntToStr(Matte.SizeX) + 'x' + IntToStr(Matte.SizeY) + 'x' +
+      IntToStr(Matte.Depth) + ', the foreground ' + IntToStr(Image.SizeX) +
+      'x' + IntToStr(Image.SizeY) + ' (one channel expected).');
+  Dest.ReSize(Image.SizeX, Image.SizeY, 3);
+  MaxPixelPos := Image.SizeX * Image.SizeY - 1;
+  Alpha := 1;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    ImagePos := PixelPos * ImageDepth;
+    DestPos := PixelPos * 3;
+    if HasMatte then Alpha := Matte.FData[PixelPos] / csByteMax
+    else if ImageDepth = 4 then Alpha := Image.FData[ImagePos + 3] / csByteMax;
+    for Channel := 0 to 2 do
+    begin
+      Value := csGray + (Image.FData[ImagePos + Channel] - csGray) * Alpha;
+      if Value < 0 then Value := 0
+      else if Value > csByteMax then Value := csByteMax;
+      Dest.FData[DestPos + Channel] := Trunc(Value);
+    end;
+  end;
+end;
+
+// IC-Light resize_and_center_crop: Image (bytes) PIL-Lanczos resized to cover
+// Width x Height (sides rounded), then cropped at the rounded centre offsets.
+procedure ICLightResizeAndCenterCrop(Image, Dest: TNNetVolume; Width,
+  Height: integer);
+var
+  Resized: TNNetVolume;
+  CoverScale: double;
+  CoverWidth, CoverHeight: integer;
+begin
+  CoverScale := Max(Width / Image.SizeX, Height / Image.SizeY);
+  CoverWidth := Round(Image.SizeX * CoverScale);
+  CoverHeight := Round(Image.SizeY * CoverScale);
+  Resized := TNNetVolume.Create();
+  try
+    ResizeImagePIL(Image, Resized, CoverWidth, CoverHeight, irfLanczos,
+      {RoundToBytes=}true);
+    Dest.CopyCropping(Resized, Round((CoverWidth - Width) / 2),
+      Round((CoverHeight - Height) / 2), Width, Height);
+  finally
+    Resized.Free;
+  end;
+end;
+
+// IC-Light numpy2pytorch in place: 0..255 -> v / 127 - 1 (127 is exactly 0).
+procedure ICLightToVaeRange(Image: TNNetVolume);
+begin
+  Image.Mul(1 / 127);
+  Image.Add(-1);
+end;
+
+// The gradio_demo.py light image: np.linspace(255, 0) across the image from
+// the lit side, truncated to bytes, on 3 channels.
+procedure ICLightLightGradient(Direction: TSDLightDirection; Width,
+  Height: integer; Dest: TNNetVolume);
+var
+  X, Y, MaxX, MaxY, AxisPos, AxisLength: integer;
+  StartValue, StepValue: double;
+  Value: TNeuralFloat;
+begin
+  if Direction in [sdlLeft, sdlRight] then AxisLength := Width
+  else AxisLength := Height;
+  if Direction in [sdlLeft, sdlTop] then StartValue := 255 else StartValue := 0;
+  StepValue := 0;
+  if AxisLength > 1 then StepValue := (255 - 2 * StartValue) / (AxisLength - 1);
+  Dest.ReSize(Width, Height, 3);
+  MaxX := Width - 1;
+  MaxY := Height - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      if Direction in [sdlLeft, sdlRight] then AxisPos := X else AxisPos := Y;
+      // linspace sets its last entry to the stop value exactly.
+      if (AxisPos = AxisLength - 1) and (AxisLength > 1) then
+        Value := 255 - StartValue
+      else Value := Trunc(AxisPos * StepValue + StartValue);
+      Dest[X, Y, 0] := Value;
+      Dest[X, Y, 1] := Value;
+      Dest[X, Y, 2] := Value;
+    end;
+end;
+
 constructor TStableDiffusionControlNet.Create(const ControlNetFolder: string);
 var
   Folder: string;
@@ -106181,6 +106383,250 @@ begin
       Timestep, Pred)
   else PredictWithExtraChannels(UNet, Config, Latents, FZeroImageLatents,
     Embeds, Timestep, Pred);
+end;
+
+constructor TStableDiffusionICLight.Create();
+begin
+  inherited Create();
+  FMatte := TNNetVolume.Create();
+  FBackground := TNNetVolume.Create();
+  FConcatLatents := TNNetVolume.Create();
+  FInitLatents := TNNetVolume.Create();
+  // Empty: no matte, no background, no init latents.
+  FMatte.ReSize(0, 0, 0);
+  FBackground.ReSize(0, 0, 0);
+  FInitLatents.ReSize(0, 0, 0);
+  FStrength := 0.9;
+  FHighResScale := 1.5;
+  FHighResStrength := 0.5;
+  FHighResMultiple := 64;
+end;
+
+destructor TStableDiffusionICLight.Destroy();
+begin
+  FInitLatents.Free;
+  FConcatLatents.Free;
+  FBackground.Free;
+  FMatte.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionICLight.SetHighResStrength(Value: double);
+begin
+  if not ((Value > 0) and (Value <= 1)) then
+    ImportError(ClassName + ': highres strength ' + FloatToStr(Value) +
+      ' is outside (0, 1].');
+  FHighResStrength := Value;
+end;
+
+procedure TStableDiffusionICLight.SetMatte(Matte: TNNetVolume);
+begin
+  if Matte = nil then
+  begin
+    FMatte.ReSize(0, 0, 0);
+    exit;
+  end;
+  FMatte.ReSize(Matte);
+  FMatte.Copy(Matte);
+end;
+
+procedure TStableDiffusionICLight.SetBackground(Background: TNNetVolume);
+begin
+  if Background = nil then
+  begin
+    FBackground.ReSize(0, 0, 0);
+    exit;
+  end;
+  if (Background.Depth <> 3) and (Background.Depth <> 4) then
+    ImportError(ClassName + ': the background has ' +
+      IntToStr(Background.Depth) + ' channels, not 3 or 4.');
+  // PIL convert("RGB") drops the alpha.
+  FBackground.CopyChannels(Background, [0, 1, 2]);
+end;
+
+procedure TStableDiffusionICLight.SetInitLatents(Latents: TNNetVolume);
+begin
+  FHasInitLatents := Assigned(Latents);
+  if not FHasInitLatents then
+  begin
+    FInitLatents.ReSize(0, 0, 0);
+    exit;
+  end;
+  FInitLatents.ReSize(Latents);
+  FInitLatents.Copy(Latents);
+end;
+
+procedure TStableDiffusionICLight.EncodeInitImage(
+  Pipeline: TStableDiffusionPipeline; Image: TNNetVolume; Width,
+  Height: integer);
+var
+  VaeImage: TNNetVolume;
+begin
+  VaeImage := TNNetVolume.Create();
+  try
+    ResizeImagePIL(Image, VaeImage, Width, Height, irfLanczos,
+      {RoundToBytes=}true);
+    ICLightToVaeRange(VaeImage);
+    Pipeline.EncodeVaeImage(VaeImage, FInitLatents);
+    FHasInitLatents := true;
+  finally
+    VaeImage.Free;
+  end;
+end;
+
+function TStableDiffusionICLight.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  if FBackground.Size > 0 then Result := InChannels = 3 * LatentChannels
+  else Result := InChannels = 2 * LatentChannels;
+end;
+
+procedure TStableDiffusionICLight.ResizeSourceImage(Latents,
+  VaeImage: TNNetVolume);
+var
+  Composite: TNNetVolume;
+begin
+  Composite := TNNetVolume.Create();
+  try
+    ICLightCompositeOnGray(FSourceImage, FMatte, Composite);
+    ICLightResizeAndCenterCrop(Composite, VaeImage,
+      Latents.SizeX * FPipeline.VaeScaleFactor,
+      Latents.SizeY * FPipeline.VaeScaleFactor);
+    ICLightToVaeRange(VaeImage);
+  finally
+    Composite.Free;
+  end;
+end;
+
+procedure TStableDiffusionICLight.EncodeImage(VaeImage, Latents: TNNetVolume);
+var
+  BackgroundImage, ForegroundLatents, BackgroundLatents: TNNetVolume;
+begin
+  FPipeline.EncodeVaeImage(VaeImage, FConcatLatents);
+  if FBackground.Size > 0 then
+  begin
+    BackgroundImage := TNNetVolume.Create();
+    ForegroundLatents := TNNetVolume.Create();
+    BackgroundLatents := TNNetVolume.Create();
+    try
+      ICLightResizeAndCenterCrop(FBackground, BackgroundImage, VaeImage.SizeX,
+        VaeImage.SizeY);
+      ICLightToVaeRange(BackgroundImage);
+      FPipeline.EncodeVaeImage(BackgroundImage, BackgroundLatents);
+      ForegroundLatents.ReSize(FConcatLatents);
+      ForegroundLatents.Copy(FConcatLatents);
+      FConcatLatents.AddLayers(ForegroundLatents, BackgroundLatents);
+    finally
+      BackgroundLatents.Free;
+      ForegroundLatents.Free;
+      BackgroundImage.Free;
+    end;
+  end;
+  if FHasInitLatents then
+  begin
+    if (FInitLatents.SizeX <> Latents.SizeX) or
+      (FInitLatents.SizeY <> Latents.SizeY) or
+      (FInitLatents.Depth <> Latents.Depth) then
+      ImportError(ClassName + ': the init latents are ' +
+        IntToStr(FInitLatents.SizeX) + 'x' + IntToStr(FInitLatents.SizeY) +
+        'x' + IntToStr(FInitLatents.Depth) + ', the run ' +
+        IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
+        IntToStr(Latents.Depth) + '.');
+    FImageLatents.ReSize(FInitLatents);
+    FImageLatents.Copy(FInitLatents);
+  end
+  else if FLightDirection <> sdlNone then
+  begin
+    ICLightLightGradient(FLightDirection, VaeImage.SizeX, VaeImage.SizeY,
+      VaeImage);
+    ICLightToVaeRange(VaeImage);
+    FPipeline.EncodeVaeImage(VaeImage, FImageLatents);
+  end
+  else FImageLatents.ReSize(0, 0, 0);
+end;
+
+procedure TStableDiffusionICLight.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+begin
+  // IC-Light encodes the latent mode: the img2img sample noise stays unused.
+  FImageSampleNoise.ReSize(Latents.SizeX, Latents.SizeY, Latents.Depth);
+  FImageSampleNoise.Fill(0);
+  FHasSampleNoise := true;
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+end;
+
+function TStableDiffusionICLight.DenoiseStrength(): double;
+begin
+  if StartsFromImage() then Result := FStrength else Result := 1;
+end;
+
+function TStableDiffusionICLight.StartsFromImage(): boolean;
+begin
+  Result := FHasInitLatents or (FLightDirection <> sdlNone);
+end;
+
+procedure TStableDiffusionICLight.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+begin
+  // The reference hook concatenates on every pass, uncond included.
+  PredictWithExtraChannels(UNet, Config, Latents, FConcatLatents, Embeds,
+    Timestep, Pred);
+end;
+
+procedure TStableDiffusionICLight.Relight(Pipeline: TStableDiffusionPipeline;
+  PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+  Seed: cardinal; Image: TNNetVolume);
+var
+  SavedConditioner: TStableDiffusionConditioner;
+  SavedStrength: double;
+  Latents: TNNetVolume;
+  PassStepCount, HighResWidth, HighResHeight, ValuePos, MaxValuePos: integer;
+  HighResSeed: cardinal;
+begin
+  SavedConditioner := Pipeline.Conditioner;
+  SavedStrength := FStrength;
+  Latents := TNNetVolume.Create();
+  Pipeline.Conditioner := Self;
+  try
+    Pipeline.MakeInitialLatents(Width, Height, Seed, Latents);
+    if StartsFromImage() then
+      PassStepCount := ICLightStepCount(StepCount, FStrength)
+    else PassStepCount := StepCount;
+    Pipeline.Denoise(PromptEmbeds, Width, Height, PassStepCount, Latents);
+    if FHighResScale > 0 then
+    begin
+      HighResWidth := ICLightHighResSide(Width, FHighResScale,
+        FHighResMultiple);
+      HighResHeight := ICLightHighResSide(Height, FHighResScale,
+        FHighResMultiple);
+      Pipeline.DecodeLatents(Latents, Width, Height, Image);
+      // pytorch2numpy: the decoded image as bytes.
+      Image.Mul(255);
+      MaxValuePos := Image.Size - 1;
+      for ValuePos := 0 to MaxValuePos do
+        Image.FData[ValuePos] := Trunc(Image.FData[ValuePos]);
+      EncodeInitImage(Pipeline, Image, HighResWidth, HighResHeight);
+      FStrength := FHighResStrength;
+      if Seed = High(cardinal) then HighResSeed := 0
+      else HighResSeed := Seed + 1;
+      Pipeline.MakeInitialLatents(HighResWidth, HighResHeight, HighResSeed,
+        Latents);
+      Pipeline.Denoise(PromptEmbeds, HighResWidth, HighResHeight,
+        ICLightStepCount(StepCount, FHighResStrength), Latents);
+      Width := HighResWidth;
+      Height := HighResHeight;
+    end;
+    Pipeline.DecodeLatents(Latents, Width, Height, Image);
+    Pipeline.DoPhase(sdphDone);
+  finally
+    FStrength := SavedStrength;
+    SetInitLatents(nil);
+    Pipeline.Conditioner := SavedConditioner;
+    Latents.Free;
+  end;
 end;
 
 constructor TStableDiffusionDepth2Img.Create();
