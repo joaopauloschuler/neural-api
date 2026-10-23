@@ -856,6 +856,31 @@ rather than acted on.
                 they now invert a TILED encode (a948d626). They refuse
                 panorama windows but not `VaeTileSize`; either refuse it too
                 or pin that the tiled latent inverts acceptably.
+- [ ] Differential Diffusion (Levin & Fried 2024, arXiv:2306.00950; diffusers
+      community `pipeline_stable_diffusion_differential_img2img` /
+      `StableDiffusionDiffImg2ImgPipeline`): per-pixel edit strength from a
+      grayscale CHANGE MAP instead of one global `--strength` and a binary
+      inpaint mask. Today `TStableDiffusionInpainter` binarizes its mask
+      (`DiffusersBinarizeMask`, >= 0.5) and blends the re-noised known latents
+      back in `AfterStep`, so a soft mask (blurred edge, gradient, depth-derived
+      falloff) has a seam and no partial edit.
+      - [ ] A conditioner `TStableDiffusionDifferentialImg2Img` (subclass of
+            `TStableDiffusionImg2Img`, reusing the inpainter's re-noise + blend
+            code by moving it to a shared parent routine rather than copying
+            it): the change map (W, H, 1|3|4, 0..255, white = change most) is
+            resized to the latent grid as a continuous map, not binarized; at
+            step i of N the known (re-noised original) latent is kept wherever
+            map < threshold(i) = 1 - (i + 1) / N, as the reference. Works on a
+            4-channel UNet with every sampler that `TStableDiffusionImg2Img`
+            accepts (DDIM, Euler, DPM++ 2M incl. Karras sigmas).
+      - [ ] Pico parity: diffusers' community pipeline on tests/fixtures
+            tiny SD (~/x venv), fixed seed and a gradient change map, DDIM
+            and Euler; final latents to ~1e-5.
+      - [ ] examples/StableDiffusion `--change-map PNG` (with `--init-image`;
+            refuses `--mask`), README section with a horizontal-gradient
+            example; examples/QwenImage `--change-map` reuses the same
+            threshold schedule over its flow-matching steps (the same blend
+            point as its inpainting).
 - [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
       Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`):
       `TStableDiffusionICLight` (`Relight`) and examples/StableDiffusion
