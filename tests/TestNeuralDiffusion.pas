@@ -87,6 +87,7 @@ type
     procedure TestVPredictionToEps;
     procedure TestDDIMTrajectoryVsOracle;
     procedure TestDPMSolverVsOracle;
+    procedure TestSDEDPMSolverVsDiffusers;
     procedure TestSamplerSchedulesVsDiffusers;
     procedure TestDiffusersSchedulerSamplerMapping;
     procedure TestPNDMVsDiffusers;
@@ -971,6 +972,12 @@ begin
   AssertTrue('dpm', Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
     '"algorithm_type": "dpmsolver++", "solver_order": 2}') = smDPMSolverPP2M);
   AssertEquals('dpm notice', '', Notice);
+  AssertTrue('sde dpm', Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
+    '"algorithm_type": "sde-dpmsolver++"}') = smDPMSolverPP2M);
+  AssertEquals('sde dpm notice', '', Notice);
+  Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
+    '"algorithm_type": "dpmsolver"}');
+  AssertTrue('dpmsolver noticed', Pos('algorithm_type', Notice) > 0);
   AssertTrue('dpm karras', Mapped('{"_class_name": ' +
     '"DPMSolverMultistepScheduler", "use_karras_sigmas": true, ' +
     '"solver_order": 3}') = smDPMSolverPP2M);
@@ -1113,6 +1120,130 @@ begin
     end;
   finally
     Sched.Free; X.Free;
+  end;
+end;
+
+// diffusers DPMSolverMultistepScheduler sde-dpmsolver++ (order 2, midpoint) from
+// IC-Light's config, 4 steps, linspace and Karras sigmas: model eps = 0.6*x +
+// 0.0003*t*cos(i), step-k noise sin(1.3k + 0.7i + 0.2), x_0 = cos(0.37i + 0.1);
+// the expected samples after each step come from diffusers (variance_noise).
+procedure TTestNeuralDiffusion.TestSDEDPMSolverVsDiffusers;
+const
+  csElementCount = 8;
+  csStepCount = 4;
+  csConfig = '{"_class_name": "DPMSolverMultistepScheduler", ' +
+    '"num_train_timesteps": 1000, "beta_start": 0.00085, "beta_end": 0.012, ' +
+    '"beta_schedule": "scaled_linear", "algorithm_type": "sde-dpmsolver++", ' +
+    '"solver_order": 2, "solver_type": "midpoint", "steps_offset": 1, ' +
+    '"timestep_spacing": "linspace", "use_karras_sigmas": true}';
+  csLinspaceTimesteps: array[0..csStepCount - 1] of integer =
+    (999, 749, 500, 250);
+  csKarrasTimesteps: array[0..csStepCount - 1] of integer = (999, 687, 146, 0);
+  csLinspaceSamples: array[0..csStepCount * csElementCount - 1] of
+    TNeuralFloat = (
+    0.7784810, 1.6039338, 2.3746724, 2.1982012, 0.7453581, -1.3449305,
+    -2.8739460, -2.9932771,
+    1.0834033, 2.1249769, 2.8321373, 2.2625833, 0.2429482, -2.2473063,
+    -3.6827700, -3.1537657,
+    1.0954170, 1.5259047, 1.6491760, 0.9802707, -0.4622122, -1.9472662,
+    -2.4864564, -1.6280247,
+    0.8249943, 1.1937059, 1.3423303, 0.8366359, -0.3360162, -1.5741191,
+    -2.0411909, -1.3430188);
+  csKarrasSamples: array[0..csStepCount * csElementCount - 1] of
+    TNeuralFloat = (
+    0.8129629, 1.7388699, 2.7173362, 2.6064234, 0.9350911, -1.5506269,
+    -3.3818517, -3.5128722,
+    0.3467744, 1.8936687, 3.0355620, 2.6912453, 0.6542423, -2.0288053,
+    -3.6980183, -3.2928085,
+    0.1142012, 1.1566367, 1.3758771, 0.7584906, -0.2975769, -1.1954108,
+    -1.4271648, -0.8070339,
+    0.1122512, 1.1368870, 1.3523837, 0.7455392, -0.2924958, -1.1749990,
+    -1.4027957, -0.7932537);
+var
+  FileName: string;
+  Lines: TStringList;
+  Sched: TNNetDiffusionScheduler;
+  X, Pred, Noise: TNNetVolume;
+  Schedule: TNeuralIntegerArray;
+  SigmaSchedule: TNNetSigmaSchedule;
+  UseKarras: boolean;
+  StepPos, ElementPos, ModelTimestep: integer;
+  CaseName: string;
+begin
+  FileName := GetTempDir(false) + 'cai_sde_dpm_scheduler_config.json';
+  Lines := TStringList.Create;
+  Sched := nil;
+  X := TNNetVolume.Create(csElementCount, 1, 1);
+  Pred := TNNetVolume.Create(csElementCount, 1, 1);
+  Noise := TNNetVolume.Create(csElementCount, 1, 1);
+  try
+    Lines.Text := csConfig;
+    Lines.SaveToFile(FileName);
+    Sched := TNNetDiffusionScheduler.CreateFromDiffusersConfig(FileName);
+    AssertTrue('sde algorithm from config',
+      Sched.DPMSolverAlgorithm = dpaSDEDPMSolverPP);
+    AssertTrue('sde dpm takes noise', Sched.StepTakesNoise(smDPMSolverPP2M));
+    AssertFalse('ddim takes no noise', Sched.StepTakesNoise(smDDIM));
+    for UseKarras := false to true do
+    begin
+      if UseKarras then
+      begin
+        CaseName := 'karras';
+        SigmaSchedule := Sched.BuildSigmaSchedule(csStepCount,
+          Sched.ConfigSpacing, smDPMSolverPP2M, true);
+      end
+      else
+      begin
+        CaseName := 'linspace';
+        Schedule := Sched.BuildSamplerSchedule(csStepCount, Sched.ConfigSpacing,
+          smDPMSolverPP2M);
+      end;
+      for ElementPos := 0 to csElementCount - 1 do
+        X.FData[ElementPos] := Cos(0.37 * ElementPos + 0.1);
+      for StepPos := 0 to csStepCount - 1 do
+      begin
+        if UseKarras then
+          ModelTimestep := Round(SigmaSchedule.ModelTimesteps[StepPos])
+        else
+          ModelTimestep := Schedule[StepPos] - 1;
+        if UseKarras then
+          AssertEquals(CaseName + ' timestep ' + IntToStr(StepPos),
+            csKarrasTimesteps[StepPos], ModelTimestep)
+        else
+          AssertEquals(CaseName + ' timestep ' + IntToStr(StepPos),
+            csLinspaceTimesteps[StepPos], ModelTimestep);
+        for ElementPos := 0 to csElementCount - 1 do
+        begin
+          Pred.FData[ElementPos] := 0.6 * X.FData[ElementPos] +
+            0.0003 * ModelTimestep * Cos(ElementPos);
+          Noise.FData[ElementPos] := Sin(1.3 * StepPos + 0.7 * ElementPos + 0.2);
+        end;
+        if UseKarras then
+          Sched.StepAtSigma(X, Pred, SigmaSchedule.Sigmas[StepPos],
+            SigmaSchedule.Sigmas[StepPos + 1], smDPMSolverPP2M, 0, Noise)
+        else
+          Sched.Step(X, Pred, Schedule[StepPos], Schedule[StepPos + 1],
+            smDPMSolverPP2M, 0, Noise);
+        for ElementPos := 0 to csElementCount - 1 do
+          if UseKarras then
+            AssertEquals(CaseName + ' step ' + IntToStr(StepPos) + ' @ ' +
+              IntToStr(ElementPos),
+              csKarrasSamples[StepPos * csElementCount + ElementPos],
+              X.FData[ElementPos], 1e-4)
+          else
+            AssertEquals(CaseName + ' step ' + IntToStr(StepPos) + ' @ ' +
+              IntToStr(ElementPos),
+              csLinspaceSamples[StepPos * csElementCount + ElementPos],
+              X.FData[ElementPos], 1e-4);
+      end;
+    end;
+  finally
+    Sched.Free;
+    Lines.Free;
+    X.Free;
+    Pred.Free;
+    Noise.Free;
+    DeleteFile(FileName);
   end;
 end;
 

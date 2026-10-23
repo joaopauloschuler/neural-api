@@ -52,6 +52,9 @@ type
     // The latents_after/timesteps SD15CheckStep reads; nil: FSD15Oracle.
     FSD15StepOracle: TJSONObject;
     FSD15StepCount: integer;
+    // SD15ConstantNoise: the value it fills and how often it ran.
+    FSD15NoiseValue: TNeuralFloat;
+    FSD15NoiseCount: integer;
     // TStableDiffusionPipeline OnPhase counts (SD15CountPhase).
     FSD15PhaseCounts: array[TStableDiffusionPipelinePhase] of integer;
     // The latents after step 0 (SDCaptureFirstStep).
@@ -108,6 +111,7 @@ type
       Latents: TNNetVolume);
     // Euler a step noise StepIndex from FSD15Oracle step_noise.
     procedure SD15StepNoise(StepIndex: integer; Noise: TNNetVolume);
+    procedure SD15ConstantNoise(StepIndex: integer; Noise: TNNetVolume);
     procedure CheckSD15ConditionedParity(Pipeline: TStableDiffusionPipeline;
       const Expected: TJSONObject);
     // Case CaseName of FileName: its ControlNets (folders controlnet_folders),
@@ -1370,6 +1374,7 @@ type
     procedure TestStableDiffusionPipelineParity;
     procedure TestStableDiffusionPipelineSamplers;
     procedure TestStableDiffusionPipelineKarrasSigmas;
+    procedure TestStableDiffusionPipelineSDEDPMNoise;
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineOddSize;
@@ -47119,6 +47124,13 @@ begin
     StepIndex], true, Noise);
 end;
 
+procedure TTestNeuralPretrained.SD15ConstantNoise(StepIndex: integer;
+  Noise: TNNetVolume);
+begin
+  Noise.Fill(FSD15NoiseValue);
+  Inc(FSD15NoiseCount);
+end;
+
 procedure TTestNeuralPretrained.SD15CountPhase(
   Phase: TStableDiffusionPipelinePhase);
 begin
@@ -47472,6 +47484,65 @@ begin
     Initial.Free;
     Embeds.Free;
     KarrasRoot.Free;
+    Root.Free;
+  end;
+end;
+
+// The SDE DPM++ 2M step takes its noise from OnAncestralNoise once per step
+// (Karras sigmas and integer timesteps), and that noise changes the result;
+// the deterministic algorithm never asks for it.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineSDEDPMNoise;
+const
+  csStepCount = 3;
+var
+  Root: TJSONData;
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, Latents, FirstLatents: TNNetVolume;
+  ImageSize: integer;
+  UseKarras: boolean;
+
+  procedure RunWithNoise(Algorithm: TNNetDPMSolverAlgorithm;
+    NoiseValue: TNeuralFloat; Dest: TNNetVolume);
+  begin
+    Pipeline.Scheduler.DPMSolverAlgorithm := Algorithm;
+    FSD15NoiseValue := NoiseValue;
+    FSD15NoiseCount := 0;
+    Dest.ReSize(Initial);
+    Dest.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSize, ImageSize, csStepCount, Dest);
+  end;
+
+begin
+  Root := LoadSD15Fixture('tiny_sd15_pipeline_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  FirstLatents := TNNetVolume.Create;
+  try
+    ImageSize := TJSONObject(Root).Get('image_size', 0);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['latents'], true, Initial);
+    Pipeline.GuidanceScale := 1;
+    Pipeline.EncodePrompt(TJSONObject(Root).Get('prompt', ''), Embeds);
+    Pipeline.Sampler := smDPMSolverPP2M;
+    Pipeline.OnAncestralNoise := @SD15ConstantNoise;
+    for UseKarras := false to true do
+    begin
+      Pipeline.KarrasSigmas := UseKarras;
+      RunWithNoise(dpaDPMSolverPP, 0.5, FirstLatents);
+      AssertEquals('ode asks no noise', 0, FSD15NoiseCount);
+      RunWithNoise(dpaSDEDPMSolverPP, 0.5, FirstLatents);
+      AssertEquals('sde noise per step', csStepCount, FSD15NoiseCount);
+      RunWithNoise(dpaSDEDPMSolverPP, -0.5, Latents);
+      AssertTrue('sde result follows the noise',
+        Latents.SumDiff(FirstLatents) > 1e-3);
+    end;
+  finally
+    Pipeline.Free;
+    FirstLatents.Free;
+    Latents.Free;
+    Initial.Free;
+    Embeds.Free;
     Root.Free;
   end;
 end;

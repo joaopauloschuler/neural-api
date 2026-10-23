@@ -843,11 +843,9 @@ rather than acted on.
             img2img init at strength 0.9 (steps / strength rounded), none = txt2img.
       - (c) The reference's highres pass: decode, resize by 1.5 to multiples
             of 64, re-encode, img2img at strength 0.5 with the same concat.
-      - (d) Sampler: the reference runs DPMSolverMultistep `sde-dpmsolver++`
-            with Karras sigmas; `TNNetSamplerMethod` has only the
-            deterministic `smDPMSolverPP2M`. Add the SDE variant as an
-            algorithm option of the existing DPM++ 2M step (diffusers
-            `algorithm_type`), not a separate scheduler.
+      - [X] (d) Sampler: `TNNetDiffusionScheduler.DPMSolverAlgorithm =
+            dpaSDEDPMSolverPP` (diffusers `sde-dpmsolver++`, read from
+            `algorithm_type`), `--sampler dpm++2m-sde`; TestSDEDPMSolverVsDiffusers.
       - (e) Pico-fixture parity vs diffusers + the reference hook in the ~/x
             venv (offset merge, 8-channel UNet input, one denoise step),
             then `--relight` / `--light left|right|top|bottom` /

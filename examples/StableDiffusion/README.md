@@ -399,6 +399,7 @@ The betas, the timestep spacing (`leading`, `trailing` or `linspace`, with
 | `EulerDiscreteScheduler`          | Euler      | `euler`     |
 | `EulerAncestralDiscreteScheduler` | Euler a    | `euler-a`   |
 | `DPMSolverMultistepScheduler`     | DPM-Solver++ 2M | `dpm++2m` |
+| `DPMSolverMultistepScheduler`, `algorithm_type: sde-dpmsolver++` | DPM-Solver++ 2M SDE | `dpm++2m-sde` |
 | `LCMScheduler`                    | LCM (see below) | `lcm`   |
 
 Any other class runs DDIM and prints a `Notice:` line. The notice also lists
@@ -406,6 +407,14 @@ config options that are not implemented and are ignored, e.g. `solver_order`
 other than 2, or `skip_prk_steps: false` (the Runge-Kutta warm-up).
 `--sampler` overrides the config's choice. PNDM runs one more UNet step than
 `--steps`, as diffusers does.
+
+`dpm++2m-sde` is the stochastic variant of the same order-2 midpoint step
+(diffusers `algorithm_type: "sde-dpmsolver++"`, the sampler IC-Light uses): each
+step shrinks the sample by `exp(-h)` and adds fresh Gaussian noise, so the image
+depends on the step noise as well as on `--seed`'s initial latents. The step
+noise comes from the global RNG (or `OnAncestralNoise`, as for Euler a). It
+pairs with `--karras-sigmas`. Scheduler parity `< 1e-4` against diffusers with
+injected noise, Karras sigmas on and off (`TestSDEDPMSolverVsDiffusers`).
 
 Euler, Euler a and DPM-Solver++ 2M follow `use_karras_sigmas` as diffusers
 does: the sigmas follow the Karras rho = 7 ramp and stay continuous, and each
@@ -846,9 +855,10 @@ StableDiffusion [--model DIR] [options]
   --size N          sets both --width and --height
   --seed N          noise seed (default 0)
   --sampler NAME    auto (default: from the scheduler config), ddim, pndm,
-                    euler, euler-a, dpm++2m or lcm (Latent Consistency; an
+                    euler, euler-a, dpm++2m, dpm++2m-sde (diffusers
+                    sde-dpmsolver++) or lcm (Latent Consistency; an
                     LCM-LoRA via --lora or an LCM-distilled UNet, 2-8 steps)
-  --karras-sigmas   Karras sigmas for euler, euler-a and dpm++2m (diffusers
+  --karras-sigmas   Karras sigmas for euler, euler-a and dpm++2m* (diffusers
                     use_karras_sigmas); --no-karras-sigmas turns them off
                     (default: the scheduler config's)
   --output PNG      output file (default stable_diffusion.png)

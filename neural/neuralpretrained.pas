@@ -12850,8 +12850,8 @@ type
     // the sampler's init noise sigma; clean out); Conditioner.PredictGuidedNoise
     // runs the UNet passes of each step (CFG when GuidanceScale > 1).
     // A Conditioner strength < 1 runs only the last steps (LCM: all StepCount
-    // over a shorter origin grid). Euler a and LCM draw their step noise from
-    // OnAncestralNoise or the global RNG.
+    // over a shorter origin grid). Euler a, LCM and SDE DPM++ 2M draw their step
+    // noise from OnAncestralNoise or the global RNG.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume);
     // DDIM inversion (diffusers DDIMInverseScheduler, eta 0) in place: clean
@@ -12945,8 +12945,8 @@ type
       write SetTextEncoderInt8;
     property OnPhase: TStableDiffusionPhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TStableDiffusionStepEvent read FOnStep write FOnStep;
-    // When set, Euler a and LCM take each step's noise from it, not the global
-    // RNG (LCM ignores the last step's).
+    // When set, Euler a, LCM and SDE DPM++ 2M take each step's noise from it, not
+    // the global RNG (LCM and DPM++ ignore the last step's).
     property OnAncestralNoise: TStableDiffusionNoiseEvent
       read FOnAncestralNoise write FOnAncestralNoise;
     // ControlNet / T2I-Adapter / IP-Adapter / GLIGEN / img2img / inpainting /
@@ -104090,7 +104090,7 @@ begin
     end;
     // Euler a injects its full ancestral noise; the others are deterministic.
     if FSampler = smEulerAncestral then Eta := 1 else Eta := 0;
-    if (not IsInversion) and (FSampler in [smEulerAncestral, smLCM]) and
+    if (not IsInversion) and FScheduler.StepTakesNoise(FSampler) and
       Assigned(FOnAncestralNoise) then
       StepNoise := TNNetVolume.Create(Latents);
     if UseSigmaSchedule then MaxStepPos := High(SigmaSchedule.ModelTimesteps)

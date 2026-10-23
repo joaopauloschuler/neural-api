@@ -12,7 +12,8 @@ through TStableDiffusionPipeline in neuralpretrained.pas.
 
 The scheduler config gives the betas, timestep spacing and prediction type,
 and its _class_name the sampler (DDIM, PNDM/PLMS, Euler, Euler a,
-DPM-Solver++ 2M or LCM; other classes run DDIM). --sampler overrides it.
+DPM-Solver++ 2M, its SDE variant or LCM; other classes run DDIM). --sampler
+overrides it.
 --sampler lcm with an LCM-LoRA (--lora, e.g. latent-consistency/
 lcm-lora-sdv1-5) samples in 2-8 steps (default 4, guidance 1.0). An
 LCM-distilled folder (SimianLuo/LCM_Dreamshaper_v7) needs no LoRA: its UNet
@@ -93,10 +94,15 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
 const
   PicoModelFolder = '../../tests/fixtures/tiny_sd15';
   // --sampler names of the methods TStableDiffusionPipeline maps to.
-  SamplerOptionNames: array[0..5] of string =
-    ('ddim', 'pndm', 'euler', 'euler-a', 'dpm++2m', 'lcm');
-  SamplerOptionMethods: array[0..5] of TNNetSamplerMethod =
-    (smDDIM, smPNDM, smEuler, smEulerAncestral, smDPMSolverPP2M, smLCM);
+  SamplerOptionNames: array[0..6] of string =
+    ('ddim', 'pndm', 'euler', 'euler-a', 'dpm++2m', 'dpm++2m-sde', 'lcm');
+  SamplerOptionMethods: array[0..6] of TNNetSamplerMethod =
+    (smDDIM, smPNDM, smEuler, smEulerAncestral, smDPMSolverPP2M,
+     smDPMSolverPP2M, smLCM);
+  // The DPM-Solver++ algorithm of each name (read for dpm++2m* only).
+  SamplerOptionDPMAlgorithms: array[0..6] of TNNetDPMSolverAlgorithm =
+    (dpaDPMSolverPP, dpaDPMSolverPP, dpaDPMSolverPP, dpaDPMSolverPP,
+     dpaDPMSolverPP, dpaSDEDPMSolverPP, dpaDPMSolverPP);
   // --freeu presets of the FreeU paper (s1, s2, b1, b2).
   FreeUPresetNames: array[0..1] of string = ('sd15', 'sd21');
   FreeUPresetFactors: array[0..1, 0..3] of TNeuralFloat =
@@ -290,11 +296,12 @@ begin
   WriteLn('  --size N          sets both --width and --height');
   WriteLn('  --seed N          noise seed (default 0)');
   WriteLn('  --sampler NAME    auto (default: from the scheduler config), ddim,');
-  WriteLn('                    pndm, euler, euler-a, dpm++2m or lcm (Latent ',
-    'Consistency;');
+  WriteLn('                    pndm, euler, euler-a, dpm++2m, dpm++2m-sde ',
+    '(diffusers');
+  WriteLn('                    sde-dpmsolver++) or lcm (Latent Consistency;');
   WriteLn('                    an LCM-LoRA via --lora or an LCM-distilled ',
     'UNet, 2-8 steps)');
-  WriteLn('  --karras-sigmas   Karras sigmas for euler, euler-a and dpm++2m ',
+  WriteLn('  --karras-sigmas   Karras sigmas for euler, euler-a and dpm++2m* ',
     '(diffusers');
   WriteLn('                    use_karras_sigmas); --no-karras-sigmas turns ',
     'them off');
@@ -450,13 +457,16 @@ begin
     if SamplerOptionNames[NamePos] = Name then Result := NamePos;
 end;
 
-function SamplerText(Method: TNNetSamplerMethod): string;
+function SamplerText(Method: TNNetSamplerMethod;
+  DPMAlgorithm: TNNetDPMSolverAlgorithm): string;
 var
   NamePos: integer;
 begin
   Result := 'method ' + IntToStr(Ord(Method));
-  for NamePos := 0 to High(SamplerOptionMethods) do
-    if SamplerOptionMethods[NamePos] = Method then
+  for NamePos := High(SamplerOptionMethods) downto 0 do
+    if (SamplerOptionMethods[NamePos] = Method) and
+      ((Method <> smDPMSolverPP2M) or
+      (SamplerOptionDPMAlgorithms[NamePos] = DPMAlgorithm)) then
       Result := SamplerOptionNames[NamePos];
 end;
 
@@ -962,8 +972,12 @@ begin
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
     if Opt.SamplerName <> 'auto' then
+    begin
       Pipeline.Sampler := SamplerOptionMethods[
         SamplerOptionIndex(Opt.SamplerName)];
+      Pipeline.Scheduler.DPMSolverAlgorithm := SamplerOptionDPMAlgorithms[
+        SamplerOptionIndex(Opt.SamplerName)];
+    end;
     if Opt.KarrasSigmas >= 0 then Pipeline.KarrasSigmas := Opt.KarrasSigmas = 1;
     StepCount := Opt.Steps;
     GuidanceScale := Opt.GuidanceScale;
@@ -1038,7 +1052,8 @@ begin
       WriteLn('Sampler:  lcm with the ', Pipeline.SchedulerClassName,
         ' config''s betas and the LCM origin timesteps')
     else
-      WriteLn('Sampler:  ', SamplerText(Pipeline.Sampler), ' with the ',
+      WriteLn('Sampler:  ', SamplerText(Pipeline.Sampler,
+        Pipeline.Scheduler.DPMSolverAlgorithm), ' with the ',
         Pipeline.SchedulerClassName, ' config''s betas and timestep spacing');
     if Pipeline.KarrasSigmas and
       (Pipeline.Sampler in [smEuler, smEulerAncestral, smDPMSolverPP2M]) then

@@ -111,6 +111,11 @@ type
   TNNetSamplerMethod = (smDDPM, smDDIM, smDPMSolverPP2M, smEulerAncestral,
     smUniPC, smHeun, smPNDM, smEuler, smLCM);
 
+  // diffusers DPMSolverMultistepScheduler algorithm_type of smDPMSolverPP2M:
+  // dpaDPMSolverPP the deterministic ODE step, dpaSDEDPMSolverPP the SDE step
+  // that injects sigma_next*sqrt(1-exp(-2h)) of fresh noise.
+  TNNetDPMSolverAlgorithm = (dpaDPMSolverPP, dpaSDEDPMSolverPP);
+
   // Timestep SPACING for the Sample() driver.
   //   tsUniform : evenly strided timesteps in 1..T (the original behaviour).
   //   tsKarras  : Karras et al. (2022) rho=7 sigma spacing. The sampling sigmas
@@ -167,6 +172,7 @@ type
     FHasPrev: boolean;
     FPrevX0: TNNetVolume;
     FPrevLambda: TNeuralFloat;
+    FDPMSolverAlgorithm: TNNetDPMSolverAlgorithm;
     // UniPC predictor-corrector extra state. FUniPrevT is the integer timestep
     // of the previous step (s0 of the corrector), FUniPrevSample is that step's
     // (corrected) output sample x_{s0}, FUniLowerOrderNums counts how many
@@ -228,8 +234,9 @@ type
       SigmaNext, InvSqrtAbCur, SqrtAbNext, Eta: TNeuralFloat);
     // DPM-Solver++(2M) move of Xt to a point of ab AbNext > 0 given X0; KX is
     // sqrt(1-ab_next)/sqrt(1-ab_cur). Updates the multistep history.
-    procedure DPMSolverPP2MUpdate(Xt, X0: TNNetVolume; LambdaCur, LambdaNext,
-      KX, AbNext: TNeuralFloat);
+    // The SDE algorithm draws its noise from Noise, or RandG when nil.
+    procedure DPMSolverPP2MUpdate(Xt, X0, Noise: TNNetVolume; LambdaCur,
+      LambdaNext, KX, AbNext: TNeuralFloat);
     // np.interp of the sigma table at a fractional 0-based timestep.
     function InterpolatedSigma(ModelTimestep: double): double;
     // DDIM eta-0 move as XtCoef*x_t + PredCoef*RawPred: sqrt(ab_to)*x0 +
@@ -332,6 +339,10 @@ type
     // The config's timestep_spacing (tsUniform from Create) and steps_offset.
     property ConfigSpacing: TNNetTimestepSpacing read FConfigSpacing;
     property StepsOffset: integer read FStepsOffset;
+    // smDPMSolverPP2M update rule (default dpaDPMSolverPP; a diffusers config
+    // sets it from algorithm_type).
+    property DPMSolverAlgorithm: TNNetDPMSolverAlgorithm
+      read FDPMSolverAlgorithm write FDPMSolverAlgorithm;
 
     // FORWARD process. Xt := sqrt(ab_t)*X0 + sqrt(1-ab_t)*Noise. If NoiseOut is
     // given it receives the sampled noise (the eps training target). When
@@ -369,6 +380,8 @@ type
 
     // Reset the DPM-Solver++ multistep history. Call before each new trajectory.
     procedure ResetMultistep;
+    // True when Step / StepAtSigma of Method read their Noise argument.
+    function StepTakesNoise(Method: TNNetSamplerMethod): boolean;
 
     // ONE reverse step from timestep Tt to TtPrev (TtPrev=0 -> clean image), in
     // place on Xt. RawPred is the model's raw prediction (eps or v) at Tt.
@@ -378,8 +391,8 @@ type
     // scales the injected ancestral noise (Eta=1 = the standard "Euler a";
     // Eta=0 reduces it to a deterministic Euler step). smEuler ignores Eta.
     // smPNDM ignores TtPrev once BuildSamplerSchedule set its stride.
-    // Noise (smEulerAncestral, smLCM) supplies the standard-normal draw instead
-    // of RandG, e.g. to replay another implementation's noise.
+    // Noise (StepTakesNoise) supplies the standard-normal draw instead of RandG,
+    // e.g. to replay another implementation's noise.
     procedure Step(Xt, RawPred: TNNetVolume; Tt, TtPrev: integer;
       Method: TNNetSamplerMethod = smDDIM; Eta: TNeuralFloat = 0.0;
       Noise: TNNetVolume = nil); virtual;
@@ -719,7 +732,8 @@ type
 // The sampler for a diffusers scheduler_config.json (its text) by _class_name:
 // DDIMScheduler -> smDDIM, PNDMScheduler -> smPNDM, EulerDiscreteScheduler ->
 // smEuler, EulerAncestralDiscreteScheduler -> smEulerAncestral (eta 1),
-// DPMSolverMultistepScheduler -> smDPMSolverPP2M, LCMScheduler -> smLCM (needs
+// DPMSolverMultistepScheduler -> smDPMSolverPP2M (dpmsolver++ or
+// sde-dpmsolver++), LCMScheduler -> smLCM (needs
 // a TNNetLCMScheduler). Any other class samples with
 // smDDIM: its betas, spacing and prediction type still load, so it stays
 // usable. Notice is '' or says what differs from the named scheduler (the
@@ -973,6 +987,8 @@ begin
       Obj.Get('set_alpha_to_one', true));
     FConfigSpacing := Spacing;
     FStepsOffset := Obj.Get('steps_offset', 0);
+    if Obj.Get('algorithm_type', '') = 'sde-dpmsolver++' then
+      FDPMSolverAlgorithm := dpaSDEDPMSolverPP;
     ReadDiffusersConfig(Obj);
   finally
     Root.Free;
@@ -1485,6 +1501,14 @@ begin
   FPndmEtsLen := 0;
 end;
 
+function TNNetDiffusionScheduler.StepTakesNoise(
+  Method: TNNetSamplerMethod): boolean;
+begin
+  Result := (Method in [smEulerAncestral, smLCM]) or
+    ((Method = smDPMSolverPP2M) and
+    (FDPMSolverAlgorithm = dpaSDEDPMSolverPP));
+end;
+
 procedure TNNetDiffusionScheduler.Step(Xt, RawPred: TNNetVolume;
   Tt, TtPrev: integer; Method: TNNetSamplerMethod; Eta: TNeuralFloat;
   Noise: TNNetVolume);
@@ -1644,7 +1668,7 @@ begin
             Exit;
           end;
           kX := FSqrtOneMinusAlphaBar[TtPrev] / FSqrtOneMinusAlphaBar[Tt];
-          DPMSolverPP2MUpdate(Xt, Eps, lamT, Lambda(TtPrev), kX,
+          DPMSolverPP2MUpdate(Xt, Eps, Noise, lamT, Lambda(TtPrev), kX,
             FAlphaBar[TtPrev]);
         end;
       smUniPC:
@@ -2079,15 +2103,24 @@ begin
   end;
 end;
 
-procedure TNNetDiffusionScheduler.DPMSolverPP2MUpdate(Xt, X0: TNNetVolume;
-  LambdaCur, LambdaNext, KX, AbNext: TNeuralFloat);
+procedure TNNetDiffusionScheduler.DPMSolverPP2MUpdate(Xt, X0,
+  Noise: TNNetVolume; LambdaCur, LambdaNext, KX, AbNext: TNeuralFloat);
 var
-  h, hLast, kD, cA, cB: TNeuralFloat;
+  h, hLast, kD, cA, cB, kZ: TNeuralFloat;
+  ElementPos, MaxElementPos: integer;
 begin
   // x_next = KX*x_t - alpha_next*(exp(-h)-1)*D, h = lambda_next - lambda_cur;
   // D = x0 on the first step, else the midpoint (1+1/(2r))*x0 - (1/(2r))*x0_prev.
+  // SDE (diffusers sde-dpmsolver++): KX*exp(-h), alpha_next*(exp(-2h)-1) on D,
+  // plus sigma_next*sqrt(1-exp(-2h))*z.
   h := LambdaNext - LambdaCur;              // > 0
-  kD := Sqrt(AbNext) * (Exp(-h) - 1.0);
+  if FDPMSolverAlgorithm = dpaSDEDPMSolverPP then
+  begin
+    KX := KX * Exp(-h);
+    kD := Sqrt(AbNext) * (Exp(-2.0 * h) - 1.0);
+  end
+  else
+    kD := Sqrt(AbNext) * (Exp(-h) - 1.0);
   if not FHasPrev then
   begin
     // First order (equal to DDIM): KX*Xt - kD*X0 (#13).
@@ -2103,6 +2136,17 @@ begin
     Xt.Mul(KX);
     Xt.MulAdd(-kD * cA, X0);
     Xt.MulAdd(kD * cB, FPrevX0);
+  end;
+  if FDPMSolverAlgorithm = dpaSDEDPMSolverPP then
+  begin
+    kZ := Sqrt(1.0 - AbNext) * Sqrt(1.0 - Exp(-2.0 * h));
+    if Assigned(Noise) then Xt.MulAdd(kZ, Noise)
+    else
+    begin
+      MaxElementPos := Xt.Size - 1;
+      for ElementPos := 0 to MaxElementPos do
+        Xt.FData[ElementPos] := Xt.FData[ElementPos] + kZ * RandG(0, 1);
+    end;
   end;
   // Store this step's x0 and lambda for the next multistep correction.
   if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Xt);
@@ -2252,7 +2296,7 @@ begin
   NextInvSqrtAb := Sqrt(1 + NextSigma * NextSigma);
   if Method = smDPMSolverPP2M then
     // lambda = log(alpha/sigma_vp) = -ln(sigma); sqrt(1-ab) = sigma*sqrt(ab).
-    DPMSolverPP2MUpdate(Xt, FEpsScratch, -Ln(Sigma), -Ln(NextSigma),
+    DPMSolverPP2MUpdate(Xt, FEpsScratch, Noise, -Ln(Sigma), -Ln(NextSigma),
       (NextSigma / NextInvSqrtAb) / (Sigma * SqrtAb), 1 / Sqr(NextInvSqrtAb))
   else
   begin
@@ -3464,7 +3508,9 @@ begin
     else if SchedulerClass = 'DPMSolverMultistepScheduler' then
     begin
       Result := smDPMSolverPP2M;
-      NoteIfNot('algorithm_type', 'dpmsolver++');
+      // DPMSolverAlgorithm of a config-built scheduler follows sde-dpmsolver++.
+      if Obj.Get('algorithm_type', 'dpmsolver++') <> 'sde-dpmsolver++' then
+        NoteIfNot('algorithm_type', 'dpmsolver++');
       NoteIfNot('solver_type', 'midpoint');
       if Obj.Get('solver_order', 2) <> 2 then
         Note(SchedulerClass + ' solver_order ' +
