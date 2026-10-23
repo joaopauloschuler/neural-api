@@ -818,7 +818,20 @@ rather than acted on.
         - [ ] Prompt-to-Prompt on a real checkpoint (SD 1.5) on the user's
               GPU box: swap, refine and reweight from a seed and from an
               inverted photo; LocalBlend (the reference's mask that limits
-              the edit to the edited words' region) is not ported.
+              the edit to the edited words' region) is not ported. Also run
+              `--invert-image --null-text` (with and without `--edit-prompt`)
+              there: reconstruction quality at guidance 7.5.
+        - [ ] Null-text inversion follow-ups (b5f693ec..59dcdab1):
+          - [ ] Error-only backprop mode on `TNNet` (propagate input errors,
+                skip weight deltas, no delta/inertia buffers), so
+                `NullTextInversion` can run on the kept inference UNet and on
+                int8 weights instead of a separate trainable FP32 UNet (about 3x
+                the FP32 weight bytes for deltas + inertia; SD 1.5 estimated
+                ~10 GB, not measured).
+          - [ ] The trainable UNet never runs on OpenCL: 50 steps x 10 inner
+                steps is up to 500 CPU forward+backward passes.
+          - [ ] One CLI run builds the UNet twice (trainable for the inversion,
+                inference for sampling back), reading the weights twice.
 - [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
       Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`): relight
       a cut-out subject from a text prompt ("sunset over the sea, warm rim
@@ -850,7 +863,27 @@ rather than acted on.
             `--relight-background`, `--birefnet` (RMBG-1.4 not ported; RGBA
             alpha or BiRefNet / RMBG-2.0), `--highres-scale/-strength`,
             `--relight-added-prompt`, README section.
-      - (f) Real run on the user's GPU box (fc and fbc, `--int8` too).
+      - [ ] (f) Real run on the user's GPU box (fc and fbc, `--int8` too). The
+            img2img start / highres pass now follow the truncated Karras
+            schedule (fed30990), so check the highres output there.
+      - [ ] (g) A whole `Relight` parity test with DPM++ 2M SDE Karras (the
+            example's default) against the gradio reference; today the four
+            IC-Light tests sample with DDIM.
+      - [ ] (h) `gradio_demo_bg.py` was not checked: the fbc low-res pass is
+            assumed txt2img, guidance 2.0 is used for fbc (its default may be
+            7.0), and its own light presets (gradients, grey) are not ported.
+      - [ ] (i) Multi-chunk prompts of different chunk counts: the reference
+            repeats the shorter prompt's chunks; this port pads with empty
+            chunks.
+      - [ ] (j) `--birefnet-config FILE`: today the BiRefNet config must be a
+            `config.json` next to the model file.
+- [ ] Karras / continuous-sigma img2img follow-ups (fed30990, e9fe925f): pico
+      parity vs diffusers for img2img with Euler linspace, Euler a Karras
+      (per-step ancestral noise) and 9-channel inpainting below strength 1 with
+      Karras (only DPM++ 2M, SDE and Euler Karras are pinned); move the three
+      tests that still assign `Pipeline.Sampler := DiffusersSchedulerSampler(...)`
+      to `SelectSamplerFromConfig`; `TNNetFlowMatchEulerScheduler`'s DPM path
+      still refuses `sde-dpmsolver++`.
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close; and `gligen-1-4-inpainting-text-box` with
@@ -882,6 +915,10 @@ rather than acted on.
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
           offline (the importer is config-driven and ready).
+      (f) the pico fixture's `semantic_map` is class 3 everywhere, so
+          `TestMask2FormerParity`'s semantic check is weak (the synthetic cases in
+          `TestMask2FormerSemanticDecodeReference` carry it); a fixture with varied
+          output would make the real-forward check meaningful.
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
