@@ -835,11 +835,6 @@ rather than acted on.
               `--invert-image --null-text` (with and without `--edit-prompt`)
               there: reconstruction quality at guidance 7.5.
         - [ ] Null-text inversion follow-ups (b5f693ec..59dcdab1):
-          - [x] Error-only backprop mode on `TNNet` (`SetErrorOnlyBackprop`):
-                `NullTextInversion` runs on the sampling UNet, int8 included,
-                with no delta/inertia buffers. The memory saving against the
-                old trainable FP32 UNet (SD 1.5 estimated ~10 GB) is not
-                measured on a real checkpoint.
           - [ ] OpenCL: with OpenCL on, `NullTextInversion` still builds a
                 trainable FP32 UNet on the CPU; 50 steps x 10 inner steps is
                 up to 500 CPU forward+backward passes. Error-only on the
@@ -847,10 +842,6 @@ rather than acted on.
                 leaves every backward cache (GroupNorm's normalized input,
                 attention probabilities, ...) on the host, or add a device
                 backward.
-          - [x] One CLI run builds the UNet once: `--null-text` keeps the
-                components loaded (CPU only; `--gpu` still builds two UNets,
-                the trainable CPU one for the fit and the OpenCL one for
-                sampling).
           - [ ] Decide: DDIM / null-text inversion encode through
                 `EncodeVaeImage`, so with `VaeTileSize` set on a large image
                 they now invert a TILED encode (a948d626). They refuse
@@ -2623,22 +2614,6 @@ cannot pay for its own transfer.
       (both CPU-only today); when this lands, add `TNNetConvolution` to the
       device-backward list at the top of "OpenCL forward coverage".
 
-- [x] Real-input FFTs that still ran a full complex FFT with Im = 0 and were not
-      a drop-in for `RealFFTForward` / `RealFFTInverse` (all four DONE; shared
-      primitives `RealFFTForwardBins` / `RealFFTInverseRealPart` in neuralvolume):
-      - [x] `TNNetCirculantLinear` FFT path: kernel spectrum, products and
-        inverses on the half spectrum (`RealFFTForward` / `RealFFTInverse` in
-        place). CPU A/B ~1.25x (N 1024), ~2x (N 1000) forward+backward.
-      - [x] `TNNetSpectralConv1D`: `RealFFTForwardBins` (modes above Nyquist
-        by conjugate symmetry) and `RealFFTInverseRealPart`. CPU A/B ~1.4x
-        (256x1x32 m16), ~1.5x (200x1x32 m64) forward+backward.
-      - [x] `TNNetFourierMix` (UseFFT): real hidden-axis FFT, sequence-axis
-        FFT on the D div 2 + 1 bins only, the rest from 2-D Hermitian symmetry.
-        CPU A/B ~1.6x (128x1x256), ~1.9x (100x1x96) forward+backward.
-      - [x] `TNNetSpectralConv2D`: real row FFT along X keeping the ModesX bins
-        (`RealFFTForwardBins` rebuilds those above Nyquist), Y FFT on the kept
-        bins only; inverse via `RealFFTInverseRealPart`. CPU A/B ~2.1-2.8x
-        forward, ~2.4x forward+backward (64x64x16 m12, 60x60x8 m16).
 - [ ] Decision for the user: inference-time release of the convolution im2col
       matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
       convolution keeps it after the forward in both memory modes (the FP32
