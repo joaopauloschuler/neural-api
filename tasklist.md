@@ -2395,20 +2395,24 @@ dev box proves parity; throughput numbers have to come from the GPU box.
     - [ ] GPU-box: gpt-oss decode tok/s with the resident KV cache against
           the parent of the importer commit (per-head sink heads, host cached
           decode), FP32 and int8 KV.
-    - [ ] The uncached full forward of a `TNNetFusedSDPA` has no OpenCL path
-          (`WillOpenCL` needs the cache), so the gpt-oss full forward (perplexity,
-          the oracle test) went back to the host when the importer switched
-          from the per-head sink heads, which ran it on `cai_sdpa_flash`. A
-          flash full forward for the fused layer (append the step into a
-          scratch cache at slot 0, then `ComputeStep`'s flash with the causal or
-          non-causal mask, sinks included) would restore it and add it to
-          every fused importer; ChatTerminal is not affected (its prefill runs
-          as cached windows). Then GPU-box: gpt-oss prefill tok/s.
-    - [ ] The `--no-fused-attn` fallback keeps the host cached decode:
-          `TNNetGptOssSinkAttention.CachedStepIsExact` is false and the base
-          `RunCachedStepOnSource` passes no sinks. Passing `SinkLogits()` there
-          (`ComputeStep` takes them now) would put that path on the resident
-          cache too.
+    - [X] The uncached full forward of a `TNNetFusedSDPA` has no OpenCL path
+          (`WillOpenCL` needs the cache). DONE 1336ef5a: `RunFlashOnSource`
+          appends the input into the helper's cache buffers as a scratch cache
+          at slot 0 and reuses `ComputeStep` (causal / windowed / non-causal,
+          soft-cap, sinks) or `ComputeStepIdentityScores`, through the
+          inherited `ComputeFlashOpenCL`; source bound, result resident, host
+          fallback. Every fused importer's full forward is on OpenCL now.
+          Tests: `FusedSDPAFullForwardOpenCLParity` (max|diff| <= 1.2e-6 on
+          PoCL), `TestGptOssLogitParityOpenCL` (every fused layer on OpenCL).
+          int8 KV does not apply (the uncached forward is FP32 on both sides).
+    - [ ] GPU-box: gpt-oss prefill tok/s (uncached full forward, e.g. the
+          perplexity run) against the parent of 1336ef5a.
+    - [X] The `--no-fused-attn` fallback keeps the host cached decode. DONE
+          1336ef5a: the base `RunCachedStepOnSource` passes `SinkLogits()` and
+          `TNNetGptOssSinkAttention.CachedStepIsExact` is true for its exact
+          class. Tests: `GptOssSinkAttentionCachedDecodeOpenCLParity` (FP32 and
+          int8 KV, every step on OpenCL, no steady-state transfer) and the
+          per-head leg of `TestGptOssStreamedDecodeOpenCLParity`.
     - [ ] No model-level int8-KV parity test for gpt-oss: on the pico a top-2
           routing flip turns int8 rounding into logit jumps, so int8 with sinks
           is covered per layer only (`TestFusedSDPASinkCachedDecodeParity`,
