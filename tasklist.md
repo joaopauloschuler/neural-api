@@ -800,7 +800,7 @@ rather than acted on.
               (`DenoiseEdit` from the inverted latents) stay faithful; today
               `--invert-image` with `--edit-prompt` is only faithful at
               guidance 1. Steps, each its own commit:
-          - [ ] (a) Gradient of the SD UNet output with respect to its text
+          - [X] (a) Gradient of the SD UNet output with respect to its text
                 (encoder_hidden_states) input: check whether `TNNet.Backpropagate`
                 already leaves the error on the text `TNNetInput` (the attn2 K/V
                 projections read it); if not, add it. Test: numerical gradient

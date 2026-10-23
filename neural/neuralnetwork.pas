@@ -24604,7 +24604,10 @@ type
       // have its Output sized) before this is called, since the transient error
       // tensors are sized to match Output. Safe to call repeatedly. Guards a
       // nil/zero-layer net (does nothing).
-      procedure EnableInputGradient();
+      procedure EnableInputGradient(); overload;
+      // EnableInputGradient for InputLayer, any input of a multi-input net (e.g.
+      // the text states of a UNet): Backpropagate then leaves d(loss)/d(input) there.
+      procedure EnableInputGradient(InputLayer: TNNetLayer); overload;
       // Forward+backward adversarial-robustness diagnostic. Given a trained
       // classifier NN, a labelled probe batch (Samples, a TNNetVolumeList of
       // input volumes, plus Labels, the matching integer class indices — NOT
@@ -139809,10 +139812,13 @@ begin
 end;
 
 procedure TNNet.EnableInputGradient();
-var
-  InputLayer: TNNetLayer;
 begin
   if (FLayers = nil) or (CountLayers() < 1) then Exit;
+  EnableInputGradient(FLayers[0]);
+end;
+
+procedure TNNet.EnableInputGradient(InputLayer: TNNetLayer);
+begin
   // Enable input-gradient flow. By default a network's input layer carries a
   // 1-element OutputError (it never needs gradients for training), so the
   // first trainable layer's backward pass skips writing the input gradient.
@@ -139820,7 +139826,6 @@ begin
   // refresh the first layer's cached "calculate previous-layer error" flag
   // (convolutions cache it at wiring time) so the gradient reaches the input.
   // Only transient error tensors are touched; weights are untouched.
-  InputLayer := FLayers[0];
   // Recorded on the input layer, so a later TNNet.SetTrainable(True) regrows it.
   if InputLayer is TNNetInput then TNNetInput(InputLayer).EnableErrorCollection();
   if InputLayer.OutputError.Size <> InputLayer.Output.Size then

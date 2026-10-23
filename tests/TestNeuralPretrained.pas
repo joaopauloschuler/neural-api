@@ -1507,6 +1507,9 @@ type
     // guidance 1 and 3, vs diffusers DDIMInverseScheduler float64 (ad hoc run);
     // then DDIM from the guidance-1 latents.
     procedure TestStableDiffusionDDIMInversionParity;
+    // TNNet.EnableInputGradient on the tiny_sd15 UNet's text states input:
+    // Backpropagate's error there vs central differences of 0.5 |pred - target|^2.
+    procedure TestSDUNetTextStatesGradient;
     // get_word_inds, get_replacement_mapper_ and get_mapper of
     // google/prompt-to-prompt on hand-made token lengths and ids.
     procedure TestSDPromptWordTokenPositions;
@@ -52210,6 +52213,78 @@ begin
     Img2Img.Free;
     Pipeline.Free;
     FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSDUNetTextStatesGradient;
+const
+  cTimestep = 500;
+  cStep = 1e-2;
+  cProbePositions: array[0..5] of integer = (0, 7, 33, 64, 101, 159);
+var
+  NN: TNNet;
+  Config: TSDUNetConfig;
+  TextInput: TNNetLayer;
+  Latents, Embeds, Target, Pred, Gradient: TNNetVolume;
+  ProbePos, EmbedPos: integer;
+  SavedValue, LossPlus, LossMinus, Numerical, Tolerance: TNeuralFloat;
+
+  function Loss(): TNeuralFloat;
+  begin
+    SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
+    Pred.Sub(Target);
+    Result := 0.5 * Pred.GetSumSqr();
+  end;
+
+begin
+  RandSeed := 20221117;
+  Config := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd15/unet/config.json'));
+  Config.LatentGrid := 8;
+  Config.LatentGridY := 6;
+  Config.TextSeqLen := 5;
+  NN := BuildSDUNetFromSafeTensorsEx(
+    FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config,
+    {pTrainable=}true);
+  Latents := TNNetVolume.Create(8, 6, Config.InChannels);
+  Embeds := TNNetVolume.Create(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+  Target := TNNetVolume.Create(8, 6, Config.OutChannels);
+  Pred := TNNetVolume.Create();
+  Gradient := TNNetVolume.Create();
+  try
+    NN.SetBatchUpdate(true);
+    Latents.RandomizeGaussian(1.0);
+    Embeds.RandomizeGaussian(1.0);
+    Target.RandomizeGaussian(1.0);
+    TextInput := SDUNetTextStatesInput(NN);
+    SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
+    NN.EnableInputGradient(TextInput);
+    SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
+    NN.Backpropagate(Target);
+    AssertEquals('error on the text input', Embeds.Size,
+      TextInput.OutputError.Size);
+    Gradient.Copy(TextInput.OutputError);
+    AssertTrue('nonzero text gradient', Gradient.GetSumAbs() > 0);
+    for ProbePos := 0 to High(cProbePositions) do
+    begin
+      EmbedPos := cProbePositions[ProbePos];
+      SavedValue := Embeds.FData[EmbedPos];
+      Embeds.FData[EmbedPos] := SavedValue + cStep;
+      LossPlus := Loss();
+      Embeds.FData[EmbedPos] := SavedValue - cStep;
+      LossMinus := Loss();
+      Embeds.FData[EmbedPos] := SavedValue;
+      Numerical := (LossPlus - LossMinus) / (2 * cStep);
+      Tolerance := 2e-3 + 0.03 * Abs(Numerical);
+      AssertEquals('d loss / d embed ' + IntToStr(EmbedPos), Numerical,
+        Gradient.FData[EmbedPos], Tolerance);
+    end;
+  finally
+    Gradient.Free;
+    Pred.Free;
+    Target.Free;
+    Embeds.Free;
+    Latents.Free;
+    NN.Free;
   end;
 end;
 
