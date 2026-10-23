@@ -1286,6 +1286,8 @@ type
     procedure TestMask2FormerInstancePanopticFixture;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloConfigClassNames;
+    // YoloClassIdOfLabel: config names, COCO-80 fallback, case and unknown labels.
+    procedure TestYoloClassIdOfLabel;
     procedure TestYoloObjectDetectionParity;
     procedure TestYoloDetectionDecode;
     procedure TestYoloSegConfigDefaults;
@@ -43098,6 +43100,27 @@ begin
     on E: Exception do Raised := true;
   end;
   AssertTrue('names count must match num_classes', Raised);
+end;
+
+procedure TTestNeuralPretrained.TestYoloClassIdOfLabel;
+var
+  Config: TYoloConfig;
+begin
+  Config.NumClasses := 3;
+  Config.ModelType := 'yolov8';
+  Config.ClassNames := TStringArray.Create('person', 'traffic light', 'Dog');
+  AssertEquals('exact', 0, YoloClassIdOfLabel(Config, 'person'));
+  AssertEquals('two words', 1, YoloClassIdOfLabel(Config, 'traffic light'));
+  AssertEquals('case-insensitive', 2, YoloClassIdOfLabel(Config, 'DOG'));
+  AssertEquals('trimmed', 1, YoloClassIdOfLabel(Config, '  Traffic Light '));
+  AssertEquals('unknown', -1, YoloClassIdOfLabel(Config, 'car'));
+  AssertEquals('empty', -1, YoloClassIdOfLabel(Config, ''));
+  Config.ClassNames := nil;
+  Config.NumClasses := 80;
+  AssertEquals('COCO car', 2, YoloClassIdOfLabel(Config, 'Car'));
+  AssertEquals('COCO toothbrush', 79, YoloClassIdOfLabel(Config, 'toothbrush'));
+  Config.ModelType := 'fastsam';
+  AssertEquals('no COCO names for fastsam', -1, YoloClassIdOfLabel(Config, 'car'));
 end;
 
 // Verifies ReadYoloConfigFromJSONFile on the committed YOLOv8 pico config.

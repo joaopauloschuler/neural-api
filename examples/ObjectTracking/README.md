@@ -37,7 +37,12 @@ ratio and height. On every frame `Update`:
 
 The tracker ignores the class: a person box can continue a car track. Use
 `--classes` to track only some classes; the program removes the other
-detections **before** the tracker sees them.
+detections **before** the tracker sees them. The list mixes class ids and
+class names (case-insensitive, e.g. `--classes person,car` or `0,Car`); the
+names are the ones shown on the boxes (see below), resolved after the config is
+loaded. An unknown name stops the program with the close matches, or with every
+valid name when nothing is close; an id outside the config's classes is an
+error too.
 
 ## Usage
 
@@ -46,7 +51,7 @@ cd examples/ObjectTracking
 lazbuild -B ObjectTracking.lpi
 ../../bin/x86_64-linux/bin/ObjectTracking                    # pico fixture smoke
 ../../bin/x86_64-linux/bin/ObjectTracking --model yolov8n.safetensors \
-  --input frames/ --output tracked/ --gif tracked.gif --classes 0
+  --input frames/ --output tracked/ --gif tracked.gif --classes person,car
 ```
 
 `--model` takes an ultralytics yolov8 checkpoint converted to safetensors, with
@@ -67,7 +72,7 @@ the class id is shown.
 | `--input DIR` | folder of consecutive frames | required with `--model` |
 | `--output DIR` | where `<frame>_tracks.png` goes | required with `--model` |
 | `--gif FILE` | also write the annotated frames as an animated GIF (frames of another size are left out) | none |
-| `--classes LIST` | comma-separated class ids to track, e.g. `0,2` (COCO: 0 = person, 2 = car) | all |
+| `--classes LIST` | comma-separated class ids or names to track, e.g. `0,2` or `person,car` (COCO: 0 = person, 2 = car) | all |
 | `--score S` | detector score threshold; keep it at or below 0.1 so the low-score association has boxes | 0.1 |
 | `--iou T` | detector NMS IoU threshold | 0.7 |
 | `--track-thresh T` | ByteTrack high-score threshold | 0.5 |

@@ -16862,6 +16862,9 @@ function ReadYoloConfigFromJSONFile(const FileName: string): TYoloConfig;
 // yolov8 config without names, else the id as text.
 function YoloClassLabel(const Config: TYoloConfig; ClassId: integer): string;
 
+// Class id whose YoloClassLabel equals ClassLabel (case-insensitive, trimmed), else -1.
+function YoloClassIdOfLabel(const Config: TYoloConfig; const ClassLabel: string): integer;
+
 function YoloConfigToString(const Config: TYoloConfig): string;
 
 // Builds the YOLOv8 detector (or segmenter) described by Config, loading every
@@ -95984,6 +95987,22 @@ begin
      (ClassId < csCocoClassCount) then
     Result := csCocoClassNames[ClassId];
   if Result = '' then Result := IntToStr(ClassId);
+end;
+
+function YoloClassIdOfLabel(const Config: TYoloConfig; const ClassLabel: string): integer;
+var
+  ClassId, MaxClassId: integer;
+  TrimmedLabel: string;
+begin
+  Result := -1;
+  TrimmedLabel := Trim(ClassLabel);
+  MaxClassId := Config.NumClasses - 1;
+  for ClassId := 0 to MaxClassId do
+    if SameText(YoloClassLabel(Config, ClassId), TrimmedLabel) then
+    begin
+      Result := ClassId;
+      exit;
+    end;
 end;
 
 function YoloConfigToString(const Config: TYoloConfig): string;

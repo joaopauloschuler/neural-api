@@ -48,7 +48,7 @@ type
   TObjectTrackingOptions = record
     ModelFile, ConfigFile, InputDir, OutputDir, GifFile: string;
     ScoreThreshold, IoUThreshold: TNeuralFloat;
-    KeptClassIds: TNeuralIntegerArray; // empty = every class
+    ClassList: string; // --classes as given; '' = every class
     TrackThreshold, MatchThreshold: double;
     TrackBuffer, Fps: integer;
     UseOpenCL, UseInt8: boolean;
@@ -67,8 +67,8 @@ begin
   WriteLn('  --output DIR         writes <frame>_tracks.png');
   WriteLn('  --gif FILE           also write the annotated frames as an ',
     'animated GIF');
-  WriteLn('  --classes LIST       comma-separated class ids to track, e.g. 0,2 ',
-    '(default: all)');
+  WriteLn('  --classes LIST       comma-separated class ids or names to track, ',
+    'e.g. 0,2 or person,car (default: all)');
   WriteLn('  --score S            detector score threshold (default 0.1, the ',
     'ByteTrack low-score bound)');
   WriteLn('  --iou T              detector NMS IoU threshold (default 0.7)');
@@ -86,12 +86,71 @@ begin
   WriteLn('  --gpu-device N       OpenCL device index (default 0)');
 end;
 
-// "0,2,7" -> (0, 2, 7).
-function ParseClassIds(const ClassList: string): TNeuralIntegerArray;
+// Levenshtein distance of A and B, case-insensitive.
+function LabelEditDistance(const A, B: string): integer;
+var
+  LowerA, LowerB: string;
+  Row: array of integer;
+  PosA, PosB, MaxPosA, MaxPosB, Diagonal, Above, Cost: integer;
+begin
+  LowerA := LowerCase(A);
+  LowerB := LowerCase(B);
+  MaxPosA := Length(LowerA);
+  MaxPosB := Length(LowerB);
+  SetLength(Row, MaxPosB + 1);
+  for PosB := 0 to MaxPosB do Row[PosB] := PosB;
+  for PosA := 1 to MaxPosA do
+  begin
+    Diagonal := Row[0];
+    Row[0] := PosA;
+    for PosB := 1 to MaxPosB do
+    begin
+      Above := Row[PosB];
+      if LowerA[PosA] = LowerB[PosB] then Cost := 0 else Cost := 1;
+      Row[PosB] := Min(Min(Row[PosB] + 1, Row[PosB - 1] + 1), Diagonal + Cost);
+      Diagonal := Above;
+    end;
+  end;
+  Result := Row[MaxPosB];
+end;
+
+// Error text for an unknown class name: the close matches, else every valid name.
+function UnknownClassMessage(const ClassLabel: string; const Config: TYoloConfig): string;
+var
+  ClassId, MaxClassId: integer;
+  CandidateLabel, CloseMatches, ValidNames: string;
+begin
+  CloseMatches := '';
+  ValidNames := '';
+  MaxClassId := Config.NumClasses - 1;
+  for ClassId := 0 to MaxClassId do
+  begin
+    CandidateLabel := YoloClassLabel(Config, ClassId);
+    if ValidNames <> '' then ValidNames := ValidNames + ', ';
+    ValidNames := ValidNames + CandidateLabel;
+    if (Pos(LowerCase(ClassLabel), LowerCase(CandidateLabel)) > 0) or
+       (LabelEditDistance(ClassLabel, CandidateLabel) <= Max(1, Length(ClassLabel) div 3)) then
+    begin
+      if CloseMatches <> '' then CloseMatches := CloseMatches + ', ';
+      CloseMatches := CloseMatches + CandidateLabel;
+    end;
+  end;
+  Result := 'unknown class "' + ClassLabel + '" in --classes; ';
+  if CloseMatches <> '' then
+    Result := Result + 'did you mean: ' + CloseMatches
+  else
+    Result := Result + 'valid names: ' + ValidNames;
+end;
+
+// "0,car,Traffic Light" -> class ids, names resolved against the loaded Config.
+function ResolveClassList(const ClassList: string; const Config: TYoloConfig): TNeuralIntegerArray;
 var
   Items: TStringList;
-  ItemPos, MaxItemPos: integer;
+  ItemPos, MaxItemPos, ClassId: integer;
+  Item: string;
 begin
+  Result := nil;
+  if Trim(ClassList) = '' then exit;
   Items := TStringList.Create;
   try
     Items.StrictDelimiter := true;
@@ -100,7 +159,22 @@ begin
     SetLength(Result, Items.Count);
     MaxItemPos := Items.Count - 1;
     for ItemPos := 0 to MaxItemPos do
-      Result[ItemPos] := StrToInt(Trim(Items[ItemPos]));
+    begin
+      Item := Trim(Items[ItemPos]);
+      if TryStrToInt(Item, ClassId) then
+      begin
+        if (ClassId < 0) or (ClassId >= Config.NumClasses) then
+          raise Exception.Create('class id ' + Item + ' in --classes is outside 0..' +
+            IntToStr(Config.NumClasses - 1));
+      end
+      else
+      begin
+        ClassId := YoloClassIdOfLabel(Config, Item);
+        if ClassId < 0 then
+          raise Exception.Create(UnknownClassMessage(Item, Config));
+      end;
+      Result[ItemPos] := ClassId;
+    end;
   finally
     Items.Free;
   end;
@@ -127,7 +201,7 @@ begin
   Opt.GifFile := '';
   Opt.ScoreThreshold := 0.1;
   Opt.IoUThreshold := 0.7;
-  Opt.KeptClassIds := nil;
+  Opt.ClassList := '';
   Opt.TrackThreshold := 0.5;
   Opt.MatchThreshold := 0.8;
   Opt.TrackBuffer := 30;
@@ -146,7 +220,7 @@ begin
     else if Arg = '--input' then Opt.InputDir := NextArg()
     else if Arg = '--output' then Opt.OutputDir := NextArg()
     else if Arg = '--gif' then Opt.GifFile := NextArg()
-    else if Arg = '--classes' then Opt.KeptClassIds := ParseClassIds(NextArg())
+    else if Arg = '--classes' then Opt.ClassList := NextArg()
     else if Arg = '--score' then Opt.ScoreThreshold := StrToFloat(NextArg())
     else if Arg = '--iou' then Opt.IoUThreshold := StrToFloat(NextArg())
     else if Arg = '--track-thresh' then Opt.TrackThreshold := StrToFloat(NextArg())
@@ -297,6 +371,7 @@ var
   Image, NetInput: TNNetVolume;
   Letterbox: TYoloLetterbox;
   Dets: TYoloDetectionArray;
+  KeptClassIds: TNeuralIntegerArray;
   Tracks: TByteTrackedBoxArray;
   GifWriter: TNNetAnimatedGIFWriter;
   FramePos, MaxFramePos, TrackPos, MaxTrackPos, GifWidth, GifHeight,
@@ -325,6 +400,7 @@ begin
     NN := BuildYoloFromSafeTensors(Opt.ModelFile, Config, {pTrainable=}false,
       Opt.ConfigFile);
     WriteLn(YoloConfigToString(Config));
+    KeptClassIds := ResolveClassList(Opt.ClassList, Config);
     ComputeText := PrepareCompute(NN, Opt
       {$IFDEF OpenCL}, OpenCLDevices{$ENDIF});
     Tracker := TByteTracker.Create(Opt.TrackThreshold, Opt.MatchThreshold,
@@ -345,7 +421,7 @@ begin
       Dets := DecodeYoloDetections(NN.GetLastLayer().Output, Config,
         Opt.ScoreThreshold, Opt.IoUThreshold);
       ScaleYoloBoxesToImage(Dets, Config.ImageSize, Image.SizeX, Image.SizeY);
-      KeepDetectionsOfClasses(Dets, Opt.KeptClassIds);
+      KeepDetectionsOfClasses(Dets, KeptClassIds);
       Tracks := Tracker.Update(Dets);
       FrameSeconds := (Now() - StartTime) * 86400.0;
       TotalSeconds := TotalSeconds + FrameSeconds;
@@ -465,7 +541,7 @@ begin
   // 0.6; the score bound and the class filter keep a handful of boxes.
   Opt.TrackThreshold := 0.4;
   Opt.ScoreThreshold := 0.525;
-  Opt.KeptClassIds := ParseClassIds('0');
+  Opt.ClassList := '0';
   TrackFolder(Opt);
 end;
 
