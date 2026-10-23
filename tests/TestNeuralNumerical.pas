@@ -334,6 +334,7 @@ type
     // TNNetSpectralConv1D Fourier Neural Operator spectral conv layer
     procedure TestSpectralConv1DGradientCheck;
     procedure TestSpectralConv1DGradientCheckNonPow2;
+    procedure TestSpectralConv1DGradientCheckAboveNyquist;
     procedure TestSpectralConv1DModesTruncation;
     procedure TestSpectralConv1DSerializationRoundTrip;
     // TNNetDWT1D lifting-scheme single-level 1-D discrete wavelet transform
@@ -64386,13 +64387,14 @@ begin
   end;
 end;
 
-procedure SpectralConv1DGradCheck(ATestCase: TTestCase; SeqLen: integer);
+procedure SpectralConv1DGradCheck(ATestCase: TTestCase; SeqLen: integer;
+  Modes: integer = 3);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
   SC: TNNetSpectralConv1D;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
-  i, InDepth, OutDepth, Modes, InSize, OutSize, WCount: integer;
+  i, InDepth, OutDepth, InSize, OutSize, WCount: integer;
 
   function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
   var
@@ -64416,7 +64418,7 @@ begin
   // a real bug. (TestNeuralNumerical shares one RNG; reseed to avoid tripping
   // unrelated ordering-sensitive checks.)
   RandSeed := 424242;
-  InDepth := 2; OutDepth := 2; Modes := 3;
+  InDepth := 2; OutDepth := 2;
   InSize := SeqLen * InDepth;
   OutSize := SeqLen * OutDepth;
   NN := TNNet.Create();
@@ -64501,6 +64503,15 @@ begin
   // SeqLen 7 and 12 run the Bluestein plan.
   SpectralConv1DGradCheck(Self, 7);
   SpectralConv1DGradCheck(Self, 12);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DGradientCheckAboveNyquist;
+begin
+  // Modes > SeqLen div 2 + 1: the modes above Nyquist come from conjugate
+  // symmetry of the real FFT; odd and even SeqLen, and SeqLen = 1.
+  SpectralConv1DGradCheck(Self, 7, 6);
+  SpectralConv1DGradCheck(Self, 8, 8);
+  SpectralConv1DGradCheck(Self, 1, 1);
 end;
 
 procedure TTestNeuralNumerical.TestSpectralConv1DModesTruncation;
@@ -66788,6 +66799,13 @@ begin
     7, 1, 3, 2, 7, 1, 'SpectralConv1D L=7 all modes');
   SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(2, 3),
     16, 1, 2, 2, 3, 1, 'SpectralConv1D L=16 (radix-2)');
+  // Modes above SeqLen div 2 + 1 (rebuilt by conjugate symmetry), odd and even.
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(2, 10),
+    12, 1, 2, 2, 10, 1, 'SpectralConv1D L=12 Modes 10');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(3, 8),
+    8, 1, 2, 3, 8, 1, 'SpectralConv1D L=8 all modes');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv1D.Create(2, 1),
+    1, 1, 2, 2, 1, 1, 'SpectralConv1D L=1');
   SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(2, 3, 2),
     6, 5, 2, 2, 3, 2, 'SpectralConv2D 6x5');
   SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(3, 2, 3),

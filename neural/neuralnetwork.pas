@@ -17918,12 +17918,14 @@ type
     FModes: integer;        // number of kept low-frequency modes
     FSeqLen: integer;       // SeqLen (= prev SizeX), any length >= 1
     FInDepth: integer;      // input Depth
-    FFFTPlan: TFFTPlan;     // length-FSeqLen plan, built in SetPrevLayer
-    // Scratch buffers (per Compute/Backpropagate), kept to avoid re-alloc.
+    FRealPlan: TRealFFTPlan; // length-FSeqLen real plan, built in SetPrevLayer
+    // Scratch buffers (per Compute/Backpropagate), kept to avoid re-alloc. The
+    // spectra hold Max(FModes, FSeqLen div 2 + 1) bins: the kept modes plus the
+    // half spectrum RealFFTInverseRealPart works on.
+    FRealRow: array of Double;              // one real sequence (FSeqLen)
     FXre, FXim: array of array of Double;  // [ci][k] forward spectrum of input
-    FSreBuf, FSimBuf: array of Double;      // ComputeCPU per-output spectrum (FSeqLen)
-    FGreBuf, FGimBuf: array of Double;      // BackpropagateCPU FFT scratch (FSeqLen)
-    FdXreBuf, FdXimBuf: array of array of Double; // BackpropagateCPU input-spectrum grad [FInDepth][FModes]
+    FSreBuf, FSimBuf: array of Double;      // ComputeCPU per-output spectrum
+    FGreBuf, FGimBuf: array of Double;      // BackpropagateCPU FFT scratch
     // AVX-contiguous mirrors of the spectral weights, rebuilt in AfterWeightUpdate
     // from the interleaved W.FData. Layout: index (co*FModes + m)*FInDepth + ci so
     // that, for a fixed (co,m), the InDepth reduction over ci is a contiguous
@@ -98235,8 +98237,6 @@ procedure TNNetSpectralConv1D.FreeBackpropScratch();
 begin
   SetLength(FGreBuf, 0);
   SetLength(FGimBuf, 0);
-  SetLength(FdXreBuf, 0);
-  SetLength(FdXimBuf, 0);
   SetLength(FdXrePlane, 0);
   SetLength(FdXimPlane, 0);
   SetLength(FdWrPlane, 0);
@@ -98245,10 +98245,8 @@ end;
 
 procedure TNNetSpectralConv1D.SizeBackpropScratch();
 begin
-  SetLength(FGreBuf, FSeqLen);
-  SetLength(FGimBuf, FSeqLen);
-  SetLength(FdXreBuf, FInDepth, FModes);
-  SetLength(FdXimBuf, FInDepth, FModes);
+  SetLength(FGreBuf, Max(FModes, FSeqLen div 2 + 1));
+  SetLength(FGimBuf, Max(FModes, FSeqLen div 2 + 1));
   SetLength(FdXrePlane, FModes * FInDepth);
   SetLength(FdXimPlane, FModes * FInDepth);
   SetLength(FdWrPlane, FOutDepth * FModes * FInDepth);
@@ -98309,12 +98307,13 @@ begin
   FNeurons[0].FBiasWeight := 0;
   BuildArrNeurons();
 
-  FFTPlanInit(FFFTPlan, FSeqLen);
-  SetLength(FXre, FInDepth, FSeqLen);
-  SetLength(FXim, FInDepth, FSeqLen);
+  RealFFTPlanInit(FRealPlan, FSeqLen);
+  SetLength(FRealRow, FSeqLen);
+  SetLength(FXre, FInDepth, Max(FModes, FSeqLen div 2 + 1));
+  SetLength(FXim, FInDepth, Max(FModes, FSeqLen div 2 + 1));
   // FSreBuf/FSimBuf are forward Compute scratch; the rest is backprop-only.
-  SetLength(FSreBuf, FSeqLen);
-  SetLength(FSimBuf, FSeqLen);
+  SetLength(FSreBuf, Max(FModes, FSeqLen div 2 + 1));
+  SetLength(FSimBuf, Max(FModes, FSeqLen div 2 + 1));
   // AVX-contiguous weight + input-spectrum planes (forward path).
   SetLength(FWrPlane, FOutDepth * FModes * FInDepth);
   SetLength(FWiPlane, FOutDepth * FModes * FInDepth);
@@ -98397,7 +98396,7 @@ procedure TNNetSpectralConv1D.ComputeCPU();
 var
   ci, co, m, n: integer;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  wBaseIdx, xBaseIdx, pos, TailLen: integer;
+  wBaseIdx, xBaseIdx, pos: integer;
   PrevOut: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -98414,17 +98413,17 @@ begin
   // additionally hand-edited (a finite-difference perturbation writes
   // Weights.FData straight), so it keeps refreshing per forward.
   if FIsTrainable then RebuildWeightPlanes();
-  // 1. Real FFT of every input channel along SeqLen.
+  // 1. Real FFT of every input channel along SeqLen; modes above SeqLen div 2
+  // come from conjugate symmetry.
   for ci := 0 to InDepthM1 do
   begin
     pos := ci;
     for n := 0 to SeqLenM1 do
     begin
-      FXre[ci][n] := PrevOut.FData[pos];
-      FXim[ci][n] := 0;
+      FRealRow[n] := PrevOut.FData[pos];
       Inc(pos, FInDepth);
     end;
-    FFTPlanExecute(FFFTPlan, FXre[ci], FXim[ci], false);
+    RealFFTForwardBins(FRealPlan, FRealRow, FXre[ci], FXim[ci], FModes);
   end;
   // Pack the kept-mode input spectra into contiguous (m,ci) Single planes so the
   // InDepth contraction below is a vectorizable DotProduct.
@@ -98441,16 +98440,10 @@ begin
   // The InDepth complex contraction is the 4-multiply complex GEMM, each real
   // reduction an AVX DotProduct over the contiguous ci axis:
   //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
-  TailLen := (FSeqLen - FModes) * csDoubleSize;  // #5: high modes stay zero
   for co := 0 to OutDepthM1 do
   begin
-    // Modes 0..FModes-1 are overwritten below, so only the truncated tail needs
-    // clearing (#13: one FillChar instead of a scalar loop).
-    if TailLen > 0 then
-    begin
-      FillChar(FSreBuf[FModes], TailLen, 0);
-      FillChar(FSimBuf[FModes], TailLen, 0);
-    end;
+    // Modes 0..FModes-1 are overwritten below; RealFFTInverseRealPart treats
+    // the bins above them as zero.
     for m := 0 to ModesM1 do
     begin
       wBaseIdx := (co * FModes + m) * FInDepth;
@@ -98462,11 +98455,12 @@ begin
         TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
         TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
     end;
-    FFTPlanExecute(FFFTPlan, FSreBuf, FSimBuf, true);  // inverse FFT (includes 1/L)
+    // Real part of the inverse FFT (includes 1/L).
+    RealFFTInverseRealPart(FRealPlan, FSreBuf, FSimBuf, FModes, FRealRow);
     pos := co;
     for n := 0 to SeqLenM1 do
     begin
-      FOutput.FData[pos] := FSreBuf[n];  // real part
+      FOutput.FData[pos] := FRealRow[n];
       Inc(pos, FOutDepth);
     end;
   end;
@@ -98496,7 +98490,7 @@ var
   invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
   xr, xi, wr, wi: TNeuralFloat;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  wBaseIdx, xBaseIdx, wPos, xPos, planeSize, wPlaneSize, pos, OutStride, TailLen: integer;
+  wBaseIdx, xBaseIdx, wPos, xPos, planeSize, wPlaneSize, pos, OutStride: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
   invL := 1.0 / FSeqLen;
@@ -98521,11 +98515,10 @@ begin
     pos := co;
     for n := 0 to SeqLenM1 do
     begin
-      FGreBuf[n] := FOutputError.FData[pos];
-      FGimBuf[n] := 0;
+      FRealRow[n] := FOutputError.FData[pos];
       Inc(pos, FOutDepth);
     end;
-    FFTPlanExecute(FFFTPlan, FGreBuf, FGimBuf, false);
+    RealFFTForwardBins(FRealPlan, FRealRow, FGreBuf, FGimBuf, FModes);
     for m := 0 to ModesM1 do
     begin
       gyr := invL * FGreBuf[m];
@@ -98578,43 +98571,27 @@ begin
       Inc(wBaseIdx, FInDepth);
     end;
 
-  // Scatter the contiguous (m,ci) input-spectrum gradient back to the [ci][m]
-  // scratch the per-channel IFFT below consumes.
-  for ci := 0 to InDepthM1 do
-  begin
-    xBaseIdx := ci;             // #12: carries m * FInDepth + ci
-    for m := 0 to ModesM1 do
-    begin
-      FdXreBuf[ci][m] := FdXrePlane[xBaseIdx];
-      FdXimBuf[ci][m] := FdXimPlane[xBaseIdx];
-      Inc(xBaseIdx, FInDepth);
-    end;
-  end;
-
   // Propagate the input-spectrum gradient back through the input FFT:
   //   dL/dx[ci][n] = L * Re( IFFT(dXhat[ci]) )[n].
   if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
   begin
     LocalPrevError := FPrevLayer.OutputError;
-    TailLen := (FSeqLen - FModes) * csDoubleSize;  // #5: high modes stay zero
     for ci := 0 to InDepthM1 do
     begin
-      // Modes 0..FModes-1 are overwritten next, so only the tail is cleared.
-      if TailLen > 0 then
-      begin
-        FillChar(FGreBuf[FModes], TailLen, 0);
-        FillChar(FGimBuf[FModes], TailLen, 0);
-      end;
+      // Gather channel ci of the contiguous (m,ci) gradient planes; the bins
+      // above FModes count as zero in RealFFTInverseRealPart.
+      xBaseIdx := ci;             // #12: carries m * FInDepth + ci
       for m := 0 to ModesM1 do
       begin
-        FGreBuf[m] := FdXreBuf[ci][m];
-        FGimBuf[m] := FdXimBuf[ci][m];
+        FGreBuf[m] := FdXrePlane[xBaseIdx];
+        FGimBuf[m] := FdXimPlane[xBaseIdx];
+        Inc(xBaseIdx, FInDepth);
       end;
-      FFTPlanExecute(FFFTPlan, FGreBuf, FGimBuf, true);  // IFFT (includes 1/L)
+      RealFFTInverseRealPart(FRealPlan, FGreBuf, FGimBuf, FModes, FRealRow);  // includes 1/L
       pos := ci;
       for n := 0 to SeqLenM1 do
       begin
-        contrib := FSeqLen * FGreBuf[n];       // undo the IFFT's 1/L -> real adjoint
+        contrib := FSeqLen * FRealRow[n];       // undo the IFFT's 1/L -> real adjoint
         LocalPrevError.FData[pos] := LocalPrevError.FData[pos] + contrib;
         Inc(pos, FInDepth);
       end;

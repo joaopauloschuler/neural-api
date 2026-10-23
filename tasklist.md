@@ -2585,8 +2585,9 @@ cannot pay for its own transfer.
       a drop-in for `RealFFTForward` / `RealFFTInverse`:
       - `TNNetCirculantLinear` FFT path: real kernel, input and error; would need
         the product and inverse on the half spectrum (kernel spectrum too).
-      - `TNNetSpectralConv1D`: Modes may exceed SeqLen div 2 + 1, so the bins
-        above Nyquist would have to be rebuilt by conjugate symmetry.
+      - [x] `TNNetSpectralConv1D`: `RealFFTForwardBins` (modes above Nyquist
+        by conjugate symmetry) and `RealFFTInverseRealPart`. CPU A/B ~1.4x
+        (256x1x32 m16), ~1.5x (200x1x32 m64) forward+backward.
       - [x] `TNNetFourierMix` (UseFFT): real hidden-axis FFT, sequence-axis
         FFT on the D div 2 + 1 bins only, the rest from 2-D Hermitian symmetry.
         CPU A/B ~1.6x (128x1x256), ~1.9x (100x1x96) forward+backward.
