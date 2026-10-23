@@ -2184,11 +2184,15 @@ rather than acted on.
       on SD 1.5 with a real multi-person photo; check the `--pose-out` image
       by eye against controlnet_aux DWpose / OpenposeDetector output, then
       mark both READMEs supported.
-      Also check `tools/make_openpose_draw_oracle.py` against the real
-      controlnet_aux source: controlnet_aux was not installed, so its
-      COCO-17 -> OpenPose-18 order, limb colors and DWpose drawing order
-      (all limbs, canvas x0.6, then dots) were written from memory; only the
-      cv2 drawing primitives come from a real OpenCV wheel.
+      `DrawOpenPoseBodies` and `tools/make_openpose_draw_oracle.py` were
+      checked line by line against the controlnet_aux 0.0.10 sdist (equal to
+      GitHub master) on 2026-10-23: dwpose/wholebody.py:100-116 (neck and
+      reorder), dwpose/__init__.py:54-65 (/W, /H, score > 0.3) and
+      dwpose/util.py:67-108 (draw_bodypose) all match; nothing changed.
+      OpenposeDetector (open_pose/__init__.py:56-58, open_pose/util.py:69-123)
+      draws differently: limbs then dots PER PERSON, with color * 0.6 at fill
+      time, so a later person's limbs cover an earlier person's dots. Compare
+      the `--pose-out` image against DWpose output, not OpenposeDetector output.
 
 - [X] Multi-object VIDEO tracking: exact assignment + ByteTrack (Zhang et al.
       ECCV 2022, arXiv:2110.06864) over the landed YOLOv8 detector, plus
