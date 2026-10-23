@@ -199,6 +199,14 @@ type
       out Config: TRVMConfig): double;
     procedure RunRVMOpenCLParity(const Base: string; FrameWidth,
       FrameHeight: integer);
+    // Case Tag of <Base>_io.safetensors through BuildRetinaFaceFromSafeTensors.
+    procedure RetinaFaceParity(const Base, Tag: string;
+      out Config: TRetinaFaceConfig; out FaceCount: integer;
+      out RawDiff, DecodeDiff, FaceDiff: double);
+    // RetinaFaceParity with all three differences < 1e-4 and more than 5 faces.
+    procedure CheckRetinaFaceParity(const Base, Tag: string;
+      out Config: TRetinaFaceConfig; out FaceCount: integer);
+    procedure RunRetinaFaceOpenCLParity(const Base, Tag: string);
     function GFPGANParityMaxDiff(const WeightsFile, IOFile, ConfigFile: string;
       pRoundTrip: boolean; out Config: TGFPGANConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
@@ -1513,6 +1521,11 @@ type
     procedure TestRVMResNet50Parity;
     procedure TestRVMResNet50NoRefinerParity;
     procedure TestRVMResNet50OpenCLParity;
+    procedure TestRetinaFaceMobileNetParity;
+    procedure TestRetinaFaceMobileNetOddSizeParity;
+    procedure TestRetinaFaceResNet50Parity;
+    procedure TestRetinaFaceResizedInput;
+    procedure TestRetinaFaceOpenCLParity;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -55162,6 +55175,276 @@ end;
 procedure TTestNeuralPretrained.TestRVMResNet50OpenCLParity;
 begin
   RunRVMOpenCLParity('tiny_rvm_resnet50', 80, 64);
+end;
+
+// Largest |field diff| between Faces and the oracle rows Dets [K, 15]
+// (box, score, 5 landmarks); a count mismatch fails the test.
+function RetinaFaceFacesMaxDiff(const What: string;
+  const Faces: TRetinaFaceDetectionArray; Dets: TNNetVolume;
+  FaceCount: integer): double;
+var
+  FacePos, PointPos, RowBase: integer;
+begin
+  Result := 0;
+  if Length(Faces) <> FaceCount then
+    raise Exception.Create(What + ': ' + IntToStr(Length(Faces)) +
+      ' faces after NMS, oracle has ' + IntToStr(FaceCount));
+  for FacePos := 0 to FaceCount - 1 do
+  begin
+    RowBase := FacePos * 15;
+    Result := Max(Result, Abs(Faces[FacePos].X1 - Dets.FData[RowBase]));
+    Result := Max(Result, Abs(Faces[FacePos].Y1 - Dets.FData[RowBase + 1]));
+    Result := Max(Result, Abs(Faces[FacePos].X2 - Dets.FData[RowBase + 2]));
+    Result := Max(Result, Abs(Faces[FacePos].Y2 - Dets.FData[RowBase + 3]));
+    Result := Max(Result, Abs(Faces[FacePos].Score - Dets.FData[RowBase + 4]));
+    for PointPos := 0 to 4 do
+    begin
+      Result := Max(Result, Abs(Faces[FacePos].LandmarkX[PointPos] -
+        Dets.FData[RowBase + 5 + 2 * PointPos]));
+      Result := Max(Result, Abs(Faces[FacePos].LandmarkY[PointPos] -
+        Dets.FData[RowBase + 6 + 2 * PointPos]));
+    end;
+  end;
+end;
+
+// Rows: [0..3] = loc, [4..5] = conf logits, [6..15] = landm (oracle [N, k]).
+// RawDiff = net rows vs oracle rows; DecodeDiff = faces decoded from the ORACLE
+// rows vs its post-NMS faces, in pixels; FaceDiff = faces of DetectRetinaFaceFaces
+// vs the same, divided by max(W, H) (the head regresses image-relative units and
+// the 256/512-pixel anchors scale a float32 rounding of the rows up to ~1e-3 px).
+procedure TTestNeuralPretrained.RetinaFaceParity(const Base, Tag: string;
+  out Config: TRetinaFaceConfig; out FaceCount: integer;
+  out RawDiff, DecodeDiff, FaceDiff: double);
+const
+  Parts: array[0..2] of string = ('_loc', '_conf', '_landm');
+  PartOffsets: array[0..2] of integer = (0, 4, 6);
+var
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image, Expected, Output, OracleRows, Dets: TNNetVolume;
+  PartPos, PriorPos, Channel, Width: integer;
+  Threshold: TNeuralFloat;
+begin
+  IO := TNNetSafeTensorsReader.Create(FixturePath(Base + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  OracleRows := TNNetVolume.Create;
+  Dets := TNNetVolume.Create;
+  NN := nil;
+  try
+    LoadDDColorTorchImage(IO, Tag + '_image', Image);
+    NN := BuildRetinaFaceFromSafeTensors(FixturePath(Base + '.pth'),
+      Image.SizeX, Image.SizeY, Config, {pTrainable=}false);
+    IO.LoadTensorFlat(Tag + '_conf_threshold', Expected);
+    Threshold := Expected.FData[0];
+    IO.LoadTensorFlat(Tag + '_dets', Dets);
+    FaceCount := IO.DimSize(Tag + '_dets', 0);
+    FaceDiff := RetinaFaceFacesMaxDiff(Tag + ' net', DetectRetinaFaceFaces(NN,
+      Config, Image, Threshold, 0.4), Dets, FaceCount) /
+      Max(Image.SizeX, Image.SizeY);
+    NN.GetOutput(Output);
+    AssertEquals('prior rows', RetinaFacePriorCount(Config), Output.SizeX);
+    OracleRows.ReSize(Output.SizeX, 1, csRetinaFaceRowWidth);
+    for PartPos := 0 to 2 do
+    begin
+      IO.LoadTensorFlat(Tag + Parts[PartPos], Expected);
+      Width := IO.DimSize(Tag + Parts[PartPos], 1);
+      AssertEquals(Parts[PartPos] + ' rows', Output.SizeX,
+        IO.DimSize(Tag + Parts[PartPos], 0));
+      for PriorPos := 0 to Output.SizeX - 1 do
+        for Channel := 0 to Width - 1 do
+          OracleRows[PriorPos, 0, PartOffsets[PartPos] + Channel] :=
+            Expected.FData[PriorPos * Width + Channel];
+    end;
+    RawDiff := MaxAbsVolumeDiff(Output, OracleRows);
+    DecodeDiff := RetinaFaceFacesMaxDiff(Tag + ' oracle rows',
+      DecodeRetinaFaceDetections(OracleRows, Config, Threshold, 0.4), Dets,
+      FaceCount);
+    WriteLn('  RetinaFace ', Base, ' ', Image.SizeX, 'x', Image.SizeY, ': ',
+      FaceCount, ' faces; raw rows max|diff| = ', RawDiff:0:9,
+      ', decode of oracle rows = ', DecodeDiff:0:9, ' px, end to end = ',
+      FaceDiff:0:9, ' of the image size');
+  finally
+    NN.Free;
+    Dets.Free;
+    OracleRows.Free;
+    Output.Free;
+    Expected.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CheckRetinaFaceParity(const Base, Tag: string;
+  out Config: TRetinaFaceConfig; out FaceCount: integer);
+var
+  RawDiff, DecodeDiff, FaceDiff: double;
+begin
+  RetinaFaceParity(Base, Tag, Config, FaceCount, RawDiff, DecodeDiff, FaceDiff);
+  AssertTrue('raw rows max |diff| = ' + FloatToStr(RawDiff) + ' must be < 1e-4',
+    RawDiff < 1e-4);
+  AssertTrue('decode max |diff| = ' + FloatToStr(DecodeDiff) + ' px must be < 1e-4',
+    DecodeDiff < 1e-4);
+  AssertTrue('end-to-end faces max |diff| = ' + FloatToStr(FaceDiff) +
+    ' of the image size must be < 1e-4', FaceDiff < 1e-4);
+  AssertTrue('some faces', FaceCount > 5);
+end;
+
+// tiny_retinaface_mobilenet.*: facexlib 0.3.0 RetinaFace (its own retinaface*.py,
+// float64) over a half-width MobileNetV1; keys saved with the "module." prefix.
+procedure TTestNeuralPretrained.TestRetinaFaceMobileNetParity;
+var
+  Config: TRetinaFaceConfig;
+  FaceCount: integer;
+begin
+  CheckRetinaFaceParity('tiny_retinaface_mobilenet', 'even', Config, FaceCount);
+  AssertEquals('backbone', 'mobilenet0.25', Config.Backbone);
+  AssertEquals('stem width', 4, Config.MobileNetWidths[0]);
+  AssertEquals('stage3 width', 128, Config.StageChannels[2]);
+  AssertEquals('FPN width', 32, Config.OutChannels);
+  AssertEquals('leaky', 0.1, Config.LeakySlope, 1e-6);
+end;
+
+// 61x45: every level rounds up (8x6, 4x3, 2x2) and the FPN upsamples 2 -> 3 rows.
+procedure TTestNeuralPretrained.TestRetinaFaceMobileNetOddSizeParity;
+var
+  Config: TRetinaFaceConfig;
+  FaceCount: integer;
+begin
+  CheckRetinaFaceParity('tiny_retinaface_mobilenet', 'odd', Config, FaceCount);
+  AssertTrue('NMS suppressed some candidates', FaceCount < 41);
+end;
+
+// tiny_retinaface_resnet50.*: the same RetinaFace over a pico torchvision Bottleneck
+// ResNet (blocks [1,2,1,1]); FPN width 68 > 64 makes FPN/SSH use ReLU.
+procedure TTestNeuralPretrained.TestRetinaFaceResNet50Parity;
+var
+  Config: TRetinaFaceConfig;
+  FaceCount: integer;
+begin
+  CheckRetinaFaceParity('tiny_retinaface_resnet50', 'odd', Config, FaceCount);
+  AssertEquals('backbone', 'resnet50', Config.Backbone);
+  AssertEquals('layer2 blocks', 2, Config.ResNet.BlocksPerStage[1]);
+  AssertEquals('FPN inputs', 32, Config.StageChannels[0]);
+  AssertEquals('FPN width', 68, Config.OutChannels);
+  AssertEquals('leaky', 0, Config.LeakySlope, 1e-9);
+  AssertTrue('NMS suppressed some candidates', FaceCount < 41);
+end;
+
+// A 2x image is resized to the net size and the faces come back in its pixels:
+// boxes and landmarks scale by 2 against the same detections at net size.
+procedure TTestNeuralPretrained.TestRetinaFaceResizedInput;
+var
+  Config: TRetinaFaceConfig;
+  NN: TNNet;
+  Small, Large: TNNetVolume;
+  SmallFaces, LargeFaces: TRetinaFaceDetectionArray;
+  X, Y, Channel: integer;
+begin
+  NN := BuildRetinaFaceFromSafeTensors(FixturePath('tiny_retinaface_mobilenet.pth'),
+    48, 40, Config, false);
+  Small := TNNetVolume.Create(48, 40, 3);
+  Large := TNNetVolume.Create(96, 80, 3);
+  try
+    for Y := 0 to 79 do
+      for X := 0 to 95 do
+        for Channel := 0 to 2 do
+          Large[X, Y, Channel] := 128 + 90 * Sin((X div 2) * 0.3 + Channel) *
+            Cos((Y div 2) * 0.25);
+    for Y := 0 to 39 do
+      for X := 0 to 47 do
+        for Channel := 0 to 2 do
+          Small[X, Y, Channel] := Large[2 * X, 2 * Y, Channel];
+    SmallFaces := DetectRetinaFaceFaces(NN, Config, Small, 0.5, 0.4, 3);
+    LargeFaces := DetectRetinaFaceFaces(NN, Config, Large, 0.5, 0.4, 3);
+    AssertTrue('MaxFaces caps the list', Length(SmallFaces) <= 3);
+    AssertEquals('same face count', Length(SmallFaces), Length(LargeFaces));
+    AssertTrue('some faces', Length(SmallFaces) > 0);
+    AssertEquals('x1 scales by 2', 2 * SmallFaces[0].X1, LargeFaces[0].X1, 1e-3);
+    AssertEquals('y2 scales by 2', 2 * SmallFaces[0].Y2, LargeFaces[0].Y2, 1e-3);
+    AssertEquals('nose x scales by 2', 2 * SmallFaces[0].LandmarkX[2],
+      LargeFaces[0].LandmarkX[2], 1e-3);
+    AssertEquals('same score', SmallFaces[0].Score, LargeFaces[0].Score, 1e-5);
+  finally
+    Large.Free;
+    Small.Free;
+    NN.Free;
+  end;
+end;
+
+// The pico net under EnableOpenCL, then also ForceOpenCL, against the host net.
+procedure TTestNeuralPretrained.RunRetinaFaceOpenCLParity(const Base, Tag: string);
+{$IFDEF OpenCL}
+var
+  Config: TRetinaFaceConfig;
+  OnOpenCL, OnHost: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image, NetInput, OutCL, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, OpenCLLayerCnt: integer;
+  MaxDiff: double;
+  Forced: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  IO := TNNetSafeTensorsReader.Create(FixturePath(Base + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  NetInput := TNNetVolume.Create;
+  OutCL := TNNetVolume.Create;
+  OutCPU := TNNetVolume.Create;
+  OnHost := nil;
+  OnOpenCL := nil;
+  try
+    LoadDDColorTorchImage(IO, Tag + '_image', Image);
+    OnHost := BuildRetinaFaceFromSafeTensors(FixturePath(Base + '.pth'),
+      Image.SizeX, Image.SizeY, Config, false);
+    OnOpenCL := BuildRetinaFaceFromSafeTensors(FixturePath(Base + '.pth'),
+      Image.SizeX, Image.SizeY, Config, false);
+    RetinaFacePrepareInput(Image, Config, NetInput);
+    OnOpenCL.EnableOpenCL(PlatformId, DeviceId);
+    MaxDiff := 0;
+    OnHost.Compute(NetInput);
+    OnHost.GetOutput(OutCPU);
+    for Forced := false to true do
+    begin
+      OnOpenCL.ForceOpenCL(Forced);
+      OnOpenCL.Compute(NetInput);
+      OnOpenCL.GetOutput(OutCL);
+      MaxDiff := Max(MaxDiff, MaxAbsVolumeDiff(OutCL, OutCPU));
+    end;
+    OpenCLLayerCnt := 0;
+    for LayerPos := 0 to OnOpenCL.CountLayers() - 1 do
+      if OnOpenCL.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+    WriteLn('  RetinaFace ', Base, ' OpenCL max|diff| = ', MaxDiff:0:9,
+      ', layers on OpenCL: ', OpenCLLayerCnt, ' of ', OnOpenCL.CountLayers());
+    AssertTrue('some layers run on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue('head rows OpenCL vs CPU max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OnOpenCL.Free;
+    OnHost.Free;
+    OutCPU.Free;
+    OutCL.Free;
+    NetInput.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestRetinaFaceOpenCLParity;
+begin
+  RunRetinaFaceOpenCLParity('tiny_retinaface_mobilenet', 'odd');
+  RunRetinaFaceOpenCLParity('tiny_retinaface_resnet50', 'odd');
 end;
 
 // DDColorPrepareInput keeps only L (gray RGB in [0,1]); DDColorComposeOutput keeps

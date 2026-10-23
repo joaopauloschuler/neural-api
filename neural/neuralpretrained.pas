@@ -15986,6 +15986,85 @@ type
   end;
 
 // ---------------------------------------------------------------------------
+// RETINAFACE FACE DETECTOR IMPORT (Deng et al. CVPR 2020, as packaged by
+// facexlib: detection_mobilenet0.25_Final.pth / detection_Resnet50_Final.pth).
+// One TNNet per input size: BGR image minus (104, 117, 123) -> MobileNetV1-0.25
+// (stage1..3) or torchvision ResNet-50 (layer2..4) -> FPN (nearest upsample to
+// the lateral size) -> one SSH module per level -> one fused 1x1 head conv per
+// level. Output (NumPriors, 1, 16) in facexlib prior order (level, row, column,
+// anchor): [0..3] box offsets, [4..5] background/face logits, [6..15] the five
+// landmark offsets. DecodeRetinaFaceDetections turns it into boxes, scores and
+// landmarks in image pixels (prior-box decode, threshold, greedy NMS).
+// Coded by Claude (AI).
+const
+  csRetinaFaceMobileNetBlockCount = 14;   // conv_bn + 13 conv_dw
+  csRetinaFaceRowWidth = 16;              // 4 box + 2 class + 10 landmark values
+
+type
+  TRetinaFaceConfig = record
+    Backbone: string;                       // 'mobilenet0.25' or 'resnet50'
+    // mobilenet0.25: output width of body.stage1.0 .. body.stage3.1 (from shapes)
+    MobileNetWidths: array[0..csRetinaFaceMobileNetBlockCount - 1] of integer;
+    ResNet: TResNetConfig;                  // resnet50 trunk (from shapes)
+    StageChannels: array[0..2] of integer;  // the three FPN input widths
+    OutChannels: integer;                   // FPN / SSH width (64 or 256)
+    LeakySlope: TNeuralFloat;               // FPN / SSH: 0.1 if OutChannels <= 64
+    ImageWidth, ImageHeight: integer;       // net input size
+    MinSizes: array[0..2, 0..1] of integer; // anchor sizes per level, pixels
+    Steps: array[0..2] of integer;          // level strides: 8, 16, 32
+    Variances: array[0..1] of TNeuralFloat; // 0.1 (centre), 0.2 (size)
+    BnEps: TNeuralFloat;
+  end;
+
+  TRetinaFaceDetection = record
+    X1, Y1, X2, Y2, Score: TNeuralFloat;    // box corners in image pixels
+    // left eye, right eye, nose, left and right mouth corner (facexlib order)
+    LandmarkX, LandmarkY: array[0..4] of TNeuralFloat;
+  end;
+  TRetinaFaceDetectionArray = array of TRetinaFaceDetection;
+
+// Strips a "module." prefix, detects the backbone (body.stage1.* = mobilenet0.25,
+// body.layer2.* = resnet50) and reads every width from the checkpoint shapes.
+function InferRetinaFaceConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  ImageWidth, ImageHeight: integer): TRetinaFaceConfig;
+
+function RetinaFaceConfigToString(const Config: TRetinaFaceConfig): string;
+
+// Builds the detector for Config and loads every weight, folding each BatchNorm
+// (caller owns Reader; a "module." key prefix is stripped from it).
+function BuildRetinaFace(Reader: TNNetSafeTensorsReader;
+  const Config: TRetinaFaceConfig; pTrainable: boolean = true): TNNet;
+
+function BuildRetinaFaceFromSafeTensorsEx(const FileName: string;
+  const Config: TRetinaFaceConfig; pTrainable: boolean = true): TNNet;
+
+// Same with the config inferred from the .pth / .safetensors checkpoint.
+function BuildRetinaFaceFromSafeTensors(const FileName: string;
+  ImageWidth, ImageHeight: integer; out Config: TRetinaFaceConfig;
+  pTrainable: boolean = true): TNNet;
+
+// Number of output rows: sum over levels of ceil(H/step)*ceil(W/step)*2.
+function RetinaFacePriorCount(const Config: TRetinaFaceConfig): integer;
+
+// Image (W, H, 3) RGB 0..255 -> NetInput (ImageWidth, ImageHeight, 3) BGR minus
+// (104, 117, 123); a different image size is bilinear-resized first.
+procedure RetinaFacePrepareInput(Image: TNNetVolume;
+  const Config: TRetinaFaceConfig; NetInput: TNNetVolume);
+
+// Output -> faces scoring > ConfThreshold after greedy NMS (IoU > NMSThreshold),
+// best first, at most MaxFaces (0 = all); pixels = net-input pixels / ScaleX|Y.
+function DecodeRetinaFaceDetections(Output: TNNetVolume;
+  const Config: TRetinaFaceConfig; ConfThreshold: TNeuralFloat = 0.8;
+  NMSThreshold: TNeuralFloat = 0.4; MaxFaces: integer = 0;
+  ScaleX: TNeuralFloat = 1; ScaleY: TNeuralFloat = 1): TRetinaFaceDetectionArray;
+
+// RetinaFacePrepareInput -> NN.Compute -> DecodeRetinaFaceDetections, in the
+// pixel coordinates of Image (facexlib detect_faces; FaceRestoreHelper uses 0.97).
+function DetectRetinaFaceFaces(NN: TNNet; const Config: TRetinaFaceConfig;
+  Image: TNNetVolume; ConfThreshold: TNeuralFloat = 0.8;
+  NMSThreshold: TNeuralFloat = 0.4; MaxFaces: integer = 0): TRetinaFaceDetectionArray;
+
+// ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
 // ultralytics/yolov8n) -- the repo's FIRST anchor-free fully-convolutional
 // one-stage detector, STRUCTURALLY DISTINCT from the landed DETR importer (no
@@ -108833,34 +108912,43 @@ begin
   Result := Reader.DimSize(Name, Axis);
 end;
 
-// ResNet50Encoder: torchvision Bottleneck ResNet with a dilated layer4; the
-// stage widths and block counts come from the "backbone.layerN.M.*" shapes.
-function InferRVMResNetConfig(Reader: TNNetSafeTensorsReader): TResNetConfig;
+// torchvision Bottleneck ResNet trunk under Prefix (e.g. 'backbone.'): stem width
+// and per-stage widths and block counts from the shapes; no stage dilated.
+function InferResNetTrunkConfig(Reader: TNNetSafeTensorsReader;
+  const Prefix, ImporterName: string): TResNetConfig;
 var
   Stage, BlockCount, BlockTotal: integer;
   StagePrefix: string;
+
+  function TrunkDim(const Name: string; Axis: integer): integer;
+  begin
+    if not Reader.HasTensor(Name) then
+      ImportError(ImporterName + ': missing tensor "' + Name + '".');
+    Result := Reader.DimSize(Name, Axis);
+  end;
+
 begin
   Result.ModelType := 'resnet';
   Result.BlockKind := rbkBottleneck;
-  Result.StemWidth := RVMDim(Reader, 'backbone.conv1.weight', 0);
-  Result.NumChannels := Reader.DimSize('backbone.conv1.weight', 1);
+  Result.StemWidth := TrunkDim(Prefix + 'conv1.weight', 0);
+  Result.NumChannels := TrunkDim(Prefix + 'conv1.weight', 1);
   if Result.NumChannels <> 3 then
-    ImportError(csRVMImporter + ': "backbone.conv1.weight" must read 3 channels.');
+    ImportError(ImporterName + ': "' + Prefix + 'conv1.weight" must read 3 channels.');
   BlockTotal := 0;
   for Stage := 0 to 3 do
   begin
-    StagePrefix := 'backbone.layer' + IntToStr(Stage + 1) + '.';
-    Result.StageWidths[Stage] := RVMDim(Reader, StagePrefix + '0.conv1.weight', 0);
+    StagePrefix := Prefix + 'layer' + IntToStr(Stage + 1) + '.';
+    Result.StageWidths[Stage] := TrunkDim(StagePrefix + '0.conv1.weight', 0);
     BlockCount := 1;
     while Reader.HasTensor(StagePrefix + IntToStr(BlockCount) + '.conv1.weight') do
       Inc(BlockCount);
     Result.BlocksPerStage[Stage] := BlockCount;
     BlockTotal := BlockTotal + BlockCount;
-    Result.ReplaceStrideWithDilation[Stage] := Stage = 3;
+    Result.ReplaceStrideWithDilation[Stage] := false;
   end;
-  if not Reader.HasTensor('backbone.layer1.0.conv3.weight') then
-    ImportError(csRVMImporter + ': the ResNet backbone must use Bottleneck blocks.');
-  Result.Expansion := Reader.DimSize('backbone.layer1.0.conv3.weight', 0) div
+  if not Reader.HasTensor(Prefix + 'layer1.0.conv3.weight') then
+    ImportError(ImporterName + ': the ResNet backbone must use Bottleneck blocks.');
+  Result.Expansion := Reader.DimSize(Prefix + 'layer1.0.conv3.weight', 0) div
     Result.StageWidths[0];
   Result.Depth := 3 * BlockTotal + 2;
   Result.ImageSize := 0;
@@ -108951,7 +109039,9 @@ begin
   Result.BnEps := 0.00001;
   if Result.Variant = 'resnet50' then
   begin
-    Result.ResNet := InferRVMResNetConfig(Reader);
+    // ResNet50Encoder dilates layer4.
+    Result.ResNet := InferResNetTrunkConfig(Reader, 'backbone.', csRVMImporter);
+    Result.ResNet.ReplaceStrideWithDilation[3] := true;
     SetLength(Result.Backbone.Blocks, 0);
     Result.Backbone.StemWidth := 0;
     Result.Backbone.HeadConvWidth := 0;
@@ -109455,6 +109545,524 @@ begin
   if (Level < 1) or (Level > 4) then
     ImportError(csRVMImporter + ': hidden state level must be 1..4.');
   Result := FStateInputs[4 - Level].Output;
+end;
+
+// ===========================================================================
+// RetinaFace importer (facexlib detection_*_Final.pth)
+// ===========================================================================
+
+const
+  csRetinaFaceImporter = 'RetinaFace import';
+  // facexlib MobileNetV1: conv_bn(s2), then conv_dw strides; stage ends at 5/11/13.
+  csRetinaFaceMobileNetStrides: array[0..csRetinaFaceMobileNetBlockCount - 1] of
+    integer = (2, 1, 2, 1, 2, 1, 2, 1, 1, 1, 1, 1, 2, 1);
+  csRetinaFaceMobileNetStageEnd: array[0..2] of integer = (5, 11, 13);
+  csRetinaFaceAnchorCount = 2;
+
+// "body.stageS.N" of mobilenet block BlockPos (0..13).
+function RetinaFaceMobileNetBlockPrefix(BlockPos: integer): string;
+begin
+  if BlockPos <= csRetinaFaceMobileNetStageEnd[0] then
+    Result := 'body.stage1.' + IntToStr(BlockPos)
+  else if BlockPos <= csRetinaFaceMobileNetStageEnd[1] then
+    Result := 'body.stage2.' + IntToStr(BlockPos - csRetinaFaceMobileNetStageEnd[0] - 1)
+  else
+    Result := 'body.stage3.' + IntToStr(BlockPos - csRetinaFaceMobileNetStageEnd[1] - 1);
+end;
+
+function RetinaFaceDim(Reader: TNNetSafeTensorsReader; const Name: string;
+  Axis: integer): integer;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError(csRetinaFaceImporter + ': missing tensor "' + Name + '".');
+  Result := Reader.DimSize(Name, Axis);
+end;
+
+function InferRetinaFaceConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  ImageWidth, ImageHeight: integer): TRetinaFaceConfig;
+var
+  BlockPos, Level: integer;
+  BlockPrefix: string;
+begin
+  Reader.RenameTensorPrefix('module.', '');
+  if (ImageWidth < 1) or (ImageHeight < 1) then
+    ImportError(csRetinaFaceImporter + ': image size must be positive.');
+  FillChar(Result.MobileNetWidths, SizeOf(Result.MobileNetWidths), 0);
+  if Reader.HasTensor('body.stage1.0.0.weight') then
+  begin
+    Result.Backbone := 'mobilenet0.25';
+    for BlockPos := 0 to csRetinaFaceMobileNetBlockCount - 1 do
+    begin
+      BlockPrefix := RetinaFaceMobileNetBlockPrefix(BlockPos);
+      // conv_bn = .0 conv .1 bn; conv_dw = .0 depthwise .1 bn .3 pointwise .4 bn.
+      if BlockPos = 0 then
+        Result.MobileNetWidths[0] := RetinaFaceDim(Reader, BlockPrefix + '.0.weight', 0)
+      else
+        Result.MobileNetWidths[BlockPos] :=
+          RetinaFaceDim(Reader, BlockPrefix + '.3.weight', 0);
+    end;
+    if Reader.HasTensor('body.stage3.2.0.weight') then
+      ImportError(csRetinaFaceImporter + ': body.stage3 has more than 2 blocks; ' +
+        'not a facexlib MobileNetV1.');
+    for Level := 0 to 2 do
+      Result.StageChannels[Level] :=
+        Result.MobileNetWidths[csRetinaFaceMobileNetStageEnd[Level]];
+    Result.ResNet := Default(TResNetConfig);
+  end
+  else if Reader.HasTensor('body.layer2.0.conv1.weight') then
+  begin
+    Result.Backbone := 'resnet50';
+    Result.ResNet := InferResNetTrunkConfig(Reader, 'body.', csRetinaFaceImporter);
+    for Level := 0 to 2 do
+      Result.StageChannels[Level] := Result.ResNet.StageWidths[Level + 1] *
+        Result.ResNet.Expansion;
+  end
+  else
+    ImportError(csRetinaFaceImporter + ': neither "body.stage1.0.0.weight" ' +
+      '(mobilenet0.25) nor "body.layer2.0.conv1.weight" (resnet50) found; not a ' +
+      'facexlib RetinaFace checkpoint.');
+  Result.OutChannels := RetinaFaceDim(Reader, 'fpn.output1.0.weight', 0);
+  if Result.OutChannels mod 4 <> 0 then
+    ImportError(csRetinaFaceImporter + ': FPN width ' +
+      IntToStr(Result.OutChannels) + ' must be a multiple of 4 (SSH split).');
+  // facexlib FPN / SSH: leaky = 0.1 if out_channels <= 64 else 0.
+  if Result.OutChannels <= 64 then Result.LeakySlope := 0.1
+  else Result.LeakySlope := 0;
+  Result.ImageWidth := ImageWidth;
+  Result.ImageHeight := ImageHeight;
+  Result.MinSizes[0, 0] := 16;  Result.MinSizes[0, 1] := 32;
+  Result.MinSizes[1, 0] := 64;  Result.MinSizes[1, 1] := 128;
+  Result.MinSizes[2, 0] := 256; Result.MinSizes[2, 1] := 512;
+  Result.Steps[0] := 8; Result.Steps[1] := 16; Result.Steps[2] := 32;
+  Result.Variances[0] := 0.1;
+  Result.Variances[1] := 0.2;
+  Result.BnEps := 0.00001;
+end;
+
+function RetinaFaceConfigToString(const Config: TRetinaFaceConfig): string;
+begin
+  Result := 'RetinaFace config: backbone=' + Config.Backbone +
+    ', fpn_in=' + IntToStr(Config.StageChannels[0]) + '/' +
+    IntToStr(Config.StageChannels[1]) + '/' + IntToStr(Config.StageChannels[2]) +
+    ', out_channel=' + IntToStr(Config.OutChannels) +
+    ', leaky=' + FloatToStr(Config.LeakySlope) +
+    ', image=' + IntToStr(Config.ImageWidth) + 'x' + IntToStr(Config.ImageHeight) +
+    ', priors=' + IntToStr(RetinaFacePriorCount(Config));
+end;
+
+function RetinaFacePriorCount(const Config: TRetinaFaceConfig): integer;
+var
+  Level: integer;
+begin
+  Result := 0;
+  for Level := 0 to 2 do
+    Result := Result + csRetinaFaceAnchorCount *
+      ((Config.ImageHeight + Config.Steps[Level] - 1) div Config.Steps[Level]) *
+      ((Config.ImageWidth + Config.Steps[Level] - 1) div Config.Steps[Level]);
+end;
+
+function BuildRetinaFace(Reader: TNNetSafeTensorsReader;
+  const Config: TRetinaFaceConfig; pTrainable: boolean): TNNet;
+type
+  TRetinaFaceSSHLayers = record
+    Conv3, Conv5A, Conv5B, Conv7A, Conv7B: TNNetLayer;
+  end;
+var
+  NN: TNNet;
+  Trunk: TResNetTrunk;
+  MobileConv, MobileDw, MobileDwBias:
+    array[0..csRetinaFaceMobileNetBlockCount - 1] of TNNetLayer;
+  Taps, Laterals, LateralActs, Pyramid, Heads, LevelRows: array[0..2] of TNNetLayer;
+  Merges: array[0..1] of TNNetLayer;
+  Conv5AAct: TNNetLayer;
+  SSH: array[0..2] of TRetinaFaceSSHLayers;
+  BlockPos, Level, InWidth, OutWidth, Quarter, PriorCount: integer;
+  BlockPrefix, LevelPrefix: string;
+  Shift: TNNetVolume;
+
+  function AddConv(Width, K, Stride: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayer( TNNetConvolutionLinear.Create(Width, K, K div 2,
+      Stride, 0).SetTrainable(pTrainable) );
+  end;
+
+  function AddConvAfter(Width, K: integer; Source: TNNetLayer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter( TNNetConvolutionLinear.Create(Width, K, K div 2,
+      1, 0).SetTrainable(pTrainable), Source );
+  end;
+
+  // nn.LeakyReLU(Slope); Slope 0 is a plain ReLU.
+  function AddAct(Slope: TNeuralFloat): TNNetLayer;
+  begin
+    if Slope = 0 then Result := NN.AddLayer( TNNetReLU.Create() )
+    else Result := NN.AddLayer( TNNetLeakyReLU.Create(Slope) );
+  end;
+
+  procedure LoadFusedHead(Layer: TNNetLayer; Level: integer);
+  const
+    // per anchor: box (4) at 0, class (2) at 4, landmarks (10) at 6.
+    HeadNames: array[0..2] of string = ('BboxHead', 'ClassHead', 'LandmarkHead');
+    HeadWidths: array[0..2] of integer = (4, 2, 10);
+    HeadOffsets: array[0..2] of integer = (0, 4, 6);
+  var
+    W, B, FusedW, FusedB: TNNetVolume;
+    HeadPos, Anchor, Channel, FusedRow, MaxChannelPos: integer;
+    WName: string;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    FusedW := TNNetVolume.Create(csRetinaFaceAnchorCount * csRetinaFaceRowWidth *
+      Config.OutChannels, 1, 1);
+    FusedB := TNNetVolume.Create(csRetinaFaceAnchorCount * csRetinaFaceRowWidth, 1, 1);
+    try
+      for HeadPos := 0 to 2 do
+      begin
+        WName := HeadNames[HeadPos] + '.' + IntToStr(Level) + '.conv1x1.';
+        if (RetinaFaceDim(Reader, WName + 'weight', 0) <>
+             csRetinaFaceAnchorCount * HeadWidths[HeadPos]) or
+           (Reader.DimSize(WName + 'weight', 1) <> Config.OutChannels) or
+           (RetinaFaceDim(Reader, WName + 'bias', 0) <>
+             csRetinaFaceAnchorCount * HeadWidths[HeadPos]) then
+          ImportError(csRetinaFaceImporter + ': "' + WName + 'weight" must have ' +
+            'shape [' + IntToStr(csRetinaFaceAnchorCount * HeadWidths[HeadPos]) +
+            ', ' + IntToStr(Config.OutChannels) + ', 1, 1], got ' +
+            Reader.ShapeAsString(WName + 'weight'));
+        Reader.LoadTensorFlat(WName + 'weight', W);
+        Reader.LoadTensorFlat(WName + 'bias', B);
+        MaxChannelPos := HeadWidths[HeadPos] - 1;
+        // torch channel Anchor * width + Channel (permute(0,2,3,1).view(-1, width)).
+        for Anchor := 0 to csRetinaFaceAnchorCount - 1 do
+          for Channel := 0 to MaxChannelPos do
+          begin
+            FusedRow := Anchor * csRetinaFaceRowWidth + HeadOffsets[HeadPos] + Channel;
+            Move(W.FData[(Anchor * HeadWidths[HeadPos] + Channel) * Config.OutChannels],
+              FusedW.FData[FusedRow * Config.OutChannels],
+              Config.OutChannels * csNeuralFloatSize);
+            FusedB.FData[FusedRow] := B.FData[Anchor * HeadWidths[HeadPos] + Channel];
+          end;
+      end;
+      WriteTorchConvWeights(Layer, FusedW, FusedB, nil, nil,
+        csRetinaFaceAnchorCount * csRetinaFaceRowWidth, Config.OutChannels, 1);
+    finally
+      W.Free; B.Free; FusedW.Free; FusedB.Free;
+    end;
+  end;
+
+  procedure LoadConvBN(Layer: TNNetLayer; const Prefix: string;
+    OutCh, InCh, K: integer);
+  begin
+    LoadResNetConvFoldBN(Reader, Layer, Prefix + '.0.weight', Prefix + '.1',
+      OutCh, InCh, K, Config.BnEps);
+  end;
+
+begin
+  Reader.RenameTensorPrefix('module.', '');
+  if (Config.Backbone <> 'mobilenet0.25') and (Config.Backbone <> 'resnet50') then
+    ImportError(csRetinaFaceImporter + ': unknown backbone "' + Config.Backbone + '".');
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageWidth, Config.ImageHeight, 3) );
+    if Config.Backbone = 'mobilenet0.25' then
+    begin
+      // conv_bn / conv_dw: every activation is LeakyReLU(0.1).
+      MobileConv[0] := AddConv(Config.MobileNetWidths[0], 3,
+        csRetinaFaceMobileNetStrides[0]);
+      AddAct(0.1);
+      Level := 0;
+      for BlockPos := 1 to csRetinaFaceMobileNetBlockCount - 1 do
+      begin
+        MobileDw[BlockPos] := NN.AddLayer( TNNetDepthwiseConvLinear.Create(1, 3, 1,
+          csRetinaFaceMobileNetStrides[BlockPos]).SetTrainable(pTrainable) );
+        MobileDwBias[BlockPos] := NN.AddLayer( TNNetChannelBias.Create() );
+        AddAct(0.1);
+        MobileConv[BlockPos] := AddConv(Config.MobileNetWidths[BlockPos], 1, 1);
+        AddAct(0.1);
+        if BlockPos = csRetinaFaceMobileNetStageEnd[Level] then
+        begin
+          Taps[Level] := NN.GetLastLayer();
+          Inc(Level);
+        end;
+      end;
+    end
+    else
+    begin
+      AddResNetTrunk(NN, Config.ResNet, pTrainable, Trunk);
+      for Level := 0 to 2 do Taps[Level] := Trunk.StageOutputs[Level + 1];
+    end;
+    // FPN: 1x1 laterals, then top-down nearest upsample to the lateral size.
+    for Level := 0 to 2 do
+    begin
+      Laterals[Level] := AddConvAfter(Config.OutChannels, 1, Taps[Level]);
+      LateralActs[Level] := AddAct(Config.LeakySlope);
+    end;
+    Pyramid[2] := LateralActs[2];
+    for Level := 1 downto 0 do
+    begin
+      NN.AddLayerAfter( TNNetResize2D.Create(LateralActs[Level].Output.SizeX,
+        LateralActs[Level].Output.SizeY, {nearest=}0), Pyramid[Level + 1] );
+      NN.AddLayer( TNNetSum.Create([LateralActs[Level], NN.GetLastLayer()]) );
+      Merges[Level] := AddConv(Config.OutChannels, 3, 1);
+      Pyramid[Level] := AddAct(Config.LeakySlope);
+    end;
+    // SSH per level: cat(3x3 C/2, 5x5 C/4, 7x7 C/4) -> ReLU, then the head.
+    Quarter := Config.OutChannels div 4;
+    PriorCount := 0;
+    for Level := 0 to 2 do
+    begin
+      SSH[Level].Conv3 := AddConvAfter(Config.OutChannels div 2, 3, Pyramid[Level]);
+      SSH[Level].Conv5A := AddConvAfter(Quarter, 3, Pyramid[Level]);
+      Conv5AAct := AddAct(Config.LeakySlope);
+      SSH[Level].Conv5B := AddConv(Quarter, 3, 1);
+      SSH[Level].Conv7A := AddConvAfter(Quarter, 3, Conv5AAct);
+      AddAct(Config.LeakySlope);
+      SSH[Level].Conv7B := AddConv(Quarter, 3, 1);
+      NN.AddLayer( TNNetDeepConcat.Create([SSH[Level].Conv3, SSH[Level].Conv5B,
+        SSH[Level].Conv7B]) );
+      NN.AddLayer( TNNetReLU.Create() );
+      Heads[Level] := AddConv(csRetinaFaceAnchorCount * csRetinaFaceRowWidth, 1, 1);
+      LevelRows[Level] := NN.AddLayer( TNNetReshape.Create(Heads[Level].Output.SizeX *
+        Heads[Level].Output.SizeY * csRetinaFaceAnchorCount, 1, csRetinaFaceRowWidth) );
+      PriorCount := PriorCount + LevelRows[Level].Output.SizeX;
+    end;
+    if PriorCount <> RetinaFacePriorCount(Config) then
+      ImportError(csRetinaFaceImporter + ': internal error - ' +
+        IntToStr(PriorCount) + ' head rows, expected ' +
+        IntToStr(RetinaFacePriorCount(Config)) + ' priors.');
+    NN.AddLayer( TNNetConcat.Create([LevelRows[0], LevelRows[1], LevelRows[2]]) );
+    NN.AddLayer( TNNetReshape.Create(PriorCount, 1, csRetinaFaceRowWidth) );
+
+    // ---------------- Weights ----------------
+    if Config.Backbone = 'mobilenet0.25' then
+    begin
+      InWidth := 3;
+      for BlockPos := 0 to csRetinaFaceMobileNetBlockCount - 1 do
+      begin
+        BlockPrefix := RetinaFaceMobileNetBlockPrefix(BlockPos);
+        OutWidth := Config.MobileNetWidths[BlockPos];
+        if BlockPos = 0 then
+          LoadConvBN(MobileConv[0], BlockPrefix, OutWidth, InWidth, 3)
+        else
+        begin
+          LoadMobileNetDepthwiseFoldBN(Reader, MobileDw[BlockPos],
+            BlockPrefix + '.0.weight', BlockPrefix + '.1', InWidth, 3,
+            Config.BnEps, Shift);
+          LoadChannelBiasFromShift(MobileDwBias[BlockPos], Shift);
+          LoadResNetConvFoldBN(Reader, MobileConv[BlockPos],
+            BlockPrefix + '.3.weight', BlockPrefix + '.4', OutWidth, InWidth, 1,
+            Config.BnEps);
+        end;
+        InWidth := OutWidth;
+      end;
+    end
+    else
+      LoadResNetTrunk(Reader, Config.ResNet, 'body.', Trunk);
+    for Level := 0 to 2 do
+      LoadConvBN(Laterals[Level], 'fpn.output' + IntToStr(Level + 1),
+        Config.OutChannels, Config.StageChannels[Level], 1);
+    for Level := 0 to 1 do
+      LoadConvBN(Merges[Level], 'fpn.merge' + IntToStr(Level + 1),
+        Config.OutChannels, Config.OutChannels, 3);
+    for Level := 0 to 2 do
+    begin
+      LevelPrefix := 'ssh' + IntToStr(Level + 1) + '.';
+      LoadConvBN(SSH[Level].Conv3, LevelPrefix + 'conv3X3',
+        Config.OutChannels div 2, Config.OutChannels, 3);
+      LoadConvBN(SSH[Level].Conv5A, LevelPrefix + 'conv5X5_1',
+        Quarter, Config.OutChannels, 3);
+      LoadConvBN(SSH[Level].Conv5B, LevelPrefix + 'conv5X5_2', Quarter, Quarter, 3);
+      LoadConvBN(SSH[Level].Conv7A, LevelPrefix + 'conv7X7_2', Quarter, Quarter, 3);
+      LoadConvBN(SSH[Level].Conv7B, LevelPrefix + 'conv7x7_3', Quarter, Quarter, 3);
+      LoadFusedHead(Heads[Level], Level);
+    end;
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRetinaFaceFromSafeTensorsEx(const FileName: string;
+  const Config: TRetinaFaceConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRetinaFace(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRetinaFaceFromSafeTensors(const FileName: string;
+  ImageWidth, ImageHeight: integer; out Config: TRetinaFaceConfig;
+  pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Config := InferRetinaFaceConfigFromTensors(Reader, ImageWidth, ImageHeight);
+    Result := BuildRetinaFace(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure RetinaFacePrepareInput(Image: TNNetVolume;
+  const Config: TRetinaFaceConfig; NetInput: TNNetVolume);
+var
+  Resized: TNNetVolume;
+  MaxPixelPos, PixelPos, Base: integer;
+  Red: TNeuralFloat;
+begin
+  if Image.Depth <> 3 then
+    ImportError(csRetinaFaceImporter + ': RetinaFacePrepareInput needs an RGB ' +
+      'image, got depth ' + IntToStr(Image.Depth) + '.');
+  if (Image.SizeX = Config.ImageWidth) and (Image.SizeY = Config.ImageHeight) then
+    NetInput.Copy(Image)
+  else
+  begin
+    Resized := TNNetVolume.Create;
+    try
+      ResizeImageBilinearNoAntialias(Image, Resized, Config.ImageWidth,
+        Config.ImageHeight);
+      NetInput.Copy(Resized);
+    finally
+      Resized.Free;
+    end;
+  end;
+  // RGB -> BGR minus the facexlib mean (104, 117, 123), in place.
+  MaxPixelPos := NetInput.SizeX * NetInput.SizeY - 1;
+  Base := 0;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    Red := NetInput.FData[Base];
+    NetInput.FData[Base] := NetInput.FData[Base + 2] - 104;
+    NetInput.FData[Base + 1] := NetInput.FData[Base + 1] - 117;
+    NetInput.FData[Base + 2] := Red - 123;
+    Inc(Base, 3);
+  end;
+end;
+
+function DecodeRetinaFaceDetections(Output: TNNetVolume;
+  const Config: TRetinaFaceConfig; ConfThreshold: TNeuralFloat;
+  NMSThreshold: TNeuralFloat; MaxFaces: integer;
+  ScaleX: TNeuralFloat; ScaleY: TNeuralFloat): TRetinaFaceDetectionArray;
+var
+  Cand: TRetinaFaceDetectionArray;
+  BX1, BY1, BX2, BY2, Scores: TNeuralFloatDynArr;
+  Classes, KeptIdx: TNeuralIntegerArray;
+  Level, GridW, GridH, Row, Col, Anchor, PriorPos, RowBase, CandCnt: integer;
+  MaxRowPos, MaxColPos, MaxCandPos, KeptCnt, FacePos, PointPos: integer;
+  LogitThreshold, PriorCX, PriorCY, PriorW, PriorH, CX, CY, BoxW, BoxH: TNeuralFloat;
+  CenterVar, SizeVar, PixelsX, PixelsY: TNeuralFloat;
+begin
+  if (Output.SizeX <> RetinaFacePriorCount(Config)) or
+     (Output.Depth <> csRetinaFaceRowWidth) then
+    ImportError(csRetinaFaceImporter + ': output must be (' +
+      IntToStr(RetinaFacePriorCount(Config)) + ', 1, ' +
+      IntToStr(csRetinaFaceRowWidth) + '), got (' + IntToStr(Output.SizeX) + ', ' +
+      IntToStr(Output.SizeY) + ', ' + IntToStr(Output.Depth) + ').');
+  // softmax[1] > t  iff  logit1 - logit0 > ln(t / (1 - t)) (#14: no exp per prior).
+  if ConfThreshold <= 0 then LogitThreshold := -1e30
+  else if ConfThreshold >= 1 then LogitThreshold := 1e30
+  else LogitThreshold := Ln(ConfThreshold / (1.0 - ConfThreshold));
+  CenterVar := Config.Variances[0];
+  SizeVar := Config.Variances[1];
+  PixelsX := Config.ImageWidth / ScaleX;
+  PixelsY := Config.ImageHeight / ScaleY;
+  SetLength(Cand, Output.SizeX);
+  CandCnt := 0;
+  PriorPos := 0;
+  for Level := 0 to 2 do
+  begin
+    GridH := (Config.ImageHeight + Config.Steps[Level] - 1) div Config.Steps[Level];
+    GridW := (Config.ImageWidth + Config.Steps[Level] - 1) div Config.Steps[Level];
+    MaxRowPos := GridH - 1;
+    MaxColPos := GridW - 1;
+    for Row := 0 to MaxRowPos do
+      for Col := 0 to MaxColPos do
+        for Anchor := 0 to csRetinaFaceAnchorCount - 1 do
+        begin
+          RowBase := PriorPos * csRetinaFaceRowWidth;
+          Inc(PriorPos);
+          if Output.FData[RowBase + 5] - Output.FData[RowBase + 4] <= LogitThreshold then
+            Continue;
+          // facexlib PriorBox: (cx, cy, s_kx, s_ky) in [0,1] units, as float32.
+          PriorCX := (Col + 0.5) * Config.Steps[Level] / Config.ImageWidth;
+          PriorCY := (Row + 0.5) * Config.Steps[Level] / Config.ImageHeight;
+          PriorW := Config.MinSizes[Level, Anchor] / Config.ImageWidth;
+          PriorH := Config.MinSizes[Level, Anchor] / Config.ImageHeight;
+          CX := PriorCX + Output.FData[RowBase] * CenterVar * PriorW;
+          CY := PriorCY + Output.FData[RowBase + 1] * CenterVar * PriorH;
+          BoxW := PriorW * Exp(Output.FData[RowBase + 2] * SizeVar);
+          BoxH := PriorH * Exp(Output.FData[RowBase + 3] * SizeVar);
+          // facexlib decode: corner = centre - size / 2, far corner = corner + size.
+          CX := CX - BoxW / 2;
+          CY := CY - BoxH / 2;
+          with Cand[CandCnt] do
+          begin
+            X1 := CX * PixelsX;
+            Y1 := CY * PixelsY;
+            X2 := (CX + BoxW) * PixelsX;
+            Y2 := (CY + BoxH) * PixelsY;
+            Score := 1.0 / (1.0 + Exp(Output.FData[RowBase + 4] -
+              Output.FData[RowBase + 5]));
+            for PointPos := 0 to 4 do
+            begin
+              LandmarkX[PointPos] := (PriorCX + Output.FData[RowBase + 6 + 2 * PointPos] *
+                CenterVar * PriorW) * PixelsX;
+              LandmarkY[PointPos] := (PriorCY + Output.FData[RowBase + 7 + 2 * PointPos] *
+                CenterVar * PriorH) * PixelsY;
+            end;
+          end;
+          Inc(CandCnt);
+        end;
+  end;
+  // Class-agnostic greedy NMS through the shared helper (torchvision.ops.nms).
+  SetLength(BX1, CandCnt); SetLength(BY1, CandCnt);
+  SetLength(BX2, CandCnt); SetLength(BY2, CandCnt);
+  SetLength(Scores, CandCnt); SetLength(Classes, CandCnt);
+  MaxCandPos := CandCnt - 1;
+  for FacePos := 0 to MaxCandPos do
+  begin
+    BX1[FacePos] := Cand[FacePos].X1; BY1[FacePos] := Cand[FacePos].Y1;
+    BX2[FacePos] := Cand[FacePos].X2; BY2[FacePos] := Cand[FacePos].Y2;
+    Scores[FacePos] := Cand[FacePos].Score;
+    Classes[FacePos] := 0;
+  end;
+  KeptIdx := NeuralGreedyNMS(BX1, BY1, BX2, BY2, Scores, Classes, CandCnt,
+    NMSThreshold);
+  KeptCnt := Length(KeptIdx);
+  if (MaxFaces > 0) and (KeptCnt > MaxFaces) then KeptCnt := MaxFaces;
+  SetLength(Result, KeptCnt);
+  for FacePos := 0 to KeptCnt - 1 do
+    Result[FacePos] := Cand[KeptIdx[FacePos]];
+end;
+
+function DetectRetinaFaceFaces(NN: TNNet; const Config: TRetinaFaceConfig;
+  Image: TNNetVolume; ConfThreshold: TNeuralFloat; NMSThreshold: TNeuralFloat;
+  MaxFaces: integer): TRetinaFaceDetectionArray;
+var
+  NetInput, Output: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  try
+    RetinaFacePrepareInput(Image, Config, NetInput);
+    NN.Compute(NetInput);
+    NN.GetOutput(Output);
+    Result := DecodeRetinaFaceDetections(Output, Config, ConfThreshold,
+      NMSThreshold, MaxFaces, Config.ImageWidth / Image.SizeX,
+      Config.ImageHeight / Image.SizeY);
+  finally
+    Output.Free;
+    NetInput.Free;
+  end;
 end;
 
 {$IFDEF OpenCL}

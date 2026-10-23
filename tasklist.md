@@ -854,23 +854,37 @@ rather than acted on.
       inference_gfpgan.py runs by default). FaceRestoration currently needs a
       pre-aligned 512x512 crop (the GFPGAN importer comment says "Face detection
       and alignment are not part of the net"), so it cannot restore a real group
-      photo. Steps: (1) `BuildRetinaFace[FromSafeTensors[Ex]]` for facexlib's
-      `detection_mobilenet0.25_Final.pth` (MobileNet0.25 + FPN + SSH heads; load
-      the .pth through neuraltorchbin) and `detection_Resnet50_Final.pth` (reuse
-      the BuildResNet trunk taps); prior-box decode of boxes + 5 landmarks and box
-      NMS shared with the YOLO post-process (`TYoloDetectionArray` NMS) instead of
-      a copy; (2) a least-squares similarity transform (Umeyama, 4 DOF) from the
-      5 landmarks to the FFHQ 512 template, and a bilinear affine warp that writes
-      a fixed-size crop (reuse the TNNetAffineGridSample/TNNetGridSample sampling
-      code; `AugAffineWarp` is nearest and in-place, so it does not fit);
-      (3) inverse-warp the restored face back with an eroded + Gaussian-feathered
-      mask (reuse `GaussianBlurImage` in neuralimageresize.pas) and blend; optional
-      background upsampling through the landed RealESRGAN importer
-      (`--bg-upsampler`, like gfpgan's). Example: `FaceRestoration --input
-      photo.jpg` (no `--aligned`) restores every detected face; keep the current
-      aligned mode as `--aligned`. Parity: detector boxes/landmarks and the
-      aligned crop vs facexlib on a real photo (oracle in the ~/x venv), then the
-      final composite vs inference_gfpgan.py. Pico fixtures for the suite.
+      photo.
+  - [X] (1) RetinaFace detector importer in neuralpretrained.pas:
+        `BuildRetinaFace[FromSafeTensors[Ex]]` / `InferRetinaFaceConfigFromTensors`
+        for facexlib's `detection_mobilenet0.25_Final.pth` and
+        `detection_Resnet50_Final.pth` (backbone from the `body.stage1` /
+        `body.layer2` keys, "module." stripped; the ResNet trunk reuses
+        AddResNetTrunk / LoadResNetTrunk), `RetinaFacePrepareInput` (BGR minus
+        104/117/123, bilinear resize when the image size differs),
+        `DecodeRetinaFaceDetections` (prior boxes, box + landmark decode,
+        threshold, `NeuralGreedyNMS`, MaxFaces) and `DetectRetinaFaceFaces`,
+        returning `TRetinaFaceDetectionArray` (X1/Y1/X2/Y2/Score + LandmarkX/Y[0..4]
+        in the pixels of the image passed in). Pico parity + OpenCL parity only
+        (TestRetinaFace*); no real checkpoint was on the dev box.
+  - [ ] Run the real detection_mobilenet0.25_Final.pth / detection_Resnet50_Final.pth
+        on a real photo against facexlib `detect_faces` (oracle in the ~/x venv:
+        facexlib 0.3.0 is not installed there; the wheel's retinaface*.py run with
+        torchvision from /tmp/tvlib and a cv2 stub).
+  - [ ] (2) A least-squares similarity transform (Umeyama, 4 DOF) from the 5
+        landmarks to the FFHQ 512 template, and a bilinear affine warp that writes
+        a fixed-size crop (reuse the TNNetAffineGridSample/TNNetGridSample sampling
+        code; `AugAffineWarp` is nearest and in-place, so it does not fit).
+        FaceRestoreHelper keeps faces with eye distance >= 5 px and uses
+        conf_threshold 0.97 at the original image size.
+  - [ ] (3) Inverse-warp the restored face back with an eroded + Gaussian-feathered
+        mask (reuse `GaussianBlurImage` in neuralimageresize.pas) and blend;
+        optional background upsampling through the landed RealESRGAN importer
+        (`--bg-upsampler`, like gfpgan's).
+  - [ ] Example: `FaceRestoration --input photo.jpg` (no `--aligned`) restores
+        every detected face; keep the current aligned mode as `--aligned`.
+  - [ ] Parity: the aligned crop vs facexlib on a real photo, then the final
+        composite vs inference_gfpgan.py. Pico fixtures for the suite.
 - [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
       landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`
       and `ddcolor_modelscope` on real grayscale photos (CPU and `--gpu`) against
