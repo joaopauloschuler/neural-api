@@ -2204,6 +2204,41 @@ rather than acted on.
             matched, only the PIL backend; `TSuperPointKeypoints` has no
             post_process_keypoint_detection rescale to the original image size.
 
+- [ ] CoTracker3 point tracking importer + examples/PointTracking (Karaev et al.
+      2024, *CoTracker3: Simpler and Better Point Tracking by Pseudo-Labelling
+      Real Videos*, arXiv:2410.11831; checkpoint facebook/cotracker3,
+      `scaled_offline.pth`). Video in plus query points `(t, x, y)`, out a 2-D
+      track and a visibility/confidence score per point per frame. The library
+      has dense two-frame flow (RAFT, RIFE) and sparse two-image matching
+      (SuperPoint + LightGlue), but nothing follows a point across a whole clip.
+      Reuse: `RaftBuildEncoder` / `RaftLoadEncoder` for the per-frame CNN
+      encoder (CoTracker3 uses the same BasicEncoder at stride 4); the bilinear
+      sampler of `TNNetGridSample` for the multi-scale local correlation around
+      each track (4 pyramid levels, a 7x7 window, track-feature x frame-feature
+      dot products, the same idea as `TNNetCorrelationLookup` but sampled at
+      sparse points); the existing attention blocks for the update transformer,
+      which alternates time attention per track with cross attention between
+      the real tracks and 64 learned virtual tracks. The update runs K
+      iterations (default 6) and refines track deltas plus visibility and
+      confidence logits.
+      - [ ] `BuildCoTrackerFromSafeTensors[Ex]` + `CoTrackerPredictTracks` in
+            neural/neuralpretrained.pas (offline mode: the whole clip in one
+            window). The checkpoint is a torch `.pth` with no safetensors copy
+            and the library has no `.pth` reader, so a one-off conversion and
+            a pico fixture plus oracle are needed: ask the user before adding
+            the Python tool. Parity test against the reference
+            `CoTrackerThreeOffline` forward on the pico fixture (tracks and
+            visibility).
+      - [ ] examples/PointTracking (.lpr + .lpi + README.md): read a frame
+            sequence (a folder of images), track a regular grid of points or
+            points given on the command line, and write the frames with the
+            tracks drawn as colored trails plus an animated GIF with the
+            existing GIF writer.
+      - [ ] Later: online (sliding-window) mode for long videos, reusing the
+            offline weights with the `window_len` / `step` overlap of the
+            reference `CoTrackerOnlinePredictor`; a real-checkpoint run on a
+            real clip from the user's GPU box.
+
 ## OpenCL forward coverage — layers still on the host
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
