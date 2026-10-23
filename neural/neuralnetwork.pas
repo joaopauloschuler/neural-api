@@ -21978,10 +21978,16 @@ type
       // TNNetScaledDotProductAttention, then one TNNetDeepConcat over the head
       // outputs). Both paths return the layer holding the CONCATENATED head
       // outputs (width QHeads*HeadDim) - callers add their own out-projection.
-      // Coded by Claude (AI).
+      // HasSinks adds gpt-oss per-query-head sinks (the fused layer's option,
+      // or one TNNetGptOssSinkAttention per head; no soft-cap); load their
+      // logits with SetGQASinkLogits. Coded by Claude (AI).
       function AddGQAAttentionFromSources(QSrc, KSrc, VSrc: TNNetLayer;
         QHeads, KVHeads, HeadDim: integer; CausalMask: boolean = false;
-        Window: integer = 0; ScoreSoftCap: TNeuralFloat = 0): TNNetLayer;
+        Window: integer = 0; ScoreSoftCap: TNeuralFloat = 0;
+        HasSinks: boolean = false): TNNetLayer;
+      // Copies Logits (one per query head, in head order) into the sinks of
+      // AttnOutput, a result of AddGQAAttentionFromSources with HasSinks.
+      procedure SetGQASinkLogits(AttnOutput: TNNetLayer; Logits: TNNetVolume);
       // Multi-head Latent Attention (MLA, DeepSeek-V2, Liu et al. 2024) over a
       // (SeqLen,1,d_model) token tensor (source is GetLastLayer()). Unlike GQA
       // -- which shrinks the KV cache by SHARING full-width K/V across query-head
@@ -94633,7 +94639,8 @@ end;
 
 function TNNet.AddGQAAttentionFromSources(QSrc, KSrc, VSrc: TNNetLayer;
   QHeads, KVHeads, HeadDim: integer; CausalMask: boolean = false;
-  Window: integer = 0; ScoreSoftCap: TNeuralFloat = 0): TNNetLayer;
+  Window: integer = 0; ScoreSoftCap: TNeuralFloat = 0;
+  HasSinks: boolean = false): TNNetLayer;
 var
   GroupSize, HeadCnt, KVGroup, d, QHeadsM1, HeadDimM1: integer;
   QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
@@ -94650,12 +94657,15 @@ begin
     FErrorProc('AddGQAAttentionFromSources requires QHeads divisible by' +
       ' KVHeads. QHeads=' + IntToStr(QHeads) +
       ', KVHeads=' + IntToStr(KVHeads));
+  if HasSinks and (ScoreSoftCap > 0) then
+    FErrorProc('AddGQAAttentionFromSources: sinks take no score soft-cap.');
   if NeuralAllowFusedAttention then
   begin
     // FUSED: ONE attention layer over the packed [allQ|allK|allV] concat.
     AddLayer( TNNetDeepConcat.Create([QSrc, KSrc, VSrc]) );
     Result := AddLayer( TNNetFusedSDPA.Create(QHeads, KVHeads, HeadDim,
-      CausalMask, Window, ScoreSoftCap) );
+      CausalMask, Window, ScoreSoftCap, {pCachedForwardNonCausal=}false,
+      HasSinks) );
     exit;
   end;
   GroupSize := QHeads div KVHeads; // query heads sharing one KV head
@@ -94679,14 +94689,51 @@ begin
     VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VSrc);
     // Pack [Q_h | K_group | V_group] (width 3*HeadDim) as SDPA expects.
     HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
-    HeadOutputs[HeadCnt] :=
-      AddLayerAfter(TNNetScaledDotProductAttention.Create(HeadDim, CausalMask,
-        Window, ScoreSoftCap), HeadPack);
+    if HasSinks then
+      HeadOutputs[HeadCnt] := AddLayerAfter(TNNetGptOssSinkAttention.Create(
+        HeadDim, CausalMask, Window), HeadPack)
+    else
+      HeadOutputs[HeadCnt] :=
+        AddLayerAfter(TNNetScaledDotProductAttention.Create(HeadDim, CausalMask,
+          Window, ScoreSoftCap), HeadPack);
   end;
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(HeadOutputs, 0);
   SetLength(QChannels, 0);
   SetLength(KVChannels, 0);
+end;
+
+procedure TNNet.SetGQASinkLogits(AttnOutput: TNNetLayer; Logits: TNNetVolume);
+var
+  Heads: TNNetLayerList;
+  HeadPos, MaxHeadPos: integer;
+begin
+  if AttnOutput is TNNetFusedSDPA then
+  begin
+    TNNetFusedSDPA(AttnOutput).SetSinkLogits(Logits);
+    exit;
+  end;
+  // The per-head wiring: a concat of one TNNetGptOssSinkAttention per head.
+  if not (AttnOutput is TNNetConcatBase) then
+  begin
+    FErrorProc('SetGQASinkLogits: ' + AttnOutput.ClassName + ' is not a ' +
+      'result of AddGQAAttentionFromSources.');
+    exit;
+  end;
+  Heads := TNNetConcatBase(AttnOutput).FPrevLayerList;
+  if Heads.Count <> Logits.Size then
+  begin
+    FErrorProc('SetGQASinkLogits: ' + IntToStr(Logits.Size) + ' logits for ' +
+      IntToStr(Heads.Count) + ' heads.');
+    exit;
+  end;
+  MaxHeadPos := Heads.Count - 1;
+  for HeadPos := 0 to MaxHeadPos do
+    if Heads[HeadPos] is TNNetGptOssSinkAttention
+      then TNNetGptOssSinkAttention(Heads[HeadPos]).SetSinkLogit(
+        Logits.FData[HeadPos])
+      else FErrorProc('SetGQASinkLogits: head ' + IntToStr(HeadPos) + ' is a ' +
+        Heads[HeadPos].ClassName + ', not a TNNetGptOssSinkAttention.');
 end;
 
 function TNNet.AddMultiHeadLatentAttention(d_model, Heads,

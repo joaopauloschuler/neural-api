@@ -1727,8 +1727,9 @@ type
   // GPT-OSS (OpenAI gpt-oss, model_type "gpt_oss"; openai/gpt-oss-20b and
   // gpt-oss-120b). A sparse top-k MoE decoder that CROSSES several subsystems:
   //  - attention with a LEARNED PER-HEAD SINK logit appended to the softmax
-  //    denominator (TNNetGptOssSinkAttention; the sink leaks softmax mass off
-  //    the real keys but contributes nothing to the value mix);
+  //    denominator (TNNetFusedSDPA with sinks, built by AddGQAAttentionFromSources;
+  //    the sink leaks softmax mass off the real keys but contributes nothing
+  //    to the value mix);
   //  - ALTERNATING sliding-window / full attention per layer (layer_types,
   //    the same per-layer banded-window wiring as Gemma-2/3);
   //  - YaRN RoPE (rope_parameters.rope_type "yarn") on EVERY layer;
@@ -34910,12 +34911,10 @@ var
   NN: TNNet;
   EmbeddingLayer, LMHead, BranchInput, NormedSource: TNNetLayer;
   AttnNorm, MlpNorm, QProj, KProj, VProj, OProj: TNNetLayer;
-  QSlice, KSlice, HeadPack: TNNetLayer;
-  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
-  SliceChannels: array of integer;
-  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
-  HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
-  NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, VocabSizeM1, HiddenSizeM1: integer;
+  QRotated, KRotated, AttnOutput: TNNetLayer;
+  BlockCnt, SeqLen: integer;
+  HeadDim, QWidth, KVWidth, LayerWindow, j: integer;
+  NumLayersM1, VocabSizeM1, HiddenSizeM1: integer;
   LMHeadName, BlockPrefix: string;
   Tmp: TNNetVolume;
 begin
@@ -34932,7 +34931,6 @@ begin
       ImportError('gpt-oss import: num_attention_heads=' +
         IntToStr(Config.NumHeads) + ' is not a multiple of ' +
         'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
-    GroupSize := Config.NumHeads div Config.NumKVHeads;
     if Reader.HasTensor('model.embed_tokens.weight') then
       Config.Prefix := 'model.'
     else if Reader.HasTensor('embed_tokens.weight') then
@@ -34956,10 +34954,6 @@ begin
       Config.VocabSize, Config.HiddenSize, {EncodeZero=}1
       ).SetTrainable(pTrainable) );
     if not pTrainable then NN.SetTrainable();
-    SetLength(KRotated, Config.NumKVHeads);
-    SetLength(VSlices, Config.NumKVHeads);
-    SetLength(HeadOutputs, Config.NumHeads);
-    SetLength(SliceChannels, HeadDim);
 
     Tmp := TNNetVolume.Create;
     try
@@ -34976,9 +34970,6 @@ begin
     end;
 
     NumLayersM1 := Config.NumLayers - 1;
-    NumKVHeadsM1 := Config.NumKVHeads - 1;
-    NumHeadsM1 := Config.NumHeads - 1;
-    HeadDimM1 := HeadDim - 1;
     for BlockCnt := 0 to NumLayersM1 do
     begin
       BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
@@ -34999,33 +34990,15 @@ begin
       VProj := NN.AddLayerAfter(
         TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable),
         NormedSource);
-      for KVHeadCnt := 0 to NumKVHeadsM1 do
-      begin
-        for d := 0 to HeadDimM1 do
-          SliceChannels[d] := KVHeadCnt * HeadDim + d;
-        KSlice := NN.AddLayerAfter(
-          TNNetSplitChannels.Create(SliceChannels), KProj);
-        KRotated[KVHeadCnt] := NN.AddLayerAfter(
-          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), KSlice);
-        VSlices[KVHeadCnt] := NN.AddLayerAfter(
-          TNNetSplitChannels.Create(SliceChannels), VProj);
-      end;
-      for HeadCnt := 0 to NumHeadsM1 do
-      begin
-        KVGroup := HeadCnt div GroupSize;
-        for d := 0 to HeadDimM1 do
-          SliceChannels[d] := HeadCnt * HeadDim + d;
-        QSlice := NN.AddLayerAfter(
-          TNNetSplitChannels.Create(SliceChannels), QProj);
-        QSlice := NN.AddLayerAfter(
-          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), QSlice);
-        HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
-          [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
-        HeadOutputs[HeadCnt] := NN.AddLayerAfter(
-          TNNetGptOssSinkAttention.Create(HeadDim, {pCausalMask=}True,
-            {pWindow=}LayerWindow), HeadPack);
-      end;
-      NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+      // Full-rotary YaRN RoPE, head-tiled over the whole q and k projections
+      // (one layer each, the same rotation every per-head slice would get).
+      QRotated := NN.AddLayerAfter(CreateRoPEFromScaling(Config.RopeTheta,
+        Config.RopeScaling, {pRotaryHeadDim=}HeadDim), QProj);
+      KRotated := NN.AddLayerAfter(CreateRoPEFromScaling(Config.RopeTheta,
+        Config.RopeScaling, {pRotaryHeadDim=}HeadDim), KProj);
+      AttnOutput := NN.AddGQAAttentionFromSources(QRotated, KRotated, VProj,
+        Config.NumHeads, Config.NumKVHeads, HeadDim, {CausalMask=}true,
+        {Window=}LayerWindow, {ScoreSoftCap=}0, {HasSinks=}true);
       OProj := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([OProj, BranchInput]) );
@@ -35060,9 +35033,7 @@ begin
             'self_attn.sinks" has ' + IntToStr(Tmp.Size) +
             ' entries, expected num_attention_heads=' +
             IntToStr(Config.NumHeads) + '.');
-        for HeadCnt := 0 to NumHeadsM1 do
-          TNNetGptOssSinkAttention(HeadOutputs[HeadCnt]).SetSinkLogit(
-            Tmp.FData[HeadCnt]);
+        NN.SetGQASinkLogits(AttnOutput, Tmp);
       finally
         Tmp.Free;
       end;

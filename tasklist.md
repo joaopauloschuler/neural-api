@@ -2339,32 +2339,39 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         RWKV decode and prefill on the GPU box.
   - [ ] No real RWKV checkpoint has been decoded on a GPU; only the pico fixture.
 - [ ] Follow-ups of the attention subclasses' device paths:
-  - [ ] Follow-ups of the `TNNetGptOssSinkAttention` device forward (bc08ac04):
-        the full forward runs on `cai_sdpa_flash`
-        with the source bound and the result resident. The flash epilogue and
-        `cai_sdpa_decode_merge` take an optional per-query-head sink buffer
-        (`FHasSinks` = 0 for every other caller); a split launch adds the sink
-        in the merge only, so it counts once. The cached forward
-        (`TNNetStreamingDecoder`, i.e. ChatTerminal) runs the base
-        `ComputeIncremental` with the sink (virtual `SinkLogits`), FP32 and
-        int8, on the host. Open follow-ups:
-    - [ ] Resident-KV decode for GPT-OSS: the importer builds one sink layer
-          per query head, and this class keeps the host cached decode
-          (`CachedStepIsExact` is false), so every decode step pulls each head's [Q|K|V] pack
-          to RAM. Route: give `TNNetFusedSDPA` a per-query-head sink
-          option (one neuron of QHeads weights, FStruct flag, the CPU prefill
-          / cached-token / chunked-row paths and the backward), pass
-          `SinkLogits` to `TNNetFusedSDPACL.ComputeStep` (the kernels already
-          take it, `cai_sdpa_flash_int8` included; only `ComputeFlashPacked`
-          passes it today), then build gpt-oss through `AddGQAAttentionFromSources`.
-          Parity: the pico oracle, the streamed decode, and
-          `FusedSDPA*OpenCLParity`-style split / int8 cases with sinks.
-          A single-head alternative now exists: the resident cached step on
-          `TNNetScaledDotProductAttention` (used by `TNNetSinkAttention`) is
-          off for this class only because `CachedStepIsExact` is false and
-          `TNNetFusedSDPACL.ComputeStep` takes no sink buffer yet.
-    - [ ] GPU-box: GPT-OSS prefill tok/s with the sink heads on
-          `cai_sdpa_flash` against the parent commit.
+  - [ ] Follow-ups of the GPT-OSS attention sinks. `TNNetGptOssSinkAttention`
+        (bc08ac04) runs its full forward on `cai_sdpa_flash`; the flash
+        epilogue and `cai_sdpa_decode_merge` take a per-query-head sink buffer,
+        and a split launch adds the sink in the merge only. Since 36da5698
+        `TNNetFusedSDPA` has the same sinks (`pHasSinks`, one neuron of QHeads
+        logits, option bit 2 of FStruct[7]) on the CPU paths, the backward and
+        the resident cached step (`TNNetFusedSDPACL.ComputeStep`, split-row
+        decode and flash, FP32 and int8 KV). The gpt-oss importer now builds
+        one fused layer per decoder layer through
+        `AddGQAAttentionFromSources(..., HasSinks=true)` (head-tiled YaRN RoPE
+        on the whole q/k projections); `TNNetGptOssSinkAttention` is only the
+        `NeuralAllowFusedAttention=false` fallback. Open follow-ups:
+    - [ ] GPU-box: gpt-oss decode tok/s with the resident KV cache against
+          the parent of the importer commit (per-head sink heads, host cached
+          decode), FP32 and int8 KV.
+    - [ ] The uncached full forward of a `TNNetFusedSDPA` has no OpenCL path
+          (`WillOpenCL` needs the cache), so the gpt-oss full forward (perplexity,
+          the oracle test) went back to the host when the importer switched
+          from the per-head sink heads, which ran it on `cai_sdpa_flash`. A
+          flash full forward for the fused layer (append the step into a
+          scratch cache at slot 0, then `ComputeStep`'s flash with the causal or
+          non-causal mask, sinks included) would restore it and add it to
+          every fused importer; ChatTerminal is not affected (its prefill runs
+          as cached windows). Then GPU-box: gpt-oss prefill tok/s.
+    - [ ] The `--no-fused-attn` fallback keeps the host cached decode:
+          `TNNetGptOssSinkAttention.CachedStepIsExact` is false and the base
+          `RunCachedStepOnSource` passes no sinks. Passing `SinkLogits()` there
+          (`ComputeStep` takes them now) would put that path on the resident
+          cache too.
+    - [ ] No model-level int8-KV parity test for gpt-oss: on the pico a top-2
+          routing flip turns int8 rounding into logit jumps, so int8 with sinks
+          is covered per layer only (`TestFusedSDPASinkCachedDecodeParity`,
+          `FusedSDPASink*OpenCLParity`).
   - [ ] Follow-ups of the `TNNetSinkAttention` full forward on `cai_sdpa_flash` (732bbaa5): the
         K sink slots are cache rows 0..K-1 (a prefix `ComputeFlashPacked`
         uploads only when the weights change or the cache buffer regrows), the

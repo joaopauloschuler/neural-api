@@ -751,6 +751,9 @@ type
     // The gpt-oss pico streamed token by token through TNNetStreamingDecoder
     // (FP32 KV cache) against the full forward.
     procedure TestGptOssStreamedDecodeParity;
+    // The gpt-oss pico through 4-token cached windows, a snapshot handoff and a
+    // width-1 tail, on the CPU and (with a device) on OpenCL.
+    procedure TestGptOssWindowedPrefillParity;
     // The gpt-oss pico full forward and streamed decode with OpenCL enabled,
     // against the HF oracle and the CPU twin.
     procedure TestGptOssLogitParityOpenCL;
@@ -16646,7 +16649,8 @@ end;
 // top-2, 1 kv head < 4 query heads, untied head; hidden/inter are 32 so the
 // SAME pico re-emits with MXFP4-packed experts). It is the CROSS of several
 // subsystems no other importer combines: (a) attention with a LEARNED PER-HEAD
-// SINK logit appended to the softmax denominator (TNNetGptOssSinkAttention);
+// SINK logit appended to the softmax denominator (TNNetFusedSDPA with sinks,
+// and the per-head TNNetGptOssSinkAttention fallback);
 // (b) ALTERNATING sliding-window (layer 0) / full (layer 1) attention;
 // (c) YaRN RoPE on every layer; (d) top-k routed experts with gpt-oss's
 // CLAMPED-SwiGLU activation (TNNetGptOssGatedSwiGLU, interleaved gate|up,
@@ -16661,8 +16665,9 @@ procedure TTestNeuralPretrained.TestGptOssLogitParity;
 var
   NN: TNNet;
   Config: TGptOssConfig;
-  LayerCnt, SinkCnt, SwiGLUCnt, GateCnt: integer;
-  Sink: TNNetGptOssSinkAttention;
+  LayerCnt, SinkCnt, SwiGLUCnt, GateCnt, HeadCnt: integer;
+  Attn: TNNetFusedSDPA;
+  SavedAllowFused: boolean;
 begin
   RandSeed := 424242;
   NN := BuildGptOssFromSafeTensorsEx(
@@ -16683,28 +16688,32 @@ begin
     AssertTrue('yarn rope', Config.RopeScaling.Mode = rsmYaRN);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
-    // Structure: NumHeads sink-attention heads per layer (the alternating
-    // window lives on each), one router gate + one clamped SwiGLU per expert
-    // per layer.
+    // Structure: one fused sink attention layer per decoder layer (the
+    // alternating window lives on each), one router gate + one clamped
+    // SwiGLU per expert per layer.
     SinkCnt := 0; SwiGLUCnt := 0; GateCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
-      if NN.Layers[LayerCnt].ClassType = TNNetGptOssSinkAttention then
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then
       begin
-        Sink := TNNetGptOssSinkAttention(NN.Layers[LayerCnt]);
-        // Layer 0 heads carry Window=4; layer 1 heads Window=0 (full).
-        if SinkCnt < Config.NumHeads then
-          AssertEquals('layer0 sink head window', 4, Sink.Window)
+        Attn := TNNetFusedSDPA(NN.Layers[LayerCnt]);
+        AssertTrue('attention layer has sinks', Attn.HasSinks);
+        AssertEquals('query heads', Config.NumHeads, Attn.QHeads);
+        AssertEquals('kv heads', Config.NumKVHeads, Attn.KVHeads);
+        // Layer 0 carries Window=4; layer 1 Window=0 (full).
+        if SinkCnt = 0 then
+          AssertEquals('layer0 window', 4, Attn.Window)
         else
-          AssertEquals('layer1 sink head window', 0, Sink.Window);
+          AssertEquals('layer1 window', 0, Attn.Window);
         Inc(SinkCnt);
       end;
+      AssertFalse('no per-head sink heads in the fused build',
+        NN.Layers[LayerCnt].ClassType = TNNetGptOssSinkAttention);
       if NN.Layers[LayerCnt].ClassType = TNNetGptOssGatedSwiGLU then
         Inc(SwiGLUCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
     end;
-    AssertEquals('sink heads = NumHeads * layers', Config.NumHeads * 2,
-      SinkCnt);
+    AssertEquals('one sink attention layer per decoder layer', 2, SinkCnt);
     AssertEquals('one clamped SwiGLU per expert per layer',
       Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
     AssertEquals('one top-k gate per layer', Config.NumLayers, GateCnt);
@@ -16722,6 +16731,31 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gpt_oss_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+  // The per-head fallback (--no-fused-attn): one TNNetGptOssSinkAttention per
+  // query head, its sink loaded by SetGQASinkLogits.
+  SavedAllowFused := NeuralAllowFusedAttention;
+  NeuralAllowFusedAttention := false;
+  try
+    NN := BuildGptOssFromSafeTensorsEx(
+      FixturePath('tiny_gpt_oss.safetensors'),
+      Config, {SeqLen=}0, {pTrainable=}false,
+      FixturePath('tiny_gpt_oss_config.json'));
+  finally
+    NeuralAllowFusedAttention := SavedAllowFused;
+  end;
+  try
+    HeadCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt].ClassType = TNNetGptOssSinkAttention then
+        Inc(HeadCnt);
+    AssertEquals('per-head sink heads = NumHeads * layers',
+      Config.NumHeads * Config.NumLayers, HeadCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gpt_oss_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -16842,8 +16876,8 @@ begin
     Rejected);
 end;
 
-// TNNetStreamingDecoder switches every TNNetGptOssSinkAttention onto the KV
-// cache, so the sink must also join the cached softmax; the sliding layer
+// TNNetStreamingDecoder switches every sink-enabled TNNetFusedSDPA onto the KV
+// cache, so the sinks must also join the cached softmax; the sliding layer
 // (window 4) is exercised past its window by the 16 steps. The int8 cache is
 // checked per layer in TestNeuralNumerical: here a top-2 routing flip on the
 // pico turns its rounding into logit jumps. Coded by Claude (AI).
@@ -16875,8 +16909,8 @@ begin
     Full.Compute(FullIn);
     Full.GetOutput(FullOut);
     Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
-    AssertEquals('sink heads collected', Config.NumHeads * Config.NumLayers,
-      Session.SDPACount);
+    AssertEquals('one attention layer collected per decoder layer',
+      Config.NumLayers, Session.SDPACount);
     Session.Reset();
     for T := 0 to SeqLen - 1 do
     begin
@@ -16897,9 +16931,118 @@ begin
   end;
 end;
 
-// The full forward with OpenCL enabled and forced, so the per-head [Q|K|V]
-// packs are resident: every sink head must run cai_sdpa_flash on its bound
-// source and the logits must still match the HF oracle. Coded by Claude (AI).
+// The production prefill on gpt-oss: 4-token cached windows (every attention
+// step is a sink-enabled TNNetFusedSDPA over a multi-row step), the snapshot
+// handed to a width-1 twin, then single tokens; the sliding layer (window 4)
+// is crossed by the windows. Against the full forward within 2e-4, FP32 KV.
+// With an OpenCL device the same stream runs on OpenCL twins (flash windows,
+// split-row decode, both with the sinks) and must match within 1e-3, every
+// TNNetFusedSDPA on the device. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGptOssWindowedPrefillParity;
+const
+  SeqLen = 16;
+  WindowLen = 4;
+  PromptLen = 12;
+var
+  Full, Twin1, Twin4: TNNet;
+  Config: TGptOssConfig;
+  Session1, Session4: TNNetStreamingDecoder;
+  FullIn, FullOut, Logits1, Logits4: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  MaxDiff: double;
+  {$IFDEF OpenCL}
+  TwinCL1, TwinCL4: TNNet;
+  SessionCL1, SessionCL4: TNNetStreamingDecoder;
+  LogitsCL: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+
+  function BuildTwin(pSeqLen: integer): TNNet;
+  begin
+    Result := BuildGptOssFromSafeTensorsEx(
+      FixturePath('tiny_gpt_oss.safetensors'), Config, pSeqLen,
+      {pTrainable=}false, FixturePath('tiny_gpt_oss_config.json'));
+  end;
+
+begin
+  RandSeed := 424242;
+  Full := BuildTwin(SeqLen);
+  Twin1 := nil; Twin4 := nil;
+  Session1 := nil; Session4 := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  FullOut := TNNetVolume.Create();
+  Logits1 := TNNetVolume.Create();
+  Logits4 := TNNetVolume.Create();
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do
+    begin
+      Toks[T] := (5 * T + 2) mod Vocab;
+      FullIn.FData[T] := Toks[T];
+    end;
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    Twin1 := BuildTwin(1);
+    Twin4 := BuildTwin(WindowLen);
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen);
+    Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen);
+    RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, Logits1);
+    RunWindowedPrefillStream(Session4, Session1, Toks, WindowLen, PromptLen,
+      Logits4);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits1);
+    AssertTrue('width-1 stream vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits4);
+    AssertTrue('4-token windows + width-1 tail vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    {$IFDEF OpenCL}
+    if AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      TwinCL1 := nil; TwinCL4 := nil;
+      SessionCL1 := nil; SessionCL4 := nil;
+      LogitsCL := TNNetVolume.Create();
+      try
+        TwinCL1 := BuildTwin(1);
+        TwinCL4 := BuildTwin(WindowLen);
+        TwinCL1.EnableOpenCL(PlatformId, DeviceId);
+        TwinCL4.EnableOpenCL(PlatformId, DeviceId);
+        SessionCL1 := TNNetStreamingDecoder.Create(TwinCL1, SeqLen);
+        SessionCL4 := TNNetStreamingDecoder.Create(TwinCL4, SeqLen);
+        RunWindowedPrefillStream(SessionCL4, SessionCL1, Toks, WindowLen,
+          PromptLen, LogitsCL);
+        MaxDiff := MaxAbsVolumeDiff(Logits4, LogitsCL);
+        AssertTrue('OpenCL windows + tail vs the CPU: max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+        AssertAllOnDevice(TwinCL4, TNNetFusedSDPA, 'gpt-oss window twin');
+        AssertAllOnDevice(TwinCL1, TNNetFusedSDPA, 'gpt-oss tail twin');
+      finally
+        LogitsCL.Free;
+        SessionCL4.Free;
+        SessionCL1.Free;
+        TwinCL4.Free;
+        TwinCL1.Free;
+      end;
+    end;
+    {$ENDIF}
+  finally
+    Logits4.Free;
+    Logits1.Free;
+    FullOut.Free;
+    FullIn.Free;
+    Session4.Free;
+    Session1.Free;
+    Twin4.Free;
+    Twin1.Free;
+    Full.Free;
+  end;
+end;
+
+// The full forward with OpenCL enabled and forced must match the HF oracle.
+// The fused build first; then the per-head build (--no-fused-attn), whose
+// resident [Q|K|V] packs put every sink head on cai_sdpa_flash with its source
+// bound. Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestGptOssLogitParityOpenCL;
 {$IFDEF OpenCL}
 var
@@ -16909,6 +17052,7 @@ var
   DeviceId: cl_device_id;
   LayerCnt, SinkCnt: integer;
   Sink: TNNetLayer;
+  SavedAllowFused: boolean;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -16919,6 +17063,24 @@ begin
   NN := BuildGptOssFromSafeTensorsEx(FixturePath('tiny_gpt_oss.safetensors'),
     Config, {SeqLen=}0, {pTrainable=}false,
     FixturePath('tiny_gpt_oss_config.json'));
+  try
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.ForceOpenCL(true);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gpt_oss_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  SavedAllowFused := NeuralAllowFusedAttention;
+  NeuralAllowFusedAttention := false;
+  try
+    NN := BuildGptOssFromSafeTensorsEx(
+      FixturePath('tiny_gpt_oss.safetensors'), Config, {SeqLen=}0,
+      {pTrainable=}false, FixturePath('tiny_gpt_oss_config.json'));
+  finally
+    NeuralAllowFusedAttention := SavedAllowFused;
+  end;
   try
     NN.EnableOpenCL(PlatformId, DeviceId);
     NN.ForceOpenCL(true);
@@ -16950,10 +17112,12 @@ begin
 end;
 {$ENDIF}
 
+// Every decode step of every sink-enabled TNNetFusedSDPA runs on the resident
+// KV cache in OpenCL memory.
 procedure TTestNeuralPretrained.TestGptOssStreamedDecodeOpenCLParity;
 begin
   {$IFDEF OpenCL}
-  RunStreamedDecodeOpenCLParity('tiny_gpt_oss');
+  RunStreamedDecodeOpenCLParity('tiny_gpt_oss', TNNetFusedSDPA);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
