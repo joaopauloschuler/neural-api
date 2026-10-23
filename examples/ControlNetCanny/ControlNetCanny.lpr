@@ -14,8 +14,11 @@ with a TStableDiffusionControlNet conditioner in neuralpretrained.pas.
 --control FILE is the control image (for the canny ControlNet: white edges on
 black, e.g. the output of cv2.Canny); it is resized to the image size. --photo
 FILE instead resizes a photo to the image size and extracts its edges with
-CannyEdges (a cv2.Canny port in neuralimageresize.pas). Without either the
-example draws a circle and a square outline.
+CannyEdges (a cv2.Canny port in neuralimageresize.pas). --pose-photo FILE
+--yolo FILE --vitpose FILE resizes a photo the same way, finds every person
+(EstimateMultiPersonPose) and draws the OpenPose control image of an openpose
+ControlNet (DrawOpenPoseBodies). Without any of them the example draws a
+circle and a square outline.
 
 --control-start / --control-end limit the ControlNet to that fraction of the
 steps and --guess-mode runs it in the prompt pass only (diffusers
@@ -24,8 +27,9 @@ control_guidance_start / _end and guess_mode). --ip-adapter FILE --ip-image PNG
 (TStableDiffusionMultiConditioner).
 
 A second --controlnet DIR adds another ControlNet (diffusers MultiControlNet);
---control, --photo, --edges-out, --scale, --control-start and --control-end
-apply to the latest --controlnet (to the first one before any).
+--control, --photo, --edges-out, --pose-photo, --pose-out, --scale,
+--control-start and --control-end apply to the latest --controlnet (to the
+first one before any).
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -51,6 +55,8 @@ type
   // One --controlnet and the per-ControlNet options that follow it.
   TControlNetEntry = record
     Folder, ControlFile, PhotoFile, EdgesFile: string;
+    // --pose-photo and --pose-out; '' for none.
+    PosePhotoFile, PoseFile: string;
     ConditioningScale, ControlStart, ControlEnd: double;
   end;
 
@@ -66,6 +72,10 @@ type
     IPScale: double;
     // cv2.Canny thresholds and the optional GaussianBlurImage radius before it.
     CannyLow, CannyHigh, CannyBlur: double;
+    // YOLOv8 and ViTPose safetensors of --pose-photo (configs beside them).
+    YoloFile, ViTPoseFile: string;
+    // Their config.json files; '' = beside the safetensors.
+    YoloConfigFile, ViTPoseConfigFile: string;
     Seed: cardinal;
     UseOpenCL, UseInt8: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
@@ -111,8 +121,19 @@ begin
   WriteLn('  --canny-blur R    Gaussian blur radius before canny ',
     '(default 0: none, as cv2.Canny)');
   WriteLn('  --edges-out PNG   also save the extracted edge map');
-  WriteLn('                    (--control, --photo, --edges-out, --scale, ',
-    '--control-start, --control-end: of the latest --controlnet)');
+  WriteLn('  --pose-photo FILE photo to draw the OpenPose image of (every ',
+    'person); needs --yolo and --vitpose');
+  WriteLn('  --yolo FILE       YOLOv8 safetensors (config.json beside it) ',
+    'finding the person boxes');
+  WriteLn('  --vitpose FILE    ViTPose safetensors (config.json beside it), ',
+    'e.g. usyd-community/vitpose-base-simple');
+  WriteLn('  --yolo-config F   YOLOv8 config.json (default: beside --yolo)');
+  WriteLn('  --vitpose-config F ViTPose config.json (default: beside --vitpose)');
+  WriteLn('  --pose-out PNG    also save the OpenPose image');
+  WriteLn('                    (--control, --photo, --edges-out, --pose-photo, ',
+    '--pose-out, --scale,');
+  WriteLn('                    --control-start, --control-end: of the latest ',
+    '--controlnet)');
   WriteLn('  --prompt TEXT     prompt (default "a futuristic city, ',
     'detailed, sharp focus")');
   WriteLn('  --negative TEXT   negative prompt (default empty)');
@@ -149,6 +170,8 @@ begin
   Result.ControlFile := '';
   Result.PhotoFile := '';
   Result.EdgesFile := '';
+  Result.PosePhotoFile := '';
+  Result.PoseFile := '';
   Result.ConditioningScale := 1.0;
   Result.ControlStart := 0;
   Result.ControlEnd := 1;
@@ -176,6 +199,10 @@ begin
   Opt.CannyLow := 100;
   Opt.CannyHigh := 200;
   Opt.CannyBlur := 0;
+  Opt.YoloFile := '';
+  Opt.ViTPoseFile := '';
+  Opt.YoloConfigFile := '';
+  Opt.ViTPoseConfigFile := '';
   Opt.Prompt := 'a futuristic city, detailed, sharp focus';
   Opt.NegativePrompt := '';
   Opt.OutputFile := 'controlnet_canny.png';
@@ -214,6 +241,14 @@ begin
     else if Arg = '--photo' then Opt.ControlNets[EntryPos].PhotoFile := NextArg()
     else if Arg = '--edges-out' then
       Opt.ControlNets[EntryPos].EdgesFile := NextArg()
+    else if Arg = '--pose-photo' then
+      Opt.ControlNets[EntryPos].PosePhotoFile := NextArg()
+    else if Arg = '--pose-out' then
+      Opt.ControlNets[EntryPos].PoseFile := NextArg()
+    else if Arg = '--yolo' then Opt.YoloFile := NextArg()
+    else if Arg = '--vitpose' then Opt.ViTPoseFile := NextArg()
+    else if Arg = '--yolo-config' then Opt.YoloConfigFile := NextArg()
+    else if Arg = '--vitpose-config' then Opt.ViTPoseConfigFile := NextArg()
     else if Arg = '--canny-low' then
       Opt.CannyLow := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--canny-high' then
@@ -265,10 +300,16 @@ begin
   if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
   MaxEntryPos := High(Opt.ControlNets);
   for EntryPos := 0 to MaxEntryPos do
-    if (Opt.ControlNets[EntryPos].ControlFile <> '') and
-      (Opt.ControlNets[EntryPos].PhotoFile <> '') then
-      raise Exception.Create('pass --control or --photo, not both, for ' +
-        Opt.ControlNets[EntryPos].Folder);
+  begin
+    if Ord(Opt.ControlNets[EntryPos].ControlFile <> '') +
+      Ord(Opt.ControlNets[EntryPos].PhotoFile <> '') +
+      Ord(Opt.ControlNets[EntryPos].PosePhotoFile <> '') > 1 then
+      raise Exception.Create('pass one of --control, --photo, --pose-photo ' +
+        'for ' + Opt.ControlNets[EntryPos].Folder);
+    if (Opt.ControlNets[EntryPos].PosePhotoFile <> '') and
+      ((Opt.YoloFile = '') or (Opt.ViTPoseFile = '')) then
+      raise Exception.Create('--pose-photo needs --yolo and --vitpose');
+  end;
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
 end;
@@ -305,8 +346,35 @@ begin
     end;
 end;
 
+// Control := the OpenPose image of every person in Photo (already at the image
+// size): --yolo finds the person boxes, --vitpose their joints.
+procedure DrawPoseControlImage(const Opt: TControlNetCannyOptions;
+  Photo, Control: TNNetVolume);
+var
+  YoloNN, PoseNN: TNNet;
+  YoloConfig: TYoloConfig;
+  PoseConfig: TViTPoseConfig;
+  Poses: TPoseKeypointsArray;
+begin
+  PoseNN := nil;
+  YoloNN := BuildYoloFromSafeTensors(Opt.YoloFile, YoloConfig,
+    {pTrainable=}false, Opt.YoloConfigFile);
+  try
+    PoseNN := BuildViTPoseFromSafeTensors(Opt.ViTPoseFile, PoseConfig,
+      {pTrainable=}false, Opt.ViTPoseConfigFile);
+    Poses := EstimateMultiPersonPose(YoloNN, YoloConfig, PoseNN, PoseConfig,
+      Photo);
+  finally
+    PoseNN.Free;
+    YoloNN.Free;
+  end;
+  WriteLn(Format('Pose:       %d person(s) found', [Length(Poses)]));
+  DrawOpenPoseBodies(Control, Photo.SizeX, Photo.SizeY, Poses);
+end;
+
 // Control := the entry's control image: its --control file, the canny edges
-// of its --photo at the image size, or the drawn outlines.
+// of its --photo or the OpenPose image of its --pose-photo at the image size,
+// or the drawn outlines.
 procedure LoadControlImage(const Entry: TControlNetEntry; const Opt:
   TControlNetCannyOptions; ImageWidth, ImageHeight: integer;
   Control, Photo: TNNetVolume);
@@ -326,6 +394,16 @@ begin
     if (Entry.EdgesFile <> '') and
       not SaveImageFromVolumeIntoFile(Control, Entry.EdgesFile) then
       raise Exception.Create('could not save ' + Entry.EdgesFile);
+  end
+  else if Entry.PosePhotoFile <> '' then
+  begin
+    if not LoadImageFromFileIntoVolume(Entry.PosePhotoFile, Photo) then
+      raise Exception.Create('could not read ' + Entry.PosePhotoFile);
+    ResizeImagePIL(Photo, Photo, ImageWidth, ImageHeight, irfLanczos, true);
+    DrawPoseControlImage(Opt, Photo, Control);
+    if (Entry.PoseFile <> '') and
+      not SaveImageFromVolumeIntoFile(Control, Entry.PoseFile) then
+      raise Exception.Create('could not save ' + Entry.PoseFile);
   end
   else DrawEdgeMap(Control, ImageWidth, ImageHeight);
 end;
@@ -420,6 +498,8 @@ begin
         WriteLn(Format('Control:    canny edges of %s (low %.0f, high %.0f, ' +
           'blur %.2f)', [Entry.PhotoFile, Opt.CannyLow, Opt.CannyHigh,
           Opt.CannyBlur]))
+      else if Entry.PosePhotoFile <> '' then
+        WriteLn('Control:    OpenPose image of ', Entry.PosePhotoFile)
       else WriteLn('Control:    drawn circle and square outlines');
       if (Entry.ControlStart > 0) or (Entry.ControlEnd < 1) then
         WriteLn(Format('Window:     steps %.2f..%.2f of the run',

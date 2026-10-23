@@ -31,6 +31,17 @@ box (class 0). The person boxes come from:
 The output photo (`--output`, default `pose_out.png`) shows each box in green
 and each joint as a red square; the joints are also printed.
 
+## OpenPose image for ControlNet
+
+`--openpose-out FILE` also writes the poses as an OpenPose control image at
+the photo size: `DrawOpenPoseBodies` (`neural/neuralpretrained.pas`) maps the
+17 COCO joints to the 18 OpenPose joints and draws limbs and dots as
+controlnet_aux's DWpose detector does (`TestOpenPoseDrawParity` matches that
+drawing code run with OpenCV 4.10 value for value). That image is the input
+of an openpose ControlNet such as `lllyasviel/sd-controlnet-openpose`;
+`examples/ControlNetCanny --pose-photo` builds it from a whole photo and runs
+the ControlNet in one go.
+
 ## Running
 
 ```
@@ -38,7 +49,8 @@ cd examples/PoseEstimation
 lazbuild -B PoseEstimation.lpi
 ../../bin/x86_64-linux/bin/PoseEstimation          # pico fixture smoke
 ../../bin/x86_64-linux/bin/PoseEstimation --model vitpose/model.safetensors \
-  --image photo.jpg --yolo yolov8n/model.safetensors --conf 0.25
+  --image photo.jpg --yolo yolov8n/model.safetensors --conf 0.25 \
+  --openpose-out openpose.png
 ```
 
 | Option | Meaning |
@@ -51,6 +63,7 @@ lazbuild -B PoseEstimation.lpi
 | `--yolo-config FILE` | YOLOv8 `config.json` (default: next to `--yolo`) |
 | `--conf X` | person score threshold (default 0.25) |
 | `--output FILE` | annotated photo (default `pose_out.png`) |
+| `--openpose-out FILE` | also the OpenPose image of the poses (see below) |
 
 With no arguments the program loads the committed pico fixtures
 (`tests/fixtures/tiny_vitpose.*` and `tests/fixtures/tiny_yolo.*`) from
@@ -63,7 +76,8 @@ synthetic photo and prints the results.
   joints that are not real people. `TestViTPoseTopDownParity` matches the
   keypoints of transformers to 2.3e-5 px on that model.
 - A real run with `usyd-community/vitpose-base-simple` and `yolov8n` has not
-  been made yet.
+  been made yet. Neither has an openpose ControlNet run on its
+  `--openpose-out` image.
 - transformers' processor has no flip test, so neither does this example.
 - Inference only, CPU.
 

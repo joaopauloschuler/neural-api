@@ -2175,41 +2175,15 @@ rather than acted on.
             offline weights with the `window_len` / `step` overlap of the
             reference `CoTrackerOnlinePredictor`; a real-checkpoint run on a
             real clip from the user's GPU box.
-- [ ] Whole-photo multi-person pose + OpenPose control image for ControlNet.
-      Today `BuildViTPoseFromSafeTensors` + `DecodeViTPoseKeypoints` take ONE
-      pre-cropped person and return integer heatmap-grid peaks, and
-      examples/ControlNetCanny can make its own control image only for Canny
-      (`--photo` + `CannyEdges`). Nothing turns a photo into the pose image that
-      `lllyasviel/sd-controlnet-openpose` / `control_v11p_sd15_openpose` expect.
-      Steps, each ending green with a commit:
-      - [X] Top-down ViTPose like transformers `VitPoseImageProcessor`: person
-            box (xywh) -> center/scale with the 1.25 padding and the 3:4
-            aspect fix, affine warp of the crop to the model input size
-            (bilinear, reuse the existing resize/affine sampling code), then
-            `post_process_pose_estimation`: the inverse affine back to image
-            pixels plus the quarter-pixel heatmap refinement (and optional
-            flip test). Pico parity vs transformers in the ~/x venv on
-            `tests/fixtures/tiny_vitpose*` with one non-square box.
-            Done: `EstimateViTPoseInBox`, 2.3e-5 px; transformers refines with DARK (not quarter-pixel), no flip test.
-      - [X] Multi-person driver: YOLO (`BuildYolo` + `DecodeYoloDetections`,
-            class 0 = person, score threshold) feeds the boxes, one ViTPose
-            pass per box; a plain `TPoseKeypoints` result per person.
-            Done: `EstimateMultiPersonPose` (+ `LetterboxYoloImage`, moved out of FastSAM); PoseEstimation takes --box/--yolo.
-      - [X] OpenPose renderer as controlnet_aux `draw_bodypose`: COCO-17 ->
-            OpenPose-18 mapping (neck = mid-shoulder, only when both
-            shoulders pass the score threshold), the 17 limb pairs with their
-            fixed colors as ellipse polygons at 0.6 alpha (stickwidth 4) and
-            the 18 colored joint dots on black, at the photo size. Pixel
-            test against controlnet_aux output for one fixed keypoint set
-            (oracle values committed, no Python at run time).
-            Done: `DrawOpenPoseBodies` (DWpose order) + cv2 ports `EllipsePolygonCV2`/`FillConvexPolygonCV2`/`FillCircleCV2`/`DrawLineCV2`; exact vs cv2 4.10.
-      - [ ] examples/ControlNetCanny: `--pose-photo FILE --yolo FILE --vitpose
-            FILE [--pose-out FILE]` builds the control image the same way
-            `--photo` builds edges, so a ControlNet openpose checkpoint runs
-            from a plain photo; README section + an examples/PoseEstimation
-            README note that it now handles whole photos. Real run (yolov8n
-            + usyd-community/vitpose-base-simple + sd-controlnet-openpose) on
-            the user's GPU box before the README calls it supported.
+- [ ] Real-checkpoint run of the photo -> OpenPose -> ControlNet path (code
+      DONE: `EstimateViTPoseInBox`, `EstimateMultiPersonPose`,
+      `DrawOpenPoseBodies`, examples/ControlNetCanny `--pose-photo --yolo
+      --vitpose [--pose-out]`, examples/PoseEstimation `--openpose-out`; only
+      the pico fixtures have run). On the user's GPU box: yolov8n +
+      usyd-community/vitpose-base-simple + lllyasviel/sd-controlnet-openpose
+      on SD 1.5 with a real multi-person photo; check the `--pose-out` image
+      by eye against controlnet_aux DWpose / OpenposeDetector output, then
+      mark both READMEs supported.
 
 ## OpenCL forward coverage — layers still on the host
 

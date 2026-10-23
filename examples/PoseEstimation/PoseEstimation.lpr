@@ -9,6 +9,8 @@
 ///   heatmap peak + DARK refinement -> keypoints in photo pixels.
 /// The person boxes come from --box (one box), from a YOLOv8 detector with
 /// --yolo (every person in the photo), or default to the whole photo.
+/// --openpose-out also writes the OpenPose image of the poses
+/// (DrawOpenPoseBodies), the control image of an openpose ControlNet.
 ///
 /// With no arguments it runs the committed PICO fixtures (random weights, a
 /// synthetic photo), so the numbers exercise the pipeline, not real joints.
@@ -26,6 +28,8 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
 type
   TPoseOptions = record
     ModelFile, ConfigFile, ImageFile, OutputFile: string;
+    // --openpose-out: the OpenPose control image of the poses; '' for none.
+    OpenPoseFile: string;
     YoloFile, YoloConfigFile: string;
     HasBox: boolean;
     Box: array[0..3] of TNeuralFloat;
@@ -45,6 +49,7 @@ begin
   WriteLn('  --yolo-config FILE   YOLOv8 config.json (default: next to --yolo)');
   WriteLn('  --conf X             person score threshold (default 0.25)');
   WriteLn('  --output FILE        photo with boxes and joints (default pose_out.png)');
+  WriteLn('  --openpose-out FILE  also the OpenPose image (ControlNet openpose input)');
   WriteLn('Without --box or --yolo the whole photo is one person box.');
 end;
 
@@ -84,6 +89,7 @@ begin
   Result := true;
   Opt.ModelFile := ''; Opt.ConfigFile := ''; Opt.ImageFile := '';
   Opt.OutputFile := 'pose_out.png';
+  Opt.OpenPoseFile := '';
   Opt.YoloFile := ''; Opt.YoloConfigFile := '';
   Opt.HasBox := false;
   Opt.ScoreThreshold := 0.25;
@@ -103,6 +109,7 @@ begin
       else if Arg = '--yolo-config' then Opt.YoloConfigFile := NextArg()
       else if Arg = '--conf' then Opt.ScoreThreshold := StrToFloat(NextArg())
       else if Arg = '--output' then Opt.OutputFile := NextArg()
+      else if Arg = '--openpose-out' then Opt.OpenPoseFile := NextArg()
       else if (Arg = '--help') or (Arg = '-h') then
       begin
         PrintUsage();
@@ -205,7 +212,7 @@ var
   PoseNN, YoloNN: TNNet;
   PoseConfig: TViTPoseConfig;
   YoloConfig: TYoloConfig;
-  Image: TNNetVolume;
+  Image, OpenPoseImage: TNNetVolume;
   Poses: TPoseKeypointsArray;
   X, Y, Channel, PersonPos: integer;
   IsSmoke: boolean;
@@ -226,6 +233,7 @@ begin
   PoseNN := BuildViTPoseFromSafeTensors(Opt.ModelFile, PoseConfig,
     {pTrainable=}false, Opt.ConfigFile);
   Image := TNNetVolume.Create;
+  OpenPoseImage := TNNetVolume.Create;
   try
     WriteLn(ViTPoseConfigToString(PoseConfig));
     if Opt.YoloFile <> '' then
@@ -246,6 +254,14 @@ begin
     WriteLn(Length(Poses), ' person(s) on the ', Image.SizeX, 'x', Image.SizeY,
       ' photo.');
     for PersonPos := 0 to High(Poses) do PrintPose(Poses[PersonPos]);
+    if Opt.OpenPoseFile <> '' then
+    begin
+      DrawOpenPoseBodies(OpenPoseImage, Image.SizeX, Image.SizeY, Poses);
+      if SaveImageFromVolumeIntoFile(OpenPoseImage, Opt.OpenPoseFile) then
+        WriteLn('Wrote ', Opt.OpenPoseFile)
+      else
+        WriteLn('Could not write ', Opt.OpenPoseFile);
+    end;
     if not IsSmoke then
     begin
       DrawPoses(Image, Poses);
@@ -255,6 +271,7 @@ begin
         WriteLn('Could not write ', Opt.OutputFile);
     end;
   finally
+    OpenPoseImage.Free;
     Image.Free;
     YoloNN.Free;
     PoseNN.Free;
