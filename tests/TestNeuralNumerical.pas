@@ -231,6 +231,8 @@ type
     procedure TestDepthwiseConvDilatedGradientCheck;
     // Input + weight gradients of the dilated TNNetConvolution (torch dilation).
     procedure TestConvolutionDilatedGradientCheck;
+    // The same for the dilated TNNetConvolutionRectangular (non-square kernel).
+    procedure TestConvolutionRectangularDilatedGradientCheck;
     procedure TestPointwiseConvNumerical;
     procedure TestSeparableConvNumerical;
     
@@ -461,6 +463,8 @@ type
     // Dilated TNNetConvolution in OpenCL: implicit GEMM, cai_im2col and the
     // int8 forward, from a host and a resident source, vs the CPU forward.
     procedure TestConvolutionDilatedOpenCLParity;
+    // The same for the dilated TNNetConvolutionRectangular (3x1, 2x3 kernels).
+    procedure TestConvolutionRectangularDilatedOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
     // TNNetEmbedding -> TNNetDepthwiseConv1D -> TNNetSiLU with ForceOpenCL off:
     // the conv's own size verdict is False, so only a source already in OpenCL
@@ -8657,6 +8661,21 @@ begin
   LayerInputAndWeightGradientCheck(Self,
     TNNetConvolutionLinear.Create(2, 3, 0, 1, 0, 3),
     'Convolution(dilation 3)', 8, 7, 2, 0.05, true, true);
+end;
+
+procedure TTestNeuralNumerical.TestConvolutionRectangularDilatedGradientCheck;
+begin
+  RandSeed := 31338;
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetConvolutionRectangular.Create(3, 3, 1, 2, 1, 0, 2),
+    'ConvolutionRectangular(3x1, dilation 2, pad 2)', 6, 5, 2, 0.05, true, true);
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetConvolutionRectangular.Create(3, 2, 3, 1, 2, 0, 2),
+    'ConvolutionRectangular(2x3, dilation 2, pad 1, stride 2)', 7, 8, 2, 0.05,
+    true, true);
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetConvolutionRectangular.Create(2, 1, 3, 0, 1, 0, 3),
+    'ConvolutionRectangular(1x3, dilation 3)', 5, 8, 2, 0.05, true, true);
 end;
 
 procedure TTestNeuralNumerical.TestMinChannelGradientCheck;
@@ -71130,15 +71149,17 @@ end;
 
 // Input(9,8,5) -> [identity pointwise source] -> TNNetConvolutionLinear(6,
 // 3x3, Padding, Stride, dilation); OpenCL output vs the CPU output.
+// FeatureSizeX <> FeatureSizeY builds a TNNetConvolutionRectangular instead.
 procedure ConvolutionDilatedOpenCLParityCheck(ATestCase: TTestCase;
-  Padding, Stride, Dilation: integer; HostSource, Quantize: boolean);
+  Padding, Stride, Dilation: integer; HostSource, Quantize: boolean;
+  FeatureSizeX: integer = 3; FeatureSizeY: integer = 3);
 {$IFDEF OpenCL}
 const
   InX = 9; InY = 8; InD = 5;
 var
   NN: TNNet;
   Source: TNNetLayer;
-  Conv: TNNetConvolutionLinear;
+  Conv: TNNetConvolution;
   Input, OutCPU: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -71175,7 +71196,12 @@ begin
       end;
       Source.FlushWeightCache();
     end;
-    Conv := TNNetConvolutionLinear.Create(6, 3, Padding, Stride, 0, Dilation);
+    if FeatureSizeX <> FeatureSizeY then
+      Conv := TNNetConvolutionRectangular.Create(6, FeatureSizeX, FeatureSizeY,
+        Padding, Stride, 0, Dilation)
+    else
+      Conv := TNNetConvolutionLinear.Create(6, FeatureSizeX, Padding, Stride, 0,
+        Dilation);
     NN.AddLayer(Conv);
     for NeuronPos := 0 to Conv.Neurons.Count - 1 do
     begin
@@ -71194,8 +71220,9 @@ begin
       // The int8 forward has no implicit GEMM: one pass covers it.
       for Implicit := Quantize to true do
       begin
-        Tag := 'pad=' + IntToStr(Padding) + ' stride=' + IntToStr(Stride) +
-          ' dilation=' + IntToStr(Dilation) + ' host=' +
+        Tag := 'kernel=' + IntToStr(FeatureSizeX) + 'x' +
+          IntToStr(FeatureSizeY) + ' pad=' + IntToStr(Padding) + ' stride=' +
+          IntToStr(Stride) + ' dilation=' + IntToStr(Dilation) + ' host=' +
           BoolToStr(HostSource, true) + ' int8=' + BoolToStr(Quantize, true) +
           ' implicit=' + BoolToStr(Implicit and not Quantize, true);
         SetOpenCLImplicitConv(Implicit and not Quantize);
@@ -71245,6 +71272,19 @@ begin
     ConvolutionDilatedOpenCLParityCheck(Self, 0, 1, 3, HostSource, false);
   end;
   ConvolutionDilatedOpenCLParityCheck(Self, 2, 1, 2, true, true);
+end;
+
+procedure TTestNeuralNumerical.TestConvolutionRectangularDilatedOpenCLParity;
+var
+  HostSource: boolean;
+begin
+  for HostSource := false to true do
+  begin
+    ConvolutionDilatedOpenCLParityCheck(Self, 2, 1, 2, HostSource, false, 3, 1);
+    ConvolutionDilatedOpenCLParityCheck(Self, 1, 2, 2, HostSource, false, 2, 3);
+    ConvolutionDilatedOpenCLParityCheck(Self, 0, 1, 3, HostSource, false, 1, 3);
+  end;
+  ConvolutionDilatedOpenCLParityCheck(Self, 2, 1, 2, true, true, 3, 1);
 end;
 
 procedure TTestNeuralNumerical.TestChannelMulByLayerOpenCLParity;

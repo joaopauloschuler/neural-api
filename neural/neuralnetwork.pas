@@ -16929,6 +16929,9 @@ type
       // Tap spacing per axis (values below 1 read as 1); like SetFeatureSizeXY,
       // it must run before SetPrevLayer.
       procedure SetDilationXY(pDilationX, pDilationY: integer);
+      // Raises when FDilationX or FDilationY is above 1: guards the dense-only
+      // reference routines that the dilated forward and backward do not use.
+      procedure RaiseWhenDilated(const pRoutineName: string);
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); reintroduce; overload;
       property FeatureSizeX: integer read FFeatureSizeX;
@@ -17393,11 +17396,16 @@ type
   /// load (FStruct[1]=FeatureSizeX, FStruct[5]=FeatureSizeY). The AVX
   /// dot-product path operates on the flattened (FeatureSizeX*FeatureSizeY*
   /// InDepth) channel vector exactly as the square case, so vectorization is
-  /// preserved. This variant has Linear (Identity) activation.
+  /// preserved. This variant has Linear (Identity) activation. The 7-argument
+  /// Create adds torch dilation (both axes, FStruct[6]).
   // Coded by Claude (AI).
   TNNetConvolutionRectangular = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
+    // The 6-argument Create plus torch dilation (taps pDilation apart in X
+    // and Y, FStruct[6]).
+    constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY,
+      pInputPadding, pStride, pSuppressBias, pDilation: integer); overload;
   end;
 
   /// Rectangular (asymmetric) kernel convolution with ReLU activation.
@@ -92129,6 +92137,18 @@ begin
   FActivationFnDerivative := @IdentityDerivative;
 end;
 
+constructor TNNetConvolutionRectangular.Create(pNumFeatures, pFeatureSizeX,
+  pFeatureSizeY, pInputPadding, pStride, pSuppressBias, pDilation: integer);
+begin
+  // Virtual: the descendant's own 6-argument Create sets its activation.
+  Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride,
+    pSuppressBias);
+  // Dilation 1 leaves FStruct[6] at 0, so the saved structure is unchanged.
+  if pDilation <= 1 then exit;
+  SetDilationXY(pDilation, pDilation);
+  FStruct[6] := FDilationX;
+end;
+
 { TNNetConv1DLinear }
 constructor TNNetConv1DLinear.Create(pNumFeatures, pFeatureSize, pPadding,
   pStride: integer; pDilation: integer = 1; pSuppressBias: integer = 0);
@@ -120703,6 +120723,7 @@ var
   OutputRawPos: integer;
   CanBackpropOnPos: boolean;
 begin
+  RaiseWhenDilated('BackpropagateCPU');
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
@@ -120765,6 +120786,7 @@ var
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
 begin
+  RaiseWhenDilated('BackpropagateFastCPU');
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
@@ -121196,6 +121218,7 @@ var
   localNumElements, MissedElements: integer;
   MaxPrevX, MaxPrevY: integer;
 begin
+  RaiseWhenDilated('BackpropagateFastCPUDev');
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
@@ -121581,6 +121604,7 @@ var
   DepthFSize, ColBase: integer;
   PrevPtrA, PrevPtrB: TNeuralFloatArrPtr;
 begin
+  RaiseWhenDilated('BackpropagateOpenCL');
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
   MaxD := OutputError.Depth - 1;
@@ -121805,6 +121829,14 @@ begin
   FDilationX := Max(pDilationX, 1);
   FDilationY := Max(pDilationY, 1);
   SetFeatureSizeXY(FFeatureSizeX, FFeatureSizeY);
+end;
+
+procedure TNNetConvolutionAbstract.RaiseWhenDilated(const pRoutineName: string);
+begin
+  if (FDilationX > 1) or (FDilationY > 1) then
+    raise Exception.Create(ClassName + '.' + pRoutineName +
+      ': dense-only routine; this layer is dilated (' + IntToStr(FDilationX) +
+      'x' + IntToStr(FDilationY) + ').');
 end;
 
 destructor TNNetConvolutionAbstract.Destroy();
@@ -142448,8 +142480,8 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4], St[6]);
-      'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
-      'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
+      'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4], St[6]);
+      'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4], St[6]);
       'TNNetConv1DLinear' :         Result := TNNetConv1DLinear.Create(St[0], St[1], St[2], St[3], St[6], St[4]);
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -142907,8 +142939,8 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4], St[6]) else
-      if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4], St[6]) else
+      if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4], St[6]) else
       if S[0] = 'TNNetConv1DLinear' then Result := TNNetConv1DLinear.Create(St[0], St[1], St[2], St[3], St[6], St[4]) else
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
@@ -152977,6 +153009,7 @@ var
   OutputCntX, OutputCntY: integer;
   MaxX, MaxY: integer;
 begin
+  RaiseWhenDilated('PrepareInputForConvolution');
   if (FPointwise) then
   begin
     // There is nothing to do. YAY!
@@ -153296,6 +153329,7 @@ var
   lo02, lo12, lo22: integer;
   DepthX: integer;
 begin
+  RaiseWhenDilated('ComputeNeuronAtOutputPos3');
   Total := 0;
   LocalW := FArrNeurons[NeuronIdx].Weights;  // #10: array mirror
 
@@ -153373,6 +153407,7 @@ var
   lo02, lo12, lo22: integer;
 
 begin
+  RaiseWhenDilated('ComputeNeuronAtOutputPos3D3');
   x1 := x + 1;
   x2 := x + 2;
   y1 := y + 1;
@@ -153447,6 +153482,7 @@ var
   LocalW: TNNetVolume;
   fiBase, loBase: integer;
 begin
+  RaiseWhenDilated('ComputeNeuronAtOutputPosDefault');
   // This is the default behaviour
   Total := 0;
   MaxX := x + FFeatureSizeX - 1;
@@ -153480,6 +153516,7 @@ var
   DepthX: integer;
   yCount: integer;
 begin
+  RaiseWhenDilated('ComputeNeuronAtOutputPosDefaultFast');
   LocalW := FArrNeurons[NeuronIdx].Weights;  // #10: array mirror
   Total := 0;
 

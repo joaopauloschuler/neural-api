@@ -2452,8 +2452,8 @@ cannot pay for its own transfer.
 
 - [ ] Dilated `TNNetConvolution` follow-ups (c331577c; the 6-argument
       `Create(..., SuppressBias, Dilation)`, FStruct[6]):
-  - [ ] `TNNetConvolutionRectangular` takes no dilation argument.
-  - [ ] The unused `BackpropagateCPU` / `BackpropagateFastCPU` /
+  - [X] `TNNetConvolutionRectangular` takes no dilation argument.
+  - [X] The unused `BackpropagateCPU` / `BackpropagateFastCPU` /
         `BackpropagateFastCPUDev` and the Debug-only reference routines are
         still dense-only; either honour FDilationY or raise when it is > 1.
   - [ ] Winograd and the 2x-upsample fold decline dilation > 1 (plain path);
