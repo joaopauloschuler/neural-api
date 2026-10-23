@@ -305,6 +305,14 @@ type
     function BuildSigmaSchedule(NumSteps: integer;
       Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
       KarrasSigmas: boolean): TNNetSigmaSchedule;
+    // BuildSigmaSchedule from the Img2ImgStartStep entry on (diffusers
+    // get_timesteps + set_begin_index); Sigmas[0] is the add_noise sigma.
+    function BuildImg2ImgSigmaSchedule(NumSteps: integer;
+      Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+      KarrasSigmas: boolean; Strength: double): TNNetSigmaSchedule;
+    // sqrt(ab) and sqrt(1-ab) at a continuous sigma, ab = 1/(1+sigma^2).
+    class procedure AlphaBarRootsAtSigma(Sigma: double;
+      out SqrtAb, SqrtOneMinusAb: TNeuralFloat);
     // Step from Sigma to NextSigma (0: clean) for smEuler, smEulerAncestral and
     // smDPMSolverPP2M; Xt in the VP scale, as Step. Call ResetMultistep first.
     procedure StepAtSigma(Xt, RawPred: TNNetVolume; Sigma, NextSigma: double;
@@ -1323,7 +1331,6 @@ procedure TNNetDiffusionScheduler.AlphaBarRootsAt(ModelTimestep: double;
   out SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 var
   Tt: integer;
-  Sigma: double;
 begin
   Tt := Round(ModelTimestep) + 1;
   if (ModelTimestep = Tt - 1) and (Tt >= 1) and (Tt <= FT) then
@@ -1332,8 +1339,13 @@ begin
     SqrtOneMinusAb := FSqrtOneMinusAlphaBar[Tt];
     exit;
   end;
-  // ab = 1/(1+sigma^2): sqrt(ab) = 1/sqrt(1+sigma^2), sqrt(1-ab) = sigma*sqrt(ab).
-  Sigma := InterpolatedSigma(ModelTimestep);
+  AlphaBarRootsAtSigma(InterpolatedSigma(ModelTimestep), SqrtAb,
+    SqrtOneMinusAb);
+end;
+
+class procedure TNNetDiffusionScheduler.AlphaBarRootsAtSigma(Sigma: double;
+  out SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+begin
   SqrtAb := 1 / Sqrt(1 + Sigma * Sigma);
   SqrtOneMinusAb := Sigma * SqrtAb;
 end;
@@ -2282,6 +2294,20 @@ begin
   end;
   Result.Sigmas[NumSteps] := 0;
   ResetMultistep;
+end;
+
+function TNNetDiffusionScheduler.BuildImg2ImgSigmaSchedule(NumSteps: integer;
+  Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+  KarrasSigmas: boolean; Strength: double): TNNetSigmaSchedule;
+var
+  StartStep: integer;
+begin
+  Result := BuildSigmaSchedule(NumSteps, Spacing, Method, KarrasSigmas);
+  StartStep := Img2ImgStartStep(Length(Result.ModelTimesteps), Strength);
+  Result.Sigmas := Copy(Result.Sigmas, StartStep,
+    Length(Result.Sigmas) - StartStep);
+  Result.ModelTimesteps := Copy(Result.ModelTimesteps, StartStep,
+    Length(Result.ModelTimesteps) - StartStep);
 end;
 
 procedure TNNetDiffusionScheduler.StepAtSigma(Xt, RawPred: TNNetVolume;

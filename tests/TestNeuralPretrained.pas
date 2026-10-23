@@ -1432,6 +1432,7 @@ type
     procedure TestStableDiffusionInpaintParity;
     procedure TestStableDiffusionInpaintStrengthParity;
     procedure TestStableDiffusionImg2ImgParity;
+    procedure TestStableDiffusionImg2ImgKarrasSigmas;
     procedure TestStableDiffusionLCMParity;
     procedure TestStableDiffusionLCMDistilledParity;
     procedure TestStableDiffusion2Config;
@@ -49005,6 +49006,211 @@ begin
   finally
     ImageNoise.Free;
     SourceImage.Free;
+    Pipeline.Free;
+    Img2Img.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+type
+  // Keeps a copy of the noised start latents of each run.
+  TSDStartCapturingImg2Img = class(TStableDiffusionImg2Img)
+  public
+    StartLatents: TNNetVolume;
+    procedure NoiseImageLatents(Latents: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat); override;
+  end;
+
+procedure TSDStartCapturingImg2Img.NoiseImageLatents(Latents: TNNetVolume;
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat);
+begin
+  inherited NoiseImageLatents(Latents, SqrtAb, SqrtOneMinusAb);
+  StartLatents.ReSize(Latents);
+  StartLatents.Copy(Latents);
+end;
+
+// Img2img on the truncated Karras schedule (DPM++ 2M, its SDE form, Euler) vs
+// diffusers float64: start latents, first step and result, in the VP scale.
+procedure TTestNeuralPretrained.TestStableDiffusionImg2ImgKarrasSigmas;
+type
+  TKarrasImg2ImgCase = record
+    Sampler: TNNetSamplerMethod;
+    Algorithm: TNNetDPMSolverAlgorithm;
+    Strength: double;
+    StepCount: integer;
+    Start, First, Final: array[0..5] of double;
+    StartSum, StartSumSq, FirstSum, FirstSumSq, FinalSum,
+      FinalSumSq: double;
+  end;
+const
+  cPicks: array[0..17] of integer = (0, 0, 0, 1, 2, 3, 2, 5, 1, 3, 4, 7,
+    0, 3, 6, 3, 1, 2);
+  cCases: array[0..8] of TKarrasImg2ImgCase = (
+    (Sampler: smDPMSolverPP2M; Algorithm: dpaDPMSolverPP; Strength: 0.5;
+     StepCount: 2;
+     Start: (-0.398183725, 0.618779407, 0.117660824, 0.644042537,
+       0.295661785, -0.527544697);
+     First: (-0.269196662, 0.567869988, 0.0598746547, 0.704141184,
+       0.66600412, -0.7601042);
+     Final: (-0.24183018, 0.581773048, 0.0721001667, 0.715927104,
+       0.685485542, -0.776912815);
+     StartSum: 2.71275189; StartSumSq: 18.8894894;
+     FirstSum: 8.3631934; FirstSumSq: 25.8873109;
+     FinalSum: 9.20638381; FinalSumSq: 27.0830352),
+    (Sampler: smDPMSolverPP2M; Algorithm: dpaDPMSolverPP; Strength: 0.7;
+     StepCount: 3;
+     Start: (-1.06980136, 1.07356949, 0.191199972, 2.14011174,
+       0.471146869, -1.1816573);
+     First: (-1.04881424, 0.862600336, 0.846940826, 3.95611716,
+       2.14649274, -2.66377601);
+     Final: (-0.837715339, 0.564680854, 0.816618394, 4.31479944,
+       2.1717385, -2.78706535);
+     StartSum: 2.11995943; StartSumSq: 136.358578;
+     FirstSum: 35.746982; FirstSumSq: 448.065657;
+     FinalSum: 46.0081952; FinalSumSq: 502.153493),
+    (Sampler: smDPMSolverPP2M; Algorithm: dpaDPMSolverPP; Strength: 0.9;
+     StepCount: 4;
+     Start: (-1.28016299, 1.12645747, 0.195236111, 2.67102062,
+       0.476958802, -1.35069152);
+     First: (-2.5842651, 1.32711229, 1.05029154, 9.6081468,
+       4.22099953, -5.10322904);
+     Final: (-3.57523587, 1.99476763, 3.21687623, 14.8970033,
+       7.52291388, -7.70733377);
+     StartSum: 1.14828799; StartSumSq: 210.100352;
+     FirstSum: 71.2787636; FirstSumSq: 2355.91318;
+     FinalSum: 164.291796; FinalSumSq: 6193.35479),
+    (Sampler: smDPMSolverPP2M; Algorithm: dpaSDEDPMSolverPP; Strength: 0.5;
+     StepCount: 2;
+     Start: (-0.398183725, 0.618779407, 0.117660824, 0.644042537,
+       0.295661785, -0.527544697);
+     First: (-0.238149189, 0.57418538, 0.0671403344, 0.723426206,
+       0.723007362, -0.771132748);
+     Final: (-0.210702965, 0.591622104, 0.0801253569, 0.734598463,
+       0.740220522, -0.78699004);
+     StartSum: 2.71275189; StartSumSq: 18.8894894;
+     FirstSum: 11.7978138; FirstSumSq: 27.4638171;
+     FinalSum: 12.6528255; FinalSumSq: 28.7285507),
+    (Sampler: smDPMSolverPP2M; Algorithm: dpaSDEDPMSolverPP; Strength: 0.7;
+     StepCount: 3;
+     Start: (-1.06980136, 1.07356949, 0.191199972, 2.14011174,
+       0.471146869, -1.1816573);
+     First: (-0.807598097, 0.820055309, 1.07129878, 4.18930107,
+       2.53810819, -2.70262423);
+     Final: (-0.402648315, 0.469601363, 1.16567748, 4.67034626,
+       2.79696722, -2.83926932);
+     StartSum: 2.11995943; StartSumSq: 136.358578;
+     FirstSum: 64.7171005; FirstSumSq: 504.848281;
+     FinalSum: 99.1626084; FinalSumSq: 626.455113),
+    (Sampler: smDPMSolverPP2M; Algorithm: dpaSDEDPMSolverPP; Strength: 0.9;
+     StepCount: 4;
+     Start: (-1.28016299, 1.12645747, 0.195236111, 2.67102062,
+       0.476958802, -1.35069152);
+     First: (-1.86284773, 1.1536516, 1.55158842, 10.3932316,
+       5.33815087, -4.99424995);
+     Final: (-1.29938836, 1.88067798, 5.31045137, 16.9356036,
+       11.2220558, -7.12247841);
+     StartSum: 1.14828799; StartSumSq: 210.100352;
+     FirstSum: 162.094571; FirstSumSq: 2714.82534;
+     FinalSum: 508.712722; FinalSumSq: 8794.07818),
+    (Sampler: smEuler; Algorithm: dpaDPMSolverPP; Strength: 0.5;
+     StepCount: 2;
+     Start: (-0.335306986, 0.569661388, 0.109388691, 0.508531743,
+       0.275643213, -0.463689012);
+     First: (-0.247912229, 0.561414056, 0.0766109227, 0.530858953,
+       0.515922209, -0.607469799);
+     Final: (-0.209663274, 0.558092523, 0.0826083123, 0.550170575,
+       0.56320539, -0.621197071);
+     StartSum: 2.71084667; StartSumSq: 14.6263531;
+     FirstSum: 6.57033487; FirstSumSq: 17.7164535;
+     FinalSum: 7.67857082; FinalSumSq: 19.047988),
+    (Sampler: smEuler; Algorithm: dpaDPMSolverPP; Strength: 0.7;
+     StepCount: 3;
+     Start: (-0.808041508, 0.916196534, 0.166755268, 1.54319368,
+       0.413662721, -0.934676279);
+     First: (-0.535155831, 0.521350967, 0.270996728, 2.00779662,
+       1.249744, -1.54733452);
+     Final: (-0.375626372, 0.41532617, 0.250995305, 2.20089644,
+       1.23680904, -1.64517163);
+     StartSum: 2.52546397; StartSumSq: 73.9060986;
+     FirstSum: 17.3646263; FirstSumSq: 133.470778;
+     FinalSum: 24.3056496; FinalSumSq: 155.47918),
+    (Sampler: smEuler; Algorithm: dpaDPMSolverPP; Strength: 0.9;
+     StepCount: 4;
+     Start: (-1.19569598, 1.12674995, 0.198182171, 2.44286385,
+       0.486440684, -1.29143526);
+     First: (-1.58136076, 0.990469868, 0.686893121, 5.28846265,
+       2.29766756, -3.02640822);
+     Final: (-1.33630715, 0.554315652, 1.10147075, 6.79295954,
+       3.29175263, -3.78009071);
+     StartSum: 1.72738714; StartSumSq: 176.157627;
+     FirstSum: 38.7861518; FirstSumSq: 736.965192;
+     FinalSum: 72.6482998; FinalSumSq: 1216.46326));
+var
+  Pipeline: TStableDiffusionPipeline;
+  Img2Img: TSDStartCapturingImg2Img;
+  SourceImage, ImageNoise, Initial, Embeds, Latents: TNNetVolume;
+  CasePos, ImageWidth, ImageHeight: integer;
+  CaseName: string;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  Img2Img := TSDStartCapturingImg2Img.Create();
+  Img2Img.StartLatents := TNNetVolume.Create;
+  SourceImage := TNNetVolume.Create;
+  ImageNoise := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  FSDFirstStepLatents := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays[
+      'image_sample_noise'], true, ImageNoise);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['latents'], true,
+      Initial);
+    Img2Img.SetImage(SourceImage);
+    Img2Img.SetSampleNoise(ImageNoise);
+    Img2Img.ImageSizeFor(Pipeline.VaeScaleFactor, ImageWidth, ImageHeight);
+    Pipeline.Conditioner := Img2Img;
+    Pipeline.GuidanceScale := TJSONObject(FSD15Oracle).Get('guidance_scale',
+      0.0);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    Pipeline.KarrasSigmas := true;
+    Pipeline.OnStep := @SDCaptureFirstStep;
+    Pipeline.OnAncestralNoise := @SD15ConstantNoise;
+    FSD15NoiseValue := 0.5;
+    for CasePos := 0 to High(cCases) do
+    begin
+      CaseName := 'case ' + IntToStr(CasePos);
+      Pipeline.Sampler := cCases[CasePos].Sampler;
+      Pipeline.Scheduler.DPMSolverAlgorithm := cCases[CasePos].Algorithm;
+      Img2Img.Strength := cCases[CasePos].Strength;
+      Latents.ReSize(Initial);
+      Latents.Copy(Initial);
+      Pipeline.Denoise(Embeds, ImageWidth, ImageHeight,
+        TJSONObject(FSD15Oracle).Get('steps', 0), Latents);
+      AssertEquals(CaseName + ' guided passes', 2 * cCases[CasePos].StepCount,
+        Pipeline.ImageStats.UNetPassCount);
+      CheckICLightPicks(CaseName + ' start', Img2Img.StartLatents, cPicks,
+        cCases[CasePos].Start, cCases[CasePos].StartSum,
+        cCases[CasePos].StartSumSq);
+      CheckICLightPicks(CaseName + ' first step', FSDFirstStepLatents, cPicks,
+        cCases[CasePos].First, cCases[CasePos].FirstSum,
+        cCases[CasePos].FirstSumSq);
+      CheckICLightPicks(CaseName + ' result', Latents, cPicks,
+        cCases[CasePos].Final, cCases[CasePos].FinalSum,
+        cCases[CasePos].FinalSumSq);
+    end;
+  finally
+    FreeAndNil(FSDFirstStepLatents);
+    Latents.Free;
+    Embeds.Free;
+    Initial.Free;
+    ImageNoise.Free;
+    SourceImage.Free;
+    Img2Img.StartLatents.Free;
     Pipeline.Free;
     Img2Img.Free;
     FreeAndNil(FSD15Oracle);

@@ -12466,13 +12466,14 @@ type
     // Before the first step; Latents is the unit noise (grid, latent channels).
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); virtual;
-    // diffusers strength: Denoise runs Scheduler.BuildImg2ImgSchedule at it.
+    // diffusers strength: Denoise truncates its timestep or sigma schedule.
     function DenoiseStrength(): double; virtual;
     // True: start from NoiseImageLatents, not from noise. Base: strength < 1.
     function StartsFromImage(): boolean; virtual;
-    // StartsFromImage: Latents (the unit noise) := the image latents noised to
-    // the 1-based timestep Tt (diffusers add_noise). This base raises.
-    procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); virtual;
+    // StartsFromImage: Latents (the unit noise) := SqrtAb * image latents +
+    // SqrtOneMinusAb * that noise (diffusers add_noise). This base raises.
+    procedure NoiseImageLatents(Latents: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat); virtual;
     // True when the steps need the negative prompt (base: GuidanceScale > 1).
     function IsGuided(GuidanceScale: TNeuralFloat): boolean; virtual;
     // Pred := one step's guided prediction from PredictPass calls; this base
@@ -12487,8 +12488,8 @@ type
       Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); virtual;
     // After the sampler step that reached NextTt (1-based; 0 = clean).
     procedure AfterStep(Latents: TNNetVolume; NextTt: integer); virtual;
-    // True when the steps may run at continuous sigmas: NoiseImageLatents and
-    // AfterStep are not needed. Base: not StartsFromImage.
+    // True when the steps may run at continuous sigmas: AfterStep needs no
+    // integer timestep. Base: true.
     function AcceptsSigmaSchedule(): boolean; virtual;
     // Frees the nets unless the pipeline keeps its components loaded.
     procedure EndDenoise(); virtual;
@@ -13340,8 +13341,8 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
   end;
 
-  // diffusers StableDiffusionImg2ImgPipeline: the BuildImg2ImgSchedule steps run
-  // from the sampled VAE latents of the image noised to the first of them.
+  // diffusers StableDiffusionImg2ImgPipeline: the strength-truncated schedule
+  // runs from the sampled VAE latents of the image noised to its first step.
   TStableDiffusionImg2Img = class(TStableDiffusionImageConditioner)
   protected
     // The unit noise the run started from.
@@ -13362,7 +13363,8 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
     function DenoiseStrength(): double; override;
     function StartsFromImage(): boolean; override;
-    procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); override;
+    procedure NoiseImageLatents(Latents: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat); override;
     // diffusers strength in (0, 1]; 1 still starts from the noised image.
     property Strength: double read FStrength write SetStrength;
   end;
@@ -13884,7 +13886,8 @@ type
       Latents: TNNetVolume; TextSeqLen: integer); override;
     function DenoiseStrength(): double; override;
     function StartsFromImage(): boolean; override;
-    procedure NoiseImageLatents(Latents: TNNetVolume; Tt: integer); override;
+    procedure NoiseImageLatents(Latents: TNNetVolume;
+      SqrtAb, SqrtOneMinusAb: TNeuralFloat); override;
     function IsGuided(GuidanceScale: TNeuralFloat): boolean; override;
     procedure PredictGuidedNoise(UNet: TNNet; const Config: TSDUNetConfig;
       Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
@@ -104444,7 +104447,7 @@ var
   IPAdapterFile, GLIGENFile: string;
   DeepCacheLayout: TSDUNetDeepCacheLayout;
   GridX, GridY, StepPos, MaxStepPos, CachePos: integer;
-  Eta, NoiseScale: TNeuralFloat;
+  Eta, NoiseScale, SqrtAb, SqrtOneMinusAb: TNeuralFloat;
   Timestep: double;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
@@ -104505,13 +104508,22 @@ begin
     StepConditioner.CollectConditioners(FPassConditioners);
     DoPhase(sdphDenoise);
     // diffusers Euler / Euler a (linspace: fractional timesteps) and Karras
-    // sigmas sample at continuous sigmas; image starts keep integer timesteps.
+    // sigmas sample at continuous sigmas; image starts truncate that schedule.
     UseSigmaSchedule := (not IsInversion) and
       StepConditioner.AcceptsSigmaSchedule() and
       (((FSampler in [smEuler, smEulerAncestral]) and (FKarrasSigmas or
       (FScheduler.ConfigSpacing = tsUniform))) or
       ((FSampler = smDPMSolverPP2M) and FKarrasSigmas));
-    if UseSigmaSchedule then
+    if UseSigmaSchedule and StepConditioner.StartsFromImage() then
+    begin
+      SigmaSchedule := FScheduler.BuildImg2ImgSigmaSchedule(StepCount,
+        FScheduler.ConfigSpacing, FSampler, FKarrasSigmas,
+        StepConditioner.DenoiseStrength());
+      FScheduler.AlphaBarRootsAtSigma(SigmaSchedule.Sigmas[0], SqrtAb,
+        SqrtOneMinusAb);
+      StepConditioner.NoiseImageLatents(Latents, SqrtAb, SqrtOneMinusAb);
+    end
+    else if UseSigmaSchedule then
     begin
       SigmaSchedule := FScheduler.BuildSigmaSchedule(StepCount,
         FScheduler.ConfigSpacing, FSampler, FKarrasSigmas);
@@ -104528,7 +104540,8 @@ begin
       // strength schedule (no init sigma).
       Schedule := FScheduler.BuildImg2ImgSchedule(StepCount,
         FScheduler.ConfigSpacing, FSampler, StepConditioner.DenoiseStrength());
-      StepConditioner.NoiseImageLatents(Latents, Schedule[0]);
+      FScheduler.AlphaBarRootsAt(Schedule[0] - 1, SqrtAb, SqrtOneMinusAb);
+      StepConditioner.NoiseImageLatents(Latents, SqrtAb, SqrtOneMinusAb);
     end
     else
     begin
@@ -104991,7 +105004,7 @@ begin
 end;
 
 procedure TStableDiffusionConditioner.NoiseImageLatents(Latents: TNNetVolume;
-  Tt: integer);
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 begin
   ImportError(ClassName + ': no image to start a strength < 1 run from.');
 end;
@@ -105011,7 +105024,7 @@ end;
 
 function TStableDiffusionConditioner.AcceptsSigmaSchedule(): boolean;
 begin
-  Result := not StartsFromImage();
+  Result := true;
 end;
 
 procedure TStableDiffusionConditioner.EndDenoise();
@@ -106197,11 +106210,11 @@ begin
 end;
 
 procedure TStableDiffusionMultiConditioner.NoiseImageLatents(
-  Latents: TNNetVolume; Tt: integer);
+  Latents: TNNetVolume; SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 begin
   if Assigned(FImageConditioner) then
-    FImageConditioner.NoiseImageLatents(Latents, Tt)
-  else inherited NoiseImageLatents(Latents, Tt);
+    FImageConditioner.NoiseImageLatents(Latents, SqrtAb, SqrtOneMinusAb)
+  else inherited NoiseImageLatents(Latents, SqrtAb, SqrtOneMinusAb);
 end;
 
 function TStableDiffusionMultiConditioner.IsGuided(
@@ -106387,9 +106400,11 @@ begin
 end;
 
 procedure TStableDiffusionImg2Img.NoiseImageLatents(Latents: TNNetVolume;
-  Tt: integer);
+  SqrtAb, SqrtOneMinusAb: TNeuralFloat);
 begin
-  FPipeline.Scheduler.AddNoise(FImageLatents, Latents, Tt, nil, FNoise);
+  Latents.Copy(FImageLatents);
+  Latents.Mul(SqrtAb);
+  Latents.MulAdd(SqrtOneMinusAb, FNoise);
 end;
 
 constructor TStableDiffusionInpainter.Create();
@@ -106510,7 +106525,7 @@ end;
 function TStableDiffusionInpainter.AcceptsSigmaSchedule(): boolean;
 begin
   // The 4-channel blend noises the kept region at each integer timestep.
-  Result := FIsConcatUNet and inherited AcceptsSigmaSchedule();
+  Result := FIsConcatUNet;
 end;
 
 constructor TStableDiffusionInstructPix2Pix.Create();
