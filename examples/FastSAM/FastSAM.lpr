@@ -3,16 +3,19 @@ program FastSAM;
 FastSAM: real-time "segment anything" with a YOLOv8 instance-segmentation net
 (Zhao et al. 2023, arXiv:2306.12156; ultralytics FastSAM-s / FastSAM-x), with
 the importer in neuralpretrained.pas (BuildYoloFromSafeTensors with
-task "segment", DecodeYoloSegmentation, FastSAMSelectByBox / ByPoint).
+task "segment", DecodeYoloSegmentationNative, FastSAMSelectByBox / ByPoint /
+ByText).
 
 Two modes:
   * no arguments: a smoke of the committed random pico fixture
     tests/fixtures/tiny_yolo_seg: synthesize a small colour image, segment
-    everything, then run one box prompt and one point prompt.
-  * --model FILE --image IMG [--box X1,Y1,X2,Y2] [--point X,Y,LABEL ...]:
-    segment a real image with a real checkpoint (FastSAM-s.pt / FastSAM-x.pt
-    converted to safetensors, see README.md). Without a prompt every mask is
-    drawn; with a box or points only the selected mask is drawn.
+    everything, then run one box prompt, one point prompt and one text
+    prompt (pico CLIP fixture, fixed token ids).
+  * --model FILE --image IMG [--box X1,Y1,X2,Y2] [--point X,Y,LABEL ...]
+    [--text "..." --clip DIR]: segment a real image with a real checkpoint
+    (FastSAM-s.pt / FastSAM-x.pt converted to safetensors, see README.md).
+    Without a prompt every mask is drawn; with a box, points or a text prompt
+    only the selected mask is drawn.
 
 The image is letterboxed to the net input (ultralytics LetterBox: keep the
 aspect ratio, pad with gray 114). Retina masks (the default) are computed at
@@ -33,7 +36,8 @@ Coded by Claude (AI).
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
-  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
+  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained,
+  neuralhftokenizer;
 
 const
   FixturesDir = '../../tests/fixtures/';
@@ -48,8 +52,17 @@ type
     HasBox, RetinaMasks: boolean;
     Box: array[0..3] of integer;
     PointX, PointY, PointLabels: array of integer;
+    TextPrompt, ClipDir: string;
     UseOpenCL: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
+  end;
+
+  // The CLIP towers and the text embedding of a text prompt (TextEmb nil = no prompt).
+  TFastSAMClip = record
+    TextNet, VisionNet: TNNet;
+    Config: TClipConfig;
+    ProcessorConfig: TClipImageProcessorConfig;
+    TextEmb: TNNetVolume;
   end;
 
   // Where the image sits inside the letterboxed net input.
@@ -74,6 +87,10 @@ begin
   WriteLn('  --box X1,Y1,X2,Y2    box prompt in image pixels');
   WriteLn('  --point X,Y,LABEL    point prompt in image pixels, LABEL 1 = keep,');
   WriteLn('                       0 = remove; repeat for several points');
+  WriteLn('  --text "..."         CLIP text prompt (needs --clip)');
+  WriteLn('  --clip DIR           HF CLIP folder (openai/clip-vit-base-patch32):');
+  WriteLn('                       model.safetensors, config.json,');
+  WriteLn('                       preprocessor_config.json, tokenizer.json');
   WriteLn('  --gpu                run on OpenCL (build with -dOpenCL)');
   WriteLn('  --gpu-platform N / --gpu-device N   select the OpenCL device');
 end;
@@ -125,6 +142,8 @@ begin
   SetLength(Opt.PointX, 0);
   SetLength(Opt.PointY, 0);
   SetLength(Opt.PointLabels, 0);
+  Opt.TextPrompt := '';
+  Opt.ClipDir := '';
   Opt.UseOpenCL := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
@@ -155,6 +174,8 @@ begin
       Opt.PointY[PointCnt - 1] := PointValues[1];
       Opt.PointLabels[PointCnt - 1] := PointValues[2];
     end
+    else if Arg = '--text' then Opt.TextPrompt := NextArg()
+    else if Arg = '--clip' then Opt.ClipDir := IncludeTrailingPathDelimiter(NextArg())
     else if Arg = '--no-retina' then Opt.RetinaMasks := false
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
@@ -171,6 +192,8 @@ begin
   end;
   if (Opt.ModelFile <> '') and (Opt.ImageFile = '') then
     raise Exception.Create('--model needs --image');
+  if (Opt.TextPrompt <> '') and (Opt.ClipDir = '') then
+    raise Exception.Create('--text needs --clip');
 end;
 
 // NetInput (Size, Size, 3) in [0,1] := ultralytics LetterBox of Image (0..255).
@@ -254,6 +277,74 @@ begin
   end;
 end;
 
+// Masks := its channel MaskIdx alone (an empty mask when MaskIdx < 0).
+procedure KeepMask(Masks, Selected: TNNetVolume; MaskIdx: integer);
+begin
+  Selected.ReSize(Masks.SizeX, Masks.SizeY, 1);
+  if MaskIdx >= 0 then Selected.CopyChannels(Masks, [MaskIdx])
+  else Selected.Fill(0);
+  Masks.Copy(Selected);
+end;
+
+// Clip.TextEmb := unit-L2 CLIP text embedding of TokenIds (no BOS/EOS), framed
+// as <bos> ids <eos> and padded with <eos> to the text net context.
+procedure EncodeClipText(var Clip: TFastSAMClip; const TokenIds: array of integer;
+  BosId, EosId: integer);
+var
+  TextInput: TNNetVolume;
+  SeqLen, TokenPos, MaxTokenPos: integer;
+begin
+  SeqLen := Clip.TextNet.Layers[0].Output.SizeX;
+  TextInput := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    TextInput.Fill(EosId);
+    TextInput.FData[0] := BosId;
+    MaxTokenPos := Min(High(TokenIds), SeqLen - 3);
+    for TokenPos := 0 to MaxTokenPos do
+      TextInput.FData[TokenPos + 1] := TokenIds[TokenPos];
+    Clip.TextNet.Compute(TextInput);
+    Clip.TextEmb := TNNetVolume.Create;
+    ClipExtractEmbedding(Clip.TextNet.GetLastLayer().Output,
+      ClipTextEosPosition(TextInput, Clip.Config.EosTokenId), Clip.TextEmb);
+  finally
+    TextInput.Free;
+  end;
+end;
+
+// Loads the CLIP towers and the image processor of ModelFile / ProcessorFile.
+procedure LoadClip(var Clip: TFastSAMClip; const ModelFile, ConfigFile,
+  ProcessorFile: string);
+begin
+  BuildClipFromSafeTensors(ModelFile, Clip.TextNet, Clip.VisionNet, Clip.Config,
+    {TextSeqLen=}0, {pTrainable=}false, ConfigFile);
+  Clip.ProcessorConfig := ReadClipImageProcessorConfig(ProcessorFile);
+end;
+
+// Loads --clip DIR and encodes --text with the CLIP tokenizer of DIR.
+procedure PrepareTextPrompt(var Clip: TFastSAMClip; const Opt: TFastSAMOptions);
+var
+  Tokenizer: TNeuralHFTokenizer;
+  ModelFile: string;
+begin
+  ModelFile := Opt.ClipDir + 'model.safetensors';
+  if not FileExists(ModelFile) then ModelFile := Opt.ClipDir + 'pytorch_model.bin';
+  LoadClip(Clip, ModelFile, Opt.ClipDir + 'config.json',
+    Opt.ClipDir + 'preprocessor_config.json');
+  Tokenizer := TNeuralHFTokenizer.Create();
+  try
+    if FileExists(Opt.ClipDir + 'tokenizer.json') then
+      Tokenizer.LoadFromFile(Opt.ClipDir + 'tokenizer.json')
+    else
+      Tokenizer.LoadCLIPVocabAndMerges(Opt.ClipDir + 'vocab.json',
+        Opt.ClipDir + 'merges.txt');
+    EncodeClipText(Clip, Tokenizer.Encode(Opt.TextPrompt), Tokenizer.BosId,
+      Tokenizer.EosId);
+  finally
+    Tokenizer.Free;
+  end;
+  WriteLn('CLIP text prompt "', Opt.TextPrompt, '" (', Opt.ClipDir, ')');
+end;
+
 // Maps a pixel coordinate of the image into the letterboxed net input.
 function ImageToNet(Coordinate: integer; Scale: TNeuralFloat; Offset: integer): integer;
 begin
@@ -263,10 +354,11 @@ end;
 // Runs the net on Image, applies the prompts of Opt and writes the overlay.
 // Retina masks live at the image size; --no-retina masks at the net input size.
 procedure SegmentImage(NN: TNNet; const Config: TYoloConfig; Image: TNNetVolume;
-  const Opt: TFastSAMOptions);
+  const Opt: TFastSAMOptions; const Clip: TFastSAMClip);
 var
   NetInput, Masks, Selected, ImageMasks: TNNetVolume;
-  Dets: TYoloDetectionArray;
+  Dets, ImageDets: TYoloDetectionArray;
+  Similarities: TNeuralFloatDynArr;
   Box: TLetterbox;
   PromptX, PromptY: array of integer;
   PointPos, MaxPointPos, MaskIdx: integer;
@@ -307,10 +399,7 @@ begin
         PromptY[1]);
       WriteLn(Format('  box prompt (%d,%d,%d,%d) selects mask %d',
         [Opt.Box[0], Opt.Box[1], Opt.Box[2], Opt.Box[3], MaskIdx]));
-      Selected.ReSize(Masks.SizeX, Masks.SizeY, 1);
-      if MaskIdx >= 0 then Selected.CopyChannels(Masks, [MaskIdx])
-      else Selected.Fill(0);
-      Masks.Copy(Selected);
+      KeepMask(Masks, Selected, MaskIdx);
     end
     else if Length(Opt.PointX) > 0 then
     begin
@@ -331,6 +420,21 @@ begin
       WriteLn(Format('  %d point prompt(s) select %d mask pixels',
         [MaxPointPos + 1, Round(Selected.GetSum())]));
       Masks.Copy(Selected);
+    end
+    else if Clip.TextEmb <> nil then
+    begin
+      // the crops come from Image, so --no-retina boxes move to image pixels
+      ImageDets := Copy(Dets);
+      if not Opt.RetinaMasks then
+        ScaleYoloBoxesToImage(ImageDets, Config.ImageSize, Image.SizeX, Image.SizeY);
+      MaskIdx := FastSAMSelectByText(Clip.VisionNet, Clip.ProcessorConfig, Image,
+        Masks, ImageDets, Clip.TextEmb, Similarities);
+      if MaskIdx >= 0 then
+        WriteLn(Format('  text prompt selects mask %d (CLIP cosine %.4f)',
+          [MaskIdx, Similarities[MaskIdx]]))
+      else
+        WriteLn('  text prompt: no mask over 100 pixels');
+      KeepMask(Masks, Selected, MaskIdx);
     end;
     if Opt.RetinaMasks then
       ImageMasks.Copy(Masks)
@@ -403,6 +507,7 @@ var
   Image: TNNetVolume;
   ComputeText: string;
   IsSmoke: boolean;
+  Clip: TFastSAMClip;
   {$IFDEF OpenCL}
   OpenCLDevices: TEasyOpenCL;
   {$ENDIF}
@@ -418,6 +523,7 @@ begin
   end;
   Image := TNNetVolume.Create;
   NN := nil;
+  FillChar(Clip, SizeOf(Clip), 0);
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -435,28 +541,45 @@ begin
       MakeTinyImage(Image, 120, 80);
       WriteLn('Pico smoke: segment everything');
       Opt.OutputFile := 'fastsam_everything.png';
-      SegmentImage(NN, Config, Image, Opt);
+      SegmentImage(NN, Config, Image, Opt, Clip);
       WriteLn('Pico smoke: box prompt');
       Opt.HasBox := true;
       Opt.Box[0] := 10; Opt.Box[1] := 10; Opt.Box[2] := 70; Opt.Box[3] := 60;
       Opt.OutputFile := 'fastsam_box.png';
-      SegmentImage(NN, Config, Image, Opt);
+      SegmentImage(NN, Config, Image, Opt, Clip);
       WriteLn('Pico smoke: point prompt');
       Opt.HasBox := false;
       Opt.PointX := [60, 100];
       Opt.PointY := [40, 20];
       Opt.PointLabels := [1, 0];
       Opt.OutputFile := 'fastsam_point.png';
-      SegmentImage(NN, Config, Image, Opt);
+      SegmentImage(NN, Config, Image, Opt, Clip);
+      WriteLn('Pico smoke: text prompt (pico CLIP, fixed token ids)');
+      Opt.PointX := nil;
+      LoadClip(Clip, FixturesDir + 'tiny_clip.safetensors',
+        FixturesDir + 'tiny_clip_config.json',
+        FixturesDir + 'tiny_clip_preprocessor_config.json');
+      // the pico vision tower takes ImageSize pixels, not the fixture's crop
+      Clip.ProcessorConfig.ShortestEdge := Clip.Config.ImageSize;
+      Clip.ProcessorConfig.CropWidth := Clip.Config.ImageSize;
+      Clip.ProcessorConfig.CropHeight := Clip.Config.ImageSize;
+      // pico vocab: bos 0, eot 32 (the highest id)
+      EncodeClipText(Clip, [31, 8, 30, 17, 26], 0, 32);
+      Opt.OutputFile := 'fastsam_text.png';
+      SegmentImage(NN, Config, Image, Opt, Clip);
       WriteLn('(Random pico weights: the masks are not meaningful objects.)');
     end
     else
     begin
       if not LoadImageFromFileIntoVolume(Opt.ImageFile, Image) then
         raise Exception.Create('could not load ' + Opt.ImageFile);
-      SegmentImage(NN, Config, Image, Opt);
+      if Opt.TextPrompt <> '' then PrepareTextPrompt(Clip, Opt);
+      SegmentImage(NN, Config, Image, Opt, Clip);
     end;
   finally
+    Clip.TextEmb.Free;
+    Clip.VisionNet.Free;
+    Clip.TextNet.Free;
     NN.Free;
     {$IFDEF OpenCL}
     OpenCLDevices.Free;

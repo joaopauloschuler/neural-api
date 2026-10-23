@@ -1276,6 +1276,7 @@ type
     procedure TestFastSAMPromptSelection;
     procedure TestYoloSegOpenCLParity;
     procedure TestYoloSegNativeMasks;
+    procedure TestFastSAMTextSelection;
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
     procedure TestOwlViTDetectionDecode;
@@ -56472,6 +56473,102 @@ begin
     Masks.Free;
     Proto.Free;
     Head.Free;
+  end;
+end;
+
+// FastSAMSelectByText on the pico CLIP: a text embedding equal to the CLIP
+// embedding of one box crop selects that mask; masks of area <= 100 are skipped.
+procedure TTestNeuralPretrained.TestFastSAMTextSelection;
+var
+  TextNet, VisionNet: TNNet;
+  ClipConfig: TClipConfig;
+  ProcessorConfig: TClipImageProcessorConfig;
+  Image, Masks, Crop, Pixels, TextEmb: TNNetVolume;
+  Dets: TYoloDetectionArray;
+  Similarities: TNeuralFloatDynArr;
+  X, Y, Channel, MaskPos, TargetPos: integer;
+
+  // Box crop of Image, pixel by pixel (ultralytics int() bounds).
+  procedure CropBox(MaskIdx: integer);
+  var
+    CX, CY, CC, Left, Top: integer;
+  begin
+    Left := Trunc(Dets[MaskIdx].X1); Top := Trunc(Dets[MaskIdx].Y1);
+    Crop.ReSize(Trunc(Dets[MaskIdx].X2) - Left, Trunc(Dets[MaskIdx].Y2) - Top, 3);
+    for CY := 0 to Crop.SizeY - 1 do
+      for CX := 0 to Crop.SizeX - 1 do
+        for CC := 0 to 2 do
+          Crop[CX, CY, CC] := Image[Left + CX, Top + CY, CC];
+  end;
+
+  procedure SetDet(MaskIdx: integer; X1, Y1, X2, Y2: TNeuralFloat);
+  var
+    MX, MY: integer;
+  begin
+    Dets[MaskIdx].X1 := X1; Dets[MaskIdx].Y1 := Y1;
+    Dets[MaskIdx].X2 := X2; Dets[MaskIdx].Y2 := Y2;
+    for MY := Trunc(Y1) to Trunc(Y2) - 1 do
+      for MX := Trunc(X1) to Trunc(X2) - 1 do
+        Masks[MX, MY, MaskIdx] := 1;
+  end;
+
+begin
+  BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'), TextNet,
+    VisionNet, ClipConfig, {TextSeqLen=}8, {pTrainable=}false,
+    FixturePath('tiny_clip_config.json'));
+  ProcessorConfig := ReadClipImageProcessorConfig(
+    FixturePath('tiny_clip_preprocessor_config.json'));
+  // the pico vision tower takes 16x16 pixels
+  ProcessorConfig.ShortestEdge := ClipConfig.ImageSize;
+  ProcessorConfig.CropWidth := ClipConfig.ImageSize;
+  ProcessorConfig.CropHeight := ClipConfig.ImageSize;
+  Image := TNNetVolume.Create(48, 36, 3);
+  Masks := TNNetVolume.Create(48, 36, 4);
+  Crop := TNNetVolume.Create;
+  Pixels := TNNetVolume.Create;
+  TextEmb := TNNetVolume.Create;
+  try
+    for Y := 0 to 35 do
+      for X := 0 to 47 do
+        for Channel := 0 to 2 do
+          Image[X, Y, Channel] := 127.5 + 127.5 * Sin(X * (0.11 + 0.07 * Channel) +
+            Y * (0.23 - 0.05 * Channel) + Channel);
+    SetLength(Dets, 4);
+    SetDet(0, 30, 2, 35, 7);          // 25 px: skipped
+    SetDet(1, 0.7, 0.2, 20.9, 18.5);
+    SetDet(2, 22, 10, 47.6, 35.9);
+    SetDet(3, 5, 20, 30, 33);
+    for TargetPos := 0 to 3 do
+    begin
+      CropBox(TargetPos);
+      ClipPreprocessImage(Crop, Pixels, ProcessorConfig);
+      VisionNet.Compute(Pixels);
+      ClipExtractEmbedding(VisionNet.GetLastLayer().Output, 0, TextEmb);
+      MaskPos := FastSAMSelectByText(VisionNet, ProcessorConfig, Image, Masks,
+        Dets, TextEmb, Similarities);
+      AssertEquals('similarity count', 4, Length(Similarities));
+      AssertEquals('skipped small mask', -2, Similarities[0], 1e-6);
+      if TargetPos = 0 then
+        AssertTrue('small mask never selected', MaskPos > 0)
+      else
+      begin
+        AssertEquals('text matching crop ' + IntToStr(TargetPos), TargetPos, MaskPos);
+        AssertEquals('self cosine', 1, Similarities[TargetPos], 1e-4);
+      end;
+    end;
+    // every mask too small: nothing selected
+    Masks.Fill(0);
+    SetDet(1, 0, 0, 10, 10);
+    AssertEquals('no mask over 100 px', -1, FastSAMSelectByText(VisionNet,
+      ProcessorConfig, Image, Masks, Dets, TextEmb, Similarities));
+  finally
+    TextEmb.Free;
+    Pixels.Free;
+    Crop.Free;
+    Masks.Free;
+    Image.Free;
+    VisionNet.Free;
+    TextNet.Free;
   end;
 end;
 

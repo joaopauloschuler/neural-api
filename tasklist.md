@@ -286,8 +286,11 @@ rather than acted on.
             (`ScaleYoloBoxesToImage`, `ComputeYoloMasksNative`,
             `DecodeYoloSegmentationNative`; examples/FastSAM default;
             `TestYoloSegNativeMasks`).
-      - [ ] CLIP text prompt (`text_prompt`: crop each mask's box, CLIP
-            image/text similarity, argmax).
+      - [X] CLIP text prompt (`FastSAMSelectByText`, ultralytics
+            FastSAMPredictor rules; examples/FastSAM `--text --clip`;
+            `TestFastSAMTextSelection` on the pico CLIP).
+      - [ ] Real run of `--text` with openai/clip-vit-base-patch32 (real
+            tokenizer.json + towers) against ultralytics' selection.
 
 - [ ] Marigold diffusion depth / surface normals follow-ups (`TMarigoldPipeline`
       in neuralpretrained.pas + `examples/MarigoldDepth`, dc2979d4; checkpoints

@@ -16504,7 +16504,8 @@ function RestoreFacesInImage(Detector: TNNet;
 // detections into masks (ultralytics 8.0 process_mask, or process_mask_native
 // at the net input size with RetinaMasks); the *Native variants run
 // process_mask_native at the original image size (FastSAM's CLI default);
-// FastSAMSelectByBox / FastSAMSelectByPoint are FastSAM's box / point prompts.
+// FastSAMSelectByBox / FastSAMSelectByPoint / FastSAMSelectByText are FastSAM's
+// box / point / CLIP text prompts.
 // Coded by Claude (AI).
 type
   TYoloConfig = record
@@ -16616,6 +16617,13 @@ function FastSAMSelectByBox(Masks: TNNetVolume; X1, Y1, X2, Y2: integer): intege
 // OR'ed into Dest (W,H,1), one under a label-0 point is erased from it.
 procedure FastSAMSelectByPoint(Masks: TNNetVolume;
   const PointX, PointY, PointLabels: array of integer; Dest: TNNetVolume);
+
+// FastSAM text prompt: argmax cosine of TextEmb (unit-L2) vs CLIP VisionNet on each Dets
+// box cropped from Image (RGB 0..255); masks of area <= 100 score -2, skipped; -1 if none.
+function FastSAMSelectByText(VisionNet: TNNet;
+  const ProcessorConfig: TClipImageProcessorConfig; Image, Masks: TNNetVolume;
+  const Dets: TYoloDetectionArray; TextEmb: TNNetVolume;
+  out Similarities: TNeuralFloatDynArr): integer;
 
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
@@ -95092,6 +95100,62 @@ begin
         if Masks.FData[PixelPos * MaskCnt + MaskIdx] > 0.5 then
           Dest.FData[PixelPos] := PointLabels[PointPos];
     end;
+  end;
+end;
+
+function FastSAMSelectByText(VisionNet: TNNet;
+  const ProcessorConfig: TClipImageProcessorConfig; Image, Masks: TNNetVolume;
+  const Dets: TYoloDetectionArray; TextEmb: TNNetVolume;
+  out Similarities: TNeuralFloatDynArr): integer;
+var
+  Crop, Pixels, ImageEmb: TNNetVolume;
+  MaskCnt, MaxMaskPos, MaskPos, PixelPos, MaxPixelPos: integer;
+  CropX1, CropY1, CropX2, CropY2: integer;
+  Area: TNeuralFloatDynArr;
+  BestSimilarity: TNeuralFloat;
+begin
+  Result := -1;
+  MaskCnt := Min(Masks.Depth, Length(Dets));
+  SetLength(Similarities, MaskCnt);
+  if (MaskCnt = 0) or (Masks.Size = 0) then Exit;
+  MaxMaskPos := MaskCnt - 1;
+  SetLength(Area, MaskCnt);
+  for MaskPos := 0 to MaxMaskPos do Area[MaskPos] := 0;
+  MaxPixelPos := Masks.SizeX * Masks.SizeY - 1;
+  for PixelPos := 0 to MaxPixelPos do
+    for MaskPos := 0 to MaxMaskPos do
+      Area[MaskPos] := Area[MaskPos] + Masks.FData[PixelPos * Masks.Depth + MaskPos];
+  Crop := TNNetVolume.Create;
+  Pixels := TNNetVolume.Create;
+  ImageEmb := TNNetVolume.Create;
+  try
+    BestSimilarity := -2;
+    for MaskPos := 0 to MaxMaskPos do
+    begin
+      Similarities[MaskPos] := -2;
+      // ultralytics: orig_img[int(y1):int(y2), int(x1):int(x2)]
+      CropX1 := Max(0, Trunc(Dets[MaskPos].X1));
+      CropY1 := Max(0, Trunc(Dets[MaskPos].Y1));
+      CropX2 := Min(Image.SizeX, Trunc(Dets[MaskPos].X2));
+      CropY2 := Min(Image.SizeY, Trunc(Dets[MaskPos].Y2));
+      if (Area[MaskPos] <= 100) or (CropX2 <= CropX1) or (CropY2 <= CropY1) then
+        Continue;
+      Crop.CopyCropping(Image, CropX1, CropY1, CropX2 - CropX1, CropY2 - CropY1);
+      ClipPreprocessImage(Crop, Pixels, ProcessorConfig);
+      VisionNet.Compute(Pixels);
+      VisionNet.GetLastLayer().ForceOutputOnRAM();
+      ClipExtractEmbedding(VisionNet.GetLastLayer().Output, 0, ImageEmb);
+      Similarities[MaskPos] := ClipSimilarity(ImageEmb, TextEmb);
+      if Similarities[MaskPos] > BestSimilarity then
+      begin
+        BestSimilarity := Similarities[MaskPos];
+        Result := MaskPos;
+      end;
+    end;
+  finally
+    ImageEmb.Free;
+    Pixels.Free;
+    Crop.Free;
   end;
 end;
 
