@@ -487,28 +487,24 @@ rather than acted on.
       prompt's token spans. Pico-fixture parity + an examples/GroundingDINODetect
       ("detect: a cat. a remote." -> boxes) demo.
 
-- [ ] YOLO-World v2 real-time open-vocabulary detection on the landed YOLOv8
-      importer (`BuildYoloWorldFromSafeTensors[Ex]`, ultralytics
-      yolov8s-worldv2 / yolov8m-worldv2, Cheng et al. 2024). Same CSP/C2f
-      backbone + PANet neck + DFL box branch as `BuildYoloFromSafeTensors`
-      (reuse it, do not copy it); three changes make it open-vocabulary:
-      (1) the class branch emits per-cell embeddings scored against CLIP text
-      embeddings by a contrastive head (L2-normalised dot product + learned
-      per-level scale/bias), so the class count is the number of prompts;
-      (2) the neck's C2f blocks become max-sigmoid attention blocks
-      (C2fAttn: each cell gets `sigmoid(max over prompts of <cell, text>)` as a
-      channel gate); (3) the text embeddings come from the landed
-      `BuildClipTextTower` (ViT-B/32 text tower). Text embeddings are computed
-      once per prompt list and fed as a second input, so detection speed stays
-      at YOLOv8 level, unlike OWL-ViT / Florence-2. Add the contrastive
-      score to `DecodeYoloDetections` through an optional embedding argument
-      instead of a second decoder; class labels = the prompt strings.
-      Ultralytics ships .pt pickles (AGPL-3.0); read them through
-      neuraltorchbin.pas, or document a safetensors export, as the YOLOv8
-      fixture does. Pico parity < 1e-4 vs a float64 reference
-      forward + `--prompts "person,bus,dog"` in examples/YoloDetect (no new
-      example), README section on the speed/accuracy trade-off vs
-      examples/OpenVocabDetection.
+- [x] YOLO-World v2 importer: BuildYoloWorld[FromSafeTensors[Ex]] folds CLIP prompt
+      embeddings into the C2fAttn attention + BNContrastiveHead convs of the shared
+      YOLOv8 builder (TestYoloWorldParity, TestYoloWorldClipTextRoute);
+      examples/YoloDetect takes --prompts/--clip/--image.
+  - [ ] Run a real yolov8s-worldv2 checkpoint + openai/clip-vit-base-patch32 on a
+        photo and compare boxes/scores with ultralytics (only the random pico
+        fixture is tested; the module semantics come from memory of the
+        ultralytics source, which is not installed here).
+  - [ ] Checkpoint route: ultralytics ships yolov8s-worldv2.pt as a pickled
+        model object (AGPL-3.0); read it through neuraltorchbin.pas or document a
+        Pascal-only conversion to a safetensors state_dict + config.json.
+  - [ ] Re-prompt without reloading: keep the gl / cv3.i.2 / cv4.i tensors and
+        rewrite the folded convs for a same-count prompt list (a new count still
+        changes the conv output sizes).
+  - [ ] YOLO-World v1 (yolov8s-world: ImagePoolingAttn + L2 ContrastiveHead,
+        head at model.23) is rejected; add it only if a user needs it.
+  - [ ] Measure decode cost vs plain YOLOv8 at 640 with 80 prompts (the
+        attention logit conv is dense over heads: Channels * prompts * heads).
 
 - [ ] SAM 2 promptable image + VIDEO segmentation importer
       (`BuildSAM2FromSafeTensors[Ex]`, e.g. facebook/sam2-hiera-tiny). The landed
