@@ -13,9 +13,11 @@ caller-supplied T5 text states  (a real T5 tower is a follow-up)
      token sequence with expert adaLN-Zero modulation + 3D RoPE
   -> multi-step DDIM / DPM-Solver++ reverse loop (TNNetDiffusionScheduler)
   -> sampled (NumFrames, GridH, GridW, in_channels) video latent
-  -> 3D-causal-conv VAE decode tail (BuildCogVideoXVaeDecoderFromSafeTensorsEx
-     + DecodeCogVideoXVae): a depth-axis CAUSAL temporal conv per spatial cell
-     (left-pad time, no future-frame leakage) + SiLU + pointwise conv
+  -> AutoencoderKLCogVideoX decoder (BuildCogVideoXVaeDecoderFromPath +
+     DecodeCogVideoXVae): conv_in -> mid block -> up blocks -> norm_out ->
+     SiLU -> conv_out, every conv a causal 3D conv and every norm a
+     SpatialNorm3D on the latent; space doubles per up block, time doubles on
+     the first log2(temporal_compression_ratio) blocks (frame 0 kept single)
   -> per-frame RGB -> a sequence of P6 PPM files (frame_00.ppm, frame_01.ppm, ...)
      or PNG files, plus an optional looping animated GIF
 ```
@@ -23,17 +25,22 @@ caller-supplied T5 text states  (a real T5 tower is a follow-up)
 Nothing here is a new leaf layer — it is pure plumbing over landed pieces. With
 the committed random-weight pico fixture this is a **wiring / throughput smoke**:
 it proves the chain runs offline and produces **finite** video frames, not
-photorealism. The CogVideoX importer is parity-checked < 1e-4 in
-`TestCogVideoXParity`.
+photorealism. The denoiser is parity-checked < 1e-4 in `TestCogVideoXParity`
+and the VAE decoder < 1e-4 against diffusers' own `AutoencoderKLCogVideoX.decode`
+in `TestCogVideoXVaeDecoderParity`.
 
 ### Key neural-api pieces (`neuralpretrained`, `neuraldiffusion`)
 
 - **`BuildCogVideoXFromSafeTensors`** + **`CogVideoXConditioning`** — the flat-DiT
   denoiser and its per-step timestep/text conditioning (`TCogVideoXConfig`).
-- **`BuildCogVideoXVaeDecoderFromSafeTensorsEx`** + **`DecodeCogVideoXVae`** — the
-  3D-causal-conv VAE decode tail. The two genuinely-new CogVideoX primitives (3D
-  causal conv via `TNNetCausalConv1D`, 3D RoPE via `TNNetMRotaryEmbedding`) are
-  reused landed leaves.
+- **`BuildCogVideoXVaeDecoderFromPath`** + **`DecodeCogVideoXVae`** — the
+  diffusers `AutoencoderKLCogVideoX` decoder (`TCogVideoXVaeConfig`, read from
+  `vae/config.json`). It decodes the whole clip in one forward. diffusers
+  decodes 2 latent frames at a time with a conv cache; for 3 latent frames or
+  fewer the two are the same. The two genuinely-new CogVideoX primitives (3D
+  causal conv via `TNNetConvolution3D` after a frame-0 repeat in
+  `TNNetGatherChannels`, 3D RoPE via `TNNetMRotaryEmbedding`) are reused landed
+  leaves.
 - **`TNNetDiffusionScheduler`** — the `smDDIM` / `smDPMSolverPP2M` reverse driver.
 - **`TNNetAnimatedGIFWriter`** (`neuralgif`) — the `--gif` output: a fixed
   6x7x6 RGB-cube (or 256-gray) palette, LZW-coded frames, NETSCAPE2.0 looping;
@@ -45,13 +52,16 @@ photorealism. The CogVideoX importer is parity-checked < 1e-4 in
 cd examples/TextToVideo
 lazbuild TextToVideo.lpi --build-mode=Release
 ./TextToVideo                          # committed pico fixture
-./TextToVideo cogvideox.safetensors    # your own checkpoint (sibling config.json)
+./TextToVideo cogvideox.safetensors --vae CogVideoX-2b/vae
+                                       # your own denoiser (sibling config.json)
+                                       # and a diffusers vae folder
 ```
 
 Optional trailing flags:
 
 | Flag | Effect |
 |------|--------|
+| `--vae PATH` | `AutoencoderKLCogVideoX` weights: a diffusers `vae` folder (`config.json` + `diffusion_pytorch_model.safetensors`) or a `.safetensors` file with a sibling `config.json` (default: the pico `tests/fixtures/tiny_cogvideox_vae`) |
 | `--steps N` | number of reverse steps (default 4) |
 | `--dpm` | use DPM-Solver++(2M) instead of DDIM |
 | `--smoke` | run, assert finiteness, print `SMOKE OK`/`SMOKE FAIL` and exit (no PPM) |
@@ -101,8 +111,12 @@ option. The step is `TCogVideoXSampler.PredictNoise` and the cache
 
 ## Inputs / outputs
 
-- **Fixture (default):** `tests/fixtures/tiny_cogvideox.*` — fully self-contained,
-  no network access.
+- **Fixture (default):** `tests/fixtures/tiny_cogvideox.*` (denoiser) and
+  `tests/fixtures/tiny_cogvideox_vae/` (VAE, 2 latent frames of 2x2 decode to
+  8 frames of 16x16) — fully self-contained, no network access.
+- **Memory:** the decoder holds the whole clip at full resolution. The pico
+  fixture needs a few MB; a real 49-frame 480x720 clip does not fit in RAM
+  without the chunked / tiled decode that is still a follow-up.
 - **Text states:** deterministic synthetic values stand in for a real T5 tower.
 - **Output:** writes `frame_<ii>.ppm` (P6, or `.png` with `--png`) for each
   decoded frame, the `--gif` file when asked, and prints the config, the

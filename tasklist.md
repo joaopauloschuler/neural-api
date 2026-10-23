@@ -1602,17 +1602,35 @@ rather than acted on.
 - [ ] CogVideoX text-to-VIDEO DiT real-checkpoint follow-up
       (BuildCogVideoXFromSafeTensors[Ex] + TCogVideoXConfig + DecodeCogVideoXVae +
       examples/TextToVideo LANDED, reusing TNNetMRotaryEmbedding 3D RoPE +
-      TNNetCausalConv1D temporal VAE, no new leaf; pico parity TestCogVideoXParity
+      TNNetConvolution3D causal VAE, no new leaf; pico parity TestCogVideoXParity
       < 1e-4): real-checkpoint parity (THUDM/CogVideoX-2b) vs a sliced real checkpoint
       (the make_pico_*_fixture slicer pattern) once weights are available, incl. the
       real diffusers 3D RoPE frequency layout / temporal VAE up/down blocks and a real
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states. Further gaps (audit 2026-10-02), which together mean
       the repo has NO usable video generator today:
-  - [ ] Full AutoencoderKLCogVideoX decoder: DecodeCogVideoXVae is only the decode
-        TAIL (one causal temporal conv + SiLU + pointwise conv per spatial cell),
-        not the real up/down-block VAE, so even real denoiser weights cannot
-        produce real frames.
+  - [x] Full AutoencoderKLCogVideoX decoder: BuildCogVideoXVaeDecoder[FromPath] +
+        DecodeCogVideoXVae now build the real diffusers decoder (causal Conv3D
+        convs, SpatialNorm3D resnets, temporal/spatial up blocks, post_quant_conv,
+        scaling_factor) from composed leaves, parity < 1e-4 vs diffusers decode in
+        TestCogVideoXVaeDecoderParity, wired into examples/TextToVideo --vae.
+  - [ ] VAE follow-up: frame-batched decode with the diffusers conv cache
+        (num_latent_frames_batch_size = 2; each CogVideoXCausalConv3d carries the
+        last 2 input frames of the previous batch, and SpatialNorm3D resizes zq per
+        batch). The whole-clip DecodeCogVideoXVae equals diffusers only for <= 3
+        latent frames; a real 13-latent-frame clip needs the batched path to match
+        (and to fit in RAM).
+  - [ ] VAE follow-up: spatial tiling (diffusers tiled_decode, tile_sample_min
+        240x360, overlap 1/6 x 1/5 with blend_v/blend_h) for 480x720 output.
+  - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (BuildCogVideoXVaeDecoderFromPath
+        on the downloaded vae folder, a 2-3 latent-frame low-res slice against
+        diffusers decode) once the chunked path makes it fit; check the encoder
+        tensors are ignored and no decoder tensor is left over.
+  - [ ] VAE follow-up: OpenCL / speed. TNNetConvolution3D's CPU forward is one
+        C-wide dot product per output tap; time the decoder under OpenCL
+        (cai_conv_implicit) and check the TNNetGatherChannels frame pads and the
+        per-norm zq branches (two 1x1x1 convs + gather + DeMaxPool each) stay
+        resident; fold the per-norm zq branches if they dominate.
   - [ ] A `TCogVideoXPipeline` over a diffusers model_index.json folder (the
         TQwenImage21Pipeline shape: tokenizer + T5 -> transformer -> VAE, one
         component in memory at a time, OnPhase/OnStep) and a CLI that loads it;
@@ -2530,9 +2548,9 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       (a) `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` (d7c177dd, direct O(N^2)
       DFT per line) inside examples/LaMaInpaint at 512x512: FFT share of the
       generator forward, and whether the whole generator stays resident;
-      (b) CogVideoX VAE decode after cc4432cc (one `TNNetCausalConv1D` forward
-      per frame, `csCogVideoXVaeMaxCellsPerForward` = 4096): decode time per
-      frame against the parent commit.
+      (b) CogVideoX VAE decode: superseded, the cc4432cc decode tail is gone;
+      the full decoder's OpenCL timing is the "VAE follow-up: OpenCL / speed"
+      item under the CogVideoX entry.
 - [ ] GPU-box check: `cai_sdpa_flash` gained a uniform score-bias branch
       (13282df0) that the decode path also runs. Measure decode tok/s on a
       Qwen checkpoint before/after; if it costs anything, split the biased

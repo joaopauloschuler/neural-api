@@ -1607,6 +1607,8 @@ type
     procedure TestMMDiTConfigFromJSONFile;
     procedure TestMMDiTJointBlockParity;
     procedure TestCogVideoXParity;
+    // Pico AutoencoderKLCogVideoX decoders vs diffusers vae.decode (float64).
+    procedure TestCogVideoXVaeDecoderParity;
     // TCogVideoXSampler's First-Block Cache vs plain loops on a 3-block copy
     // of the pico checkpoint: threshold 0 bit-identical, skips as a reference.
     procedure TestCogVideoXFirstBlockCacheReference;
@@ -56735,16 +56737,16 @@ end;
 
 procedure TTestNeuralPretrained.TestCogVideoXParity;
 var
-  NN, VaeNN, VaeCellNN, VaeBlockNN: TNNet;
+  NN: TNNet;
   Config: TCogVideoXConfig;
-  Latent, TextStates, Decoded, VaeLatent, DecodedPath: TNNetVolume;
+  Latent, TextStates: TNNetVolume;
   RefRoot: TJSONData;
   RefJson: TStringList;
-  DenArr, VaeArr: TJSONArray;
+  DenArr: TJSONArray;
   CaseObj: TJSONObject;
-  LatArr, TextArr, EpsArr, VLatArr, DecArr: TJSONArray;
-  LV, T, GH, GW, CaseCnt, idx, i, ft, hh, ww, c: integer;
-  tval, RefVal, GotVal, Diff, MaxDiff, PathDiff: double;
+  LatArr, TextArr, EpsArr: TJSONArray;
+  LV, T, GH, GW, CaseCnt, i: integer;
+  tval, RefVal, GotVal, Diff, MaxDiff: double;
 begin
   RandSeed := 424242;
   Config := ReadCogVideoXConfigFromJSONFile(
@@ -56753,31 +56755,15 @@ begin
   LV := T * GH * GW;
   NN := BuildCogVideoXFromSafeTensorsEx(
     FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
-  VaeNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
-    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true);
-  // One cell per forward (the per-cell semantics) and a 3-cell block that
-  // leaves a short last block on the 2x2 grid.
-  VaeCellNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
-    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true,
-    {MaxCellsPerForward=}1);
-  VaeBlockNN := BuildCogVideoXVaeDecoderFromSafeTensorsEx(
-    FixturePath('tiny_cogvideox.safetensors'), Config, {pTrainable=}true,
-    {MaxCellsPerForward=}3);
-  DecodedPath := TNNetVolume.Create;
-  PathDiff := 0;
   RefJson := TStringList.Create;
   Latent := TNNetVolume.Create;
   TextStates := TNNetVolume.Create;
-  Decoded := TNNetVolume.Create;
-  VaeLatent := TNNetVolume.Create;
   RefRoot := nil;
   MaxDiff := 0;
   try
     AssertTrue('cogvideox denoiser built', NN <> nil);
-    AssertTrue('cogvideox vae built', VaeNN <> nil);
     RefJson.LoadFromFile(FixturePath('tiny_cogvideox_io.json'));
     RefRoot := GetJSON(RefJson.Text);
-    // ---- (A) denoiser parity ----
     DenArr := TJSONArray(TJSONObject(RefRoot).Find('denoiser'));
     AssertTrue('denoiser cases present', DenArr <> nil);
     for CaseCnt := 0 to DenArr.Count - 1 do
@@ -56807,61 +56793,76 @@ begin
     end;
     AssertTrue('CogVideoX denoiser: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
-    // ---- (B) VAE-decode parity ----
-    VaeArr := TJSONArray(TJSONObject(RefRoot).Find('vae'));
-    AssertTrue('vae cases present', VaeArr <> nil);
-    for CaseCnt := 0 to VaeArr.Count - 1 do
-    begin
-      CaseObj := TJSONObject(VaeArr.Items[CaseCnt]);
-      VLatArr := TJSONArray(CaseObj.Find('latent'));   // flat (T,GH,GW,Clat)
-      DecArr := TJSONArray(CaseObj.Find('decoded'));   // flat (T,GH,GW,Vout)
-      // pack into the (T, HW, Clat) channel-major layout DecodeCogVideoXVae wants.
-      VaeLatent.ReSize(T, GH * GW, Config.VaeLatentChannels);
-      idx := 0;
-      for ft := 0 to T - 1 do
-        for hh := 0 to GH - 1 do
-          for ww := 0 to GW - 1 do
-            for c := 0 to Config.VaeLatentChannels - 1 do
-            begin
-              VaeLatent[ft, hh * GW + ww, c] := VLatArr.Items[idx].AsFloat;
-              Inc(idx);
-            end;
-      DecodeCogVideoXVae(VaeNN, Config, VaeLatent, Decoded);
-      AssertEquals('whole-frame VAE net takes every cell in one forward',
-        GH * GW, VaeNN.Layers[0].Output.SizeY);
-      DecodeCogVideoXVae(VaeCellNN, Config, VaeLatent, DecodedPath);
-      PathDiff := Max(PathDiff, Decoded.SumDiff(DecodedPath));
-      DecodeCogVideoXVae(VaeBlockNN, Config, VaeLatent, DecodedPath);
-      PathDiff := Max(PathDiff, Decoded.SumDiff(DecodedPath));
-      idx := 0;
-      for ft := 0 to T - 1 do
-        for hh := 0 to GH - 1 do
-          for ww := 0 to GW - 1 do
-            for c := 0 to Config.VaeOutChannels - 1 do
-            begin
-              RefVal := DecArr.Items[idx].AsFloat;
-              GotVal := Decoded[ft, hh * GW + ww, c];
-              Diff := Abs(GotVal - RefVal);
-              if Diff > MaxDiff then MaxDiff := Diff;
-              Inc(idx);
-            end;
-    end;
-    AssertTrue('CogVideoX denoiser+VAE: max |diff| = ' + FloatToStr(MaxDiff) +
-      ' must be < 1e-4', MaxDiff < 1e-4);
-    AssertTrue('CogVideoX VAE whole-frame vs per-cell/block paths: sum |diff| = ' +
-      FloatToStr(PathDiff) + ' must be < 1e-5', PathDiff < 1e-5);
   finally
-    VaeCellNN.Free;
-    VaeBlockNN.Free;
-    DecodedPath.Free;
     RefRoot.Free;
     Latent.Free;
     TextStates.Free;
-    Decoded.Free;
-    VaeLatent.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXVaeDecoderParity;
+var
+  VaeNN: TNNet;
+  VaeConfig: TCogVideoXVaeConfig;
+  Latent, Frames: TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  VaeArr, LatArr, DecArr: TJSONArray;
+  CaseObj: TJSONObject;
+  CasePos, ValuePos, LatentFrames, OutFrames, OutH: integer;
+  Diff, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Latent := TNNetVolume.Create;
+  Frames := TNNetVolume.Create;
+  RefRoot := nil;
+  VaeNN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_cogvideox_vae_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    VaeArr := TJSONArray(TJSONObject(RefRoot).Find('vae'));
+    AssertTrue('vae cases present', (VaeArr <> nil) and (VaeArr.Count = 2));
+    for CasePos := 0 to VaeArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(VaeArr.Items[CasePos]);
+      LatentFrames := CaseObj.Get('latent_frames', 0);
+      OutFrames := CaseObj.Get('frames', 0);
+      OutH := CaseObj.Get('height', 0);
+      FreeAndNil(VaeNN);
+      VaeNN := BuildCogVideoXVaeDecoderFromPath(
+        ExtractFilePath(FixturePath(CaseObj.Get('folder', '') +
+          DirectorySeparator + 'config.json')), VaeConfig, LatentFrames,
+        CaseObj.Get('latent_height', 0), CaseObj.Get('latent_width', 0));
+      AssertEquals('output frame count', OutFrames,
+        CogVideoXVaeOutputFrames(VaeConfig, LatentFrames));
+      LatArr := TJSONArray(CaseObj.Find('latent'));
+      DecArr := TJSONArray(CaseObj.Find('decoded'));
+      Latent.ReSize(LatArr.Count, 1, 1);
+      for ValuePos := 0 to LatArr.Count - 1 do
+        Latent.FData[ValuePos] := LatArr.Items[ValuePos].AsFloat;
+      DecodeCogVideoXVae(VaeNN, VaeConfig, Latent, Frames);
+      AssertEquals('decoded width', CaseObj.Get('width', 0), Frames.SizeX);
+      AssertEquals('decoded rows', OutH * OutFrames, Frames.SizeY);
+      AssertEquals('decoded channels', CaseObj.Get('channels', 0), Frames.Depth);
+      AssertEquals('decoded size', DecArr.Count, Frames.Size);
+      // Frames stacked along Y are the reference's flat (t, h, w, c).
+      MaxDiff := 0;
+      for ValuePos := 0 to DecArr.Count - 1 do
+      begin
+        Diff := Abs(Frames.FData[ValuePos] - DecArr.Items[ValuePos].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(CaseObj.Get('folder', '') + ': max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    end;
+  finally
     VaeNN.Free;
+    RefRoot.Free;
+    Frames.Free;
+    Latent.Free;
+    RefJson.Free;
   end;
 end;
 

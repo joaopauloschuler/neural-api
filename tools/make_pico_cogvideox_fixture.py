@@ -2,10 +2,10 @@
 """Generate a tiny RANDOM CogVideoX (THUDM/CogVideoX-2b) native text-to-VIDEO
 parity fixture for tests/TestNeuralPretrained.pas.
 
-No network access and diffusers is NOT required: the model is randomly
-initialized from a pico config and the reference forward is a self-contained
-float64 numpy re-implementation of the canonical diffusers
-CogVideoXTransformer3DModel denoiser block + the 3D-causal-conv VAE decode tail
+No network access. The denoiser reference is a self-contained float64 numpy
+re-implementation of the canonical diffusers CogVideoXTransformer3DModel block;
+the VAE reference runs diffusers AutoencoderKLCogVideoX itself (needs torch +
+diffusers, e.g. the ~/x venv)
 (Yang et al. 2024, "CogVideoX: Text-to-Video Diffusion Models with An Expert
 Transformer", arXiv:2408.06072; diffusers.models.transformers.cogvideox_transformer_3d
 and diffusers.models.autoencoders.autoencoder_kl_cogvideox).
@@ -65,18 +65,17 @@ Two parity targets are written, each asserted < 1e-4 by the Pascal test:
       diffusers get_3d_rotary_pos_embed factored layout, expressed by the repo's
       TNNetMRotaryEmbedding (mrope_section = dt,dh,dw pairs).
 
-  (B) ONE VAE DECODE -- the 3D-causal-conv decode tail.  The latent
-      (T,H,W,Clat) is decoded by a depth-axis CAUSAL temporal convolution (the
-      genuinely-new video primitive): for each spatial cell (h,w) the channel
-      vector is convolved along the TIME axis with a left-only pad (no peeking at
-      future frames), then a pointwise (1x1) conv maps Clat->Cout per cell.
-      diffusers CogVideoXCausalConv3d with temporal kernel K and left pad K-1:
-        y[t,c] = bias[c] + sum_{k=0..K-1} sum_{c'} Wt[c][k][c'] * x[t-(K-1-k),c']
-      followed by  z[t,c] = bias2[c] + sum_{c'} Wp[c][c'] * silu(y[t,c'])  per cell.
-      The Pascal side expresses this with the VideoMAE space<->time transpose
-      (TNNetTransposeXD) + TNNetCausalConv1D (full channel-mixing causal conv
-      along the time axis) + a pointwise conv, reusing landed leaves -- NO new
-      leaf layer is required.
+  (B) THE FULL AutoencoderKLCogVideoX DECODER -- a pico diffusers
+      AutoencoderKLCogVideoX (random weights, real key names, written with
+      save_pretrained into tests/fixtures/tiny_cogvideox_vae*/) and a float64
+      reference vae.decode(latent / scaling_factor) computed by diffusers
+      itself: conv_in, the mid block, the up blocks with their temporal 2x
+      upsample (first frame kept apart on an odd frame count), norm_out
+      (SpatialNorm3D on the latent), SiLU and conv_out.  Two VAEs: the main one
+      (4 up blocks, 2 of them temporal, 3 latent frames, no post_quant_conv)
+      and a 2-block one with post_quant_conv over 2 latent frames (diffusers
+      sizes post_quant_conv by out_channels, so it needs out == latent).
+      With <= 3 latent frames diffusers decodes the whole clip in one batch.
 
 The fixture writes RAW diffusers-style tensor names; the Pascal importer reads
 exactly these.
@@ -85,7 +84,8 @@ Coded by Claude (AI).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/make_pico_cogvideox_fixture.py
-writes tests/fixtures/tiny_cogvideox{.safetensors,_config.json,_io.json}.
+writes tests/fixtures/tiny_cogvideox{.safetensors,_config.json,_io.json},
+tests/fixtures/tiny_cogvideox_vae{,_pq}/ and tiny_cogvideox_vae_io.json.
 """
 import json
 import os
@@ -109,11 +109,6 @@ TEXT_DIM = 6                      # T5 text-encoder width
 ROPE_BASE = 10000.0
 # 3D RoPE section split over the HEAD_DIM//2 = 4 channel-pairs: (t,h,w)
 SEC_T, SEC_H, SEC_W = 2, 1, 1     # sums to 4 = HEAD_DIM//2
-
-# VAE decode tail
-CLAT = 4                          # VAE latent channels
-VOUT = 3                          # decoded "RGB" channels
-KT = 3                            # temporal causal kernel size
 
 RNG = np.random.default_rng(20260626)
 
@@ -198,14 +193,6 @@ W["norm_out.linear.weight"] = randn(2 * HIDDEN, HIDDEN)
 W["norm_out.linear.bias"] = randn(2 * HIDDEN)
 W["proj_out.weight"] = randn(COUT, HIDDEN)
 W["proj_out.bias"] = randn(COUT)
-
-# VAE decode tail
-# temporal causal conv: weight (Cout=CLAT, K, Cin=CLAT) ; bias (CLAT,)
-W["decoder.conv_in.weight"] = randn(CLAT, KT, CLAT)
-W["decoder.conv_in.bias"] = randn(CLAT)
-# pointwise conv after SiLU: (VOUT, CLAT)
-W["decoder.conv_out.weight"] = randn(VOUT, CLAT)
-W["decoder.conv_out.bias"] = randn(VOUT)
 
 
 # ---------------- 3D RoPE ----------------
@@ -318,35 +305,6 @@ def denoiser_forward(latent, t, text_states):
     return eps.reshape(T, GH, GW, COUT)
 
 
-def vae_decode(latent):
-    # latent: (T, GH, GW, CLAT) -> (T, GH, GW, VOUT)
-    Wt = W["decoder.conv_in.weight"]  # (CLAT, KT, CLAT)
-    bt = W["decoder.conv_in.bias"]
-    Wp = W["decoder.conv_out.weight"]  # (VOUT, CLAT)
-    bp = W["decoder.conv_out.bias"]
-    out = np.zeros((T, GH, GW, VOUT))
-    for hh in range(GH):
-        for ww in range(GW):
-            cell = latent[:, hh, ww, :]  # (T, CLAT) along time
-            # temporal causal conv with left pad KT-1
-            y = np.zeros((T, CLAT))
-            for ti in range(T):
-                for co in range(CLAT):
-                    acc = bt[co]
-                    for kk in range(KT):
-                        src = ti - (KT - 1 - kk)
-                        if src < 0:
-                            continue
-                        acc += np.dot(Wt[co, kk, :], cell[src, :])
-                    y[ti, co] = acc
-            # pointwise conv after SiLU
-            ys = silu(y)
-            for ti in range(T):
-                for co in range(VOUT):
-                    out[ti, hh, ww, co] = bp[co] + np.dot(Wp[co, :], ys[ti, :])
-    return out
-
-
 # ---------------- run cases ----------------
 den_cases = []
 for case in range(3):
@@ -361,14 +319,56 @@ for case in range(3):
         "eps": eps.reshape(-1).tolist(),
     })
 
-vae_cases = []
-for case in range(3):
-    lat = randn(T, GH, GW, CLAT, scale=1.0)
-    dec = vae_decode(lat)
-    vae_cases.append({
-        "latent": lat.reshape(-1).tolist(),
-        "decoded": dec.reshape(-1).tolist(),
-    })
+# ---------------- AutoencoderKLCogVideoX decoder (diffusers) ----------------
+# (folder, block_out_channels, temporal_compression_ratio, out_channels,
+#  use_post_quant_conv, scaling_factor, latent frames, latent H, latent W)
+VAE_CASES = [
+    ("tiny_cogvideox_vae", (4, 4, 8, 8), 4, 3, False, 1.15258426, 3, 2, 3),
+    ("tiny_cogvideox_vae_pq", (4, 4), 2, CIN, True, 0.7, 2, 2, 3),
+]
+
+
+def write_vae_fixtures(fixtures):
+    import torch
+    from diffusers import AutoencoderKLCogVideoX
+    torch.manual_seed(20261023)
+    io_cases = []
+    for (folder, blocks, ratio, out_ch, post_quant, scaling, lt, lh, lw) in VAE_CASES:
+        vae = AutoencoderKLCogVideoX(
+            in_channels=3, out_channels=out_ch, latent_channels=CIN,
+            down_block_types=("CogVideoXDownBlock3D",) * len(blocks),
+            up_block_types=("CogVideoXUpBlock3D",) * len(blocks),
+            block_out_channels=blocks, layers_per_block=1, norm_num_groups=2,
+            temporal_compression_ratio=ratio, scaling_factor=scaling,
+            use_post_quant_conv=post_quant)
+        with torch.no_grad():
+            # Random affine norms and biases; convs keep their default init.
+            for name, param in vae.named_parameters():
+                if "norm" in name and name.endswith("weight"):
+                    param.copy_(1.0 + 0.2 * torch.randn_like(param))
+                elif name.endswith("bias"):
+                    param.copy_(0.2 * torch.randn_like(param))
+        vae.save_pretrained(os.path.join(fixtures, folder))
+        vae = vae.double().eval()
+        # float32-representable latent, so Pascal reads the same input.
+        latent = torch.randn(1, CIN, lt, lh, lw).float().double()
+        with torch.no_grad():
+            decoded = vae.decode(latent / scaling).sample  # (1, C, T, H, W)
+        # Both stored as flat (t, h, w, c), the denoiser's token-major layout.
+        io_cases.append({
+            "folder": folder,
+            "latent_frames": lt, "latent_height": lh, "latent_width": lw,
+            "latent": latent[0].permute(1, 2, 3, 0).reshape(-1).tolist(),
+            "frames": decoded.shape[2], "height": decoded.shape[3],
+            "width": decoded.shape[4], "channels": decoded.shape[1],
+            "decoded": [float("%.9g" % v) for v in
+                        decoded[0].permute(1, 2, 3, 0).reshape(-1).tolist()],
+        })
+        print(f"  {folder}: latent {lt}x{lh}x{lw} -> decoded "
+              f"{tuple(decoded.shape[2:])} x {decoded.shape[1]}")
+    with open(os.path.join(fixtures, "tiny_cogvideox_vae_io.json"), "w") as f:
+        json.dump({"vae": io_cases}, f)
+
 
 # ---------------- write ----------------
 here = os.path.dirname(os.path.abspath(__file__))
@@ -397,17 +397,14 @@ config = {
     "rope_section_h": SEC_H,
     "rope_section_w": SEC_W,
     "layer_norm_eps": 1e-5,
-    # VAE decode tail
-    "vae_latent_channels": CLAT,
-    "vae_out_channels": VOUT,
-    "vae_temporal_kernel": KT,
 }
 with open(os.path.join(fixtures, "tiny_cogvideox_config.json"), "w") as f:
     json.dump(config, f, indent=2)
 
 with open(os.path.join(fixtures, "tiny_cogvideox_io.json"), "w") as f:
-    json.dump({"denoiser": den_cases, "vae": vae_cases}, f)
+    json.dump({"denoiser": den_cases}, f)
 
 print("wrote tiny_cogvideox.safetensors,_config.json,_io.json to", fixtures)
+write_vae_fixtures(fixtures)
 print(f"  hidden={HIDDEN} heads={HEADS} head_dim={HEAD_DIM} T={T} grid={GH}x{GW} "
       f"Lv={LV} Lt={LT} sec=({SEC_T},{SEC_H},{SEC_W})")
