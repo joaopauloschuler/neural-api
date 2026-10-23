@@ -1268,6 +1268,8 @@ type
     procedure TestViTPoseKeypointDecodeTieBreak;
     procedure TestViTPoseTopDownParity;
     procedure TestMultiPersonPoseStructure;
+    procedure TestOpenPoseDrawParity;
+    procedure TestCOCOToOpenPoseBodyNeck;
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
@@ -41825,6 +41827,126 @@ begin
     PoseNN.Free;
     YoloNN.Free;
   end;
+end;
+
+// DrawOpenPoseBodies against controlnet_aux DWposeDetector repeated with cv2
+// 4.10 (tools/make_openpose_draw_oracle.py): two persons on 96 x 64, limbs and
+// dots clipped by the edges, hidden joints; plus bare cv2.ellipse2Poly cases.
+// Every canvas value must match exactly.
+procedure TTestNeuralPretrained.TestOpenPoseDrawParity;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  PersonsArr, JointsArr, JointArr, EllipsesArr, EllipseArr, PointsArr,
+    NonzeroPosArr, NonzeroValueArr: TJSONArray;
+  Poses: TPoseKeypointsArray;
+  Polygon: TImagePointArray;
+  Expected, Canvas: TNNetVolume;
+  PersonPos, Joint, EllipsePos, PointPos, ValuePos, MismatchCount,
+    FirstMismatchPos: integer;
+begin
+  RefJson := TStringList.Create;
+  Expected := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('openpose_draw_oracle.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    EllipsesArr := TJSONArray(TJSONObject(RefRoot).Find('ellipses'));
+    for EllipsePos := 0 to EllipsesArr.Count - 1 do
+    begin
+      EllipseArr := TJSONArray(EllipsesArr.Items[EllipsePos]);
+      PointsArr := TJSONArray(TJSONArray(
+        TJSONObject(RefRoot).Find('ellipse_points')).Items[EllipsePos]);
+      Polygon := EllipsePolygonCV2(EllipseArr.Items[0].AsInteger,
+        EllipseArr.Items[1].AsInteger, EllipseArr.Items[2].AsInteger,
+        EllipseArr.Items[3].AsInteger, EllipseArr.Items[4].AsInteger);
+      AssertEquals('ellipse ' + IntToStr(EllipsePos) + ' point count',
+        PointsArr.Count div 2, Length(Polygon));
+      for PointPos := 0 to High(Polygon) do
+      begin
+        AssertEquals('ellipse ' + IntToStr(EllipsePos) + ' x',
+          PointsArr.Items[2 * PointPos].AsInteger, Polygon[PointPos].X);
+        AssertEquals('ellipse ' + IntToStr(EllipsePos) + ' y',
+          PointsArr.Items[2 * PointPos + 1].AsInteger, Polygon[PointPos].Y);
+      end;
+    end;
+    PersonsArr := TJSONArray(TJSONObject(RefRoot).Find('persons'));
+    SetLength(Poses, PersonsArr.Count);
+    for PersonPos := 0 to PersonsArr.Count - 1 do
+    begin
+      JointsArr := TJSONArray(PersonsArr.Items[PersonPos]);
+      SetLength(Poses[PersonPos].Joints, JointsArr.Count);
+      for Joint := 0 to JointsArr.Count - 1 do
+      begin
+        JointArr := TJSONArray(JointsArr.Items[Joint]);
+        Poses[PersonPos].Joints[Joint].X := JointArr.Items[0].AsFloat;
+        Poses[PersonPos].Joints[Joint].Y := JointArr.Items[1].AsFloat;
+        Poses[PersonPos].Joints[Joint].Score := JointArr.Items[2].AsFloat;
+      end;
+    end;
+    DrawOpenPoseBodies(Canvas, TJSONObject(RefRoot).Get('width', 0),
+      TJSONObject(RefRoot).Get('height', 0), Poses,
+      TJSONObject(RefRoot).Get('threshold', 0.0));
+    Expected.ReSize(Canvas.SizeX, Canvas.SizeY, 3);
+    Expected.Fill(0);
+    NonzeroPosArr := TJSONArray(TJSONObject(RefRoot).Find('nonzero_pos'));
+    NonzeroValueArr := TJSONArray(TJSONObject(RefRoot).Find('nonzero_value'));
+    for ValuePos := 0 to NonzeroPosArr.Count - 1 do
+      Expected.FData[NonzeroPosArr.Items[ValuePos].AsInteger] :=
+        NonzeroValueArr.Items[ValuePos].AsInteger;
+    AssertEquals('canvas width', 96, Canvas.SizeX);
+    AssertEquals('canvas height', 64, Canvas.SizeY);
+    MismatchCount := 0;
+    FirstMismatchPos := -1;
+    for ValuePos := 0 to Canvas.Size - 1 do
+      if Canvas.FData[ValuePos] <> Expected.FData[ValuePos] then
+      begin
+        if FirstMismatchPos < 0 then FirstMismatchPos := ValuePos;
+        Inc(MismatchCount);
+      end;
+    AssertEquals('mismatching canvas values (first at flat ' +
+      IntToStr(FirstMismatchPos) + ')', 0, MismatchCount);
+  finally
+    RefRoot.Free;
+    Canvas.Free;
+    Expected.Free;
+    RefJson.Free;
+  end;
+end;
+
+// COCOToOpenPoseBody: the joint reorder, the neck at the shoulder midpoint only
+// when both shoulders pass, and joints past a short Joints array hidden.
+procedure TTestNeuralPretrained.TestCOCOToOpenPoseBodyNeck;
+var
+  Joints: TPoseJointArray;
+  Body: TOpenPoseBody;
+  Joint: integer;
+begin
+  SetLength(Joints, 17);
+  for Joint := 0 to 16 do
+  begin
+    Joints[Joint].X := 10 * Joint;
+    Joints[Joint].Y := Joint + 0.5;
+    Joints[Joint].Score := 0.9;
+  end;
+  Body := COCOToOpenPoseBody(Joints, 0.3);
+  AssertTrue('neck visible', Body.Visible[1]);
+  AssertEquals('neck x', 55, Body.X[1], 1e-6);
+  AssertEquals('neck y', 6, Body.Y[1], 1e-6);
+  AssertEquals('right shoulder is COCO 6', 60, Body.X[2], 0);
+  AssertEquals('left ear is COCO 3', 30, Body.X[17], 0);
+  Joints[6].Score := 0.3;
+  Body := COCOToOpenPoseBody(Joints, 0.3);
+  AssertFalse('neck hidden with one shoulder at the threshold', Body.Visible[1]);
+  AssertFalse('right shoulder hidden', Body.Visible[2]);
+  AssertTrue('left shoulder visible', Body.Visible[5]);
+  SetLength(Joints, 4);
+  Body := COCOToOpenPoseBody(Joints, 0.3);
+  AssertTrue('nose visible', Body.Visible[0]);
+  AssertTrue('left ear visible', Body.Visible[17]);
+  AssertFalse('right ear (COCO 4) hidden', Body.Visible[16]);
+  AssertFalse('neck hidden', Body.Visible[1]);
 end;
 
 // Verifies ReadDetrConfigFromJSONFile on the committed DETR pico config (the

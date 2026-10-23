@@ -2195,13 +2195,14 @@ rather than acted on.
             class 0 = person, score threshold) feeds the boxes, one ViTPose
             pass per box; a plain `TPoseKeypoints` result per person.
             Done: `EstimateMultiPersonPose` (+ `LetterboxYoloImage`, moved out of FastSAM); PoseEstimation takes --box/--yolo.
-      - [ ] OpenPose renderer as controlnet_aux `draw_bodypose`: COCO-17 ->
+      - [X] OpenPose renderer as controlnet_aux `draw_bodypose`: COCO-17 ->
             OpenPose-18 mapping (neck = mid-shoulder, only when both
             shoulders pass the score threshold), the 17 limb pairs with their
             fixed colors as ellipse polygons at 0.6 alpha (stickwidth 4) and
             the 18 colored joint dots on black, at the photo size. Pixel
             test against controlnet_aux output for one fixed keypoint set
             (oracle values committed, no Python at run time).
+            Done: `DrawOpenPoseBodies` (DWpose order) + cv2 ports `EllipsePolygonCV2`/`FillConvexPolygonCV2`/`FillCircleCV2`/`DrawLineCV2`; exact vs cv2 4.10.
       - [ ] examples/ControlNetCanny: `--pose-photo FILE --yolo FILE --vitpose
             FILE [--pose-out FILE]` builds the control image the same way
             `--photo` builds edges, so a ControlNet openpose checkpoint runs

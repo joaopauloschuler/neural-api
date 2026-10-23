@@ -16708,6 +16708,40 @@ function EstimateMultiPersonPose(YoloNN: TNNet; const YoloConfig: TYoloConfig;
   ScoreThreshold: TNeuralFloat = 0.25; IoUThreshold: TNeuralFloat = 0.45;
   PersonClassId: integer = 0): TPoseKeypointsArray;
 
+const
+  csOpenPoseJointCount = 18;
+  csOpenPoseLimbCount = 17;
+  // The COCO-17 joint of each OpenPose-18 joint; -1 is the neck.
+  csOpenPoseFromCOCO: array[0..csOpenPoseJointCount - 1] of integer =
+    (0, -1, 6, 8, 10, 5, 7, 9, 12, 14, 16, 11, 13, 15, 2, 1, 4, 3);
+  // controlnet_aux limbSeq (0-based OpenPose-18 joints).
+  csOpenPoseLimbs: array[0..csOpenPoseLimbCount - 1, 0..1] of integer =
+    ((1, 2), (1, 5), (2, 3), (3, 4), (5, 6), (6, 7), (1, 8), (8, 9), (9, 10),
+     (1, 11), (11, 12), (12, 13), (1, 0), (0, 14), (14, 16), (0, 15), (15, 17));
+  // controlnet_aux colors (RGB): limb i and joint i share entry i.
+  csOpenPoseColors: array[0..csOpenPoseJointCount - 1, 0..2] of integer =
+    ((255, 0, 0), (255, 85, 0), (255, 170, 0), (255, 255, 0), (170, 255, 0),
+     (85, 255, 0), (0, 255, 0), (0, 255, 85), (0, 255, 170), (0, 255, 255),
+     (0, 170, 255), (0, 85, 255), (0, 0, 255), (85, 0, 255), (170, 0, 255),
+     (255, 0, 255), (255, 0, 170), (255, 0, 85));
+
+type
+  // One person as OpenPose-18 joints in photo pixels.
+  TOpenPoseBody = record
+    X, Y: array[0..csOpenPoseJointCount - 1] of TNeuralFloat;
+    Visible: array[0..csOpenPoseJointCount - 1] of boolean;
+  end;
+
+// controlnet_aux DWpose COCO-17 -> OpenPose-18: neck = shoulder midpoint; Visible
+// = score > ScoreThreshold (neck: both shoulders); joints past Joints are not.
+function COCOToOpenPoseBody(const Joints: TPoseJointArray;
+  ScoreThreshold: TNeuralFloat = 0.3): TOpenPoseBody;
+
+// controlnet_aux DWposeDetector body image: Canvas := black (Width, Height, 3) RGB,
+// every limb (cv2 ellipse polygon, color * 0.6), then every joint dot (radius 4).
+procedure DrawOpenPoseBodies(Canvas: TNNetVolume; Width, Height: integer;
+  const Poses: TPoseKeypointsArray; ScoreThreshold: TNeuralFloat = 0.3);
+
 // process_mask_native: Masks := (ImageWidth, ImageHeight, N); unpads the Proto masks by
 // the letterbox, bilinear up to the image, crops to the IMAGE-pixel Dets, > 0.5.
 procedure ComputeYoloMasksNative(Head, Proto: TNNetVolume;
@@ -95417,6 +95451,108 @@ begin
     Inc(PersonCount);
   end;
   SetLength(Result, PersonCount);
+end;
+
+function COCOToOpenPoseBody(const Joints: TPoseJointArray;
+  ScoreThreshold: TNeuralFloat): TOpenPoseBody;
+const
+  csLeftShoulder = 5;
+  csRightShoulder = 6;
+var
+  JointPos, MaxJointPos, COCOPos: integer;
+begin
+  MaxJointPos := csOpenPoseJointCount - 1;
+  for JointPos := 0 to MaxJointPos do
+  begin
+    COCOPos := csOpenPoseFromCOCO[JointPos];
+    Result.X[JointPos] := 0;
+    Result.Y[JointPos] := 0;
+    Result.Visible[JointPos] := false;
+    if COCOPos < 0 then
+    begin
+      if Length(Joints) <= csRightShoulder then continue;
+      Result.X[JointPos] := (Joints[csLeftShoulder].X +
+        Joints[csRightShoulder].X) * 0.5;
+      Result.Y[JointPos] := (Joints[csLeftShoulder].Y +
+        Joints[csRightShoulder].Y) * 0.5;
+      Result.Visible[JointPos] :=
+        (Joints[csLeftShoulder].Score > ScoreThreshold) and
+        (Joints[csRightShoulder].Score > ScoreThreshold);
+    end
+    else if COCOPos < Length(Joints) then
+    begin
+      Result.X[JointPos] := Joints[COCOPos].X;
+      Result.Y[JointPos] := Joints[COCOPos].Y;
+      Result.Visible[JointPos] := Joints[COCOPos].Score > ScoreThreshold;
+    end;
+  end;
+end;
+
+procedure DrawOpenPoseBodies(Canvas: TNNetVolume; Width, Height: integer;
+  const Poses: TPoseKeypointsArray; ScoreThreshold: TNeuralFloat);
+const
+  csStickWidth = 4;
+  csJointRadius = 4;
+var
+  Bodies: array of TOpenPoseBody;
+  Polygon: TImagePointArray;
+  Color: array[0..2] of TNeuralFloat;
+  WidthF, HeightF, NormValue, MeanX, MeanY, DeltaX, DeltaY,
+    LimbLength: TNeuralFloat;
+  BodyPos, MaxBodyPos, JointPos, MaxJointPos, LimbPos, MaxLimbPos,
+    ChannelPos, StartJoint, EndJoint: integer;
+begin
+  Canvas.ReSize(Width, Height, 3);
+  Canvas.Fill(0);
+  WidthF := Width;
+  HeightF := Height;
+  MaxBodyPos := High(Poses);
+  MaxJointPos := csOpenPoseJointCount - 1;
+  MaxLimbPos := csOpenPoseLimbCount - 1;
+  SetLength(Bodies, Length(Poses));
+  // DWposeDetector stores x / W and y / H (float32) and multiplies back.
+  for BodyPos := 0 to MaxBodyPos do
+  begin
+    Bodies[BodyPos] := COCOToOpenPoseBody(Poses[BodyPos].Joints, ScoreThreshold);
+    for JointPos := 0 to MaxJointPos do
+    begin
+      NormValue := Bodies[BodyPos].X[JointPos] / WidthF;
+      Bodies[BodyPos].X[JointPos] := NormValue * WidthF;
+      NormValue := Bodies[BodyPos].Y[JointPos] / HeightF;
+      Bodies[BodyPos].Y[JointPos] := NormValue * HeightF;
+    end;
+  end;
+  for LimbPos := 0 to MaxLimbPos do
+  begin
+    // canvas * 0.6 truncated to uint8, applied per limb color.
+    for ChannelPos := 0 to 2 do
+      Color[ChannelPos] := csOpenPoseColors[LimbPos, ChannelPos] * 3 div 5;
+    StartJoint := csOpenPoseLimbs[LimbPos, 0];
+    EndJoint := csOpenPoseLimbs[LimbPos, 1];
+    for BodyPos := 0 to MaxBodyPos do
+    begin
+      if not (Bodies[BodyPos].Visible[StartJoint] and
+        Bodies[BodyPos].Visible[EndJoint]) then continue;
+      MeanX := (Bodies[BodyPos].X[StartJoint] + Bodies[BodyPos].X[EndJoint]) * 0.5;
+      MeanY := (Bodies[BodyPos].Y[StartJoint] + Bodies[BodyPos].Y[EndJoint]) * 0.5;
+      DeltaX := Bodies[BodyPos].X[StartJoint] - Bodies[BodyPos].X[EndJoint];
+      DeltaY := Bodies[BodyPos].Y[StartJoint] - Bodies[BodyPos].Y[EndJoint];
+      LimbLength := Sqrt(DeltaX * DeltaX + DeltaY * DeltaY);
+      Polygon := EllipsePolygonCV2(Trunc(MeanX), Trunc(MeanY),
+        Trunc(LimbLength * 0.5), csStickWidth,
+        Trunc(RadToDeg(ArcTan2(DeltaY, DeltaX))));
+      FillConvexPolygonCV2(Canvas, Polygon, Color);
+    end;
+  end;
+  for JointPos := 0 to MaxJointPos do
+  begin
+    for ChannelPos := 0 to 2 do
+      Color[ChannelPos] := csOpenPoseColors[JointPos, ChannelPos];
+    for BodyPos := 0 to MaxBodyPos do
+      if Bodies[BodyPos].Visible[JointPos] then
+        FillCircleCV2(Canvas, Trunc(Bodies[BodyPos].X[JointPos]),
+          Trunc(Bodies[BodyPos].Y[JointPos]), csJointRadius, Color);
+  end;
 end;
 
 procedure ComputeYoloMasksNative(Head, Proto: TNNetVolume;

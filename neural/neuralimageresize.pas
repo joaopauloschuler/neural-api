@@ -12,7 +12,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  neuralvolume;
+  Types, neuralvolume;
 
 type
   // PIL's resample filters (Image.Resampling); the PIL integer codes map via
@@ -121,6 +121,29 @@ procedure GaussianBlurImageCV2(Source, Dest: TNNetVolume; KernelSize: integer);
 // pixels past the edge are ignored. A 0 size is cv2's empty kernel (3 x 3).
 procedure ErodeImage(Source, Dest: TNNetVolume; KernelSizeX,
   KernelSizeY: integer);
+
+type
+  TImagePointArray = array of TPoint;
+
+// cv2.ellipse2Poly((CenterX, CenterY), (AxisX, AxisY), Angle, 0, 360, Delta):
+// cv2's float sine table, lrint rounding, repeated points dropped.
+function EllipsePolygonCV2(CenterX, CenterY, AxisX, AxisY, Angle: integer;
+  Delta: integer = 1): TImagePointArray;
+
+// cv2.line(Image, (X1, Y1), (X2, Y2), Color, 1, LINE_8): Bresenham from the
+// left end after cv2.clipLine. Color holds one value per channel of Image.
+procedure DrawLineCV2(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat);
+
+// cv2.fillConvexPoly(Image, Points, Color) (LINE_8, shift 0): the edges as
+// DrawLineCV2, then cv2's 16.16 fixed-point scanline fill, clipped.
+procedure FillConvexPolygonCV2(Image: TNNetVolume;
+  const Points: TImagePointArray; const Color: array of TNeuralFloat);
+
+// cv2.circle(Image, (CenterX, CenterY), Radius, Color, thickness=-1) (LINE_8):
+// cv2's midpoint-circle spans, clipped.
+procedure FillCircleCV2(Image: TNNetVolume; CenterX, CenterY, Radius: integer;
+  const Color: array of TNeuralFloat);
 
 type
   // 2 x 3 affine matrix [a b c; d e f], row major, as cv2: (x, y) -> (ax+by+c, dx+ey+f).
@@ -879,6 +902,349 @@ begin
         end;
         Dest.FData[PixelPos + ElementPos] := MinValue;
       end;
+    end;
+  end;
+end;
+
+var
+  // cv2 drawing.cpp SinTable: sin of 0..450 degrees as 7-decimal floats.
+  CV2SinTable: array[0..450] of single;
+
+procedure BuildCV2SinTable();
+var
+  Degree: integer;
+  SinValue: double;
+begin
+  for Degree := 0 to High(CV2SinTable) do
+  begin
+    SinValue := Round(Sin(Degree * Pi / 180) * 1e7);
+    CV2SinTable[Degree] := SinValue / 1e7;
+  end;
+end;
+
+procedure CheckDrawColor(Image: TNNetVolume; const Color: array of TNeuralFloat;
+  const Caller: string);
+begin
+  if Length(Color) <> Image.Depth then
+    raise EArgumentException.Create(Caller + ': Color needs one value per ' +
+      'channel of Image.');
+end;
+
+// Image row Y, columns FirstX..LastX (already inside the image) := Color.
+procedure FillImageRowSpan(Image: TNNetVolume; Y, FirstX, LastX: integer;
+  const Color: array of TNeuralFloat);
+var
+  X, ChannelPos, MaxChannelPos, PixelPos, Depth: integer;
+begin
+  Depth := Image.Depth;
+  MaxChannelPos := Depth - 1;
+  PixelPos := Image.GetRawPos(FirstX, Y);
+  for X := FirstX to LastX do
+  begin
+    for ChannelPos := 0 to MaxChannelPos do
+      Image.FData[PixelPos + ChannelPos] := Color[ChannelPos];
+    Inc(PixelPos, Depth);
+  end;
+end;
+
+function EllipsePolygonCV2(CenterX, CenterY, AxisX, AxisY, Angle: integer;
+  Delta: integer): TImagePointArray;
+var
+  CosAngle, SinAngle: single;
+  ArcAngle, PointCount: integer;
+  EllipseX, EllipseY: double;
+  Point, PrevPoint: TPoint;
+begin
+  if (Delta <= 0) or (Delta > 180) then
+    raise EArgumentException.Create('EllipsePolygonCV2: Delta must be 1..180.');
+  while Angle < 0 do Inc(Angle, 360);
+  while Angle > 360 do Dec(Angle, 360);
+  CosAngle := CV2SinTable[450 - Angle];
+  SinAngle := CV2SinTable[Angle];
+  SetLength(Result, 360 div Delta + 2);
+  PointCount := 0;
+  PrevPoint.X := Low(integer);
+  PrevPoint.Y := Low(integer);
+  ArcAngle := 0;
+  while ArcAngle < 360 + Delta do
+  begin
+    EllipseX := AxisX * double(CV2SinTable[450 - Min(ArcAngle, 360)]);
+    EllipseY := AxisY * double(CV2SinTable[Min(ArcAngle, 360)]);
+    Point.X := Round(CenterX + EllipseX * CosAngle - EllipseY * SinAngle);
+    Point.Y := Round(CenterY + EllipseX * SinAngle + EllipseY * CosAngle);
+    if (Point.X <> PrevPoint.X) or (Point.Y <> PrevPoint.Y) then
+    begin
+      Result[PointCount] := Point;
+      Inc(PointCount);
+      PrevPoint := Point;
+    end;
+    Inc(ArcAngle, Delta);
+  end;
+  if PointCount = 1 then
+  begin
+    Result[0].X := CenterX;
+    Result[0].Y := CenterY;
+    Result[1] := Result[0];
+    PointCount := 2;
+  end;
+  SetLength(Result, PointCount);
+end;
+
+// cv2.clipLine to [0, SizeX - 1] x [0, SizeY - 1]; false when nothing is left.
+function ClipLineCV2(SizeX, SizeY: integer; var X1, Y1, X2, Y2: integer): boolean;
+var
+  Code1, Code2, Edge, Right, Bottom: integer;
+
+  function OutCode(X, Y: integer): integer;
+  begin
+    Result := Ord(X < 0) + Ord(X > Right) * 2 + Ord(Y < 0) * 4 +
+      Ord(Y > Bottom) * 8;
+  end;
+
+begin
+  Right := SizeX - 1;
+  Bottom := SizeY - 1;
+  Code1 := OutCode(X1, Y1);
+  Code2 := OutCode(X2, Y2);
+  if ((Code1 and Code2) = 0) and ((Code1 or Code2) <> 0) then
+  begin
+    if (Code1 and 12) <> 0 then
+    begin
+      if Code1 < 8 then Edge := 0 else Edge := Bottom;
+      X1 := X1 + Trunc(double(Edge - Y1) * (X2 - X1) / (Y2 - Y1));
+      Y1 := Edge;
+      Code1 := Ord(X1 < 0) + Ord(X1 > Right) * 2;
+    end;
+    if (Code2 and 12) <> 0 then
+    begin
+      if Code2 < 8 then Edge := 0 else Edge := Bottom;
+      X2 := X2 + Trunc(double(Edge - Y2) * (X2 - X1) / (Y2 - Y1));
+      Y2 := Edge;
+      Code2 := Ord(X2 < 0) + Ord(X2 > Right) * 2;
+    end;
+    if ((Code1 and Code2) = 0) and ((Code1 or Code2) <> 0) then
+    begin
+      if Code1 <> 0 then
+      begin
+        if Code1 = 1 then Edge := 0 else Edge := Right;
+        Y1 := Y1 + Trunc(double(Edge - X1) * (Y2 - Y1) / (X2 - X1));
+        X1 := Edge;
+        Code1 := 0;
+      end;
+      if Code2 <> 0 then
+      begin
+        if Code2 = 1 then Edge := 0 else Edge := Right;
+        Y2 := Y2 + Trunc(double(Edge - X2) * (Y2 - Y1) / (X2 - X1));
+        X2 := Edge;
+        Code2 := 0;
+      end;
+    end;
+  end;
+  Result := (Code1 or Code2) = 0;
+end;
+
+// DrawLineCV2 without the Color check.
+procedure DrawLineCV2Unchecked(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat);
+var
+  DeltaMajor, DeltaMinor, StepX, StepY, Error, X, Y, Swap, PixelCount,
+    PixelPos, ChannelPos, MaxChannelPos: integer;
+  IsSteep, MinorStep: boolean;
+begin
+  if (X1 < 0) or (X1 >= Image.SizeX) or (X2 < 0) or (X2 >= Image.SizeX) or
+    (Y1 < 0) or (Y1 >= Image.SizeY) or (Y2 < 0) or (Y2 >= Image.SizeY) then
+    if not ClipLineCV2(Image.SizeX, Image.SizeY, X1, Y1, X2, Y2) then exit;
+  if X2 < X1 then
+  begin
+    Swap := X1; X1 := X2; X2 := Swap;
+    Swap := Y1; Y1 := Y2; Y2 := Swap;
+  end;
+  DeltaMajor := X2 - X1;
+  DeltaMinor := Y2 - Y1;
+  StepX := 1;
+  StepY := 1;
+  if DeltaMinor < 0 then
+  begin
+    DeltaMinor := -DeltaMinor;
+    StepY := -1;
+  end;
+  IsSteep := DeltaMinor > DeltaMajor;
+  if IsSteep then
+  begin
+    Swap := DeltaMajor; DeltaMajor := DeltaMinor; DeltaMinor := Swap;
+  end;
+  Error := DeltaMajor - 2 * DeltaMinor;
+  X := X1;
+  Y := Y1;
+  MaxChannelPos := Image.Depth - 1;
+  for PixelCount := 0 to DeltaMajor do
+  begin
+    PixelPos := Image.GetRawPos(X, Y);
+    for ChannelPos := 0 to MaxChannelPos do
+      Image.FData[PixelPos + ChannelPos] := Color[ChannelPos];
+    MinorStep := Error < 0;
+    Dec(Error, 2 * DeltaMinor);
+    if MinorStep then Inc(Error, 2 * DeltaMajor);
+    if IsSteep then
+    begin
+      Inc(Y, StepY);
+      if MinorStep then Inc(X, StepX);
+    end
+    else
+    begin
+      Inc(X, StepX);
+      if MinorStep then Inc(Y, StepY);
+    end;
+  end;
+end;
+
+procedure DrawLineCV2(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat);
+begin
+  CheckDrawColor(Image, Color, 'DrawLineCV2');
+  DrawLineCV2Unchecked(Image, X1, Y1, X2, Y2, Color);
+end;
+
+procedure FillConvexPolygonCV2(Image: TNNetVolume;
+  const Points: TImagePointArray; const Color: array of TNeuralFloat);
+const
+  csFixedShift = 16;
+  csFixedHalf = 1 shl (csFixedShift - 1);
+type
+  // One side of the polygon walked down from the top vertex, x in 16.16.
+  TPolygonEdge = record
+    PointPos, PointStep, EndY: integer;
+    X, StepX: int64;
+  end;
+var
+  Edges: array[0..1] of TPolygonEdge;
+  PointCount, PointPos, MaxPointPos, TopPos, PrevPos, EdgePos, NextPos,
+    EdgesLeft, NextY, Y, MinX, MaxX, MinY, MaxY, LeftEdge, FirstX, LastX: integer;
+  StartX, EndX: int64;
+begin
+  CheckDrawColor(Image, Color, 'FillConvexPolygonCV2');
+  PointCount := Length(Points);
+  if PointCount = 0 then exit;
+  MaxPointPos := PointCount - 1;
+  MinX := Points[0].X;
+  MaxX := MinX;
+  MinY := Points[0].Y;
+  MaxY := MinY;
+  TopPos := 0;
+  PrevPos := MaxPointPos;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    if Points[PointPos].Y < MinY then
+    begin
+      MinY := Points[PointPos].Y;
+      TopPos := PointPos;
+    end;
+    MaxY := Max(MaxY, Points[PointPos].Y);
+    MaxX := Max(MaxX, Points[PointPos].X);
+    MinX := Min(MinX, Points[PointPos].X);
+    DrawLineCV2Unchecked(Image, Points[PrevPos].X, Points[PrevPos].Y,
+      Points[PointPos].X, Points[PointPos].Y, Color);
+    PrevPos := PointPos;
+  end;
+  if (PointCount < 3) or (MaxX < 0) or (MaxY < 0) or (MinX >= Image.SizeX) or
+    (MinY >= Image.SizeY) then exit;
+  MaxY := Min(MaxY, Image.SizeY - 1);
+  for EdgePos := 0 to 1 do
+  begin
+    Edges[EdgePos].PointPos := TopPos;
+    Edges[EdgePos].EndY := MinY;
+    Edges[EdgePos].X := -(int64(1) shl csFixedShift);
+    Edges[EdgePos].StepX := 0;
+  end;
+  Edges[0].PointStep := 1;
+  Edges[1].PointStep := PointCount - 1;
+  EdgesLeft := PointCount;
+  Y := MinY;
+  repeat
+    for EdgePos := 0 to 1 do
+    begin
+      if Y < Edges[EdgePos].EndY then continue;
+      PrevPos := Edges[EdgePos].PointPos;
+      NextPos := (PrevPos + Edges[EdgePos].PointStep) mod PointCount;
+      while true do
+      begin
+        Dec(EdgesLeft);
+        if EdgesLeft < 0 then break;
+        NextY := Points[NextPos].Y;
+        if NextY > Y then
+        begin
+          StartX := int64(Points[PrevPos].X) shl csFixedShift;
+          EndX := int64(Points[NextPos].X) shl csFixedShift;
+          Edges[EdgePos].EndY := NextY;
+          Edges[EdgePos].StepX := ((EndX - StartX) * 2 + (NextY - Y)) div
+            (2 * int64(NextY - Y));
+          Edges[EdgePos].X := StartX;
+          Edges[EdgePos].PointPos := NextPos;
+          break;
+        end;
+        PrevPos := NextPos;
+        NextPos := (NextPos + Edges[EdgePos].PointStep) mod PointCount;
+      end;
+    end;
+    if EdgesLeft < 0 then break;
+    if Y >= 0 then
+    begin
+      if Edges[0].X > Edges[1].X then LeftEdge := 1 else LeftEdge := 0;
+      FirstX := SarInt64(Edges[LeftEdge].X + csFixedHalf, csFixedShift);
+      LastX := SarInt64(Edges[1 - LeftEdge].X + csFixedHalf, csFixedShift);
+      if (LastX >= 0) and (FirstX < Image.SizeX) then
+        FillImageRowSpan(Image, Y, Max(FirstX, 0), Min(LastX, Image.SizeX - 1),
+          Color);
+    end;
+    Inc(Edges[0].X, Edges[0].StepX);
+    Inc(Edges[1].X, Edges[1].StepX);
+    Inc(Y);
+  until Y > MaxY;
+end;
+
+procedure FillCircleCV2(Image: TNNetVolume; CenterX, CenterY, Radius: integer;
+  const Color: array of TNeuralFloat);
+var
+  Error, OffsetX, OffsetY, Plus, Minus, SizeX, SizeY: integer;
+
+  procedure FillClippedRow(Y, FirstX, LastX: integer);
+  begin
+    if (Y < 0) or (Y >= SizeY) then exit;
+    FirstX := Max(FirstX, 0);
+    LastX := Min(LastX, SizeX - 1);
+    if FirstX <= LastX then FillImageRowSpan(Image, Y, FirstX, LastX, Color);
+  end;
+
+begin
+  CheckDrawColor(Image, Color, 'FillCircleCV2');
+  SizeX := Image.SizeX;
+  SizeY := Image.SizeY;
+  Error := 0;
+  OffsetX := Radius;
+  OffsetY := 0;
+  Plus := 1;
+  Minus := 2 * Radius - 1;
+  while OffsetX >= OffsetY do
+  begin
+    if (CenterX - OffsetX < SizeX) and (CenterX + OffsetX >= 0) and
+      (CenterY - OffsetX < SizeY) and (CenterY + OffsetX >= 0) then
+    begin
+      FillClippedRow(CenterY - OffsetY, CenterX - OffsetX, CenterX + OffsetX);
+      FillClippedRow(CenterY + OffsetY, CenterX - OffsetX, CenterX + OffsetX);
+      if (CenterX - OffsetY < SizeX) and (CenterX + OffsetY >= 0) then
+      begin
+        FillClippedRow(CenterY - OffsetX, CenterX - OffsetY, CenterX + OffsetY);
+        FillClippedRow(CenterY + OffsetX, CenterX - OffsetY, CenterX + OffsetY);
+      end;
+    end;
+    Inc(OffsetY);
+    Inc(Error, Plus);
+    Inc(Plus, 2);
+    if Error > 0 then
+    begin
+      Dec(Error, Minus);
+      Dec(OffsetX);
+      Dec(Minus, 2);
     end;
   end;
 end;
@@ -1790,5 +2156,8 @@ begin
   Result := '';
 end;
 
+
+initialization
+  BuildCV2SinTable();
 
 end.
