@@ -36,9 +36,9 @@ gradient image is generated.
 
 ```
 cd examples/YoloDetect
-# build with lazbuild (or fpc), then:
-./YoloDetect
-./YoloDetect [model.safetensors] [config.json] [score_threshold] [iou_threshold]
+lazbuild -B YoloDetect.lpi
+../../bin/x86_64-linux/bin/YoloDetect
+../../bin/x86_64-linux/bin/YoloDetect [model.safetensors] [config.json] [score_threshold] [iou_threshold]
 ```
 
 Defaults: `score_threshold 0.5`, `iou_threshold 0.45`. The low score threshold on

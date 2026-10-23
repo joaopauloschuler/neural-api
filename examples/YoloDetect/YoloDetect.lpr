@@ -46,7 +46,7 @@ Coded by Claude (AI).
 
 {$mode objfpc}{$H+}
 
-uses
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Classes, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralpretrained;
 

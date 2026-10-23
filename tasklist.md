@@ -125,7 +125,7 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
-- [ ] examples/YoloDetect has no `.lpi`, so `lazbuild -B` cannot build it (it
+- [X] examples/YoloDetect has no `.lpi`, so `lazbuild -B` cannot build it (it
       compiles with plain `fpc -Fu<lazutils> -Funeural`). Add an `.lpi` like the
       sibling examples (e.g. examples/FastSAM/FastSAM.lpi).
 
