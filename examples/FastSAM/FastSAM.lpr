@@ -65,12 +65,6 @@ type
     TextEmb: TNNetVolume;
   end;
 
-  // Where the image sits inside the letterboxed net input.
-  TLetterbox = record
-    Scale: TNeuralFloat;
-    Left, Top, ContentX, ContentY: integer;
-  end;
-
 procedure PrintUsage();
 begin
   WriteLn('Usage: FastSAM                                 (pico fixture smoke)');
@@ -196,37 +190,8 @@ begin
     raise Exception.Create('--text needs --clip');
 end;
 
-// NetInput (Size, Size, 3) in [0,1] := ultralytics LetterBox of Image (0..255).
-procedure LetterboxImage(Image, NetInput: TNNetVolume; Size: integer;
-  out Box: TLetterbox);
-var
-  Resized: TNNetVolume;
-  X, Y, Channel, MaxX, MaxY: integer;
-begin
-  Box.Scale := Min(Size / Image.SizeX, Size / Image.SizeY);
-  Box.ContentX := Max(1, Round(Image.SizeX * Box.Scale));
-  Box.ContentY := Max(1, Round(Image.SizeY * Box.Scale));
-  Box.Left := Round((Size - Box.ContentX) / 2 - 0.1);
-  Box.Top := Round((Size - Box.ContentY) / 2 - 0.1);
-  Resized := TNNetVolume.Create;
-  try
-    ResizeImageBilinearNoAntialias(Image, Resized, Box.ContentX, Box.ContentY);
-    NetInput.ReSize(Size, Size, 3);
-    NetInput.Fill(114);
-    MaxX := Box.ContentX - 1;
-    MaxY := Box.ContentY - 1;
-    for Y := 0 to MaxY do
-      for X := 0 to MaxX do
-        for Channel := 0 to 2 do
-          NetInput[Box.Left + X, Box.Top + Y, Channel] := Resized[X, Y, Channel];
-    NetInput.Mul(1 / 255);
-  finally
-    Resized.Free;
-  end;
-end;
-
 // ImageMasks (image W, H, N) := the letterbox content of Masks, resized, > 0.5.
-procedure MasksToImage(Masks, ImageMasks: TNNetVolume; const Box: TLetterbox;
+procedure MasksToImage(Masks, ImageMasks: TNNetVolume; const Box: TYoloLetterbox;
   ImageWidth, ImageHeight: integer);
 var
   Content: TNNetVolume;
@@ -359,7 +324,7 @@ var
   NetInput, Masks, Selected, ImageMasks: TNNetVolume;
   Dets, ImageDets: TYoloDetectionArray;
   Similarities: TNeuralFloatDynArr;
-  Box: TLetterbox;
+  Box: TYoloLetterbox;
   PromptX, PromptY: array of integer;
   PointPos, MaxPointPos, MaskIdx: integer;
   StartTime: TDateTime;
@@ -369,7 +334,7 @@ begin
   Selected := TNNetVolume.Create;
   ImageMasks := TNNetVolume.Create;
   try
-    LetterboxImage(Image, NetInput, Config.ImageSize, Box);
+    LetterboxYoloImage(Image, NetInput, Config.ImageSize, Box);
     StartTime := Now();
     NN.Compute(NetInput);
     if Opt.RetinaMasks then

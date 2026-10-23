@@ -2191,9 +2191,10 @@ rather than acted on.
             flip test). Pico parity vs transformers in the ~/x venv on
             `tests/fixtures/tiny_vitpose*` with one non-square box.
             Done: `EstimateViTPoseInBox`, 2.3e-5 px; transformers refines with DARK (not quarter-pixel), no flip test.
-      - [ ] Multi-person driver: YOLO (`BuildYolo` + `DecodeYoloDetections`,
+      - [X] Multi-person driver: YOLO (`BuildYolo` + `DecodeYoloDetections`,
             class 0 = person, score threshold) feeds the boxes, one ViTPose
             pass per box; a plain `TPoseKeypoints` result per person.
+            Done: `EstimateMultiPersonPose` (+ `LetterboxYoloImage`, moved out of FastSAM); PoseEstimation takes --box/--yolo.
       - [ ] OpenPose renderer as controlnet_aux `draw_bodypose`: COCO-17 ->
             OpenPose-18 mapping (neck = mid-shoulder, only when both
             shoulders pass the score threshold), the 17 limb pairs with their

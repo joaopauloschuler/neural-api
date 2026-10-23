@@ -16680,6 +16680,34 @@ procedure ComputeYoloMasks(Head, Proto: TNNetVolume; const Config: TYoloConfig;
 procedure ScaleYoloBoxesToImage(var Dets: TYoloDetectionArray; NetSize,
   ImageWidth, ImageHeight: integer);
 
+type
+  // ultralytics LetterBox geometry: the resize gain and where the resized
+  // photo (ContentX x ContentY) sits inside the square net input.
+  TYoloLetterbox = record
+    Scale: TNeuralFloat;
+    Left, Top, ContentX, ContentY: integer;
+  end;
+
+// NetInput (Size, Size, 3) in [0,1] := ultralytics LetterBox of Image (RGB
+// 0..255): aspect-preserving bilinear resize, centred on a 114 gray pad.
+procedure LetterboxYoloImage(Image, NetInput: TNNetVolume; Size: integer;
+  out Box: TYoloLetterbox);
+
+type
+  // One person: the xyxy detector box in photo pixels, its score and the joints.
+  TPoseKeypoints = record
+    X1, Y1, X2, Y2, BoxScore: TNeuralFloat;
+    Joints: TPoseJointArray;
+  end;
+  TPoseKeypointsArray = array of TPoseKeypoints;
+
+// Multi-person pose of a photo (RGB 0..255): YoloNN finds the PersonClassId
+// boxes (score >= ScoreThreshold), then EstimateViTPoseInBox runs once per box.
+function EstimateMultiPersonPose(YoloNN: TNNet; const YoloConfig: TYoloConfig;
+  PoseNN: TNNet; const PoseConfig: TViTPoseConfig; Image: TNNetVolume;
+  ScoreThreshold: TNeuralFloat = 0.25; IoUThreshold: TNeuralFloat = 0.45;
+  PersonClassId: integer = 0): TPoseKeypointsArray;
+
 // process_mask_native: Masks := (ImageWidth, ImageHeight, N); unpads the Proto masks by
 // the letterbox, bilinear up to the image, crops to the IMAGE-pixel Dets, > 0.5.
 procedure ComputeYoloMasksNative(Head, Proto: TNNetVolume;
@@ -95320,6 +95348,75 @@ begin
     Dets[DetPos].X2 := EnsureRange((Dets[DetPos].X2 - PadX) / Gain, 0, ImageWidth);
     Dets[DetPos].Y2 := EnsureRange((Dets[DetPos].Y2 - PadY) / Gain, 0, ImageHeight);
   end;
+end;
+
+procedure LetterboxYoloImage(Image, NetInput: TNNetVolume; Size: integer;
+  out Box: TYoloLetterbox);
+var
+  Resized: TNNetVolume;
+  Y, MaxY, RowLength: integer;
+begin
+  if Image.Depth <> 3 then
+    raise EArgumentException.Create('LetterboxYoloImage: Image must be RGB.');
+  Box.Scale := Min(Size / Image.SizeX, Size / Image.SizeY);
+  Box.ContentX := Max(1, Round(Image.SizeX * Box.Scale));
+  Box.ContentY := Max(1, Round(Image.SizeY * Box.Scale));
+  Box.Left := Round((Size - Box.ContentX) / 2 - 0.1);
+  Box.Top := Round((Size - Box.ContentY) / 2 - 0.1);
+  Resized := TNNetVolume.Create;
+  try
+    ResizeImageBilinearNoAntialias(Image, Resized, Box.ContentX, Box.ContentY);
+    NetInput.ReSize(Size, Size, 3);
+    NetInput.Fill(114);
+    MaxY := Box.ContentY - 1;
+    RowLength := Box.ContentX * 3;
+    for Y := 0 to MaxY do
+      Move(Resized.FData[Resized.GetRawPos(0, Y)],
+        NetInput.FData[NetInput.GetRawPos(Box.Left, Box.Top + Y)],
+        RowLength * SizeOf(TNeuralFloat));
+    NetInput.Mul(1 / 255);
+  finally
+    Resized.Free;
+  end;
+end;
+
+function EstimateMultiPersonPose(YoloNN: TNNet; const YoloConfig: TYoloConfig;
+  PoseNN: TNNet; const PoseConfig: TViTPoseConfig; Image: TNNetVolume;
+  ScoreThreshold: TNeuralFloat; IoUThreshold: TNeuralFloat;
+  PersonClassId: integer): TPoseKeypointsArray;
+var
+  NetInput: TNNetVolume;
+  Letterbox: TYoloLetterbox;
+  Dets: TYoloDetectionArray;
+  DetPos, MaxDetPos, PersonCount: integer;
+begin
+  NetInput := TNNetVolume.Create;
+  try
+    LetterboxYoloImage(Image, NetInput, YoloConfig.ImageSize, Letterbox);
+    YoloNN.Compute(NetInput);
+    Dets := DecodeYoloDetections(YoloNN.GetLastLayer().Output, YoloConfig,
+      ScoreThreshold, IoUThreshold);
+  finally
+    NetInput.Free;
+  end;
+  ScaleYoloBoxesToImage(Dets, YoloConfig.ImageSize, Image.SizeX, Image.SizeY);
+  SetLength(Result, Length(Dets));
+  PersonCount := 0;
+  MaxDetPos := High(Dets);
+  for DetPos := 0 to MaxDetPos do
+  begin
+    if Dets[DetPos].ClassId <> PersonClassId then continue;
+    Result[PersonCount].X1 := Dets[DetPos].X1;
+    Result[PersonCount].Y1 := Dets[DetPos].Y1;
+    Result[PersonCount].X2 := Dets[DetPos].X2;
+    Result[PersonCount].Y2 := Dets[DetPos].Y2;
+    Result[PersonCount].BoxScore := Dets[DetPos].Score;
+    Result[PersonCount].Joints := EstimateViTPoseInBox(PoseNN, PoseConfig,
+      Image, Dets[DetPos].X1, Dets[DetPos].Y1,
+      Dets[DetPos].X2 - Dets[DetPos].X1, Dets[DetPos].Y2 - Dets[DetPos].Y1);
+    Inc(PersonCount);
+  end;
+  SetLength(Result, PersonCount);
 end;
 
 procedure ComputeYoloMasksNative(Head, Proto: TNNetVolume;

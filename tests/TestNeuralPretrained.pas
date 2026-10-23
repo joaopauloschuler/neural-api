@@ -1267,6 +1267,7 @@ type
     procedure TestViTPoseKeypointDecode;
     procedure TestViTPoseKeypointDecodeTieBreak;
     procedure TestViTPoseTopDownParity;
+    procedure TestMultiPersonPoseStructure;
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
@@ -41743,6 +41744,86 @@ begin
     Image.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// EstimateMultiPersonPose on the pico YOLO + ViTPose fixtures and a non-square
+// synthetic photo: one result per class-0 detection (other classes dropped), its
+// box in photo pixels, and joints equal to EstimateViTPoseInBox on that box.
+procedure TTestNeuralPretrained.TestMultiPersonPoseStructure;
+const
+  csScoreThreshold = 0.3;
+var
+  YoloNN, PoseNN: TNNet;
+  YoloConfig: TYoloConfig;
+  PoseConfig: TViTPoseConfig;
+  Photo, NetInput: TNNetVolume;
+  Letterbox: TYoloLetterbox;
+  Dets: TYoloDetectionArray;
+  Poses: TPoseKeypointsArray;
+  Joints: TPoseJointArray;
+  X, Y, Channel, DetPos, PersonPos, Joint, OtherClassCount: integer;
+begin
+  YoloNN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo.safetensors'),
+    YoloConfig, {pTrainable=}false, FixturePath('tiny_yolo_config.json'));
+  PoseNN := BuildViTPoseFromSafeTensors(FixturePath('tiny_vitpose.safetensors'),
+    PoseConfig, {pTrainable=}false, FixturePath('tiny_vitpose_config.json'));
+  Photo := TNNetVolume.Create(150, 90, 3);
+  NetInput := TNNetVolume.Create;
+  try
+    for Y := 0 to Photo.SizeY - 1 do
+      for X := 0 to Photo.SizeX - 1 do
+        for Channel := 0 to 2 do
+          Photo[X, Y, Channel] := Round(127.5 + 127.5 *
+            Sin(X * 0.11 + Y * 0.07 * (Channel + 1) + Channel));
+    Poses := EstimateMultiPersonPose(YoloNN, YoloConfig, PoseNN, PoseConfig,
+      Photo, csScoreThreshold);
+    // The same detections, decoded independently.
+    LetterboxYoloImage(Photo, NetInput, YoloConfig.ImageSize, Letterbox);
+    YoloNN.Compute(NetInput);
+    Dets := DecodeYoloDetections(YoloNN.GetLastLayer().Output, YoloConfig,
+      csScoreThreshold);
+    ScaleYoloBoxesToImage(Dets, YoloConfig.ImageSize, Photo.SizeX, Photo.SizeY);
+    PersonPos := 0;
+    OtherClassCount := 0;
+    for DetPos := 0 to High(Dets) do
+    begin
+      if Dets[DetPos].ClassId <> 0 then
+      begin
+        Inc(OtherClassCount);
+        continue;
+      end;
+      AssertTrue('more detections than results', PersonPos < Length(Poses));
+      AssertEquals('box x1', Dets[DetPos].X1, Poses[PersonPos].X1, 0);
+      AssertEquals('box y1', Dets[DetPos].Y1, Poses[PersonPos].Y1, 0);
+      AssertEquals('box x2', Dets[DetPos].X2, Poses[PersonPos].X2, 0);
+      AssertEquals('box y2', Dets[DetPos].Y2, Poses[PersonPos].Y2, 0);
+      AssertEquals('box score', Dets[DetPos].Score, Poses[PersonPos].BoxScore, 0);
+      AssertTrue('box inside the photo', (Poses[PersonPos].X1 >= 0) and
+        (Poses[PersonPos].X2 <= Photo.SizeX) and (Poses[PersonPos].Y1 >= 0) and
+        (Poses[PersonPos].Y2 <= Photo.SizeY));
+      Joints := EstimateViTPoseInBox(PoseNN, PoseConfig, Photo,
+        Dets[DetPos].X1, Dets[DetPos].Y1, Dets[DetPos].X2 - Dets[DetPos].X1,
+        Dets[DetPos].Y2 - Dets[DetPos].Y1);
+      AssertEquals('joint count', PoseConfig.NumKeypoints,
+        Length(Poses[PersonPos].Joints));
+      for Joint := 0 to High(Joints) do
+      begin
+        AssertEquals('joint x', Joints[Joint].X, Poses[PersonPos].Joints[Joint].X, 0);
+        AssertEquals('joint y', Joints[Joint].Y, Poses[PersonPos].Joints[Joint].Y, 0);
+        AssertEquals('joint score', Joints[Joint].Score,
+          Poses[PersonPos].Joints[Joint].Score, 0);
+      end;
+      Inc(PersonPos);
+    end;
+    AssertEquals('one result per person box', PersonPos, Length(Poses));
+    AssertTrue('at least one person box', PersonPos > 0);
+    AssertTrue('at least one non-person box', OtherClassCount > 0);
+  finally
+    NetInput.Free;
+    Photo.Free;
+    PoseNN.Free;
+    YoloNN.Free;
   end;
 end;
 
