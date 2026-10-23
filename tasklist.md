@@ -659,6 +659,22 @@ rather than acted on.
                 the image with diffusers.
           - [ ] diffusers' upscale pipeline takes a batch of images and
                 num_images_per_prompt; the conditioner takes one image.
+      - [ ] SD tiled upscaling over MultiDiffusion + ControlNet Tile: today only
+            TQwenImage21Pipeline drives `TMultiDiffusionWindows`
+            (neuraldiffusion.pas); TStableDiffusionPipeline denoises one
+            latent window, so img2img above the UNet's trained size costs
+            quadratic attention and loses coherence. Route the SD
+            Denoise / img2img loop through `TMultiDiffusionWindows.Plan` (the
+            same window averaging, no new blending code), so `--panorama WxH`
+            and a new `--tile-upscale N` (bicubic-upscale the input image,
+            img2img at a low strength, per-window CFG) work on SD 1.x / 2.x.
+            Feed each window's matching crop of the upscaled image to
+            BuildControlNetFromSafeTensors as the hint for
+            lllyasviel/control_v11f1e_sd15_tile, and decode with the existing
+            `TiledVaeDecode`. Parity: a one-window canvas must equal plain img2img
+            bit-for-bit; a two-window pico canvas against diffusers
+            StableDiffusionPanoramaPipeline; README section in
+            examples/StableDiffusion.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
             pooled vector and time ids into SDUNetDenoiseSDXL; scaling 0.13025;
             the pipeline refuses addition_embed_type "text_time" today.
