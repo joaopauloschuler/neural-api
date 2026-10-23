@@ -390,6 +390,13 @@ rather than acted on.
         zero-filled 9x9); the full 3x3 convs of layer4 still need a native
         dilated TNNetConvolution (today only the X-axis FDilationX of the 1-D
         convs exists; TNNetConvolutionAbstract has FDilationY now).
+  - [ ] Memory: the real `rvm_mobilenetv3.pth` at 640x480, ratio 0.75 peaked at
+        1.7 GB RSS on CPU (dev box). Find which activations dominate (the
+        full-res refiner maps?) before 720p/1080p runs; check the low-memory
+        mode and whether the full-res layers can drop their outputs early.
+  - [ ] `TNNetBoxFilter` OpenCL forward reuses `cai_pool2d` (O(r^2) taps per
+        output). If a fast_guided_filter refiner with a large radius is wired,
+        add a separable two-pass (row then column running-sum) kernel.
   - [ ] fast_guided_filter refiner (TNNetBoxFilter) and segmentation_pass
         (project_seg) are not wired; the importer rejects a checkpoint
         without `refiner.box_filter.weight` when the ratio is < 1.
