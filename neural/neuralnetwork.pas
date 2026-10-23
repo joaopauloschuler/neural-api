@@ -746,13 +746,6 @@ type
       // to the owner's next weight-bearing layer (same class), raising on a graph
       // mismatch or a refused link. Coded by Claude (AI).
       procedure LinkBuildWeightOwner();
-      // Packs Neurons[FirstNeuronPos..+NeuronCount-1] (equal [Rows,1,VectorSize]
-      // shapes) into PackedRows for DotProductsPacked, one panel block per neuron.
-      procedure PackNeuronRows(PackedRows: TNNetVolume; FirstNeuronPos, NeuronCount: integer);
-      // Projection row t, block g := the PackNeuronRows rows of neuron g . Input
-      // row t + Neurons[FirstBiasPos + g]; Projection is (SeqLen, 1, NeuronCount*Rows).
-      procedure ComputePackedNeuronProjection(PackedRows, Input, Projection: TNNetVolume;
-        FirstNeuronPos, NeuronCount, FirstBiasPos: integer);
     public
       // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
       // indexed directly without the TNNetNeuronList method/bounds overhead.
@@ -11877,6 +11870,29 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Base of the (SeqLen,1,Depth) recurrent cells whose input gates are
+  // Neurons[0..GateCount-1], each [Depth,1,InputDepth]: the recurrence-independent
+  // W_g x_t + b_g of every step is one packed GEMM before the steps. Weights
+  // written outside the training/loading paths need FlushWeightCache.
+  TNNetInputProjectionCell = class(TNNetLayer)
+    protected
+      // (SeqLen,1,GateCount*Depth): gate g of step t at (t*GateCount + g)*Depth.
+      FInputProjection: TNNetVolume;
+      // Neurons[0..GateCount-1] in PackDotProductRows panels; rebuilt when stale.
+      FInputRowsPacked: TNNetVolume;
+      FInputRowsPackedStale: boolean;
+      procedure AfterWeightUpdate(); override;
+      // Sizes both buffers for the current FOutput / FPrevLayer shapes.
+      procedure SizeInputProjection(GateCount: integer);
+      // FInputProjection := Neurons[0..GateCount-1] . FPrevLayer.FOutput rows +
+      // Neurons[FirstBiasPos + g]; repacks the rows first when they are stale.
+      procedure ComputeInputProjection(GateCount, FirstBiasPos: integer);
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      function NonWeightBytes(): int64; override;
+  end;
+
   /// TNNetSLSTMCell: the SCALAR sLSTM cell of xLSTM (Beck et al. 2024,
   // "xLSTM: Extended Long Short-Term Memory", arXiv:2405.04517). A classic
   // LSTM-style multiplicative-gate recurrence, but with EXPONENTIAL input and
@@ -11910,7 +11926,7 @@ type
   // time, a right-to-left sweep carrying dL/dc, dL/dn and dL/dh, differentiating
   // the stabilized exp gates with m treated as a stop-gradient constant.
   // Coded by Claude (AI).
-  TNNetSLSTMCell = class(TNNetLayer)
+  TNNetSLSTMCell = class(TNNetInputProjectionCell)
     private
       FLi, FLf: TNNetVolume;      // cached log-gate args, (SeqLen,1,Depth)
       FIp, FFp: TNNetVolume;      // cached renormalized gates i'_t, f'_t
@@ -12021,7 +12037,7 @@ type
   // The non-log-space parameterization above is kept for this tiny-scale library;
   // a parallel-prefix-scan forward is a future follow-up.
   // Coded by Claude (AI).
-  TNNetMinGRU = class(TNNetLayer)
+  TNNetMinGRU = class(TNNetInputProjectionCell)
     private
       FZ, FHc: TNNetVolume;       // cached z_t, candidate ht~, (SeqLen,1,Depth)
       FHt: TNNetVolume;           // cached h_t, (SeqLen,1,Depth)
@@ -12136,7 +12152,7 @@ type
   // stabilizer, no recurrent gate feed). Forward is an explicit per-timestep scan
   // (O(SeqLen*Depth^2)); backward is BPTT carrying only dL/dh_t.
   // Coded by Claude (AI).
-  TNNetMinLSTM = class(TNNetLayer)
+  TNNetMinLSTM = class(TNNetInputProjectionCell)
     private
       FF, FI, FHc: TNNetVolume;   // cached f_t, i_t, candidate ht~, (SeqLen,1,Depth)
       FFp, FIp: TNNetVolume;      // cached normalized f'_t, i'_t, (SeqLen,1,Depth)
@@ -12191,9 +12207,8 @@ type
   // cache row, which step t does not write.
   // Create(Hidden) (FStruct[0]) reads any input Depth as torch's input_size:
   // W_i* are then [Hidden,1,InputDepth] and the output is (SeqLen,1,Hidden).
-  // Weights written outside the training/loading paths need FlushWeightCache.
   // Coded by Claude (AI).
-  TNNetLSTMCell = class(TNNetLayer)
+  TNNetLSTMCell = class(TNNetInputProjectionCell)
     private
       FIg, FFg, FGg, FOg: TNNetVolume; // cached i_t,f_t,g_t,o_t, (SeqLen,1,Depth)
       FC: TNNetVolume;                 // cached c_t, (SeqLen,1,Depth)
@@ -12203,11 +12218,6 @@ type
       FGhNext: TNNetVolume;            // dL/dh_{t-1} accumulator built during step t
       FGradW: array[0..7] of TNNetVolume;  // DepthxDepth grad accumulators
       FGradB: array[0..3] of TNNetVolume;  // Depth-long grad accumulators
-      // (SeqLen,1,4*Depth): W_i* x_t + b_* of every step, gate g at g*Depth.
-      FInputProjection: TNNetVolume;
-      // W_ii/W_if/W_ig/W_io packed by PackNeuronRows; rebuilt when stale.
-      FInputRowsPacked: TNNetVolume;
-      FInputRowsPackedStale: boolean;
       {$IFDEF OpenCL}
       // OpenCL offload (forward-only) of the input projections: the four input
       // weight matrices [0..3] are packed into one [4*Depth, InputDepth] slab
@@ -12219,8 +12229,8 @@ type
       // FWiPacked only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
       procedure ComputeOpenCL();
-      {$ENDIF}
       procedure AfterWeightUpdate(); override;
+      {$ENDIF}
       // Steps t = 0..SeqLen-1 from a filled FInputProjection (bias included).
       procedure ComputeRecurrence();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -12274,9 +12284,9 @@ type
   // projections W_i* x_t + b_* of every step up front as one packed GEMM
   // (FInputProjection), then runs the per-timestep recurrence; backward is BPTT
   // carrying dL/dh_t. Every gate of step t reads h_{t-1} from the previous FHt
-  // row. Weights written outside the training/loading paths need FlushWeightCache.
+  // row.
   // Coded by Claude (AI).
-  TNNetGRUCell = class(TNNetLayer)
+  TNNetGRUCell = class(TNNetInputProjectionCell)
     private
       FR, FZ, FN: TNNetVolume;     // cached r_t,z_t,n_t, (SeqLen,1,Depth)
       FWhn: TNNetVolume;           // cached (W_hn h_{t-1}+b_hn), (SeqLen,1,Depth)
@@ -12285,11 +12295,6 @@ type
       FGhNext: TNNetVolume;        // dL/dh_{t-1} accumulator built during step t
       FGradW: array[0..5] of TNNetVolume;  // DepthxDepth grad accumulators
       FGradB: array[0..3] of TNNetVolume;  // Depth-long grad accumulators (b_r,b_z,b_in,b_hn)
-      // (SeqLen,1,3*Depth): W_ir x_t + b_r, W_iz x_t + b_z, W_in x_t + b_in.
-      FInputProjection: TNNetVolume;
-      // W_ir/W_iz/W_in packed by PackNeuronRows; rebuilt when stale.
-      FInputRowsPacked: TNNetVolume;
-      FInputRowsPackedStale: boolean;
       {$IFDEF OpenCL}
       // OpenCL offload (forward-only) of the input projections: the three input
       // weight matrices [0..2] are packed into one [3*Depth, Depth] slab
@@ -12301,8 +12306,8 @@ type
       // FWiPacked only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
       procedure ComputeOpenCL();
-      {$ENDIF}
       procedure AfterWeightUpdate(); override;
+      {$ENDIF}
       // Steps t = 0..SeqLen-1 from a filled FInputProjection (bias included).
       procedure ComputeRecurrence();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -77485,6 +77490,68 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetInputProjectionCell }
+constructor TNNetInputProjectionCell.Create();
+begin
+  inherited Create();
+  FInputProjection := TNNetVolume.Create();
+  FInputRowsPacked := TNNetVolume.Create();
+  FInputRowsPackedStale := true;
+end;
+
+destructor TNNetInputProjectionCell.Destroy();
+begin
+  FInputRowsPacked.Free;
+  FInputProjection.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetInputProjectionCell.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  FInputRowsPackedStale := true;
+end;
+
+function TNNetInputProjectionCell.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FInputProjection) +
+    VolumeBytes(FInputRowsPacked);
+end;
+
+procedure TNNetInputProjectionCell.SizeInputProjection(GateCount: integer);
+begin
+  FInputProjection.ReSize(FOutput.SizeX, 1, GateCount * FOutput.Depth);
+  FInputRowsPacked.ReSize(GateCount * TNNetVolume.PackedDotProductFloats(
+    FOutput.Depth, FPrevLayer.FOutput.Depth), 1, 1);
+  FInputRowsPackedStale := true;
+end;
+
+procedure TNNetInputProjectionCell.ComputeInputProjection(GateCount,
+  FirstBiasPos: integer);
+var
+  Input: TNNetVolume;
+  GatePos, MaxGatePos, Depth, InputDepth, BlockFloats, ProjectionStride: integer;
+begin
+  Input := FPrevLayer.FOutput;
+  Depth := FOutput.Depth;
+  InputDepth := Input.Depth;
+  BlockFloats := TNNetVolume.PackedDotProductFloats(Depth, InputDepth);
+  MaxGatePos := GateCount - 1;
+  if FInputRowsPackedStale then
+  begin
+    for GatePos := 0 to MaxGatePos do
+      TNNetVolume.PackDotProductRows(FInputRowsPacked.GetRawPtr(GatePos * BlockFloats),
+        FNeurons[GatePos].FWeights.DataPtr, Depth, InputDepth);
+    FInputRowsPackedStale := false;
+  end;
+  ProjectionStride := GateCount * Depth;
+  for GatePos := 0 to MaxGatePos do
+    TNNetVolume.DotProductsPacked(FInputProjection.GetRawPtr(GatePos * Depth),
+      ProjectionStride, FInputRowsPacked.GetRawPtr(GatePos * BlockFloats), Depth,
+      Input.DataPtr, InputDepth, Input.SizeX, InputDepth,
+      FNeurons[FirstBiasPos + GatePos].FWeights.DataPtr);
+end;
+
 { TNNetSLSTMCell }
 constructor TNNetSLSTMCell.Create();
 var ii: integer;
@@ -77549,33 +77616,33 @@ begin
   FGhNext.ReSize(1, 1, Depth);
   for ii := 0 to 7 do FGradW[ii].ReSize(Depth, 1, Depth);
   for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, Depth);
+  SizeInputProjection(4);
   InitDefault();
 end;
 
 procedure TNNetSLSTMCell.Compute();
 var
   StartTime: double;
-  Wz, Wi, Wf, Wo, Rz, Ri, Rf, Ro, Bz, Bi, Bf, Bo, Prev: TNNetVolume;
-  SeqLen, Depth, t, d, j, baseT, idx, idxPrev, rowOfs: integer;
-  SeqLenM1, DepthM1: integer;
+  Rz, Ri, Rf, Ro: TNNetVolume;
+  SeqLen, Depth, t, d, baseT, idx, idxPrev, rowOfs: integer;
+  SeqLenM1, DepthM1, Depth2, Depth3, ProjectionBase: integer;
   liv, lfv, zv, ov, mPrev, mv, ip, fp, cPrev, nPrev, cv, nv, hv: TNeuralFloat;
   accZ, accI, accF, accO: TNeuralFloat;
-  XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
-  WzR, WiR, WfR, WoR, RzR, RiR, RfR, RoR: TNeuralFloatArrPtr;
+  OutPtr, HprevPtr, ProjZ, ProjI, ProjF, ProjO: TNeuralFloatArrPtr;
+  RzR, RiR, RfR, RoR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Prev := FPrevLayer.FOutput;
-  Wz := FNeurons[0].FWeights; Wi := FNeurons[1].FWeights;
-  Wf := FNeurons[2].FWeights; Wo := FNeurons[3].FWeights;
+  // b_z + W_z x_t, b_i + W_i x_t, b_f + W_f x_t, b_o + W_o x_t of every step.
+  ComputeInputProjection(4, 8);
   Rz := FNeurons[4].FWeights; Ri := FNeurons[5].FWeights;
   Rf := FNeurons[6].FWeights; Ro := FNeurons[7].FWeights;
-  Bz := FNeurons[8].FWeights; Bi := FNeurons[9].FWeights;
-  Bf := FNeurons[10].FWeights; Bo := FNeurons[11].FWeights;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
   SeqLenM1 := SeqLen - 1;
   DepthM1 := Depth - 1;
+  Depth2 := Depth + Depth; Depth3 := Depth2 + Depth;
+  ProjectionBase := 0;
   // FHprev holds the FROZEN h_{t-1} read by every gate of step t; FH receives the
   // new h_t. Reading FHprev (not FH) avoids letting an earlier channel's h_t leak
   // into a later channel's gate within the same timestep.
@@ -77583,32 +77650,24 @@ begin
   HprevPtr := FHprev.GetRawPtr(0, 0);
   for t := 0 to SeqLenM1 do
   begin
-    XtPtr := Prev.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
     baseT := t * Depth;
+    ProjZ := FInputProjection.GetRawPtr(ProjectionBase);
+    ProjI := FInputProjection.GetRawPtr(ProjectionBase + Depth);
+    ProjF := FInputProjection.GetRawPtr(ProjectionBase + Depth2);
+    ProjO := FInputProjection.GetRawPtr(ProjectionBase + Depth3);
+    Inc(ProjectionBase, Depth3 + Depth);
     rowOfs := 0;
     for d := 0 to DepthM1 do
     begin
       idx := baseT + d; idxPrev := idx - Depth;
-      WzR := Wz.GetRawPtr(rowOfs); WiR := Wi.GetRawPtr(rowOfs);
-      WfR := Wf.GetRawPtr(rowOfs); WoR := Wo.GetRawPtr(rowOfs);
       RzR := Rz.GetRawPtr(rowOfs); RiR := Ri.GetRawPtr(rowOfs);
       RfR := Rf.GetRawPtr(rowOfs); RoR := Ro.GetRawPtr(rowOfs);
-      // gate pre-activations: bias + W_*x_t + r_*h_{t-1}; each W/r row is
-      // depth-contiguous (GetRawPtr(d, 0)) and x_t/FHprev are contiguous, so
-      // the inner accumulation is exactly two AVX dot products per gate.
-      accZ := Bz.FData[d]
-            + TNNetVolume.DotProduct(WzR, XtPtr, Depth)
-            + TNNetVolume.DotProduct(RzR, HprevPtr, Depth);
-      accI := Bi.FData[d]
-            + TNNetVolume.DotProduct(WiR, XtPtr, Depth)
-            + TNNetVolume.DotProduct(RiR, HprevPtr, Depth);
-      accF := Bf.FData[d]
-            + TNNetVolume.DotProduct(WfR, XtPtr, Depth)
-            + TNNetVolume.DotProduct(RfR, HprevPtr, Depth);
-      accO := Bo.FData[d]
-            + TNNetVolume.DotProduct(WoR, XtPtr, Depth)
-            + TNNetVolume.DotProduct(RoR, HprevPtr, Depth);
+      // gate pre-activations: (bias + W_*x_t) + r_*h_{t-1}.
+      accZ := ProjZ^[d] + TNNetVolume.DotProduct(RzR, HprevPtr, Depth);
+      accI := ProjI^[d] + TNNetVolume.DotProduct(RiR, HprevPtr, Depth);
+      accF := ProjF^[d] + TNNetVolume.DotProduct(RfR, HprevPtr, Depth);
+      accO := ProjO^[d] + TNNetVolume.DotProduct(RoR, HprevPtr, Depth);
       liv := accI;                  // log input gate
       lfv := accF;                  // log forget gate
       zv := pcr_tanhf(accZ);             // cell input
@@ -78361,43 +78420,40 @@ begin
   FGh.ReSize(1, 1, Depth);
   for ii := 0 to 1 do FGradW[ii].ReSize(Depth, 1, Depth);
   for ii := 0 to 1 do FGradB[ii].ReSize(1, 1, Depth);
+  SizeInputProjection(2);
   InitDefault();
 end;
 
 procedure TNNetMinGRU.Compute();
 var
   StartTime: double;
-  Wz, Wh, Bz, Bh, Prev: TNNetVolume;
-  SeqLen, Depth, t, d, baseT, idx, rowOfs: integer;
+  SeqLen, Depth, t, d, baseT, idx, ProjectionBase: integer;
   SeqLenM1, DepthM1: integer;
-  zv, hcv, accZ, accH, hPrev, hv: TNeuralFloat;
-  XtPtr, OutPtr: TNeuralFloatArrPtr;
-  WzR, WhR: TNeuralFloatArrPtr;
+  zv, hcv, hPrev, hv: TNeuralFloat;
+  OutPtr, ProjZ, ProjH: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Prev := FPrevLayer.FOutput;
-  Wz := FNeurons[0].FWeights; Wh := FNeurons[1].FWeights;
-  Bz := FNeurons[2].FWeights; Bh := FNeurons[3].FWeights;
+  // b_z + W_z x_t and b_h + W_h x_t of every step.
+  ComputeInputProjection(2, 2);
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
   SeqLenM1 := SeqLen - 1;
   DepthM1 := Depth - 1;
   FHprev.Fill(0);
+  ProjectionBase := 0;
   for t := 0 to SeqLenM1 do
   begin
-    XtPtr := Prev.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
+    ProjZ := FInputProjection.GetRawPtr(ProjectionBase);
+    ProjH := FInputProjection.GetRawPtr(ProjectionBase + Depth);
+    Inc(ProjectionBase, Depth + Depth);
     baseT := t * Depth;
-    rowOfs := 0;
     for d := 0 to DepthM1 do
     begin
       idx := baseT + d;
-      WzR := Wz.GetRawPtr(rowOfs); WhR := Wh.GetRawPtr(rowOfs);
-      accZ := Bz.FData[d] + TNNetVolume.DotProduct(WzR, XtPtr, Depth);
-      accH := Bh.FData[d] + TNNetVolume.DotProduct(WhR, XtPtr, Depth);
-      zv := Sigmoid(accZ);   // update gate
-      hcv := accH;           // candidate hidden (linear)
+      zv := Sigmoid(ProjZ^[d]);   // update gate
+      hcv := ProjH^[d];           // candidate hidden (linear)
       hPrev := FHprev.FData[d];
       FZ.FData[idx] := zv;
       FHc.FData[idx] := hcv;
@@ -78405,7 +78461,6 @@ begin
       FH.FData[d] := hv;
       FHt.FData[idx] := hv;
       OutPtr^[d] := hv;
-      Inc(rowOfs, Depth);
     end;
     FHprev.Copy(FH);
   end;
@@ -78978,47 +79033,43 @@ begin
   FGh.ReSize(1, 1, Depth);
   for ii := 0 to 2 do FGradW[ii].ReSize(Depth, 1, Depth);
   for ii := 0 to 2 do FGradB[ii].ReSize(1, 1, Depth);
+  SizeInputProjection(3);
   InitDefault();
 end;
 
 procedure TNNetMinLSTM.Compute();
 var
   StartTime: double;
-  Wf, Wi, Wh, Bf, Bi, Bh, Prev: TNNetVolume;
-  SeqLen, Depth, t, d, baseT, idx, rowOfs: integer;
-  SeqLenM1, DepthM1: integer;
-  fv, iv, hcv, accF, accI, accH, denom, fpr, ipr, hPrev, hv: TNeuralFloat;
-  XtPtr, OutPtr: TNeuralFloatArrPtr;
-  WfR, WiR, WhR: TNeuralFloatArrPtr;
+  SeqLen, Depth, t, d, baseT, idx, ProjectionBase: integer;
+  SeqLenM1, DepthM1, Depth2: integer;
+  fv, iv, hcv, denom, fpr, ipr, hPrev, hv: TNeuralFloat;
+  OutPtr, ProjF, ProjI, ProjH: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Prev := FPrevLayer.FOutput;
-  Wf := FNeurons[0].FWeights; Wi := FNeurons[1].FWeights;
-  Wh := FNeurons[2].FWeights; Bf := FNeurons[3].FWeights;
-  Bi := FNeurons[4].FWeights; Bh := FNeurons[5].FWeights;
+  // b_f + W_f x_t, b_i + W_i x_t and b_h + W_h x_t of every step.
+  ComputeInputProjection(3, 3);
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
   SeqLenM1 := SeqLen - 1;
   DepthM1 := Depth - 1;
+  Depth2 := Depth + Depth;
   FHprev.Fill(0);
+  ProjectionBase := 0;
   for t := 0 to SeqLenM1 do
   begin
-    XtPtr := Prev.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
+    ProjF := FInputProjection.GetRawPtr(ProjectionBase);
+    ProjI := FInputProjection.GetRawPtr(ProjectionBase + Depth);
+    ProjH := FInputProjection.GetRawPtr(ProjectionBase + Depth2);
+    Inc(ProjectionBase, Depth2 + Depth);
     baseT := t * Depth;
-    rowOfs := 0;
     for d := 0 to DepthM1 do
     begin
       idx := baseT + d;
-      WfR := Wf.GetRawPtr(rowOfs); WiR := Wi.GetRawPtr(rowOfs);
-      WhR := Wh.GetRawPtr(rowOfs);
-      accF := Bf.FData[d] + TNNetVolume.DotProduct(WfR, XtPtr, Depth);
-      accI := Bi.FData[d] + TNNetVolume.DotProduct(WiR, XtPtr, Depth);
-      accH := Bh.FData[d] + TNNetVolume.DotProduct(WhR, XtPtr, Depth);
-      fv := Sigmoid(accF);   // forget gate
-      iv := Sigmoid(accI);   // input gate
-      hcv := accH;           // candidate hidden (linear)
+      fv := Sigmoid(ProjF^[d]);   // forget gate
+      iv := Sigmoid(ProjI^[d]);   // input gate
+      hcv := ProjH^[d];           // candidate hidden (linear)
       denom := fv + iv;      // both > 0 -> denom > 0
       fpr := fv / denom;
       ipr := iv / denom;
@@ -79030,7 +79081,6 @@ begin
       FH.FData[d] := hv;
       FHt.FData[idx] := hv;
       OutPtr^[d] := hv;
-      Inc(rowOfs, Depth);
     end;
     FHprev.Copy(FH);
   end;
@@ -79183,9 +79233,6 @@ begin
   FHt := TNNetVolume.Create();
   FGc := TNNetVolume.Create(); FGh := TNNetVolume.Create();
   FGhNext := TNNetVolume.Create();
-  FInputProjection := TNNetVolume.Create();
-  FInputRowsPacked := TNNetVolume.Create();
-  FInputRowsPackedStale := true;
   for ii := 0 to 7 do FGradW[ii] := TNNetVolume.Create();
   for ii := 0 to 3 do FGradB[ii] := TNNetVolume.Create();
   AddMissingNeurons(12);
@@ -79194,21 +79241,19 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF OpenCL}
 procedure TNNetLSTMCell.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
-  FInputRowsPackedStale := true;
-  {$IFDEF OpenCL}
   FGpuWeightsDirty := true; // next device forward re-packs + re-uploads FWiPacked
-  {$ENDIF}
 end;
+{$ENDIF}
 
 destructor TNNetLSTMCell.Destroy();
 var ii: integer;
 begin
   for ii := 0 to 3 do FGradB[ii].Free;
   for ii := 0 to 7 do FGradW[ii].Free;
-  FInputRowsPacked.Free; FInputProjection.Free;
   FGhNext.Free; FGh.Free; FGc.Free;
   FHt.Free; FTanhC.Free; FC.Free;
   FOg.Free; FGg.Free; FFg.Free; FIg.Free;
@@ -79268,7 +79313,6 @@ begin
   Result := inherited NonWeightBytes() +
     VolumeBytes(FIg) + VolumeBytes(FFg) + VolumeBytes(FGg) + VolumeBytes(FOg) +
     VolumeBytes(FC) + VolumeBytes(FTanhC) + VolumeBytes(FHt) +
-    VolumeBytes(FInputProjection) + VolumeBytes(FInputRowsPacked) +
     VolumeBytes(FGc) + VolumeBytes(FGh) + VolumeBytes(FGhNext);
   for ii := 0 to 7 do Result := Result + VolumeBytes(FGradW[ii]);
   for ii := 0 to 3 do Result := Result + VolumeBytes(FGradB[ii]);
@@ -79287,10 +79331,7 @@ begin
   FGg.ReSize(CacheRows, 1, Depth); FOg.ReSize(CacheRows, 1, Depth);
   FC.ReSize(CacheRows, 1, Depth);  FTanhC.ReSize(CacheRows, 1, Depth);
   FHt.ReSize(CacheRows, 1, Depth);
-  FInputProjection.ReSize(FOutput.SizeX, 1, 4 * Depth);
-  FInputRowsPacked.ReSize(4 * TNNetVolume.PackedDotProductFloats(Depth,
-    InputDepth), 1, 1);
-  FInputRowsPackedStale := true;
+  SizeInputProjection(4);
   if FIsTrainable then
   begin
     FGc.ReSize(1, 1, Depth); FGh.ReSize(1, 1, Depth); FGhNext.ReSize(1, 1, Depth);
@@ -79482,13 +79523,7 @@ begin
   end;
   {$ENDIF}
   StartTime := Now();
-  if FInputRowsPackedStale then
-  begin
-    PackNeuronRows(FInputRowsPacked, 0, 4);
-    FInputRowsPackedStale := false;
-  end;
-  ComputePackedNeuronProjection(FInputRowsPacked, FPrevLayer.FOutput,
-    FInputProjection, 0, 4, 8);
+  ComputeInputProjection(4, 8);
   ComputeRecurrence();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -79657,9 +79692,6 @@ begin
   FN := TNNetVolume.Create(); FWhn := TNNetVolume.Create();
   FHt := TNNetVolume.Create();
   FGh := TNNetVolume.Create(); FGhNext := TNNetVolume.Create();
-  FInputProjection := TNNetVolume.Create();
-  FInputRowsPacked := TNNetVolume.Create();
-  FInputRowsPackedStale := true;
   for ii := 0 to 5 do FGradW[ii] := TNNetVolume.Create();
   for ii := 0 to 3 do FGradB[ii] := TNNetVolume.Create();
   AddMissingNeurons(11);
@@ -79668,21 +79700,19 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF OpenCL}
 procedure TNNetGRUCell.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
-  FInputRowsPackedStale := true;
-  {$IFDEF OpenCL}
   FGpuWeightsDirty := true; // next device forward re-packs + re-uploads FWiPacked
-  {$ENDIF}
 end;
+{$ENDIF}
 
 destructor TNNetGRUCell.Destroy();
 var ii: integer;
 begin
   for ii := 0 to 3 do FGradB[ii].Free;
   for ii := 0 to 5 do FGradW[ii].Free;
-  FInputRowsPacked.Free; FInputProjection.Free;
   FGhNext.Free; FGh.Free;
   FHt.Free; FWhn.Free;
   FN.Free; FZ.Free; FR.Free;
@@ -79722,10 +79752,7 @@ begin
   FR.ReSize(FOutput.SizeX, 1, Depth); FZ.ReSize(FOutput.SizeX, 1, Depth);
   FN.ReSize(FOutput.SizeX, 1, Depth); FWhn.ReSize(FOutput.SizeX, 1, Depth);
   FHt.ReSize(FOutput.SizeX, 1, Depth);
-  FInputProjection.ReSize(FOutput.SizeX, 1, 3 * Depth);
-  FInputRowsPacked.ReSize(3 * TNNetVolume.PackedDotProductFloats(Depth, Depth),
-    1, 1);
-  FInputRowsPackedStale := true;
+  SizeInputProjection(3);
   FGh.ReSize(1, 1, Depth); FGhNext.ReSize(1, 1, Depth);
   for ii := 0 to 5 do FGradW[ii].ReSize(Depth, 1, Depth);
   for ii := 0 to 3 do FGradB[ii].ReSize(1, 1, Depth);
@@ -79899,13 +79926,7 @@ begin
   end;
   {$ENDIF}
   StartTime := Now();
-  if FInputRowsPackedStale then
-  begin
-    PackNeuronRows(FInputRowsPacked, 0, 3);
-    FInputRowsPackedStale := false;
-  end;
-  ComputePackedNeuronProjection(FInputRowsPacked, FPrevLayer.FOutput,
-    FInputProjection, 0, 3, 6);
+  ComputeInputProjection(3, 6);
   ComputeRecurrence();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -151423,43 +151444,6 @@ end;
 procedure TNNetLayer.FlushWeightCache();
 begin
   AfterWeightUpdate();
-end;
-
-procedure TNNetLayer.PackNeuronRows(PackedRows: TNNetVolume;
-  FirstNeuronPos, NeuronCount: integer);
-var
-  NeuronPos, MaxNeuronPos, RowCount, VectorSize, BlockFloats, BlockStart: integer;
-begin
-  RowCount := FNeurons[FirstNeuronPos].FWeights.SizeX;
-  VectorSize := FNeurons[FirstNeuronPos].FWeights.Depth;
-  BlockFloats := TNNetVolume.PackedDotProductFloats(RowCount, VectorSize);
-  PackedRows.ReSize(NeuronCount * BlockFloats, 1, 1);
-  MaxNeuronPos := FirstNeuronPos + NeuronCount - 1;
-  BlockStart := 0;
-  for NeuronPos := FirstNeuronPos to MaxNeuronPos do
-  begin
-    TNNetVolume.PackDotProductRows(PackedRows.GetRawPtr(BlockStart),
-      FNeurons[NeuronPos].FWeights.DataPtr, RowCount, VectorSize);
-    Inc(BlockStart, BlockFloats);
-  end;
-end;
-
-procedure TNNetLayer.ComputePackedNeuronProjection(PackedRows, Input,
-  Projection: TNNetVolume; FirstNeuronPos, NeuronCount, FirstBiasPos: integer);
-var
-  BlockPos, MaxBlockPos, RowCount, VectorSize, BlockFloats: integer;
-  ProjectionStride: integer;
-begin
-  RowCount := FNeurons[FirstNeuronPos].FWeights.SizeX;
-  VectorSize := Input.Depth;
-  BlockFloats := TNNetVolume.PackedDotProductFloats(RowCount, VectorSize);
-  ProjectionStride := NeuronCount * RowCount;
-  MaxBlockPos := NeuronCount - 1;
-  for BlockPos := 0 to MaxBlockPos do
-    TNNetVolume.DotProductsPacked(Projection.GetRawPtr(BlockPos * RowCount),
-      ProjectionStride, PackedRows.GetRawPtr(BlockPos * BlockFloats), RowCount,
-      Input.DataPtr, VectorSize, Input.SizeX, VectorSize,
-      FNeurons[FirstBiasPos + BlockPos].FWeights.DataPtr);
 end;
 
 procedure TNNetLayer.ClearTimes();

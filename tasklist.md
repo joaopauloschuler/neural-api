@@ -1249,8 +1249,14 @@ rather than acted on.
           its first forward after every `PrepareStageA`. The owner could hold
           one packed copy, as `ShareOwnerWeightCaches` does for the conv cache.
           Under OpenCL the CPU packed copy is sized but unused.
-        - [ ] The LSTM/GRU input projection runs on one thread (no position
+        - [ ] The input projection (`TNNetInputProjectionCell`, base of the
+          LSTM/GRU/sLSTM/minGRU/minLSTM cells) runs on one thread (no position
           split over the pool); not measured (1-core box).
+        - [ ] `TNNetMLSTMCell`, `TNNetDeltaNet` and `TNNetClosedFormContinuous`
+          still compute their input projections as per-step dot products; they
+          do not fit `TNNetInputProjectionCell` as is (q/k/v rows with a scale,
+          a beta row, non-contiguous gate neurons). `TNNetConvLSTMCell`'s input
+          convolution is recurrence-independent too.
         - [ ] Real-checkpoint stage A on a GPU: not run (PoCL parity on the tiny
           fixture only). The AdaLayerNorms after the bi-LSTMs run on the CPU
           unless forced, because the LSTM output is on RAM.

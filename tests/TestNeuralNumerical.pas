@@ -40384,6 +40384,7 @@ begin
     L.Neurons[10].Weights.Raw[d] := Cos(d * 0.6) * 0.2 + 0.5; // b_f
     L.Neurons[11].Weights.Raw[d] := Sin(d * 0.7) * 0.3;  // b_o
   end;
+  L.FlushWeightCache();
 end;
 
 procedure TTestNeuralNumerical.TestSLSTMCellInputGradientCheck;
@@ -40504,10 +40505,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
 
         NN.Compute(Input);
@@ -40877,6 +40881,7 @@ begin
     L.Neurons[2].Weights.Raw[d] := Cos(d * 0.5) * 0.3;  // b_z
     L.Neurons[3].Weights.Raw[d] := Sin(d * 0.7) * 0.3;  // b_h
   end;
+  L.FlushWeightCache();
 end;
 
 // Exercises both sigmoid gates, the coupled f/(f+i) normalization and the
@@ -40896,6 +40901,7 @@ begin
     L.Neurons[4].Weights.Raw[d] := Sin(d * 0.4) * 0.2;       // b_i
     L.Neurons[5].Weights.Raw[d] := Sin(d * 0.7) * 0.3;       // b_h
   end;
+  L.FlushWeightCache();
 end;
 
 procedure TTestNeuralNumerical.TestMinGRUInputGradientCheck;
@@ -41010,10 +41016,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
 
         NN.Compute(Input);
@@ -41158,10 +41167,13 @@ begin
       for i := 0 to L.Neurons[n].Weights.Size - 1 do
       begin
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         lossPlus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        L.FlushWeightCache();
         lossMinus := ComputeLoss;
         L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        L.FlushWeightCache();
         numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
 
         NN.Compute(Input);
