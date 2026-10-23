@@ -12,7 +12,11 @@ uses the previous ones.
 **Status: coded; tested on CPU with the real `rvm_mobilenetv3.pth`, not yet on
 a GPU.** The importer is parity-tested against the official `model.py` on a
 random pico net (`TestRVMParity`, 1.2e-7 over 3 frames), and the OpenCL forward
-matches the CPU forward (`TestRVMOpenCLParity`). The real MobileNetV3
+matches the CPU forward (`TestRVMOpenCLParity`). The ResNet-50 variant
+(`rvm_resnet50.pth`) is coded and parity-tested on a random pico net with the
+real ResNet50Encoder wiring (`TestRVMResNet50Parity`, 1.8e-7 over 3 frames;
+OpenCL in `TestRVMResNet50OpenCLParity`), but not yet run with the real
+checkpoint. The real MobileNetV3
 checkpoint matched the official model to 2.9e-6 on a 128x96 clip (a one-off
 check). On a 640x480 4-frame clip on one CPU core, the example took about
 1.4 s per frame after the first (ratio 0.75) and about 1.7 GB of RAM.
@@ -22,7 +26,8 @@ check). On a 640x480 4-frame clip on one CPU core, the example took about
 1. The program lists the PNG / JPEG files of `--input`, sorted by name with
    numbers compared by value (`f2.png` before `f10.png`).
 2. It builds the net for the first frame's size and `--ratio`. With a ratio
-   below 1, the net downsamples the frame, runs MobileNetV3 + LR-ASPP + the
+   below 1, the net downsamples the frame, runs the backbone (MobileNetV3, or
+   ResNet-50 with a dilated layer4, picked from the checkpoint keys) + LR-ASPP + the
    recurrent decoder at low resolution, and the Deep Guided Filter refiner
    brings the matte back to full resolution.
 3. `TRVMMatting.Step` runs one frame and copies the four ConvGRU outputs back
@@ -41,6 +46,7 @@ the first frame's size and leaves frames of another size out.
 ./VideoMatting                                                  # pico fixture smoke run
 ./VideoMatting --model rvm_mobilenetv3.pth --input frames --output matted
 ./VideoMatting --model rvm_mobilenetv3.pth --input frames --output matted --ratio 0.25 --gif matted.gif --gpu
+./VideoMatting --model rvm_resnet50.pth --input frames --output matted --gpu
 ```
 
 To turn a video into frames and back, use for example ffmpeg:
@@ -52,7 +58,7 @@ ffmpeg -framerate 30 -i matted/%05d_green.png matted.mp4
 
 | option | meaning | default |
 | --- | --- | --- |
-| `--model FILE` | `rvm_mobilenetv3.pth` (or a `.safetensors` copy of it) | smoke run |
+| `--model FILE` | `rvm_mobilenetv3.pth` or `rvm_resnet50.pth` (or a `.safetensors` copy) | smoke run |
 | `--input DIR` | folder of consecutive frames of one clip, PNG / JPEG | required with `--model` |
 | `--output DIR` | output folder for `<frame>_rgba.png` and `<frame>_green.png` (created if missing) | required with `--model` |
 | `--ratio R` | downsample ratio in (0, 1] for the backbone | see below |
@@ -81,12 +87,13 @@ the size ratio; the two agree exactly when `width * ratio` and
 
 ## Checkpoint
 
-Download `rvm_mobilenetv3.pth` from the
+Download `rvm_mobilenetv3.pth` or `rvm_resnet50.pth` from the
 [RobustVideoMatting releases](https://github.com/PeterL1n/RobustVideoMatting/releases)
 and pass it to `--model`; no conversion is needed. The weights are released
 under **GPL-3.0**; read the license before you redistribute anything built on
-them. This repository does not include them. The ResNet-50 checkpoint
-(`rvm_resnet50.pth`) is not supported yet.
+them. This repository does not include them. The ResNet-50 net is larger
+(26.9M parameters against 3.7M, per the RVM README) and the RVM authors report
+a slightly better matte.
 
 With no arguments, the program writes three 44x36 frames and one 40x32 frame of
 a disc moving over a gradient into `rvm_smoke_frames/`, mattes them with the

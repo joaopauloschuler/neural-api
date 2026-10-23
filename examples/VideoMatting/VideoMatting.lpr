@@ -1,7 +1,8 @@
 program VideoMatting;
 (*
-VideoMatting: Robust Video Matting (Lin et al., WACV 2022) with the MobileNetV3
-importer in neuralpretrained.pas (BuildRVMFromSafeTensors + TRVMMatting).
+VideoMatting: Robust Video Matting (Lin et al., WACV 2022) with the RVM
+importer in neuralpretrained.pas (BuildRVMFromSafeTensors + TRVMMatting); the
+MobileNetV3 or ResNet-50 backbone is detected from the checkpoint.
 
 Two modes:
   * no arguments: a smoke of the committed random pico fixture
@@ -9,7 +10,7 @@ Two modes:
     (one of them of another size), matte them, write the outputs.
   * --model FILE --input DIR --output DIR: matte every PNG / JPEG frame of a
     folder (sorted by name, numbers compared by value) with the real
-    rvm_mobilenetv3.pth.
+    rvm_mobilenetv3.pth or rvm_resnet50.pth.
 
 RVM is recurrent: four ConvGRU states carry what the net saw in the previous
 frames, so the frames must be consecutive frames of one clip. For each frame
@@ -52,7 +53,8 @@ procedure PrintUsage();
 begin
   WriteLn('Usage: VideoMatting                          (pico fixture smoke)');
   WriteLn('       VideoMatting --model FILE --input DIR --output DIR [options]');
-  WriteLn('  --model FILE         rvm_mobilenetv3.pth (or a .safetensors of it)');
+  WriteLn('  --model FILE         rvm_mobilenetv3.pth or rvm_resnet50.pth ',
+    '(or a .safetensors of it)');
   WriteLn('  --input DIR          folder of consecutive frames (PNG / JPEG), ',
     'sorted by name');
   WriteLn('  --output DIR         writes <frame>_rgba.png and <frame>_green.png');

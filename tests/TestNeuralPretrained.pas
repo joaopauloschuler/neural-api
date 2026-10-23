@@ -194,9 +194,11 @@ type
     // a*b*; with pRoundTrip a save/load copy must reproduce the output exactly.
     function DDColorParityMaxDiff(const WeightsFile: string;
       pRoundTrip: boolean; out Config: TDDColorConfig): double;
-    function RVMSequenceMaxDiff(const Prefix: string;
+    function RVMSequenceMaxDiff(const Base, Prefix: string;
       FrameWidth, FrameHeight: integer; Ratio: double; Frames: integer;
       out Config: TRVMConfig): double;
+    procedure RunRVMOpenCLParity(const Base: string; FrameWidth,
+      FrameHeight: integer);
     function GFPGANParityMaxDiff(const WeightsFile, IOFile, ConfigFile: string;
       pRoundTrip: boolean; out Config: TGFPGANConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
@@ -1508,6 +1510,9 @@ type
     procedure TestRVMNoRefinerParity;
     procedure TestRVMRoundTrip;
     procedure TestRVMOpenCLParity;
+    procedure TestRVMResNet50Parity;
+    procedure TestRVMResNet50NoRefinerParity;
+    procedure TestRVMResNet50OpenCLParity;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -54899,9 +54904,9 @@ begin
 end;
 {$ENDIF}
 
-// Builds the pico RVM for one tiny_rvm_mobilenetv3_io.safetensors sequence and
+// Builds the pico RVM <Base>.pth for one <Base>_io.safetensors sequence and
 // returns the max |diff| of the RGBA matte and the r1..r4 states over Frames.
-function TTestNeuralPretrained.RVMSequenceMaxDiff(const Prefix: string;
+function TTestNeuralPretrained.RVMSequenceMaxDiff(const Base, Prefix: string;
   FrameWidth, FrameHeight: integer; Ratio: double; Frames: integer;
   out Config: TRVMConfig): double;
 var
@@ -54913,10 +54918,9 @@ var
 begin
   Result := 0;
   Matting := TRVMMatting.Create(BuildRVMFromSafeTensors(
-    FixturePath('tiny_rvm_mobilenetv3.pth'), FrameWidth, FrameHeight, Ratio,
+    FixturePath(Base + '.pth'), FrameWidth, FrameHeight, Ratio,
     Config, {pTrainable=}false));
-  IO := TNNetSafeTensorsReader.Create(
-    FixturePath('tiny_rvm_mobilenetv3_io.safetensors'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath(Base + '_io.safetensors'));
   Frame := TNNetVolume.Create;
   Matte := TNNetVolume.Create;
   Expected := TNNetVolume.Create;
@@ -54967,7 +54971,8 @@ var
   Config: TRVMConfig;
   MaxDiff: double;
 begin
-  MaxDiff := RVMSequenceMaxDiff('dgf', 44, 36, 0.5, 3, Config);
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_mobilenetv3', 'dgf', 44, 36, 0.5, 3,
+    Config);
   WriteLn('  RVM pico (DGF, 3 frames) max|diff| = ', MaxDiff:0:9);
   AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
     ' must be < 1e-4', MaxDiff < 1e-4);
@@ -54987,7 +54992,8 @@ var
   Config: TRVMConfig;
   MaxDiff: double;
 begin
-  MaxDiff := RVMSequenceMaxDiff('full', 22, 18, 1, 2, Config);
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_mobilenetv3', 'full', 22, 18, 1, 2,
+    Config);
   WriteLn('  RVM pico (ratio 1, 2 frames) max|diff| = ', MaxDiff:0:9);
   AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
     ' must be < 1e-4', MaxDiff < 1e-4);
@@ -55038,9 +55044,10 @@ begin
   end;
 end;
 
-// The pico net under EnableOpenCL, then also ForceOpenCL, against the host net
-// frame by frame over the 3-frame DGF sequence (state carried on both).
-procedure TTestNeuralPretrained.TestRVMOpenCLParity;
+// The pico net <Base>.pth under EnableOpenCL, then also ForceOpenCL, against the
+// host net frame by frame over the 3-frame DGF sequence (state carried on both).
+procedure TTestNeuralPretrained.RunRVMOpenCLParity(const Base: string;
+  FrameWidth, FrameHeight: integer);
 {$IFDEF OpenCL}
 var
   Config: TRVMConfig;
@@ -55058,12 +55065,11 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  OnHost := TRVMMatting.Create(BuildRVMFromSafeTensors(
-    FixturePath('tiny_rvm_mobilenetv3.pth'), 44, 36, 0.5, Config, false));
-  OnOpenCL := TRVMMatting.Create(BuildRVMFromSafeTensors(
-    FixturePath('tiny_rvm_mobilenetv3.pth'), 44, 36, 0.5, Config, false));
-  IO := TNNetSafeTensorsReader.Create(
-    FixturePath('tiny_rvm_mobilenetv3_io.safetensors'));
+  OnHost := TRVMMatting.Create(BuildRVMFromSafeTensors(FixturePath(Base +
+    '.pth'), FrameWidth, FrameHeight, 0.5, Config, false));
+  OnOpenCL := TRVMMatting.Create(BuildRVMFromSafeTensors(FixturePath(Base +
+    '.pth'), FrameWidth, FrameHeight, 0.5, Config, false));
+  IO := TNNetSafeTensorsReader.Create(FixturePath(Base + '_io.safetensors'));
   Frame := TNNetVolume.Create;
   MatteCL := TNNetVolume.Create;
   MatteCPU := TNNetVolume.Create;
@@ -55108,6 +55114,55 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+procedure TTestNeuralPretrained.TestRVMOpenCLParity;
+begin
+  RunRVMOpenCLParity('tiny_rvm_mobilenetv3', 44, 36);
+end;
+
+// tiny_rvm_resnet50.*: model.py with the real ResNet50Encoder over a pico
+// torchvision Bottleneck body (blocks [2,1,1,2], layer4 dilated); 80x64, ratio 0.5.
+procedure TTestNeuralPretrained.TestRVMResNet50Parity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_resnet50', 'dgf', 80, 64, 0.5, 3,
+    Config);
+  WriteLn('  RVM ResNet-50 pico (DGF, 3 frames) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+  AssertEquals('variant', 'resnet50', Config.Variant);
+  AssertEquals('stem width', 8, Config.ResNet.StemWidth);
+  AssertEquals('layer1 blocks', 2, Config.ResNet.BlocksPerStage[0]);
+  AssertEquals('layer4 blocks', 2, Config.ResNet.BlocksPerStage[3]);
+  AssertEquals('layer4 width', 16, Config.ResNet.StageWidths[3]);
+  AssertEquals('expansion', 4, Config.ResNet.Expansion);
+  AssertTrue('layer4 dilated', Config.ResNet.ReplaceStrideWithDilation[3]);
+  AssertEquals('f1 width', 8, Config.FeatureChannels[0]);
+  AssertEquals('f2 width', 16, Config.FeatureChannels[1]);
+  AssertEquals('f3 width', 32, Config.FeatureChannels[2]);
+  AssertEquals('LR-ASPP width', 16, Config.FeatureChannels[3]);
+end;
+
+// ResNet-50 pico at downsample_ratio 1 (no refiner): 2 frames of 76x52, odd
+// sizes down the trunk (38x26 .. 5x4 at layer4).
+procedure TTestNeuralPretrained.TestRVMResNet50NoRefinerParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_resnet50', 'full', 76, 52, 1, 2,
+    Config);
+  WriteLn('  RVM ResNet-50 pico (ratio 1, 2 frames) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+procedure TTestNeuralPretrained.TestRVMResNet50OpenCLParity;
+begin
+  RunRVMOpenCLParity('tiny_rvm_resnet50', 80, 64);
+end;
 
 // DDColorPrepareInput keeps only L (gray RGB in [0,1]); DDColorComposeOutput keeps
 // the source L and takes the chroma from the a*b* volume.

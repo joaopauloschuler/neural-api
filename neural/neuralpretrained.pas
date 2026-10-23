@@ -10527,7 +10527,11 @@ type
                                      // BuildResNet stem comment. Default false
                                      // for the pico CAI-oracle parity fixtures;
                                      // real-checkpoint loaders set it true.
+    // torchvision replace_stride_with_dilation per layer1..layer4 ([0] unused):
+    // the stage keeps stride 1 and dilates its later 3x3 convs instead.
+    ReplaceStrideWithDilation: array[0..3] of boolean;
   end;
+
 
 // Reads a torchvision-style ResNet config. The only REQUIRED field is "depth"
 // (18 / 34 / 50). Optional overrides: image_size (224), num_channels (3),
@@ -15915,9 +15919,10 @@ procedure DDColorColorize(NN: TNNet; const Config: TDDColorConfig;
 
 // ---------------------------------------------------------------------------
 // ROBUST VIDEO MATTING IMPORT (Lin et al. WACV 2022, PeterL1n/RobustVideoMatting
-// rvm_mobilenetv3.pth; GPL-3.0 weights, loaded at run time only). One TNNet per
-// frame size: frame (W, H, 3) RGB in [0,1] -> bilinear downsample by
-// DownsampleRatio -> MobileNetV3-Large (last stage dilated) -> LR-ASPP ->
+// rvm_mobilenetv3.pth / rvm_resnet50.pth; GPL-3.0 weights, loaded at run time
+// only). One TNNet per frame size: frame (W, H, 3) RGB in [0,1] -> bilinear
+// downsample by DownsampleRatio -> MobileNetV3-Large (last stage dilated) or
+// ResNet-50 (layer4 dilated, no input normalization) -> LR-ASPP ->
 // recurrent decoder (ConvGRU on half the channels at 1/16, 1/8, 1/4, 1/2) ->
 // fgr residual + alpha, then (ratio < 1) the Deep Guided Filter refiner back to
 // full size. Output (W, H, 4) = clamped foreground RGB + alpha. The four GRU
@@ -15927,8 +15932,9 @@ procedure DDColorColorize(NN: TNNet; const Config: TDDColorConfig;
 // Coded by Claude (AI).
 type
   TRVMConfig = record
-    Variant: string;                         // 'mobilenetv3'
-    Backbone: TMobileNetV3Config;            // inferred from the checkpoint
+    Variant: string;                         // 'mobilenetv3' or 'resnet50'
+    Backbone: TMobileNetV3Config;            // mobilenetv3 trunk (from shapes)
+    ResNet: TResNetConfig;                   // resnet50 trunk (from shapes)
     FeatureChannels: array[0..3] of integer; // f1, f2, f3 widths + LR-ASPP width
     DecoderChannels: array[0..3] of integer; // decode3, decode2, decode1, decode0
     RefinerHidden: integer;                  // DGF hid_channels (16); 0 = absent
@@ -15938,8 +15944,8 @@ type
     BnEps: TNeuralFloat;                     // decoder/LR-ASPP/refiner BN eps
   end;
 
-// Reads every width from the checkpoint shapes (MobileNetV3 variant only) and
-// sets the frame size and downsample ratio (0 < ratio <= 1).
+// Detects the variant from the backbone keys, reads every width from the
+// checkpoint shapes and sets the frame size and downsample ratio (0, 1].
 function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
   FrameWidth, FrameHeight: integer; DownsampleRatio: double): TRVMConfig;
 
@@ -66553,6 +66559,7 @@ begin
     // use PyTorch (floor) maxpool sizing to match top-1. The pico CAI-oracle
     // fixtures opt back to legacy CAI ceil sizing via "cai_maxpool": true.
     Result.PyTorchMaxPool := not Obj.Get('cai_maxpool', false);
+    for i := 0 to 3 do Result.ReplaceStrideWithDilation[i] := false;
     if Obj.IndexOfName('depth') < 0 then
       ImportError('ResNet import: config "' + FileName +
         '" is missing the required field "depth" (18 / 34 / 50).');
@@ -66893,19 +66900,24 @@ begin
   end;
 end;
 
-// Adds (architecture) one residual block to NN and returns the layer refs the
-// weight loader needs. AfterStem is the input to the block. For a BasicBlock:
-// conv1(3x3,stride)->relu->conv2(3x3,1), shortcut (identity or 1x1 downsample
-// conv at stride), Add, relu. For a Bottleneck: conv1(1x1,1)->relu->conv2
-// (3x3,stride)->relu->conv3(1x1,1)->[*expansion width], shortcut, Add, relu.
-// Convs carry a bias (suppressBias=0) so the folded BN shift loads into it.
+// Adds (architecture) one residual block after NN's last layer. BasicBlock:
+// conv1(3x3,stride)->relu->conv2(3x3); Bottleneck: 1x1->relu->3x3(stride,
+// Dilation)->relu->1x1(*expansion); identity or 1x1 downsample shortcut, Add,
+// relu. Convs carry a bias so the folded BN shift loads into it.
 type
   TResNetBlockLayers = record
     Conv1, Conv2, Conv3, Down: TNNetLayer;  // Conv3/Down nil when unused
   end;
 
+  // AddResNetTrunk output: stem conv/ReLU (stride 2) and each stage's last layer.
+  TResNetTrunk = record
+    StemConv, StemOutput: TNNetLayer;
+    Blocks: array of TResNetBlockLayers;
+    StageOutputs: array[0..3] of TNNetLayer;
+  end;
+
 procedure AddResNetBlock(NN: TNNet; const Config: TResNetConfig;
-  BaseWidth, Stride: integer; HasDownsample: boolean;
+  BaseWidth, Stride, Dilation: integer; HasDownsample: boolean;
   out Refs: TResNetBlockLayers);
 var
   Input, Branch: TNNetLayer;
@@ -66913,14 +66925,13 @@ var
 begin
   Refs.Conv1 := nil; Refs.Conv2 := nil; Refs.Conv3 := nil; Refs.Down := nil;
   OutWidth := BaseWidth * Config.Expansion;
-  // The block input is the current last layer; build the MAIN branch
-  // sequentially with AddLayer (it follows the input), then attach the
-  // shortcut branch with AddLayerAfter(..., Input) - the same residual idiom
-  // as THistoricalNets.AddResNetUnit (using AddLayerAfter for the main path
-  // would re-insert mid-chain and rewire the input).
+  // The main branch follows the input via AddLayer; the shortcut attaches with
+  // AddLayerAfter(..., Input) (the THistoricalNets.AddResNetUnit idiom).
   Input := NN.GetLastLayer();
   if Config.BlockKind = rbkBasic then
   begin
+    if Dilation > 1 then
+      ImportError('ResNet import: dilation > 1 is not supported in BasicBlock.');
     // torchvision puts the stride on conv1 in a BasicBlock.
     Refs.Conv1 := NN.AddLayer(
       TNNetConvolutionLinear.Create(BaseWidth, 3, 1, Stride, 0) );
@@ -66930,12 +66941,12 @@ begin
   end
   else
   begin
-    // Bottleneck: torchvision puts the stride on the 3x3 (conv2).
+    // Bottleneck: torchvision puts the stride and dilation on the 3x3 (conv2).
     Refs.Conv1 := NN.AddLayer(
       TNNetConvolutionLinear.Create(BaseWidth, 1, 0, 1, 0) );
     NN.AddLayer( TNNetReLU.Create() );
     Refs.Conv2 := NN.AddLayer(
-      TNNetConvolutionLinear.Create(BaseWidth, 3, 1, Stride, 0) );
+      TNNetConvolutionLinear.Create(BaseWidth, 3, Dilation, Stride, 0, Dilation) );
     NN.AddLayer( TNNetReLU.Create() );
     Refs.Conv3 := NN.AddLayer(
       TNNetConvolutionLinear.Create(OutWidth, 1, 0, 1, 0) );
@@ -66952,127 +66963,139 @@ begin
   NN.AddLayer( TNNetReLU.Create() );
 end;
 
+// Adds the torchvision ResNet stem (conv1 7x7 s2 -> relu -> maxpool 3x3 s2) and
+// layer1..layer4 after NN's last layer (no avgpool / fc).
+procedure AddResNetTrunk(NN: TNNet; const Config: TResNetConfig;
+  pTrainable: boolean; out Trunk: TResNetTrunk);
+var
+  RefCount, Stage, BlockIdx, Stride, Dilation, PrevDilation: integer;
+  InWidth, BaseWidth, OutWidth, MaxBlockPos: integer;
+  HasDown: boolean;
+begin
+  RefCount := 0;
+  for Stage := 0 to 3 do RefCount := RefCount + Config.BlocksPerStage[Stage];
+  SetLength(Trunk.Blocks, RefCount);
+  Trunk.StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+    Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable) );
+  Trunk.StemOutput := NN.AddLayer( TNNetReLU.Create() );
+  // torchvision maxpool is floor-sized with -inf padding; on this non-negative
+  // input TNNetMaxPoolPortable matches it exactly. Legacy CAI TNNetMaxPool
+  // (ceil-sized) serves the pico CAI-oracle fixtures (PyTorchMaxPool false).
+  if Config.PyTorchMaxPool then
+    NN.AddLayer( TNNetMaxPoolPortable.Create({pool=}3, {stride=}2, {pad=}1) )
+  else
+    NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
+  RefCount := 0;
+  InWidth := Config.StemWidth;
+  Dilation := 1;
+  for Stage := 0 to 3 do
+  begin
+    BaseWidth := Config.StageWidths[Stage];
+    OutWidth := BaseWidth * Config.Expansion;
+    MaxBlockPos := Config.BlocksPerStage[Stage] - 1;
+    // torchvision _make_layer: layers 2..4 stride 2 unless replaced by
+    // dilation; block 0 keeps the previous dilation, later blocks the new one.
+    if Stage = 0 then Stride := 1 else Stride := 2;
+    PrevDilation := Dilation;
+    if Config.ReplaceStrideWithDilation[Stage] then
+    begin
+      Dilation := Dilation * Stride;
+      Stride := 1;
+    end;
+    for BlockIdx := 0 to MaxBlockPos do
+    begin
+      if BlockIdx = 0 then
+      begin
+        HasDown := (Stride <> 1) or (InWidth <> OutWidth);
+        AddResNetBlock(NN, Config, BaseWidth, Stride, PrevDilation, HasDown,
+          Trunk.Blocks[RefCount]);
+      end
+      else
+        AddResNetBlock(NN, Config, BaseWidth, 1, Dilation, false,
+          Trunk.Blocks[RefCount]);
+      Inc(RefCount);
+      InWidth := OutWidth;
+    end;
+    Trunk.StageOutputs[Stage] := NN.GetLastLayer();
+  end;
+end;
+
+// Loads the AddResNetTrunk weights from the torchvision keys Prefix + 'conv1',
+// 'bn1', 'layerN.M.*', folding every BatchNorm.
+procedure LoadResNetTrunk(Reader: TNNetSafeTensorsReader;
+  const Config: TResNetConfig; const Prefix: string; const Trunk: TResNetTrunk);
+var
+  RefCount, Stage, BlockIdx, InWidth, BaseWidth, OutWidth, MaxBlockPos: integer;
+  BlockPrefix: string;
+begin
+  LoadResNetConvFoldBN(Reader, Trunk.StemConv, Prefix + 'conv1.weight',
+    Prefix + 'bn1', Config.StemWidth, Config.NumChannels, 7, Config.BnEps);
+  RefCount := 0;
+  InWidth := Config.StemWidth;
+  for Stage := 0 to 3 do
+  begin
+    BaseWidth := Config.StageWidths[Stage];
+    OutWidth := BaseWidth * Config.Expansion;
+    MaxBlockPos := Config.BlocksPerStage[Stage] - 1;
+    for BlockIdx := 0 to MaxBlockPos do
+    begin
+      BlockPrefix := Prefix + 'layer' + IntToStr(Stage + 1) + '.' +
+        IntToStr(BlockIdx);
+      if Config.BlockKind = rbkBasic then
+      begin
+        LoadResNetConvFoldBN(Reader, Trunk.Blocks[RefCount].Conv1,
+          BlockPrefix + '.conv1.weight', BlockPrefix + '.bn1',
+          BaseWidth, InWidth, 3, Config.BnEps);
+        LoadResNetConvFoldBN(Reader, Trunk.Blocks[RefCount].Conv2,
+          BlockPrefix + '.conv2.weight', BlockPrefix + '.bn2',
+          OutWidth, BaseWidth, 3, Config.BnEps);
+      end
+      else
+      begin
+        LoadResNetConvFoldBN(Reader, Trunk.Blocks[RefCount].Conv1,
+          BlockPrefix + '.conv1.weight', BlockPrefix + '.bn1',
+          BaseWidth, InWidth, 1, Config.BnEps);
+        LoadResNetConvFoldBN(Reader, Trunk.Blocks[RefCount].Conv2,
+          BlockPrefix + '.conv2.weight', BlockPrefix + '.bn2',
+          BaseWidth, BaseWidth, 3, Config.BnEps);
+        LoadResNetConvFoldBN(Reader, Trunk.Blocks[RefCount].Conv3,
+          BlockPrefix + '.conv3.weight', BlockPrefix + '.bn3',
+          OutWidth, BaseWidth, 1, Config.BnEps);
+      end;
+      if Trunk.Blocks[RefCount].Down <> nil then
+        LoadResNetConvFoldBN(Reader, Trunk.Blocks[RefCount].Down,
+          BlockPrefix + '.downsample.0.weight', BlockPrefix + '.downsample.1',
+          OutWidth, InWidth, 1, Config.BnEps);
+      Inc(RefCount);
+      InWidth := OutWidth;
+    end;
+  end;
+end;
+
 function BuildResNet(Reader: TNNetSafeTensorsReader;
   const Config: TResNetConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
-  StemConv, FC: TNNetLayer;
-  BlockRefs: array of TResNetBlockLayers;
-  RefCount, Stage, BlockIdx, Stride, InWidth, BaseWidth, OutWidth: integer;
-  BlkM1: integer;
-  HasDown: boolean;
-  Prefix: string;
+  FC: TNNetLayer;
+  Trunk: TResNetTrunk;
 begin
   if Config.NumChannels < 1 then
     ImportError('ResNet import: num_channels must be >= 1.');
   if Config.NumLabels < 1 then
     ImportError('ResNet import: num_labels must be >= 1.');
-  // Count total blocks to size the ref array.
-  RefCount := 0;
-  for Stage := 0 to 3 do RefCount := RefCount + Config.BlocksPerStage[Stage];
-  SetLength(BlockRefs, RefCount);
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
-    // Stem: conv 7x7 stride2 pad3 (+folded BN bias) -> relu -> maxpool.
-    StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-      Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable) );
-    NN.AddLayer( TNNetReLU.Create() );
-    // Stem maxpool 3x3 stride2 pad1. torchvision uses PyTorch maxpool: floor
-    // output sizing + (-inf) padding. For this post-ReLU (non-negative) stem
-    // input that is EXACTLY reproduced by TNNetMaxPoolPortable (floor sizing,
-    // zero pad == -inf pad here since no full window is padding, edge-clamped
-    // windows that coincide with PyTorch's floor-sized output) - verified
-    // bit-for-bit against a numpy floor+(-inf) reference. The legacy CAI
-    // TNNetMaxPool (ceil sizing, edge-clamped) is kept for the pico CAI-oracle
-    // parity fixtures and selected when Config.PyTorchMaxPool is false.
-    if Config.PyTorchMaxPool then
-      NN.AddLayer( TNNetMaxPoolPortable.Create({pool=}3, {stride=}2, {pad=}1) )
-    else
-      NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
-    RefCount := 0;
-    InWidth := Config.StemWidth;
-    for Stage := 0 to 3 do
-    begin
-      BaseWidth := Config.StageWidths[Stage];
-      OutWidth := BaseWidth * Config.Expansion;
-      BlkM1 := Config.BlocksPerStage[Stage] - 1;
-      for BlockIdx := 0 to BlkM1 do
-      begin
-        if BlockIdx = 0 then
-        begin
-          // First block of layer1 keeps stride 1; layers 2..4 stride 2. The
-          // 1x1 downsample shortcut is present whenever the block changes
-          // spatial size OR channel count (always on block 0 here: layer1's
-          // basic block keeps width but Bottleneck changes it 64->256).
-          if Stage = 0 then Stride := 1 else Stride := 2;
-          HasDown := (Stride <> 1) or (InWidth <> OutWidth);
-        end
-        else
-        begin
-          Stride := 1;
-          HasDown := false;
-        end;
-        AddResNetBlock(NN, Config, BaseWidth, Stride, HasDown,
-          BlockRefs[RefCount]);
-        Inc(RefCount);
-        InWidth := OutWidth;
-      end;
-    end;
+    AddResNetTrunk(NN, Config, pTrainable, Trunk);
     // Head: global average pool over the spatial grid -> fc -> logits.
     NN.AddLayer( TNNetAvgChannel.Create() );
     FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels).SetTrainable(pTrainable) );
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
-    LoadResNetConvFoldBN(Reader, StemConv, 'conv1.weight', 'bn1',
-      Config.StemWidth, Config.NumChannels, 7, Config.BnEps);
-    RefCount := 0;
-    InWidth := Config.StemWidth;
-    for Stage := 0 to 3 do
-    begin
-      BaseWidth := Config.StageWidths[Stage];
-      OutWidth := BaseWidth * Config.Expansion;
-      BlkM1 := Config.BlocksPerStage[Stage] - 1;
-      for BlockIdx := 0 to BlkM1 do
-      begin
-        Prefix := 'layer' + IntToStr(Stage + 1) + '.' + IntToStr(BlockIdx);
-        if BlockIdx = 0 then
-        begin
-          if Stage = 0 then Stride := 1 else Stride := 2;
-        end
-        else Stride := 1;
-        if Config.BlockKind = rbkBasic then
-        begin
-          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv1,
-            Prefix + '.conv1.weight', Prefix + '.bn1',
-            BaseWidth, InWidth, 3, Config.BnEps);
-          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv2,
-            Prefix + '.conv2.weight', Prefix + '.bn2',
-            OutWidth, BaseWidth, 3, Config.BnEps);
-        end
-        else
-        begin
-          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv1,
-            Prefix + '.conv1.weight', Prefix + '.bn1',
-            BaseWidth, InWidth, 1, Config.BnEps);
-          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv2,
-            Prefix + '.conv2.weight', Prefix + '.bn2',
-            BaseWidth, BaseWidth, 3, Config.BnEps);
-          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv3,
-            Prefix + '.conv3.weight', Prefix + '.bn3',
-            OutWidth, BaseWidth, 1, Config.BnEps);
-        end;
-        if BlockRefs[RefCount].Down <> nil then
-          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Down,
-            Prefix + '.downsample.0.weight', Prefix + '.downsample.1',
-            OutWidth, InWidth, 1, Config.BnEps);
-        Inc(RefCount);
-        InWidth := OutWidth;
-      end;
-    end;
+    LoadResNetTrunk(Reader, Config, '', Trunk);
     // fc: torchvision Linear [num_labels, last_out] with bias.
     LoadLlamaLinearWeights(Reader, FC, 'fc.weight',
       Config.StageWidths[3] * Config.Expansion, Config.NumLabels,
@@ -108810,43 +108833,61 @@ begin
   Result := Reader.DimSize(Name, Axis);
 end;
 
-function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
-  FrameWidth, FrameHeight: integer; DownsampleRatio: double): TRVMConfig;
+// ResNet50Encoder: torchvision Bottleneck ResNet with a dilated layer4; the
+// stage widths and block counts come from the "backbone.layerN.M.*" shapes.
+function InferRVMResNetConfig(Reader: TNNetSafeTensorsReader): TResNetConfig;
+var
+  Stage, BlockCount, BlockTotal: integer;
+  StagePrefix: string;
+begin
+  Result.ModelType := 'resnet';
+  Result.BlockKind := rbkBottleneck;
+  Result.StemWidth := RVMDim(Reader, 'backbone.conv1.weight', 0);
+  Result.NumChannels := Reader.DimSize('backbone.conv1.weight', 1);
+  if Result.NumChannels <> 3 then
+    ImportError(csRVMImporter + ': "backbone.conv1.weight" must read 3 channels.');
+  BlockTotal := 0;
+  for Stage := 0 to 3 do
+  begin
+    StagePrefix := 'backbone.layer' + IntToStr(Stage + 1) + '.';
+    Result.StageWidths[Stage] := RVMDim(Reader, StagePrefix + '0.conv1.weight', 0);
+    BlockCount := 1;
+    while Reader.HasTensor(StagePrefix + IntToStr(BlockCount) + '.conv1.weight') do
+      Inc(BlockCount);
+    Result.BlocksPerStage[Stage] := BlockCount;
+    BlockTotal := BlockTotal + BlockCount;
+    Result.ReplaceStrideWithDilation[Stage] := Stage = 3;
+  end;
+  if not Reader.HasTensor('backbone.layer1.0.conv3.weight') then
+    ImportError(csRVMImporter + ': the ResNet backbone must use Bottleneck blocks.');
+  Result.Expansion := Reader.DimSize('backbone.layer1.0.conv3.weight', 0) div
+    Result.StageWidths[0];
+  Result.Depth := 3 * BlockTotal + 2;
+  Result.ImageSize := 0;
+  Result.NumLabels := 0;
+  Result.BnEps := 0.00001;
+  Result.PyTorchMaxPool := true;
+end;
+
+// MobileNetV3LargeEncoder: the 15 MBConv widths/kernels/SE from the
+// "backbone.features.*" shapes; strides and dilations are fixed by RVM.
+function InferRVMMobileNetConfig(Reader: TNNetSafeTensorsReader): TMobileNetV3Config;
 var
   BlockPos, InChannels, DwIdx, ProjIdx: integer;
   BlockPrefix: string;
 begin
-  if not Reader.HasTensor('backbone.features.0.0.weight') then
-  begin
-    if Reader.HasTensor('backbone.conv1.weight') then
-      ImportError(csRVMImporter + ': the ResNet-50 variant is not supported yet.');
-    ImportError(csRVMImporter + ': "backbone.features.0.0.weight" not found; ' +
-      'not a RobustVideoMatting MobileNetV3 checkpoint.');
-  end;
-  if (FrameWidth < 1) or (FrameHeight < 1) then
-    ImportError(csRVMImporter + ': frame size must be positive.');
-  if (DownsampleRatio <= 0) or (DownsampleRatio > 1) then
-    ImportError(csRVMImporter + ': downsample ratio must be in (0, 1].');
-  Result.Variant := 'mobilenetv3';
-  Result.FrameWidth := FrameWidth;
-  Result.FrameHeight := FrameHeight;
-  Result.DownsampleRatio := DownsampleRatio;
-  Result.BnEps := 0.00001;
-  with Result.Backbone do
-  begin
-    Variant := 'large';
-    ModelType := 'mobilenet_v3';
-    NumChannels := 3;
-    ImageSize := 0;
-    NumLabels := 0;
-    ClassifierHidden := 0;
-    BnEps := 0.001;
-    StemWidth := RVMDim(Reader, 'backbone.features.0.0.weight', 0);
-    SetLength(Blocks, csRVMBlockCount);
-  end;
-  InChannels := Result.Backbone.StemWidth;
+  Result.Variant := 'large';
+  Result.ModelType := 'mobilenet_v3';
+  Result.NumChannels := 3;
+  Result.ImageSize := 0;
+  Result.NumLabels := 0;
+  Result.ClassifierHidden := 0;
+  Result.BnEps := 0.001;
+  Result.StemWidth := RVMDim(Reader, 'backbone.features.0.0.weight', 0);
+  SetLength(Result.Blocks, csRVMBlockCount);
+  InChannels := Result.StemWidth;
   for BlockPos := 0 to csRVMBlockCount - 1 do
-    with Result.Backbone.Blocks[BlockPos] do
+    with Result.Blocks[BlockPos] do
     begin
       BlockPrefix := 'backbone.features.' + IntToStr(BlockPos + 1) + '.block.';
       // The expand 1x1 is absent when exp == in; block.0 is then the depthwise.
@@ -108883,11 +108924,49 @@ begin
     '.block.0.0.weight') then
     ImportError(csRVMImporter + ': the backbone has more than ' +
       IntToStr(csRVMBlockCount) + ' MBConv blocks.');
-  Result.Backbone.HeadConvWidth := RVMDim(Reader, 'backbone.features.' +
+  Result.HeadConvWidth := RVMDim(Reader, 'backbone.features.' +
     IntToStr(csRVMBlockCount + 1) + '.0.weight', 0);
-  for BlockPos := 0 to 2 do
-    Result.FeatureChannels[BlockPos] :=
-      Result.Backbone.Blocks[csRVMFeatureBlocks[BlockPos]].OutChannels;
+end;
+
+function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  FrameWidth, FrameHeight: integer; DownsampleRatio: double): TRVMConfig;
+var
+  BlockPos: integer;
+begin
+  if Reader.HasTensor('backbone.conv1.weight') then
+    Result.Variant := 'resnet50'
+  else if Reader.HasTensor('backbone.features.0.0.weight') then
+    Result.Variant := 'mobilenetv3'
+  else
+    ImportError(csRVMImporter + ': neither "backbone.features.0.0.weight" ' +
+      '(MobileNetV3) nor "backbone.conv1.weight" (ResNet-50) found; not a ' +
+      'RobustVideoMatting checkpoint.');
+  if (FrameWidth < 1) or (FrameHeight < 1) then
+    ImportError(csRVMImporter + ': frame size must be positive.');
+  if (DownsampleRatio <= 0) or (DownsampleRatio > 1) then
+    ImportError(csRVMImporter + ': downsample ratio must be in (0, 1].');
+  Result.FrameWidth := FrameWidth;
+  Result.FrameHeight := FrameHeight;
+  Result.DownsampleRatio := DownsampleRatio;
+  Result.BnEps := 0.00001;
+  if Result.Variant = 'resnet50' then
+  begin
+    Result.ResNet := InferRVMResNetConfig(Reader);
+    SetLength(Result.Backbone.Blocks, 0);
+    Result.Backbone.StemWidth := 0;
+    Result.Backbone.HeadConvWidth := 0;
+    Result.FeatureChannels[0] := Result.ResNet.StemWidth;
+    Result.FeatureChannels[1] := Result.ResNet.StageWidths[0] * Result.ResNet.Expansion;
+    Result.FeatureChannels[2] := Result.ResNet.StageWidths[1] * Result.ResNet.Expansion;
+  end
+  else
+  begin
+    Result.Backbone := InferRVMMobileNetConfig(Reader);
+    Result.ResNet.Depth := 0;
+    for BlockPos := 0 to 2 do
+      Result.FeatureChannels[BlockPos] :=
+        Result.Backbone.Blocks[csRVMFeatureBlocks[BlockPos]].OutChannels;
+  end;
   Result.FeatureChannels[3] := RVMDim(Reader, 'aspp.aspp1.0.weight', 0);
   Result.DecoderChannels[0] := RVMDim(Reader, 'decoder.decode3.conv.0.weight', 0);
   Result.DecoderChannels[1] := RVMDim(Reader, 'decoder.decode2.conv.0.weight', 0);
@@ -108899,11 +108978,29 @@ begin
     Result.RefinerHidden := 0;
 end;
 
+// Channel count of the trunk output that feeds LR-ASPP.
+function RVMTrunkWidth(const Config: TRVMConfig): integer;
+begin
+  if Config.Variant = 'resnet50' then
+    Result := Config.ResNet.StageWidths[3] * Config.ResNet.Expansion
+  else
+    Result := Config.Backbone.HeadConvWidth;
+end;
+
 function RVMConfigToString(const Config: TRVMConfig): string;
 begin
-  Result := 'RVM ' + Config.Variant + ' config: stem=' +
-    IntToStr(Config.Backbone.StemWidth) + ', head_conv=' +
-    IntToStr(Config.Backbone.HeadConvWidth) + ', features=[' +
+  Result := 'RVM ' + Config.Variant + ' config: ';
+  if Config.Variant = 'resnet50' then
+    Result := Result + 'stem=' + IntToStr(Config.ResNet.StemWidth) +
+      ', stages=[' + IntToStr(Config.ResNet.BlocksPerStage[0]) + ',' +
+      IntToStr(Config.ResNet.BlocksPerStage[1]) + ',' +
+      IntToStr(Config.ResNet.BlocksPerStage[2]) + ',' +
+      IntToStr(Config.ResNet.BlocksPerStage[3]) + '], trunk_out=' +
+      IntToStr(RVMTrunkWidth(Config))
+  else
+    Result := Result + 'stem=' + IntToStr(Config.Backbone.StemWidth) +
+      ', head_conv=' + IntToStr(Config.Backbone.HeadConvWidth);
+  Result := Result + ', features=[' +
     IntToStr(Config.FeatureChannels[0]) + ',' + IntToStr(Config.FeatureChannels[1]) +
     ',' + IntToStr(Config.FeatureChannels[2]) + ',' +
     IntToStr(Config.FeatureChannels[3]) + '], decoder=[' +
@@ -109033,11 +109130,12 @@ var
   Features: array[0..3] of TNNetLayer; // f1, f2, f3, LR-ASPP output
   UpConvs: array[0..3] of TNNetLayer;  // decode3, decode2, decode1, decode0 conv
   GRUs: array[0..3] of TNNetLayer;     // decode4, decode3, decode2, decode1
-  Decode0Conv2: TNNetLayer;
+  Decode0Conv2, TrunkOutput: TNNetLayer;
   Trunk: TMobileNetV3Trunk;
+  ResNetTrunk: TResNetTrunk;
   Values: TNNetVolume;
-  LowWidth, LowHeight, Level, Channel, HalfC, InCh: integer;
-  HasRefiner: boolean;
+  LowWidth, LowHeight, Level, Channel, HalfC, InCh, TrunkWidth: integer;
+  HasRefiner, IsResNet: boolean;
 
   // x = [a ; b] -> [a ; GRU(b, h)] with h a new TNNetInput state.
   function AddGRUBlock(Source: TNNetLayer; Channels, GRUPos: integer): TNNetLayer;
@@ -109068,11 +109166,13 @@ var
   end;
 
 begin
-  if Config.Variant <> 'mobilenetv3' then
+  IsResNet := Config.Variant = 'resnet50';
+  if not IsResNet and (Config.Variant <> 'mobilenetv3') then
     ImportError(csRVMImporter + ': unsupported variant "' + Config.Variant + '".');
-  if Length(Config.Backbone.Blocks) <> csRVMBlockCount then
+  if not IsResNet and (Length(Config.Backbone.Blocks) <> csRVMBlockCount) then
     ImportError(csRVMImporter + ': the backbone config needs ' +
       IntToStr(csRVMBlockCount) + ' blocks.');
+  TrunkWidth := RVMTrunkWidth(Config);
   HasRefiner := Config.DownsampleRatio < 1;
   if HasRefiner then
   begin
@@ -109097,23 +109197,36 @@ begin
       Small := NN.AddLayer(TNNetBilinearResize.Create(LowWidth, LowHeight, 0))
     else
       Small := Frame;
-    // torchvision normalize(x, mean, std) feeds the backbone only.
-    NN.AddLayerAfter(TNNetChannelMul.Create(), Small);
-    for Channel := 0 to 2 do
-      Values.FData[Channel] := 1 / csRVMImageStd[Channel];
-    WriteChannelVector(NN.GetLastLayer(), Values, 3);
-    NN.AddLayer(TNNetChannelBias.Create());
-    for Channel := 0 to 2 do
-      Values.FData[Channel] := -csRVMImageMean[Channel] / csRVMImageStd[Channel];
-    WriteChannelVector(NN.GetLastLayer(), Values, 3);
-    AddMobileNetV3Trunk(NN, Config.Backbone, pTrainable, Trunk);
-    for Level := 0 to 2 do
-      Features[Level] := Trunk.BlockOutputs[csRVMFeatureBlocks[Level]];
+    if IsResNet then
+    begin
+      // ResNet50Encoder reads the frame unnormalized; f1 is the stem ReLU.
+      AddResNetTrunk(NN, Config.ResNet, pTrainable, ResNetTrunk);
+      Features[0] := ResNetTrunk.StemOutput;
+      Features[1] := ResNetTrunk.StageOutputs[0];
+      Features[2] := ResNetTrunk.StageOutputs[1];
+      TrunkOutput := ResNetTrunk.StageOutputs[3];
+    end
+    else
+    begin
+      // torchvision normalize(x, mean, std) feeds the backbone only.
+      NN.AddLayerAfter(TNNetChannelMul.Create(), Small);
+      for Channel := 0 to 2 do
+        Values.FData[Channel] := 1 / csRVMImageStd[Channel];
+      WriteChannelVector(NN.GetLastLayer(), Values, 3);
+      NN.AddLayer(TNNetChannelBias.Create());
+      for Channel := 0 to 2 do
+        Values.FData[Channel] := -csRVMImageMean[Channel] / csRVMImageStd[Channel];
+      WriteChannelVector(NN.GetLastLayer(), Values, 3);
+      AddMobileNetV3Trunk(NN, Config.Backbone, pTrainable, Trunk);
+      for Level := 0 to 2 do
+        Features[Level] := Trunk.BlockOutputs[csRVMFeatureBlocks[Level]];
+      TrunkOutput := Trunk.HeadOutput;
+    end;
     // LR-ASPP: ReLU(BN(conv1x1 x)) * sigmoid(conv1x1(avgpool x)).
     Aspp1 := NN.AddLayerAfter(TNNetConvolutionReLU.Create(
       Config.FeatureChannels[3], 1, 0, 1, 0).SetTrainable(pTrainable),
-      Trunk.HeadOutput);
-    Pooled := NN.AddLayerAfter(TNNetAvgChannel.Create(), Trunk.HeadOutput);
+      TrunkOutput);
+    Pooled := NN.AddLayerAfter(TNNetAvgChannel.Create(), TrunkOutput);
     Aspp2 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(
       Config.FeatureChannels[3], 1, 0, 1, 0).SetTrainable(pTrainable), Pooled);
     Gate := NN.AddLayer(TNNetSigmoid.Create());
@@ -109184,11 +109297,14 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
-    LoadMobileNetV3Trunk(Reader, Config.Backbone, 'backbone.', Trunk);
+    if IsResNet then
+      LoadResNetTrunk(Reader, Config.ResNet, 'backbone.', ResNetTrunk)
+    else
+      LoadMobileNetV3Trunk(Reader, Config.Backbone, 'backbone.', Trunk);
     LoadResNetConvFoldBN(Reader, Aspp1, 'aspp.aspp1.0.weight', 'aspp.aspp1.1',
-      Config.FeatureChannels[3], Config.Backbone.HeadConvWidth, 1, Config.BnEps);
+      Config.FeatureChannels[3], TrunkWidth, 1, Config.BnEps);
     LoadResNetConvFoldBN(Reader, Aspp2, 'aspp.aspp2.1.weight', '',
-      Config.FeatureChannels[3], Config.Backbone.HeadConvWidth, 1, 0);
+      Config.FeatureChannels[3], TrunkWidth, 1, 0);
     RVMLoadConvGRU(Reader, GRUs[0], 'decoder.decode4.gru.',
       Config.FeatureChannels[3] div 2);
     InCh := Config.FeatureChannels[3];
