@@ -896,6 +896,9 @@ rather than acted on.
       (CPU and `--gpu`, aligned and whole-photo) on the user's box before the
       README calls it supported. A Fuse_sft_block at the latent level (the official table puts
       '16' after the 2nd ResBlock) is rejected; codeformer.pth does not use it.
+  - [ ] `--int8` on CodeFormer is unchecked: quantization error can flip the
+        transformer's top-1 code choices. Compare the code ids and the restored
+        face of `--int8` against FP32 on the real `codeformer.pth`.
 - [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
       landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`
       and `ddcolor_modelscope` on real grayscale photos (CPU and `--gpu`) against
