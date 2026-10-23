@@ -160,11 +160,12 @@ const
   csBitmapFontGlyphWidth = 5;
   csBitmapFontGlyphHeight = 7;
 
-// Width in pixels of Text drawn by DrawBitmapText: (6 * Length - 1) * Scale.
+// Width in pixels of Text drawn by DrawBitmapText: (6 * characters - 1) * Scale,
+// a UTF-8 multi-byte character counting as one.
 function BitmapTextWidth(const Text: string; Scale: integer = 1): integer;
 
 // Draws Text in a 5x7 font, top-left at (Left, Top), each font pixel Scale x Scale,
-// clipped; lower case as upper case, unknown characters as '?'. Returns the width.
+// clipped; lower case as upper case, & [ ] " ; | as look-alikes, others '?'; returns the width.
 function DrawBitmapText(Image: TNNetVolume; Left, Top: integer;
   const Text: string; const Color: array of TNeuralFloat;
   Scale: integer = 1): integer;
@@ -1347,12 +1348,41 @@ const
     ($0E, $11, $01, $02, $04, $00, $04), ($00, $04, $04, $1F, $04, $04, $00),
     ($00, $00, $1F, $00, $1F, $00, $00), ($0C, $04, $08, $00, $00, $00, $00));
 
+// Glyph of Character: lower case as upper case, a few look-alikes, else '?'.
+function BitmapFontGlyphPos(Character: char): integer;
+const
+  csLookAlikeFrom = '&[{<]}>"`;|\';
+  csLookAlikeTo = '+((()))''''://';
+var
+  LookAlikePos: integer;
+begin
+  Result := Pos(UpCase(Character), csBitmapFontCharacters) - 1;
+  if Result >= 0 then exit;
+  LookAlikePos := Pos(Character, csLookAlikeFrom);
+  if LookAlikePos > 0 then
+    Result := Pos(csLookAlikeTo[LookAlikePos], csBitmapFontCharacters) - 1
+  else
+    Result := csBitmapFontUnknownGlyphPos;
+end;
+
+// A UTF-8 continuation byte belongs to the glyph of its lead byte.
+function IsUTF8ContinuationByte(Character: char): boolean;
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := (Ord(Character) and $C0) = $80;
+end;
+
 function BitmapTextWidth(const Text: string; Scale: integer): integer;
+var
+  CharPos, GlyphCount: integer;
 begin
   if Scale < 1 then
     raise EArgumentException.Create('BitmapTextWidth: Scale must be >= 1.');
-  if Text = '' then exit(0);
-  Result := ((csBitmapFontGlyphWidth + 1) * Length(Text) - 1) * Scale;
+  GlyphCount := 0;
+  for CharPos := 1 to Length(Text) do
+    if not IsUTF8ContinuationByte(Text[CharPos]) then Inc(GlyphCount);
+  if GlyphCount = 0 then exit(0);
+  Result := ((csBitmapFontGlyphWidth + 1) * GlyphCount - 1) * Scale;
 end;
 
 function DrawBitmapText(Image: TNNetVolume; Left, Top: integer;
@@ -1367,8 +1397,8 @@ begin
   GlyphLeft := Left;
   for CharPos := 1 to Length(Text) do
   begin
-    GlyphPos := Pos(UpCase(Text[CharPos]), csBitmapFontCharacters) - 1;
-    if GlyphPos < 0 then GlyphPos := csBitmapFontUnknownGlyphPos;
+    if IsUTF8ContinuationByte(Text[CharPos]) then continue;
+    GlyphPos := BitmapFontGlyphPos(Text[CharPos]);
     for RowPos := 0 to csBitmapFontGlyphHeight - 1 do
     begin
       RowBits := csBitmapFontRows[GlyphPos, RowPos];

@@ -16665,14 +16665,20 @@ type
     NumMasks: integer;               // mask coefficients (0 = detection only)
     ProtoHidden: integer;            // Proto hidden width (ultralytics npr)
     MaskHidden: integer;             // cv4 hidden width (ultralytics c4)
+    ClassNames: TStringArray;        // by class id from names / id2label; nil = none
   end;
 
 // Reads a YOLOv8 config. Required: num_classes (FastSAM: 1). Optional: widths,
 // depths, reg_max, box_hidden, cls_hidden, num_channels, image_size, bn_eps,
 // strides, model_type ('yolov8' / 'fastsam'), task ('detect' / 'segment'),
 // num_masks (32), proto_hidden (4*widths[0]), mask_hidden (max(widths[2]/4,
-// num_masks)). Hidden widths default to the ultralytics rules; yolov8n otherwise.
+// num_masks)), names (list or {"0": ..} map) else id2label, num_classes long.
+// Hidden widths default to the ultralytics rules; yolov8n otherwise.
 function ReadYoloConfigFromJSONFile(const FileName: string): TYoloConfig;
+
+// Box label of class ClassId: its config name, else the COCO name for an 80-class
+// yolov8 config without names, else the id as text.
+function YoloClassLabel(const Config: TYoloConfig; ClassId: integer): string;
 
 function YoloConfigToString(const Config: TYoloConfig): string;
 
@@ -32393,13 +32399,49 @@ end;
 
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================
 
+// Labels of a JSON {"0": "a", ...} map (ids exactly 0..Count-1) or ["a", ...]
+// list, index-ordered; Context starts every error message.
+function ReadIndexedJSONLabels(LabelData: TJSONData;
+  const Context: string): TStringArray;
+var
+  LabelList: TJSONArray;
+  LabelMap: TJSONObject;
+  ClassId, EntryPos, MaxEntryPos: integer;
+begin
+  Result := nil;
+  if LabelData is TJSONArray then
+  begin
+    LabelList := TJSONArray(LabelData);
+    SetLength(Result, LabelList.Count);
+    MaxEntryPos := LabelList.Count - 1;
+    for EntryPos := 0 to MaxEntryPos do
+      Result[EntryPos] := LabelList.Items[EntryPos].AsString;
+    exit;
+  end;
+  if not (LabelData is TJSONObject) then
+    ImportError(Context + ' is not a JSON object or list.');
+  LabelMap := TJSONObject(LabelData);
+  SetLength(Result, LabelMap.Count);
+  MaxEntryPos := LabelMap.Count - 1;
+  for EntryPos := 0 to MaxEntryPos do
+  begin
+    ClassId := StrToIntDef(LabelMap.Names[EntryPos], -1);
+    if (ClassId < 0) or (ClassId >= LabelMap.Count) then
+      ImportError(Context + ': id "' + LabelMap.Names[EntryPos] +
+        '" is not in 0..' + IntToStr(LabelMap.Count - 1) +
+        ' (non-contiguous map).');
+    if Result[ClassId] <> '' then
+      ImportError(Context + ': duplicate id ' + IntToStr(ClassId) + '.');
+    Result[ClassId] := LabelMap.Items[EntryPos].AsString;
+  end;
+end;
+
 function ReadId2LabelFromJSONFile(const FileName: string): TStringList;
 var
-  LpMax: integer;
   JsonText: TStringList;
   Root, MapData: TJSONData;
-  MapObj: TJSONObject;
-  ClassId, EntryCnt: integer;
+  Labels: TStringArray;
+  LabelPos, MaxLabelPos: integer;
 begin
   if not FileExists(FileName) then
     ImportError('id2label import: config file not found: ' + FileName);
@@ -32424,24 +32466,10 @@ begin
       if not (MapData is TJSONObject) then
         ImportError('id2label import: "id2label" in ' + FileName +
           ' is not a JSON object.');
-      MapObj := TJSONObject(MapData);
-      // Pre-size, then place each label at its integer key: the JSON map
-      // {"0": ..} must cover exactly 0..Count-1 (HF's contiguous ids).
-      LpMax := MapObj.Count - 1;
-      for EntryCnt := 0 to LpMax do Result.Add('');
-      LpMax := MapObj.Count - 1;
-      for EntryCnt := 0 to LpMax do
-      begin
-        ClassId := StrToIntDef(MapObj.Names[EntryCnt], -1);
-        if (ClassId < 0) or (ClassId >= MapObj.Count) then
-          ImportError('id2label import: id "' + MapObj.Names[EntryCnt] +
-            '" in ' + FileName + ' is not in 0..' +
-            IntToStr(MapObj.Count - 1) + ' (non-contiguous map).');
-        if Result[ClassId] <> '' then
-          ImportError('id2label import: duplicate id ' +
-            IntToStr(ClassId) + ' in ' + FileName + '.');
-        Result[ClassId] := MapObj.Items[EntryCnt].AsString;
-      end;
+      Labels := ReadIndexedJSONLabels(MapData,
+        'id2label import: "id2label" in ' + FileName);
+      MaxLabelPos := High(Labels);
+      for LabelPos := 0 to MaxLabelPos do Result.Add(Labels[LabelPos]);
     except
       Result.Free;
       raise;
@@ -94815,7 +94843,7 @@ var
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
-  ArrData: TJSONData;
+  ArrData, NamesData: TJSONData;
   Arr: TJSONArray;
   i: integer;
   Task: string;
@@ -94831,6 +94859,7 @@ begin
   Result.BnEps := 1e-3;
   Result.Strides[0] := 8; Result.Strides[1] := 16; Result.Strides[2] := 32;
   Result.ModelType := 'yolov8';
+  Result.ClassNames := nil;
   if not FileExists(FileName) then
     ImportError('YOLO import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
@@ -94864,6 +94893,17 @@ begin
     Result.NumClasses := Obj.Get('num_classes', 1);
     if Result.NumClasses <= 0 then
       ImportError('YOLO import: num_classes must be a positive integer.');
+    NamesData := Obj.Find('names');
+    if NamesData = nil then NamesData := Obj.Find('id2label');
+    if NamesData <> nil then
+    begin
+      Result.ClassNames := ReadIndexedJSONLabels(NamesData,
+        'YOLO import: "names" / "id2label" in ' + FileName);
+      if Length(Result.ClassNames) <> Result.NumClasses then
+        ImportError('YOLO import: ' + IntToStr(Length(Result.ClassNames)) +
+          ' class names in ' + FileName + ' for num_classes = ' +
+          IntToStr(Result.NumClasses) + '.');
+    end;
     ArrData := Obj.Find('widths');
     if (ArrData <> nil) and (ArrData is TJSONArray) then
     begin
@@ -94916,6 +94956,35 @@ begin
   end;
 end;
 
+function YoloClassLabel(const Config: TYoloConfig; ClassId: integer): string;
+const
+  csCocoClassCount = 80;
+  // ultralytics coco.yaml names, index = COCO-80 class id.
+  csCocoClassNames: array[0..csCocoClassCount - 1] of string = (
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+    'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag',
+    'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+    'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+    'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon',
+    'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot',
+    'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
+    'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote',
+    'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
+    'hair drier', 'toothbrush');
+begin
+  Result := '';
+  if (ClassId >= 0) and (ClassId < Length(Config.ClassNames)) then
+    Result := Config.ClassNames[ClassId]
+  else if (Config.ClassNames = nil) and (Config.ModelType <> 'fastsam') and
+     (Config.NumClasses = csCocoClassCount) and (ClassId >= 0) and
+     (ClassId < csCocoClassCount) then
+    Result := csCocoClassNames[ClassId];
+  if Result = '' then Result := IntToStr(ClassId);
+end;
+
 function YoloConfigToString(const Config: TYoloConfig): string;
 begin
   Result := 'YOLOv8(model_type=' + Config.ModelType +
@@ -94929,6 +94998,8 @@ begin
   if Config.NumMasks > 0 then
     Result := Result + ', num_masks=' + IntToStr(Config.NumMasks) +
       ', proto_hidden=' + IntToStr(Config.ProtoHidden);
+  if Config.ClassNames <> nil then
+    Result := Result + ', class_names=' + IntToStr(Length(Config.ClassNames));
   Result := Result + ')';
 end;
 

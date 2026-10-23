@@ -201,8 +201,9 @@ begin
 end;
 
 // Draws every track box of Tracks into Image (RGB 0..255): a 2 px outline in
-// the colour of its id and the id on a filled tag above the top-left corner.
-procedure DrawTracks(Image: TNNetVolume; const Tracks: TByteTrackedBoxArray);
+// the colour of its id and "id class" on a filled tag above the top-left corner.
+procedure DrawTracks(Image: TNNetVolume; const Tracks: TByteTrackedBoxArray;
+  const Config: TYoloConfig);
 var
   TrackPos, MaxTrackPos, X1, Y1, X2, Y2, PixelSize, TagWidth, TagHeight,
     TagTop: integer;
@@ -241,7 +242,8 @@ begin
     // The tag sits above the box, or inside it when the box touches the top.
     TagTop := Y1 - TagHeight;
     if TagTop < 0 then TagTop := Y1;
-    TrackLabel := IntToStr(Tracks[TrackPos].TrackId);
+    TrackLabel := IntToStr(Tracks[TrackPos].TrackId) + ' ' +
+      YoloClassLabel(Config, Tracks[TrackPos].ClassId);
     TagWidth := BitmapTextWidth(TrackLabel, PixelSize) + 2 * PixelSize;
     FillRectangleCV2(Image, X1, TagTop, X1 + TagWidth - 1, TagTop + TagHeight - 1,
       BoxColor);
@@ -347,7 +349,7 @@ begin
       Tracks := Tracker.Update(Dets);
       FrameSeconds := (Now() - StartTime) * 86400.0;
       TotalSeconds := TotalSeconds + FrameSeconds;
-      DrawTracks(Image, Tracks);
+      DrawTracks(Image, Tracks, Config);
       OutputFile := IncludeTrailingPathDelimiter(Opt.OutputDir) +
         ChangeFileExt(Frames[FramePos], '') + '_tracks.png';
       if not SaveImageFromVolumeIntoFile(Image, OutputFile) then
@@ -357,8 +359,9 @@ begin
       for TrackPos := 0 to MaxTrackPos do
       begin
         if TrackPos < csMaxLoggedTracks then
-          TrackText := TrackText + Format(' %d(class %d, %.2f)',
-            [Tracks[TrackPos].TrackId, Tracks[TrackPos].ClassId,
+          TrackText := TrackText + Format(' %d(class %s, %.2f)',
+            [Tracks[TrackPos].TrackId,
+            YoloClassLabel(Config, Tracks[TrackPos].ClassId),
             Tracks[TrackPos].Score]);
         MaxTrackId := Max(MaxTrackId, Tracks[TrackPos].TrackId);
       end;

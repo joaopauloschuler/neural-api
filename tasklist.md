@@ -2289,9 +2289,19 @@ rather than acted on.
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
-      - [ ] YoloDetect labels boxes with the class id (`DrawBitmapText`): no
+      - [X] YoloDetect labels boxes with the class id (`DrawBitmapText`): no
             class names reach `TYoloConfig`; read a `names` / `id2label` map
-            from config.json when present and label with the name.
+            from config.json when present and label with the name. DONE:
+            `TYoloConfig.ClassNames` (names list or map, else id2label; count
+            = num_classes), `YoloClassLabel` (name, else COCO-80 for an
+            80-class yolov8 without names, else the id); YoloDetect and
+            ObjectTracking tags and logs use it; `DrawBitmapText` draws one `?`
+            per UTF-8 character and look-alikes for & [ ] " ; |. Tests
+            `TestYoloConfigClassNames`, `TestBitmapTextUTF8AndLookAlikes`.
+      - [ ] ObjectTracking `--classes` takes ids only; class names (`person,car`)
+            could be resolved through `YoloClassLabel`.
+      - [ ] The pico YOLO fixture config has no `names`, so the example smoke
+            runs only show ids; the named path is covered by the unit test only.
       - [ ] Optional: BoT-SORT / OC-SORT style camera-motion compensation is
             not ported; ByteTrack only.
 

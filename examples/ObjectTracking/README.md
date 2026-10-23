@@ -5,7 +5,8 @@ Follows every object through a video, frame by frame. A YOLOv8 detector
 finds the objects of each frame, and `TByteTracker` links the detections of
 consecutive frames into tracks, so each object keeps one **track id** for as
 long as it stays in view. The program draws every track box in the colour of
-its id, with the id written above the box.
+its id, with the id and the class written above the box (for example
+`3 person`).
 
 **Status: planned (coded).** The example has not been run with a real
 `yolov8n` checkpoint on a real clip. It runs end to end on the random pico
@@ -54,7 +55,10 @@ its `config.json` next to it (or `--config FILE`); see
 of one clip as PNG / JPEG / PPM files, sorted by name with numbers compared by
 value (`f2.png` before `f10.png`). For each frame the program writes
 `<frame>_tracks.png` into the output folder and prints the detection count and
-the tracks (id, class, score).
+the tracks (id, class, score). The class is shown by name when the
+`config.json` has `names` (a list or a `{"0": ...}` map) or `id2label`; an
+80-class yolov8 config without names uses the built-in COCO names; otherwise
+the class id is shown.
 
 | Option | Meaning | Default |
 | --- | --- | --- |

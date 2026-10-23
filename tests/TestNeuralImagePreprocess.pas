@@ -140,6 +140,9 @@ type
     // DrawBitmapText of 'A' (3 channels), '1' at scale 2, lower case as upper
     // case and an unknown character as '?' against hand-drawn 5x7 patterns.
     procedure TestBitmapTextGlyphPixels;
+    // A UTF-8 multi-byte character is one '?' glyph wide; & [ { < ] } > " ` ; | \
+    // draw as their look-alikes + ( ( ( ) ) ) ' ' : / /.
+    procedure TestBitmapTextUTF8AndLookAlikes;
     // BitmapTextWidth / the DrawBitmapText result: (6 * Length - 1) * Scale.
     procedure TestBitmapTextWidth;
     // Text and FillRectangleCV2 across or far past the image border are
@@ -2004,6 +2007,42 @@ begin
       csGlyphQuestion, csWhite));
   finally
     Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestBitmapTextUTF8AndLookAlikes;
+const
+  csWhite: array[0..0] of TNeuralFloat = (255);
+  csLookAlikeFrom = '&[{<]}>"`;|\';
+  csLookAlikeTo = '+((()))''''://';
+var
+  Got, Want: TNNetVolume;
+  CharPos: integer;
+begin
+  // 'cafe' with U+00E9 (two UTF-8 bytes) and U+20AC (three) is 5 glyphs.
+  AssertEquals('UTF-8 width', 29,
+    BitmapTextWidth('caf' + #$C3#$A9 + #$E2#$82#$AC));
+  Got := TNNetVolume.Create(40, 9, 1);
+  Want := TNNetVolume.Create(40, 9, 1);
+  try
+    Got.Fill(0);
+    Want.Fill(0);
+    AssertEquals('UTF-8 drawn width', 29, DrawBitmapText(Got, 0, 1,
+      'caf' + #$C3#$A9 + #$E2#$82#$AC, csWhite));
+    DrawBitmapText(Want, 0, 1, 'CAF??', csWhite);
+    AssertTrue('one ? per UTF-8 character', Got.GetDistanceSqr(Want) = 0);
+    for CharPos := 1 to Length(csLookAlikeFrom) do
+    begin
+      Got.Fill(0);
+      Want.Fill(0);
+      DrawBitmapText(Got, 1, 1, csLookAlikeFrom[CharPos], csWhite);
+      DrawBitmapText(Want, 1, 1, csLookAlikeTo[CharPos], csWhite);
+      AssertTrue(csLookAlikeFrom[CharPos] + ' drawn as ' +
+        csLookAlikeTo[CharPos], Got.GetDistanceSqr(Want) = 0);
+    end;
+  finally
+    Got.Free;
+    Want.Free;
   end;
 end;
 

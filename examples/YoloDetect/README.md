@@ -24,6 +24,9 @@ image (ImageSize x ImageSize x NumChannels)
 `NumChannels`, `NumClasses`, `RegMax`, `Strides[0..2]`).
 `DecodeYoloDetections(Output, Config, ScoreThresh, IoUThresh)` turns the raw head
 volume into a `TYoloDetectionArray` (per detection: `ClassId`, `Score`, `X1/Y1/X2/Y2`).
+`YoloClassLabel(Config, ClassId)` gives the label of a class: its name from the
+config, else the COCO-80 name when an 80-class yolov8 config has no names, else
+the id as text.
 
 ## Build / run
 
@@ -58,8 +61,23 @@ pretrained checkpoint produces real detections through the exact same path.
 Prints the config (image size, class count, reg_max, strides), the output-OK
 check, the decoded `(class, score, xyxy)` list and the box self-check, then writes
 the annotated image to `yolo_detect.ppm` (a P6 PPM, min-max stretched so boxes are
-visible). Each box carries a tag in its colour with the class id and score
-(e.g. `2 0.53`), drawn with `DrawBitmapText` (`neural/neuralimageresize.pas`);
-the config has no class names, so the id stands in for the name. Pure CPU, <1 s on the fixture.
+visible). Each box carries a tag in its colour with the class label and score
+(e.g. `traffic light 0.53`), drawn with `DrawBitmapText`
+(`neural/neuralimageresize.pas`).
+
+## Class names
+
+`ReadYoloConfigFromJSONFile` reads the class names into `TYoloConfig.ClassNames`
+from `names` (a list, `["person", "bicycle", ...]`, or an ultralytics-style map,
+`{"0": "person", ...}`), else from the HF `id2label` map; the count must equal
+`num_classes`. With no names, an 80-class yolov8 config is labelled with the
+built-in COCO-80 names (ultralytics `coco.yaml`), and any other config with the
+class id. The pico fixture has no names and 3 classes, so its tags show the id
+(`2 0.53`). The 5x7 font has `0-9`, `A-Z` (lower case is drawn as upper case),
+space and `. , : - _ % # / ( ) ! ? + = '`; `& [ ] { } < > " ; |` are drawn
+as look-alikes, and any other character, including each UTF-8 character, as one
+`?`.
+
+Pure CPU, <1 s on the fixture.
 
 Coded by Claude (AI).

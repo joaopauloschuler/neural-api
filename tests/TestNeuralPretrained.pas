@@ -1283,6 +1283,7 @@ type
     procedure TestMask2FormerMaskEinsumOrderParity;
     procedure TestMask2FormerSemanticDecodeReference;
     procedure TestYoloConfigFromJSONFile;
+    procedure TestYoloConfigClassNames;
     procedure TestYoloObjectDetectionParity;
     procedure TestYoloDetectionDecode;
     procedure TestYoloSegConfigDefaults;
@@ -42808,6 +42809,66 @@ begin
     DeleteFile(StPath);
     DeleteFile(CfgPath);
   end;
+end;
+
+// names as a list or a {"0": ..} map, id2label, and no names (COCO-80 fallback
+// only for an 80-class yolov8) reach TYoloConfig.ClassNames / YoloClassLabel.
+procedure TTestNeuralPretrained.TestYoloConfigClassNames;
+var
+  CfgPath: string;
+  Config: TYoloConfig;
+  Raised: boolean;
+
+  function ReadConfig(const JsonText: string): TYoloConfig;
+  var
+    Lines: TStringList;
+  begin
+    Lines := TStringList.Create;
+    try
+      Lines.Text := JsonText;
+      Lines.SaveToFile(CfgPath);
+      Result := ReadYoloConfigFromJSONFile(CfgPath);
+    finally
+      Lines.Free;
+      DeleteFile(CfgPath);
+    end;
+  end;
+
+begin
+  CfgPath := GetTempDir + 'cai_yolo_names_config.json';
+  Config := ReadConfig('{"num_classes": 3, "names": ["person", "traffic light", "dog"]}');
+  AssertEquals('list count', 3, Length(Config.ClassNames));
+  AssertEquals('list label', 'traffic light', YoloClassLabel(Config, 1));
+  AssertTrue('ToString names count',
+    Pos('class_names=3', YoloConfigToString(Config)) > 0);
+  Config := ReadConfig('{"num_classes": 2, "names": {"1": "cat", "0": "dog"}}');
+  AssertEquals('map label 0', 'dog', YoloClassLabel(Config, 0));
+  AssertEquals('map label 1', 'cat', YoloClassLabel(Config, 1));
+  Config := ReadConfig('{"num_classes": 2, "id2label": {"0": "car", "1": "bus"}}');
+  AssertEquals('id2label label', 'bus', YoloClassLabel(Config, 1));
+  Config := ReadConfig('{"num_classes": 2, "names": ["a", "b"], ' +
+    '"id2label": {"0": "x", "1": "y"}}');
+  AssertEquals('names before id2label', 'b', YoloClassLabel(Config, 1));
+  Config := ReadYoloConfigFromJSONFile(FixturePath('tiny_yolo_config.json'));
+  AssertTrue('absent: no names', Config.ClassNames = nil);
+  AssertEquals('absent: id label', '2', YoloClassLabel(Config, 2));
+  Config := ReadConfig('{"num_classes": 80}');
+  AssertTrue('80 classes: still no names', Config.ClassNames = nil);
+  AssertEquals('COCO 0', 'person', YoloClassLabel(Config, 0));
+  AssertEquals('COCO 9', 'traffic light', YoloClassLabel(Config, 9));
+  AssertEquals('COCO 79', 'toothbrush', YoloClassLabel(Config, 79));
+  AssertEquals('out of range', '80', YoloClassLabel(Config, 80));
+  Config := ReadConfig('{"model_type": "fastsam", "num_classes": 80}');
+  AssertEquals('no COCO names for fastsam', '0', YoloClassLabel(Config, 0));
+  Config := ReadConfig('{"num_classes": 2, "names": ["", "b"]}');
+  AssertEquals('empty name falls back to the id', '0', YoloClassLabel(Config, 0));
+  Raised := false;
+  try
+    ReadConfig('{"num_classes": 3, "names": ["a", "b"]}');
+  except
+    on E: Exception do Raised := true;
+  end;
+  AssertTrue('names count must match num_classes', Raised);
 end;
 
 // Verifies ReadYoloConfigFromJSONFile on the committed YOLOv8 pico config.

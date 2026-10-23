@@ -67,7 +67,7 @@ var
   RefRoot: TJSONData;
   InArr: TJSONArray;
   W, H, NumCh, x, yy, ch, FlatIdx, i, x0, y0, x1, y1, TagTop: integer;
-  BoxLabel: string;
+  BoxLabel, ClassLabel, ClassText: string;
   BoxColor, TextColor: array[0..2] of TNeuralFloat;
   V: TNeuralFloat;
   AnyBad: boolean;
@@ -204,8 +204,11 @@ begin
     begin
       x0 := Round(Dets[i].X1); y0 := Round(Dets[i].Y1);
       x1 := Round(Dets[i].X2); y1 := Round(Dets[i].Y2);
-      WriteLn(Format('    class %d  score %.4f  xyxy=(%d,%d,%d,%d)',
-        [Dets[i].ClassId, Dets[i].Score, x0, y0, x1, y1]));
+      ClassLabel := YoloClassLabel(Config, Dets[i].ClassId);
+      if ClassLabel = IntToStr(Dets[i].ClassId) then ClassText := ''
+      else ClassText := ' (' + ClassLabel + ')';
+      WriteLn(Format('    class %d%s  score %.4f  xyxy=(%d,%d,%d,%d)',
+        [Dets[i].ClassId, ClassText, Dets[i].Score, x0, y0, x1, y1]));
       // Self-report 2: every decoded box must be finite.
       if IsNan(Dets[i].X1) or IsInfinite(Dets[i].X1) or
          IsNan(Dets[i].Y2) or IsInfinite(Dets[i].Y2) then
@@ -228,7 +231,7 @@ begin
         TextColor[0] := 255;
       TextColor[1] := TextColor[0];
       TextColor[2] := TextColor[0];
-      BoxLabel := Format('%d %.2f', [Dets[i].ClassId, Dets[i].Score]);
+      BoxLabel := Format('%s %.2f', [ClassLabel, Dets[i].Score]);
       TagTop := y0 - csBitmapFontGlyphHeight - 2;
       if TagTop < 0 then TagTop := y0;
       FillRectangleCV2(Img, x0, TagTop, x0 + BitmapTextWidth(BoxLabel) + 1,
