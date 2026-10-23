@@ -16065,6 +16065,49 @@ function DetectRetinaFaceFaces(NN: TNNet; const Config: TRetinaFaceConfig;
   NMSThreshold: TNeuralFloat = 0.4; MaxFaces: integer = 0): TRetinaFaceDetectionArray;
 
 // ---------------------------------------------------------------------------
+// WHOLE-PHOTO FACE RESTORATION (port of facexlib FaceRestoreHelper with
+// use_parse=False): RetinaFace landmarks -> 4-DOF similarity onto the FFHQ
+// 5-point template -> bilinear crop -> GFPGAN -> inverse warp pasted with an
+// eroded, Gaussian-feathered square mask on the (upscaled) background.
+// Coded by Claude (AI).
+const
+  // FaceRestoreHelper's FFHQ 5-landmark template of a 512 x 512 face, (x, y).
+  csFFHQFaceTemplate512: array[0..4, 0..1] of double = (
+    (192.98138, 239.94708), (318.90277, 240.1936), (256.63416, 314.01935),
+    (201.26117, 371.41043), (313.08905, 371.15118));
+  // align_warp_face's borderValue (135, 133, 132) of the BGR image, in RGB.
+  csFaceCropBorderRGB: array[0..2] of TNeuralFloat = (132, 133, 135);
+
+// Image -> face-crop similarity taking Detection's 5 landmarks onto the FFHQ
+// template scaled by FaceSize / 512 (EstimateSimilarityTransformLMedS).
+function FaceAlignmentMatrix(const Detection: TRetinaFaceDetection;
+  FaceSize: integer): TImageAffineMatrix;
+
+// Face := the FaceSize x FaceSize crop of Image (RGB 0..255) under Matrix
+// (cv2.warpAffine bilinear, gray border csFaceCropBorderRGB).
+procedure AlignWarpFace(Image: TNNetVolume; const Matrix: TImageAffineMatrix;
+  FaceSize: integer; Face: TNNetVolume);
+
+// Blends Face (cropped from the original image by Matrix) into Canvas, that
+// image UpscaleFactor times larger, through facexlib's eroded + feathered mask.
+procedure PasteFaceIntoImage(Face: TNNetVolume; const Matrix: TImageAffineMatrix;
+  UpscaleFactor: TNeuralFloat; Canvas: TNNetVolume);
+
+// The faces whose eye landmarks are at least MinEyeDistance pixels apart.
+function FilterFacesByEyeDistance(const Faces: TRetinaFaceDetectionArray;
+  MinEyeDistance: TNeuralFloat): TRetinaFaceDetectionArray;
+
+// GFPGANer.enhance (no face parsing): Output := Background (nil: Image) resized
+// to Trunc(UpscaleFactor * size) with every detected face restored and pasted;
+// returns the face count. Crops / RestoredFaces (optional) receive copies.
+function RestoreFacesInImage(Detector: TNNet;
+  const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
+  const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
+  UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
+  MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
+  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
+
+// ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
 // ultralytics/yolov8n) -- the repo's FIRST anchor-free fully-convolutional
 // one-stage detector, STRUCTURALLY DISTINCT from the landed DETR importer (no
@@ -110062,6 +110105,204 @@ begin
   finally
     Output.Free;
     NetInput.Free;
+  end;
+end;
+
+// ===========================================================================
+// WHOLE-PHOTO FACE RESTORATION (facexlib FaceRestoreHelper, use_parse=False)
+// ===========================================================================
+
+function FaceAlignmentMatrix(const Detection: TRetinaFaceDetection;
+  FaceSize: integer): TImageAffineMatrix;
+var
+  SourceX, SourceY, TemplateX, TemplateY: array[0..4] of double;
+  LandmarkPos: integer;
+  TemplateScale: double;
+begin
+  TemplateScale := FaceSize / 512;
+  for LandmarkPos := 0 to 4 do
+  begin
+    SourceX[LandmarkPos] := Detection.LandmarkX[LandmarkPos];
+    SourceY[LandmarkPos] := Detection.LandmarkY[LandmarkPos];
+    TemplateX[LandmarkPos] := csFFHQFaceTemplate512[LandmarkPos, 0] * TemplateScale;
+    TemplateY[LandmarkPos] := csFFHQFaceTemplate512[LandmarkPos, 1] * TemplateScale;
+  end;
+  Result := EstimateSimilarityTransformLMedS(SourceX, SourceY, TemplateX,
+    TemplateY);
+end;
+
+procedure AlignWarpFace(Image: TNNetVolume; const Matrix: TImageAffineMatrix;
+  FaceSize: integer; Face: TNNetVolume);
+begin
+  WarpImageAffine(Image, Face, Matrix, FaceSize, FaceSize, csFaceCropBorderRGB);
+end;
+
+procedure PasteFaceIntoImage(Face: TNNetVolume; const Matrix: TImageAffineMatrix;
+  UpscaleFactor: TNeuralFloat; Canvas: TNNetVolume);
+var
+  FaceToCanvas: TImageAffineMatrix;
+  Warped, Ones, Mask, Eroded, Center, SoftMask: TNNetVolume;
+  CornerPos, ElementPos, Margin, EdgeWidth, ErodeSize: integer;
+  RegionX1, RegionY1, RegionX2, RegionY2, RegionSizeX, RegionSizeY: integer;
+  X, Y, MaxRegionX, MaxRegionY, Channel, MaxChannel: integer;
+  CornerX, CornerY, MappedX, MappedY, MinX, MinY, MaxX, MaxY: double;
+  Soft, FaceWeight: TNeuralFloat;
+  CanvasPtr, WarpedPtr: TNeuralFloatArrPtr;
+begin
+  if (Face.Depth <> Canvas.Depth) then
+    ImportError('PasteFaceIntoImage: the face has ' + IntToStr(Face.Depth) +
+      ' channels, the canvas ' + IntToStr(Canvas.Depth) + '.');
+  FaceToCanvas := InvertImageAffineMatrix(Matrix);
+  for ElementPos := 0 to 5 do
+    FaceToCanvas[ElementPos] := FaceToCanvas[ElementPos] * UpscaleFactor;
+  if UpscaleFactor > 1 then
+  begin
+    FaceToCanvas[2] := FaceToCanvas[2] + 0.5 * UpscaleFactor;
+    FaceToCanvas[5] := FaceToCanvas[5] + 0.5 * UpscaleFactor;
+  end;
+  // The canvas pixels the face square (with its 1-pixel bilinear fringe) lands
+  // on, plus a margin wider than the feathering blur, so the rest is untouched.
+  MinX := MaxDouble; MinY := MaxDouble; MaxX := -MaxDouble; MaxY := -MaxDouble;
+  for CornerPos := 0 to 3 do
+  begin
+    if Odd(CornerPos) then CornerX := Face.SizeX else CornerX := -1;
+    if CornerPos >= 2 then CornerY := Face.SizeY else CornerY := -1;
+    MappedX := FaceToCanvas[0] * CornerX + FaceToCanvas[1] * CornerY + FaceToCanvas[2];
+    MappedY := FaceToCanvas[3] * CornerX + FaceToCanvas[4] * CornerY + FaceToCanvas[5];
+    MinX := Min(MinX, MappedX); MaxX := Max(MaxX, MappedX);
+    MinY := Min(MinY, MappedY); MaxY := Max(MaxY, MappedY);
+  end;
+  Margin := Ceil(Sqrt(Abs(FaceToCanvas[0] * FaceToCanvas[4] -
+    FaceToCanvas[1] * FaceToCanvas[3])) * (Max(Face.SizeX, Face.SizeY) + 2) / 20) + 4;
+  if (MaxX < -Margin) or (MaxY < -Margin) or (MinX > Canvas.SizeX + Margin) or
+     (MinY > Canvas.SizeY + Margin) then exit;
+  RegionX1 := Max(Floor(MinX) - Margin, 0);
+  RegionY1 := Max(Floor(MinY) - Margin, 0);
+  RegionX2 := Min(Ceil(MaxX) + Margin, Canvas.SizeX - 1);
+  RegionY2 := Min(Ceil(MaxY) + Margin, Canvas.SizeY - 1);
+  if (RegionX1 > RegionX2) or (RegionY1 > RegionY2) then exit;
+  RegionSizeX := RegionX2 - RegionX1 + 1;
+  RegionSizeY := RegionY2 - RegionY1 + 1;
+  FaceToCanvas[2] := FaceToCanvas[2] - RegionX1;
+  FaceToCanvas[5] := FaceToCanvas[5] - RegionY1;
+  Warped := TNNetVolume.Create;
+  Ones := TNNetVolume.Create(Face.SizeX, Face.SizeY, 1, 1);
+  Mask := TNNetVolume.Create;
+  Eroded := TNNetVolume.Create;
+  Center := TNNetVolume.Create;
+  SoftMask := TNNetVolume.Create;
+  try
+    WarpImageAffine(Face, Warped, FaceToCanvas, RegionSizeX, RegionSizeY, []);
+    WarpImageAffine(Ones, Mask, FaceToCanvas, RegionSizeX, RegionSizeY, []);
+    ErodeSize := Trunc(2 * UpscaleFactor);
+    ErodeImage(Mask, Eroded, ErodeSize, ErodeSize);
+    EdgeWidth := Trunc(Sqrt(Max(Eroded.GetSum(), 0))) div 20;
+    ErodeImage(Eroded, Center, 2 * EdgeWidth, 2 * EdgeWidth);
+    GaussianBlurImageCV2(Center, SoftMask, 2 * EdgeWidth + 1);
+    MaxRegionX := RegionSizeX - 1;
+    MaxRegionY := RegionSizeY - 1;
+    MaxChannel := Canvas.Depth - 1;
+    for Y := 0 to MaxRegionY do
+      for X := 0 to MaxRegionX do
+      begin
+        Soft := SoftMask.FData[Y * RegionSizeX + X];
+        if Soft = 0 then continue;
+        FaceWeight := Soft * Eroded.FData[Y * RegionSizeX + X];
+        CanvasPtr := Canvas.GetRawPtr(RegionX1 + X, RegionY1 + Y);
+        WarpedPtr := Warped.GetRawPtr(X, Y);
+        for Channel := 0 to MaxChannel do
+          CanvasPtr^[Channel] := FaceWeight * WarpedPtr^[Channel] +
+            (1 - Soft) * CanvasPtr^[Channel];
+      end;
+  finally
+    SoftMask.Free;
+    Center.Free;
+    Eroded.Free;
+    Mask.Free;
+    Ones.Free;
+    Warped.Free;
+  end;
+end;
+
+function FilterFacesByEyeDistance(const Faces: TRetinaFaceDetectionArray;
+  MinEyeDistance: TNeuralFloat): TRetinaFaceDetectionArray;
+var
+  FacePos, MaxFacePos, KeptCount: integer;
+begin
+  SetLength(Result, Length(Faces));
+  KeptCount := 0;
+  MaxFacePos := High(Faces);
+  for FacePos := 0 to MaxFacePos do
+    if Hypot(Faces[FacePos].LandmarkX[0] - Faces[FacePos].LandmarkX[1],
+      Faces[FacePos].LandmarkY[0] - Faces[FacePos].LandmarkY[1]) >=
+      MinEyeDistance then
+    begin
+      Result[KeptCount] := Faces[FacePos];
+      Inc(KeptCount);
+    end;
+  SetLength(Result, KeptCount);
+end;
+
+function RestoreFacesInImage(Detector: TNNet;
+  const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
+  const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
+  UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
+  MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
+  RestoredFaces: TNNetVolumeList): integer;
+var
+  Faces: TRetinaFaceDetectionArray;
+  Matrices: array of TImageAffineMatrix;
+  Crop: TNNetVolume;
+  // Restored[FacePos]: GFPGAN's output for face FacePos.
+  Restored: TNNetVolumeList;
+  FacePos, MaxFacePos, CanvasSizeX, CanvasSizeY: integer;
+
+  procedure AddCopy(List: TNNetVolumeList; Volume: TNNetVolume);
+  var
+    Copied: TNNetVolume;
+  begin
+    Copied := TNNetVolume.Create;
+    Copied.Copy(Volume);
+    List.Add(Copied);
+  end;
+
+begin
+  if Image.Depth <> 3 then
+    ImportError('RestoreFacesInImage needs an RGB image, got depth ' +
+      IntToStr(Image.Depth) + '.');
+  if UpscaleFactor <= 0 then
+    ImportError('RestoreFacesInImage: UpscaleFactor must be positive.');
+  Faces := FilterFacesByEyeDistance(DetectRetinaFaceFaces(Detector,
+    DetectorConfig, Image, ConfThreshold, 0.4, MaxFaces), MinEyeDistance);
+  Result := Length(Faces);
+  MaxFacePos := Result - 1;
+  SetLength(Matrices, Result);
+  Crop := TNNetVolume.Create;
+  Restored := TNNetVolumeList.Create(true);
+  try
+    // Every face is cropped from Image before Output (which may be Image) changes.
+    for FacePos := 0 to MaxFacePos do
+    begin
+      Matrices[FacePos] := FaceAlignmentMatrix(Faces[FacePos],
+        RestorerConfig.OutSize);
+      AlignWarpFace(Image, Matrices[FacePos], RestorerConfig.OutSize, Crop);
+      if Crops <> nil then AddCopy(Crops, Crop);
+      Restored.Add(TNNetVolume.Create);
+      GFPGANRestoreFace(Restorer, RestorerConfig, Crop, Restored[FacePos]);
+      if RestoredFaces <> nil then AddCopy(RestoredFaces, Restored[FacePos]);
+    end;
+    CanvasSizeX := Trunc(Image.SizeX * UpscaleFactor);
+    CanvasSizeY := Trunc(Image.SizeY * UpscaleFactor);
+    if Background <> nil then
+      ResizeImageLanczos4CV2(Background, Output, CanvasSizeX, CanvasSizeY)
+    else
+      ResizeImageLanczos4CV2(Image, Output, CanvasSizeX, CanvasSizeY);
+    for FacePos := 0 to MaxFacePos do
+      PasteFaceIntoImage(Restored[FacePos], Matrices[FacePos], UpscaleFactor,
+        Output);
+  finally
+    Restored.Free;
+    Crop.Free;
   end;
 end;
 

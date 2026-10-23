@@ -871,20 +871,50 @@ rather than acted on.
         on a real photo against facexlib `detect_faces` (oracle in the ~/x venv:
         facexlib 0.3.0 is not installed there; the wheel's retinaface*.py run with
         torchvision from /tmp/tvlib and a cv2 stub).
-  - [ ] (2) A least-squares similarity transform (Umeyama, 4 DOF) from the 5
-        landmarks to the FFHQ 512 template, and a bilinear affine warp that writes
-        a fixed-size crop (reuse the TNNetAffineGridSample/TNNetGridSample sampling
-        code; `AugAffineWarp` is nearest and in-place, so it does not fit).
-        FaceRestoreHelper keeps faces with eye distance >= 5 px and uses
-        conf_threshold 0.97 at the original image size.
-  - [ ] (3) Inverse-warp the restored face back with an eroded + Gaussian-feathered
-        mask (reuse `GaussianBlurImage` in neuralimageresize.pas) and blend;
-        optional background upsampling through the landed RealESRGAN importer
-        (`--bg-upsampler`, like gfpgan's).
-  - [ ] Example: `FaceRestoration --input photo.jpg` (no `--aligned`) restores
-        every detected face; keep the current aligned mode as `--aligned`.
-  - [ ] Parity: the aligned crop vs facexlib on a real photo, then the final
-        composite vs inference_gfpgan.py. Pico fixtures for the suite.
+  - [X] (2) + (3) facexlib `FaceRestoreHelper` port (use_parse=False) in
+        neuralpretrained.pas: `FaceAlignmentMatrix` (FFHQ 512 template scaled to
+        the face size; `EstimateSimilarityTransformLMedS`, a deterministic
+        cv2.estimateAffinePartial2D LMEDS: best-median point pair -> inliers ->
+        least squares), `AlignWarpFace` (gray border 132/133/135 RGB),
+        `PasteFaceIntoImage` (inverse warp x upscale + 0.5*upscale offset,
+        square mask eroded by 2*upscale, then eroded by 2*w_edge and
+        GaussianBlur(2*w_edge+1), w_edge = int(sqrt(area))//20; work limited to
+        the face's canvas box), `FilterFacesByEyeDistance` and
+        `RestoreFacesInImage`. Generic pieces in neuralimageresize.pas:
+        `WarpImageAffine` (cv2.warpAffine bilinear, BORDER_CONSTANT, float, on
+        NeuralBilinearGatherColumn), `InvertImageAffineMatrix`,
+        `EstimateSimilarityTransform[LMedS]`, `ErodeImage`, `GaussianBlurImageCV2`
+        (cv2 tables up to 9 taps), `ResizeImageLanczos4CV2`. Tests vs cv2 4.10 /
+        numpy oracles: TestSimilarityTransform*, TestWarpImageAffineMatchesFloatOracle,
+        TestResizeImageLanczos4CV2MatchesCV2, TestErodeAndGaussianBlurCV2MatchCV2,
+        TestFacePasteMatchesFacexlibOracle, TestRestoreFacesInImagePicoSmoke.
+  - [X] Example: `FaceRestoration --model M --detector D --input photo.jpg`
+        restores every face (`--upscale`, `--bg-upsampler` through
+        TRRDBNetUpscaler, `--det-threshold`, `--min-eye-distance`, `--max-faces`,
+        `--save-faces`); the old mode is `--aligned`.
+  - [ ] ParseNet face-parsing paste mask: GFPGANer builds FaceRestoreHelper with
+        `use_parse=True` (facexlib `parsing_parsenet.pth`, v0.2.2 release), so
+        inference_gfpgan.py blends through a parsing mask (GaussianBlur 101/11
+        twice, 10-px border cleared, warped with flags=3, which warpAffine runs
+        as INTER_LINEAR); our paste uses the square-mask path. Needs a ParseNet
+        importer; WarpImageAffine already covers the mask warp.
+  - [ ] Real-checkpoint parity (needs the downloads; oracle in the ~/x venv with
+        the facexlib 0.3.0 + gfpgan 1.3.8 wheels unpacked under /tmp and
+        opencv-python-headless 4.10 unpacked to /tmp/cvlib4, all on sys.path
+        via `python -I` + sys.path.insert, torchvision from /tmp/tvlib):
+        (a) `FaceRestoration --model GFPGANv1.4.pth --detector
+        detection_Resnet50_Final.pth --input photo.jpg --output out.png
+        --save-faces f --noise const --upscale 2` on a real group photo; in
+        Python run `FaceRestoreHelper(2, det_model='retinaface_resnet50',
+        use_parse=False)` -> read_image -> get_face_landmarks_5(eye_dist_threshold=5)
+        -> align_warp_face and compare `cropped_faces[i]` (BGR uint8) with
+        `f_cropped_NN.png` (expect ~0.3 gray levels mean: cv2 rounds to uint8 and
+        to 1/32-px positions) and the landmarks; (b) feed OUR restored faces
+        (`f_restored_NN.png`, RGB->BGR) through add_restored_face ->
+        get_inverse_affine -> paste_faces_to_input_image and compare the
+        composite with out.png (isolates the paste from GFPGAN noise; expect
+        < 1 gray level mean, facexlib truncates to uint8); (c) the full
+        inference_gfpgan.py composite only after the ParseNet item above.
 - [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
       landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`
       and `ddcolor_modelscope` on real grayscale photos (CPU and `--gpu`) against

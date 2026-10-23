@@ -1,8 +1,8 @@
 unit neuralimageresize;
 
 (*
-neuralimageresize: image resampling and filtering on TNNetVolume with no
-unit dependency beyond neuralvolume (no fcl-image), so importers can use it.
+neuralimageresize: image resampling, warping and filtering on TNNetVolume
+with no fcl-image dependency, so importers can use it.
 
 Coded by Claude (AI).
 *)
@@ -104,6 +104,43 @@ function ParseOutpaintSides(const Text: string;
 // as in a HF preprocessor_config.json "resample"; raises on other codes.
 function PILResampleCodeToFilter(Code: integer): TImageResampleFilter;
 
+// cv2.resize(INTER_LANCZOS4) in float: 8 taps around (Dest + 0.5) * scale - 0.5,
+// edge pixels repeated, no antialias; the same size copies. Dest may be Source.
+procedure ResizeImageLanczos4CV2(Source, Dest: TNNetVolume; NewSizeX,
+  NewSizeY: integer);
+
+// cv2.GaussianBlur(Source, (KernelSize, KernelSize), 0): sigma from KernelSize
+// (cv2's fixed tables up to 9 taps), reflect-101 edges. Dest may be Source.
+procedure GaussianBlurImageCV2(Source, Dest: TNNetVolume; KernelSize: integer);
+
+// cv2.erode with a KernelSizeX x KernelSizeY rectangle anchored at its centre;
+// pixels past the edge are ignored. A 0 size is cv2's empty kernel (3 x 3).
+procedure ErodeImage(Source, Dest: TNNetVolume; KernelSizeX,
+  KernelSizeY: integer);
+
+type
+  // 2 x 3 affine matrix [a b c; d e f], row major, as cv2: (x, y) -> (ax+by+c, dx+ey+f).
+  TImageAffineMatrix = array[0..5] of double;
+
+// cv2.invertAffineTransform.
+function InvertImageAffineMatrix(const Matrix: TImageAffineMatrix): TImageAffineMatrix;
+
+// Least-squares 4-DOF similarity (rotation, uniform scale, shift; the Umeyama
+// closed form) taking the Source points onto the Dest points.
+function EstimateSimilarityTransform(const SourceX, SourceY, DestX,
+  DestY: array of double): TImageAffineMatrix;
+
+// cv2.estimateAffinePartial2D(method=LMEDS) made deterministic: the point pair
+// whose similarity has the least median squared error picks the inliers, then least squares.
+function EstimateSimilarityTransformLMedS(const SourceX, SourceY, DestX,
+  DestY: array of double): TImageAffineMatrix;
+
+// cv2.warpAffine(Source, Matrix, (DestSizeX, DestSizeY)) bilinear in float with
+// BORDER_CONSTANT: an outside neighbour reads BorderValue (missing channels 0).
+procedure WarpImageAffine(Source, Dest: TNNetVolume;
+  const Matrix: TImageAffineMatrix; DestSizeX, DestSizeY: integer;
+  const BorderValue: array of TNeuralFloat);
+
 type
   // Resize + crop of a HF image processor: shortest-edge (KeepsAspect) or
   // direct (ResizeHeight,ResizeWidth) resize, then a (CropHeight,CropWidth) crop.
@@ -131,7 +168,7 @@ procedure ResolveHFImageResize(const ProcessorType: string;
 implementation
 
 uses
-  SysUtils, Math;
+  SysUtils, Math, neuralnetwork;
 
 function PILResampleCodeToFilter(Code: integer): TImageResampleFilter;
 begin
@@ -619,20 +656,18 @@ begin
 end;
 
 
-// Separable blur of Source by the normalized Gaussian of Sigma over taps
-// -TapRadius..TapRadius; past the edge it clamps or reflects.
-procedure BlurImageSeparable(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
-  TapRadius: integer; IsReflect: boolean);
+// Separable blur of Source by Taps (odd count, tap TapPos weighs the pixel
+// TapPos - Length(Taps) div 2 away) on both axes; past the edge it clamps or reflects.
+procedure BlurImageSeparableTaps(Source, Dest: TNNetVolume;
+  const Taps: array of double; IsReflect: boolean);
 var
-  // Taps[TapPos] weighs the pixel TapPos - TapRadius away; they sum to 1.
-  Taps: array of double;
   // NeighboursX/Y[Pos * TapCount + TapPos]: the pixel tap TapPos of Pos reads.
   NeighboursX, NeighboursY: array of integer;
   // Source blurred along X only, in the TNNetVolume layout.
   Rows: array of TNeuralFloat;
-  TapPos, MaxTapPos, TapCount, SizeX, SizeY, Depth, RowStride: integer;
+  TapPos, MaxTapPos, TapCount, TapRadius, SizeX, SizeY, Depth, RowStride: integer;
   X, Y, Channel, MaxX, MaxY, MaxChannel, PixelPos, NeighbourBase: integer;
-  Distance, TapSum, Sum: double;
+  Sum: double;
 
   procedure BuildNeighbours(MaxPos: integer; var Neighbours: array of integer);
   var
@@ -655,18 +690,9 @@ var
   end;
 
 begin
-  MaxTapPos := 2 * TapRadius;
-  TapCount := MaxTapPos + 1;
-  SetLength(Taps, TapCount);
-  TapSum := 0;
-  for TapPos := 0 to MaxTapPos do
-  begin
-    Distance := TapPos - TapRadius;
-    Taps[TapPos] := Exp(-Distance * Distance / (2 * Sigma * Sigma));
-    TapSum := TapSum + Taps[TapPos];
-  end;
-  for TapPos := 0 to MaxTapPos do
-    Taps[TapPos] := Taps[TapPos] / TapSum;
+  TapCount := Length(Taps);
+  MaxTapPos := TapCount - 1;
+  TapRadius := TapCount div 2;
   SizeX := Source.SizeX;
   SizeY := Source.SizeY;
   Depth := Source.Depth;
@@ -707,6 +733,470 @@ begin
           Sum := Sum + Taps[TapPos] * Rows[NeighboursY[NeighbourBase + TapPos] *
             RowStride + X * Depth + Channel];
         Dest.FData[PixelPos + Channel] := Sum;
+      end;
+    end;
+  end;
+end;
+
+// Separable blur of Source by the normalized Gaussian of Sigma over taps
+// -TapRadius..TapRadius; past the edge it clamps or reflects.
+procedure BlurImageSeparable(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
+  TapRadius: integer; IsReflect: boolean);
+var
+  Taps: array of double;
+  TapPos, MaxTapPos: integer;
+  Distance, TapSum: double;
+begin
+  MaxTapPos := 2 * TapRadius;
+  SetLength(Taps, MaxTapPos + 1);
+  TapSum := 0;
+  for TapPos := 0 to MaxTapPos do
+  begin
+    Distance := TapPos - TapRadius;
+    Taps[TapPos] := Exp(-Distance * Distance / (2 * Sigma * Sigma));
+    TapSum := TapSum + Taps[TapPos];
+  end;
+  for TapPos := 0 to MaxTapPos do
+    Taps[TapPos] := Taps[TapPos] / TapSum;
+  BlurImageSeparableTaps(Source, Dest, Taps, IsReflect);
+end;
+
+procedure GaussianBlurImageCV2(Source, Dest: TNNetVolume; KernelSize: integer);
+const
+  // cv2 getGaussianKernel's tables (x 256) for 1 to 9 taps when sigma <= 0.
+  csSmallTaps: array[0..4, 0..8] of double = (
+    (256, 0, 0, 0, 0, 0, 0, 0, 0),
+    (64, 128, 64, 0, 0, 0, 0, 0, 0),
+    (16, 64, 96, 64, 16, 0, 0, 0, 0),
+    (8, 28, 56, 72, 56, 28, 8, 0, 0),
+    (4, 13, 30, 51, 60, 51, 30, 13, 4));
+var
+  Taps: array of double;
+  TapPos, MaxTapPos: integer;
+begin
+  if (KernelSize < 1) or not Odd(KernelSize) then
+    raise EArgumentException.Create('GaussianBlurImageCV2: KernelSize must ' +
+      'be odd and >= 1.');
+  if KernelSize = 1 then
+  begin
+    if Dest <> Source then Dest.Copy(Source);
+    exit;
+  end;
+  if KernelSize > 9 then
+  begin
+    BlurImageSeparable(Source, Dest, 0.3 * ((KernelSize - 1) * 0.5 - 1) + 0.8,
+      KernelSize div 2, true);
+    exit;
+  end;
+  MaxTapPos := KernelSize - 1;
+  SetLength(Taps, KernelSize);
+  for TapPos := 0 to MaxTapPos do
+    Taps[TapPos] := csSmallTaps[KernelSize div 2, TapPos] / 256;
+  BlurImageSeparableTaps(Source, Dest, Taps, true);
+end;
+
+procedure ErodeImage(Source, Dest: TNNetVolume; KernelSizeX,
+  KernelSizeY: integer);
+var
+  // Source eroded along X only, in the TNNetVolume layout.
+  Rows: array of TNeuralFloat;
+  SizeX, SizeY, Depth, RowStride, X, Y, MaxX, MaxY, MaxElementPos: integer;
+  FirstX, LastX, FirstY, LastY, NeighbourPos, MaxNeighbourPos: integer;
+  ElementPos, AnchorX, AnchorY, PixelPos: integer;
+  MinValue: TNeuralFloat;
+begin
+  if (KernelSizeX < 0) or (KernelSizeY < 0) then
+    raise EArgumentException.Create('ErodeImage: negative kernel size.');
+  if (KernelSizeX = 0) or (KernelSizeY = 0) then
+  begin
+    KernelSizeX := 3;
+    KernelSizeY := 3;
+  end;
+  SizeX := Source.SizeX;
+  SizeY := Source.SizeY;
+  Depth := Source.Depth;
+  RowStride := SizeX * Depth;
+  MaxX := SizeX - 1;
+  MaxY := SizeY - 1;
+  MaxElementPos := Depth - 1;
+  AnchorX := KernelSizeX div 2;
+  AnchorY := KernelSizeY div 2;
+  SetLength(Rows, Source.Size);
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      FirstX := Max(X - AnchorX, 0);
+      LastX := Min(X - AnchorX + KernelSizeX - 1, MaxX);
+      PixelPos := Y * RowStride + X * Depth;
+      for ElementPos := 0 to MaxElementPos do
+      begin
+        MinValue := Source.FData[Y * RowStride + FirstX * Depth + ElementPos];
+        MaxNeighbourPos := Y * RowStride + LastX * Depth + ElementPos;
+        NeighbourPos := Y * RowStride + (FirstX + 1) * Depth + ElementPos;
+        while NeighbourPos <= MaxNeighbourPos do
+        begin
+          if Source.FData[NeighbourPos] < MinValue then
+            MinValue := Source.FData[NeighbourPos];
+          Inc(NeighbourPos, Depth);
+        end;
+        Rows[PixelPos + ElementPos] := MinValue;
+      end;
+    end;
+  Dest.ReSize(SizeX, SizeY, Depth);
+  for Y := 0 to MaxY do
+  begin
+    FirstY := Max(Y - AnchorY, 0);
+    LastY := Min(Y - AnchorY + KernelSizeY - 1, MaxY);
+    for X := 0 to MaxX do
+    begin
+      PixelPos := Y * RowStride + X * Depth;
+      for ElementPos := 0 to MaxElementPos do
+      begin
+        MinValue := Rows[FirstY * RowStride + X * Depth + ElementPos];
+        MaxNeighbourPos := LastY * RowStride + X * Depth + ElementPos;
+        NeighbourPos := (FirstY + 1) * RowStride + X * Depth + ElementPos;
+        while NeighbourPos <= MaxNeighbourPos do
+        begin
+          if Rows[NeighbourPos] < MinValue then MinValue := Rows[NeighbourPos];
+          Inc(NeighbourPos, RowStride);
+        end;
+        Dest.FData[PixelPos + ElementPos] := MinValue;
+      end;
+    end;
+  end;
+end;
+
+procedure ResizeImageLanczos4CV2(Source, Dest: TNNetVolume; NewSizeX,
+  NewSizeY: integer);
+const
+  csTapCount = 8;
+  csMaxTapPos = csTapCount - 1;
+type
+  // Per destination column or row: the 8 source indices and their weights.
+  TLanczos4Axis = record
+    Index: array of integer;
+    Weight: array of double;
+  end;
+var
+  AxisX, AxisY: TLanczos4Axis;
+  // Source resized along X only, (NewSizeX, SizeY, Depth).
+  Rows: array of TNeuralFloat;
+  SizeX, SizeY, Depth, X, Y, MaxX, MaxY, ElementPos, MaxElementPos: integer;
+  TapPos, TapBase, SourceRowStride, DestRowStride, DestPos, ColumnPos: integer;
+  Sum: double;
+
+  procedure BuildAxis(SourceSize, DestSize: integer; var Axis: TLanczos4Axis);
+  var
+    DestPos, MaxDestPos, SourcePos, AxisTapPos: integer;
+    Scale, Fraction, Distance, WeightSum: double;
+  begin
+    SetLength(Axis.Index, DestSize * csTapCount);
+    SetLength(Axis.Weight, DestSize * csTapCount);
+    Scale := 1 / (DestSize / SourceSize);
+    MaxDestPos := DestSize - 1;
+    for DestPos := 0 to MaxDestPos do
+    begin
+      Fraction := single((DestPos + 0.5) * Scale - 0.5);
+      SourcePos := Floor(Fraction);
+      Fraction := Fraction - SourcePos;
+      WeightSum := 0;
+      for AxisTapPos := 0 to csMaxTapPos do
+      begin
+        Axis.Index[DestPos * csTapCount + AxisTapPos] :=
+          Min(Max(SourcePos - 3 + AxisTapPos, 0), SourceSize - 1);
+        if Fraction < 1.1920929e-07 then
+        begin
+          if AxisTapPos = 3 then Axis.Weight[DestPos * csTapCount + AxisTapPos] := 1
+          else Axis.Weight[DestPos * csTapCount + AxisTapPos] := 0;
+        end
+        else
+        begin
+          Distance := (Fraction + 3 - AxisTapPos) * Pi;
+          Axis.Weight[DestPos * csTapCount + AxisTapPos] :=
+            Sin(Distance) * Sin(Distance * 0.25) / (Distance * Distance);
+        end;
+        WeightSum := WeightSum + Axis.Weight[DestPos * csTapCount + AxisTapPos];
+      end;
+      for AxisTapPos := 0 to csMaxTapPos do
+        Axis.Weight[DestPos * csTapCount + AxisTapPos] :=
+          Axis.Weight[DestPos * csTapCount + AxisTapPos] / WeightSum;
+    end;
+  end;
+
+begin
+  if (NewSizeX < 1) or (NewSizeY < 1) then
+    raise EArgumentException.Create('ResizeImageLanczos4CV2: size must be ' +
+      'positive.');
+  SizeX := Source.SizeX;
+  SizeY := Source.SizeY;
+  Depth := Source.Depth;
+  if (NewSizeX = SizeX) and (NewSizeY = SizeY) then
+  begin
+    if Dest <> Source then Dest.Copy(Source);
+    exit;
+  end;
+  BuildAxis(SizeX, NewSizeX, AxisX);
+  BuildAxis(SizeY, NewSizeY, AxisY);
+  SourceRowStride := SizeX * Depth;
+  DestRowStride := NewSizeX * Depth;
+  MaxX := NewSizeX - 1;
+  MaxY := SizeY - 1;
+  MaxElementPos := Depth - 1;
+  SetLength(Rows, NewSizeX * SizeY * Depth);
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      TapBase := X * csTapCount;
+      DestPos := Y * DestRowStride + X * Depth;
+      for ElementPos := 0 to MaxElementPos do
+      begin
+        Sum := 0;
+        for TapPos := 0 to csMaxTapPos do
+          Sum := Sum + AxisX.Weight[TapBase + TapPos] * Source.FData[Y *
+            SourceRowStride + AxisX.Index[TapBase + TapPos] * Depth + ElementPos];
+        Rows[DestPos + ElementPos] := Sum;
+      end;
+    end;
+  Dest.ReSize(NewSizeX, NewSizeY, Depth);
+  MaxY := NewSizeY - 1;
+  for Y := 0 to MaxY do
+  begin
+    TapBase := Y * csTapCount;
+    for X := 0 to MaxX do
+    begin
+      ColumnPos := X * Depth;
+      DestPos := Y * DestRowStride + ColumnPos;
+      for ElementPos := 0 to MaxElementPos do
+      begin
+        Sum := 0;
+        for TapPos := 0 to csMaxTapPos do
+          Sum := Sum + AxisY.Weight[TapBase + TapPos] *
+            Rows[AxisY.Index[TapBase + TapPos] * DestRowStride + ColumnPos +
+            ElementPos];
+        Dest.FData[DestPos + ElementPos] := Sum;
+      end;
+    end;
+  end;
+end;
+
+function InvertImageAffineMatrix(const Matrix: TImageAffineMatrix): TImageAffineMatrix;
+var
+  Determinant: double;
+begin
+  Determinant := Matrix[0] * Matrix[4] - Matrix[1] * Matrix[3];
+  if Determinant <> 0 then Determinant := 1 / Determinant;
+  Result[0] := Matrix[4] * Determinant;
+  Result[1] := -Matrix[1] * Determinant;
+  Result[3] := -Matrix[3] * Determinant;
+  Result[4] := Matrix[0] * Determinant;
+  Result[2] := -Result[0] * Matrix[2] - Result[1] * Matrix[5];
+  Result[5] := -Result[3] * Matrix[2] - Result[4] * Matrix[5];
+end;
+
+function EstimateSimilarityTransform(const SourceX, SourceY, DestX,
+  DestY: array of double): TImageAffineMatrix;
+var
+  PointPos, MaxPointPos, PointCount: integer;
+  SourceMeanX, SourceMeanY, DestMeanX, DestMeanY: double;
+  CenteredX, CenteredY, Spread, CosTerm, SinTerm, ScaledCos, ScaledSin: double;
+begin
+  PointCount := Length(SourceX);
+  if (PointCount < 2) or (Length(SourceY) <> PointCount) or
+     (Length(DestX) <> PointCount) or (Length(DestY) <> PointCount) then
+    raise EArgumentException.Create('EstimateSimilarityTransform needs at ' +
+      'least 2 points and equal-length arrays.');
+  MaxPointPos := PointCount - 1;
+  SourceMeanX := 0; SourceMeanY := 0; DestMeanX := 0; DestMeanY := 0;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    SourceMeanX := SourceMeanX + SourceX[PointPos];
+    SourceMeanY := SourceMeanY + SourceY[PointPos];
+    DestMeanX := DestMeanX + DestX[PointPos];
+    DestMeanY := DestMeanY + DestY[PointPos];
+  end;
+  SourceMeanX := SourceMeanX / PointCount;
+  SourceMeanY := SourceMeanY / PointCount;
+  DestMeanX := DestMeanX / PointCount;
+  DestMeanY := DestMeanY / PointCount;
+  Spread := 0; CosTerm := 0; SinTerm := 0;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    CenteredX := SourceX[PointPos] - SourceMeanX;
+    CenteredY := SourceY[PointPos] - SourceMeanY;
+    Spread := Spread + CenteredX * CenteredX + CenteredY * CenteredY;
+    CosTerm := CosTerm + CenteredX * (DestX[PointPos] - DestMeanX) +
+      CenteredY * (DestY[PointPos] - DestMeanY);
+    SinTerm := SinTerm + CenteredX * (DestY[PointPos] - DestMeanY) -
+      CenteredY * (DestX[PointPos] - DestMeanX);
+  end;
+  if Spread = 0 then
+    raise EArgumentException.Create('EstimateSimilarityTransform: the source ' +
+      'points coincide.');
+  ScaledCos := CosTerm / Spread;
+  ScaledSin := SinTerm / Spread;
+  Result[0] := ScaledCos;
+  Result[1] := -ScaledSin;
+  Result[2] := DestMeanX - ScaledCos * SourceMeanX + ScaledSin * SourceMeanY;
+  Result[3] := ScaledSin;
+  Result[4] := ScaledCos;
+  Result[5] := DestMeanY - ScaledSin * SourceMeanX - ScaledCos * SourceMeanY;
+end;
+
+function EstimateSimilarityTransformLMedS(const SourceX, SourceY, DestX,
+  DestY: array of double): TImageAffineMatrix;
+var
+  Candidate: TImageAffineMatrix;
+  // SquaredErrors[PointPos]: the squared residual of point PointPos (cv2 keeps float).
+  SquaredErrors, SortedErrors: array of single;
+  InlierSourceX, InlierSourceY, InlierDestX, InlierDestY: array of double;
+  PointCount, MaxPointPos, FirstPos, SecondPos, PointPos, InlierCount: integer;
+  MedianError, BestMedian, Threshold: double;
+
+  procedure ComputeErrors(const Model: TImageAffineMatrix);
+  var
+    ErrorPos: integer;
+  begin
+    for ErrorPos := 0 to MaxPointPos do
+      SquaredErrors[ErrorPos] := Sqr(Model[0] * SourceX[ErrorPos] +
+        Model[1] * SourceY[ErrorPos] + Model[2] - DestX[ErrorPos]) +
+        Sqr(Model[3] * SourceX[ErrorPos] + Model[4] * SourceY[ErrorPos] +
+        Model[5] - DestY[ErrorPos]);
+  end;
+
+  function MedianOfErrors(): double;
+  var
+    SortPos, InsertPos: integer;
+    Value: single;
+  begin
+    for SortPos := 0 to MaxPointPos do
+    begin
+      Value := SquaredErrors[SortPos];
+      InsertPos := SortPos;
+      while (InsertPos > 0) and (SortedErrors[InsertPos - 1] > Value) do
+      begin
+        SortedErrors[InsertPos] := SortedErrors[InsertPos - 1];
+        Dec(InsertPos);
+      end;
+      SortedErrors[InsertPos] := Value;
+    end;
+    Result := SortedErrors[PointCount div 2];
+  end;
+
+begin
+  Result := EstimateSimilarityTransform(SourceX, SourceY, DestX, DestY);
+  PointCount := Length(SourceX);
+  if PointCount <= 2 then exit;
+  MaxPointPos := PointCount - 1;
+  SetLength(SquaredErrors, PointCount);
+  SetLength(SortedErrors, PointCount);
+  BestMedian := MaxDouble;
+  for FirstPos := 0 to MaxPointPos - 1 do
+    for SecondPos := FirstPos + 1 to MaxPointPos do
+    begin
+      if (SourceX[FirstPos] = SourceX[SecondPos]) and
+         (SourceY[FirstPos] = SourceY[SecondPos]) then continue;
+      Candidate := EstimateSimilarityTransform(
+        [SourceX[FirstPos], SourceX[SecondPos]],
+        [SourceY[FirstPos], SourceY[SecondPos]],
+        [DestX[FirstPos], DestX[SecondPos]],
+        [DestY[FirstPos], DestY[SecondPos]]);
+      ComputeErrors(Candidate);
+      MedianError := MedianOfErrors();
+      if MedianError < BestMedian then
+      begin
+        BestMedian := MedianError;
+        Result := Candidate;
+      end;
+    end;
+  if BestMedian = MaxDouble then exit;
+  // cv2 LMeDSPointSetRegistrator: sigma = 2.5 * 1.4826 * (1 + 5 / (n - 2)) * sqrt(median).
+  Threshold := Max(2.5 * 1.4826 * (1 + 5 / (PointCount - 2)) * Sqrt(BestMedian),
+    0.001);
+  Threshold := single(Threshold * Threshold);
+  ComputeErrors(Result);
+  SetLength(InlierSourceX, PointCount);
+  SetLength(InlierSourceY, PointCount);
+  SetLength(InlierDestX, PointCount);
+  SetLength(InlierDestY, PointCount);
+  InlierCount := 0;
+  for PointPos := 0 to MaxPointPos do
+    if SquaredErrors[PointPos] <= Threshold then
+    begin
+      InlierSourceX[InlierCount] := SourceX[PointPos];
+      InlierSourceY[InlierCount] := SourceY[PointPos];
+      InlierDestX[InlierCount] := DestX[PointPos];
+      InlierDestY[InlierCount] := DestY[PointPos];
+      Inc(InlierCount);
+    end;
+  if InlierCount < 2 then exit;
+  Result := EstimateSimilarityTransform(Copy(InlierSourceX, 0, InlierCount),
+    Copy(InlierSourceY, 0, InlierCount), Copy(InlierDestX, 0, InlierCount),
+    Copy(InlierDestY, 0, InlierCount));
+end;
+
+procedure WarpImageAffine(Source, Dest: TNNetVolume;
+  const Matrix: TImageAffineMatrix; DestSizeX, DestSizeY: integer;
+  const BorderValue: array of TNeuralFloat);
+var
+  Inverse: TImageAffineMatrix;
+  // Border[Channel]: what an outside neighbour reads.
+  Border: array of TNeuralFloat;
+  SizeX, SizeY, Depth, X, Y, MaxX, MaxY, MaxChannel, Channel: integer;
+  LeftX, TopY: integer;
+  RowSourceX, RowSourceY: double;
+  SourceX, SourceY, FractionX, FractionY, InsideWeight: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  SizeX := Source.SizeX;
+  SizeY := Source.SizeY;
+  Depth := Source.Depth;
+  MaxChannel := Depth - 1;
+  SetLength(Border, Depth);
+  for Channel := 0 to MaxChannel do
+    if Channel < Length(BorderValue) then Border[Channel] := BorderValue[Channel]
+    else Border[Channel] := 0;
+  Inverse := InvertImageAffineMatrix(Matrix);
+  Dest.ReSize(DestSizeX, DestSizeY, Depth);
+  MaxX := DestSizeX - 1;
+  MaxY := DestSizeY - 1;
+  for Y := 0 to MaxY do
+  begin
+    RowSourceX := Inverse[1] * Y + Inverse[2];
+    RowSourceY := Inverse[4] * Y + Inverse[5];
+    for X := 0 to MaxX do
+    begin
+      SourceX := Inverse[0] * X + RowSourceX;
+      SourceY := Inverse[3] * X + RowSourceY;
+      LeftX := Floor(SourceX);
+      TopY := Floor(SourceY);
+      OutPtr := Dest.GetRawPtr(X, Y);
+      if (LeftX >= 0) and (LeftX < SizeX - 1) and (TopY >= 0) and
+         (TopY < SizeY - 1) then
+        NeuralBilinearGatherColumn(Source, OutPtr, SourceX, SourceY, SizeX,
+          SizeY, Depth, {BorderPad=}false)
+      else if (LeftX < -1) or (LeftX > SizeX - 1) or (TopY < -1) or
+         (TopY > SizeY - 1) then
+      begin
+        for Channel := 0 to MaxChannel do OutPtr^[Channel] := Border[Channel];
+      end
+      else
+      begin
+        NeuralBilinearGatherColumn(Source, OutPtr, SourceX, SourceY, SizeX,
+          SizeY, Depth, {BorderPad=}false);
+        FractionX := SourceX - LeftX;
+        FractionY := SourceY - TopY;
+        InsideWeight := 0;
+        if (TopY >= 0) and (LeftX >= 0) then
+          InsideWeight := InsideWeight + (1 - FractionX) * (1 - FractionY);
+        if (TopY >= 0) and (LeftX < SizeX - 1) then
+          InsideWeight := InsideWeight + FractionX * (1 - FractionY);
+        if (TopY < SizeY - 1) and (LeftX >= 0) then
+          InsideWeight := InsideWeight + (1 - FractionX) * FractionY;
+        if (TopY < SizeY - 1) and (LeftX < SizeX - 1) then
+          InsideWeight := InsideWeight + FractionX * FractionY;
+        for Channel := 0 to MaxChannel do
+          OutPtr^[Channel] := OutPtr^[Channel] + Border[Channel] *
+            (1 - InsideWeight);
       end;
     end;
   end;

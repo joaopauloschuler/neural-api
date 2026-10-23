@@ -1,20 +1,20 @@
 program FaceRestoration;
 (*
 FaceRestoration: GFPGAN v1.3 / v1.4 blind face restoration (Wang et al.,
-CVPR 2021) with the importer in neuralpretrained.pas (BuildGFPGANFromSafeTensors
-+ GFPGANRestoreFace).
+CVPR 2021) with the importers in neuralpretrained.pas.
 
-Two modes:
-  * no arguments: a smoke of the committed random pico fixture
-    tests/fixtures/tiny_gfpgan: synthesize a small colour PNG, read it back,
-    restore it, write the output PNG.
-  * --model FILE --input IMG --output IMG: restore a real face with an official
-    GFPGAN checkpoint (GFPGANv1.4.pth / GFPGANv1.3.pth, no conversion).
-
-The input must already be an ALIGNED, CROPPED face (eyes and mouth where the
-FFHQ alignment puts them, as GFPGAN's own --aligned mode expects). Face
-detection and alignment are not part of this program. A face of another size
-is resized to the net's resolution (512 for the official checkpoints).
+Modes:
+  * no arguments: smokes of the committed random pico fixtures
+    (tests/fixtures/tiny_gfpgan, tiny_retinaface_mobilenet): an aligned crop,
+    then a whole synthetic photo.
+  * --model FILE --detector FILE --input IMG --output IMG: whole-photo
+    restoration as GFPGAN's inference_gfpgan.py: RetinaFace finds every face,
+    each is aligned to the FFHQ 5-point template, restored and pasted back
+    (RestoreFacesInImage, a port of facexlib's FaceRestoreHelper without face
+    parsing) on the background upscaled by --upscale (Lanczos, or an
+    RRDBNet / Real-ESRGAN checkpoint with --bg-upsampler).
+  * --aligned --model FILE --input IMG --output IMG: the input is already an
+    aligned, cropped face (resized to 512), as GFPGAN's own --aligned.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -29,8 +29,9 @@ Coded by Claude (AI).
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils,
-  {$IFDEF OpenCL}neuralopencl,{$ENDIF}
-  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained;
+  {$IFDEF OpenCL}neuralopencl, cl,{$ENDIF}
+  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained,
+  neuralimageresize;
 
 const
   // Fixture committed with the GFPGAN importer tests.
@@ -39,29 +40,43 @@ const
 type
   TFaceRestorationOptions = record
     ModelFile, ConfigFile, InputFile, OutputFile: string;
+    DetectorFile, BackgroundFile, SaveFacesPrefix: string;
     NoiseMode: TStyleGAN2NoiseMode;
-    Seed: integer;
-    KeepSize, UseOpenCL, UseInt8: boolean;
+    Seed, BackgroundTile, MaxFaces: integer;
+    Upscale, DetectionThreshold, MinEyeDistance: TNeuralFloat;
+    IsAligned, KeepSize, UseOpenCL, UseInt8: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
 
 procedure PrintUsage();
 begin
-  WriteLn('Usage: FaceRestoration                       (pico fixture smoke)');
-  WriteLn('       FaceRestoration --model FILE --input IMG --output IMG [options]');
+  WriteLn('Usage: FaceRestoration                       (pico fixture smokes)');
+  WriteLn('       FaceRestoration --model FILE --detector FILE --input IMG --output IMG [options]');
+  WriteLn('       FaceRestoration --aligned --model FILE --input IMG --output IMG [options]');
   WriteLn('  --model FILE         GFPGAN checkpoint (GFPGANv1.4.pth / .safetensors)');
   WriteLn('  --config FILE        config.json (default: next to --model, else the');
   WriteLn('                       v1.4 settings; shapes come from the tensors)');
-  WriteLn('  --input IMG          ALIGNED, cropped face (PNG / JPEG / BMP)');
-  WriteLn('  --output IMG         restored face (PNG)');
-  WriteLn('  --keep-size          resize the restored face back to the input size');
-  WriteLn('                       (default: the net resolution, 512)');
+  WriteLn('  --input IMG          photo (or, with --aligned, an aligned face crop)');
+  WriteLn('  --output IMG         restored photo / face (PNG)');
+  WriteLn('  --aligned            the input is an ALIGNED, cropped face: no detection');
+  WriteLn('  --keep-size          (--aligned) resize the restored face back to the');
+  WriteLn('                       input size (default: the net resolution, 512)');
+  WriteLn('  --detector FILE      RetinaFace checkpoint: facexlib detection_Resnet50_Final.pth');
+  WriteLn('                       (GFPGAN''s default) or detection_mobilenet0.25_Final.pth');
+  WriteLn('  --upscale N          output size / input size (default 2, as inference_gfpgan.py)');
+  WriteLn('  --bg-upsampler FILE  RRDBNet / Real-ESRGAN checkpoint for the background');
+  WriteLn('                       (e.g. RealESRGAN_x2plus.pth; default: Lanczos resize)');
+  WriteLn('  --bg-tile N          background upsampler tile size (default 400, 0 = whole image)');
+  WriteLn('  --det-threshold T    RetinaFace score threshold (default 0.97, facexlib)');
+  WriteLn('  --min-eye-distance P skip faces whose eyes are closer than P pixels (default 5)');
+  WriteLn('  --max-faces N        restore at most the N best-scoring faces (default all)');
+  WriteLn('  --save-faces PREFIX  write PREFIX_cropped_NN.png and PREFIX_restored_NN.png');
   WriteLn('  --noise MODE         random (GFPGAN''s default), const (the ',
     'checkpoint''s');
   WriteLn('                       stored maps) or none (default random)');
   WriteLn('  --seed N             seed of the random noise (default: time based)');
   WriteLn('  --int8               store the convolution weights in int8 (less RAM)');
-  WriteLn('  --gpu                run the net on OpenCL (needs a build with ',
+  WriteLn('  --gpu                run the nets on OpenCL (needs a build with ',
     '-dOpenCL)');
   WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N       OpenCL device index (default 0)');
@@ -90,13 +105,31 @@ var
     Result := ParamStr(ArgPos);
   end;
 
+  function NextFloat(): TNeuralFloat;
+  var
+    Settings: TFormatSettings;
+  begin
+    Settings := DefaultFormatSettings;
+    Settings.DecimalSeparator := '.';
+    Result := StrToFloat(NextArg(), Settings);
+  end;
+
 begin
   Opt.ModelFile := '';
   Opt.ConfigFile := '';
   Opt.InputFile := '';
   Opt.OutputFile := '';
+  Opt.DetectorFile := '';
+  Opt.BackgroundFile := '';
+  Opt.SaveFacesPrefix := '';
   Opt.NoiseMode := snmRandom;
   Opt.Seed := -1;
+  Opt.BackgroundTile := 400;
+  Opt.MaxFaces := 0;
+  Opt.Upscale := 2;
+  Opt.DetectionThreshold := 0.97;
+  Opt.MinEyeDistance := 5;
+  Opt.IsAligned := false;
   Opt.KeepSize := false;
   Opt.UseOpenCL := false;
   Opt.UseInt8 := false;
@@ -111,7 +144,16 @@ begin
     else if Arg = '--config' then Opt.ConfigFile := NextArg()
     else if Arg = '--input' then Opt.InputFile := NextArg()
     else if Arg = '--output' then Opt.OutputFile := NextArg()
+    else if Arg = '--aligned' then Opt.IsAligned := true
     else if Arg = '--keep-size' then Opt.KeepSize := true
+    else if Arg = '--detector' then Opt.DetectorFile := NextArg()
+    else if Arg = '--upscale' then Opt.Upscale := NextFloat()
+    else if Arg = '--bg-upsampler' then Opt.BackgroundFile := NextArg()
+    else if Arg = '--bg-tile' then Opt.BackgroundTile := StrToInt(NextArg())
+    else if Arg = '--det-threshold' then Opt.DetectionThreshold := NextFloat()
+    else if Arg = '--min-eye-distance' then Opt.MinEyeDistance := NextFloat()
+    else if Arg = '--max-faces' then Opt.MaxFaces := StrToInt(NextArg())
+    else if Arg = '--save-faces' then Opt.SaveFacesPrefix := NextArg()
     else if Arg = '--noise' then Opt.NoiseMode := ParseNoiseMode(NextArg())
     else if Arg = '--seed' then Opt.Seed := StrToInt(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
@@ -128,68 +170,111 @@ begin
       raise Exception.Create('unknown argument: ' + Arg);
     Inc(ArgPos);
   end;
-  if (Opt.ModelFile <> '') and
-     ((Opt.InputFile = '') or (Opt.OutputFile = '')) then
+  if Opt.ModelFile = '' then exit;
+  if (Opt.InputFile = '') or (Opt.OutputFile = '') then
     raise Exception.Create('--model needs --input and --output');
+  if not Opt.IsAligned and (Opt.DetectorFile = '') then
+    raise Exception.Create('a whole photo needs --detector FILE ' +
+      '(detection_Resnet50_Final.pth); pass --aligned for an aligned face crop');
+  if Opt.Upscale <= 0 then
+    raise Exception.Create('--upscale must be positive');
 end;
 
-// Loads InputFile, restores it with the GFPGAN checkpoint and writes OutputFile.
-procedure RestoreFile(const Opt: TFaceRestorationOptions);
+type
+  // The OpenCL device the nets run on, or the reason they run on the CPU.
+  TComputeDevice = record
+    {$IFDEF OpenCL}
+    Devices: TEasyOpenCL;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    {$ENDIF}
+    IsOpenCL: boolean;
+    Description: string;
+  end;
+
+procedure SelectComputeDevice(const Opt: TFaceRestorationOptions;
+  out Device: TComputeDevice);
+{$IFDEF OpenCL}
+var
+  Problem: string;
+  PlatformPos, DevicePos: integer;
+{$ENDIF}
+begin
+  Device.IsOpenCL := false;
+  Device.Description := 'CPU';
+  {$IFDEF OpenCL}
+  Device.Devices := nil;
+  {$ENDIF}
+  if not Opt.UseOpenCL then exit;
+  {$IFDEF OpenCL}
+  Device.Devices := TEasyOpenCL.Create();
+  PlatformPos := Opt.OpenCLPlatform;
+  DevicePos := Opt.OpenCLDevice;
+  if Device.Devices.SelectPlatformAndDevice(PlatformPos, DevicePos, Problem) then
+  begin
+    Device.PlatformId := Device.Devices.PlatformIds[PlatformPos];
+    Device.DeviceId := Device.Devices.Devices[DevicePos];
+    Device.IsOpenCL := true;
+    Device.Description := 'OpenCL on ' + Device.Devices.PlatformNames[PlatformPos] +
+      ' / ' + Device.Devices.DeviceNames[DevicePos];
+  end
+  else
+    Device.Description := 'CPU (' + Problem + ')';
+  {$ELSE}
+  Device.Description := 'CPU (built without -dOpenCL)';
+  {$ENDIF}
+end;
+
+procedure EnableDevice(NN: TNNet; const Device: TComputeDevice);
+begin
+  {$IFDEF OpenCL}
+  if Device.IsOpenCL then NN.EnableOpenCL(Device.PlatformId, Device.DeviceId);
+  {$ENDIF}
+end;
+
+function LoadRestorer(const Opt: TFaceRestorationOptions;
+  const Device: TComputeDevice; out Config: TGFPGANConfig): TNNet;
+var
+  StartTime: TDateTime;
+begin
+  StartTime := Now();
+  Result := BuildGFPGANFromSafeTensors(Opt.ModelFile, Config, {pTrainable=}false,
+    Opt.ConfigFile, Opt.NoiseMode);
+  WriteLn(GFPGANConfigToString(Config));
+  WriteLn(Format('  loaded in %.1f s', [(Now() - StartTime) * 86400.0]));
+  // Quantize before EnableOpenCL: the OpenCL arming reads the int8 codes.
+  if Opt.UseInt8 then Result.QuantizeWeightsInt8();
+  EnableDevice(Result, Device);
+end;
+
+function ComputeText(const Opt: TFaceRestorationOptions;
+  const Device: TComputeDevice): string;
+begin
+  Result := Device.Description;
+  if Opt.UseInt8 then Result := Result + ', int8 weights';
+end;
+
+// --aligned: restores the face crop in InputFile and writes OutputFile.
+procedure RestoreAlignedFile(const Opt: TFaceRestorationOptions;
+  const Device: TComputeDevice);
 var
   NN: TNNet;
   Config: TGFPGANConfig;
   Face, Restored, Resized: TNNetVolume;
-  ComputeText: string;
   StartTime: TDateTime;
-  {$IFDEF OpenCL}
-  OpenCLDevices: TEasyOpenCL;
-  OpenCLProblem: string;
-  OpenCLPlatform, OpenCLDevice: integer;
-  {$ENDIF}
 begin
   Face := TNNetVolume.Create;
   Restored := TNNetVolume.Create;
   Resized := TNNetVolume.Create;
   NN := nil;
-  {$IFDEF OpenCL}
-  OpenCLDevices := nil;
-  {$ENDIF}
   try
     if not LoadImageFromFileIntoVolume(Opt.InputFile, Face) then
       raise Exception.Create('could not load ' + Opt.InputFile);
-    StartTime := Now();
-    NN := BuildGFPGANFromSafeTensors(Opt.ModelFile, Config, {pTrainable=}false,
-      Opt.ConfigFile, Opt.NoiseMode);
-    WriteLn(GFPGANConfigToString(Config));
-    WriteLn(Format('  loaded in %.1f s', [(Now() - StartTime) * 86400.0]));
-    // Quantize before EnableOpenCL: the OpenCL arming reads the int8 codes.
-    if Opt.UseInt8 then NN.QuantizeWeightsInt8();
-    ComputeText := 'CPU';
-    if Opt.UseOpenCL then
-    begin
-      {$IFDEF OpenCL}
-      OpenCLDevices := TEasyOpenCL.Create();
-      OpenCLPlatform := Opt.OpenCLPlatform;
-      OpenCLDevice := Opt.OpenCLDevice;
-      if OpenCLDevices.SelectPlatformAndDevice(OpenCLPlatform, OpenCLDevice,
-        OpenCLProblem) then
-      begin
-        NN.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
-          OpenCLDevices.Devices[OpenCLDevice]);
-        ComputeText := 'OpenCL on ' +
-          OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
-          OpenCLDevices.DeviceNames[OpenCLDevice];
-      end
-      else
-        ComputeText := 'CPU (' + OpenCLProblem + ')';
-      {$ELSE}
-      ComputeText := 'CPU (built without -dOpenCL)';
-      {$ENDIF}
-    end;
-    if Opt.UseInt8 then ComputeText := ComputeText + ', int8 weights';
+    NN := LoadRestorer(Opt, Device, Config);
     if Opt.Seed >= 0 then RestartRandSeed(Opt.Seed);
     WriteLn(Format('Restoring a %dx%d face on %s, net resolution %dx%d',
-      [Face.SizeX, Face.SizeY, ComputeText, Config.OutSize, Config.OutSize]));
+      [Face.SizeX, Face.SizeY, ComputeText(Opt, Device), Config.OutSize,
+      Config.OutSize]));
     StartTime := Now();
     GFPGANRestoreFace(NN, Config, Face, Restored);
     WriteLn(Format('  %.1f s', [(Now() - StartTime) * 86400.0]));
@@ -205,12 +290,129 @@ begin
       Opt.OutputFile]));
   finally
     NN.Free;
-    {$IFDEF OpenCL}
-    OpenCLDevices.Free;
-    {$ENDIF}
     Resized.Free;
     Restored.Free;
     Face.Free;
+  end;
+end;
+
+// Background for the paste: the photo upscaled by the RRDBNet checkpoint, in 0..255.
+function UpscaleBackground(const Opt: TFaceRestorationOptions;
+  const Device: TComputeDevice; Image: TNNetVolume): TNNetVolume;
+var
+  Upsampler: TRRDBNetUpscaler;
+  StartTime: TDateTime;
+begin
+  Result := TNNetVolume.Create;
+  Upsampler := TRRDBNetUpscaler.Create(Opt.BackgroundFile);
+  try
+    Upsampler.Tile := Opt.BackgroundTile;
+    {$IFDEF OpenCL}
+    if Device.IsOpenCL then
+      Upsampler.EnableOpenCL(Device.PlatformId, Device.DeviceId);
+    {$ENDIF}
+    WriteLn(Format('Upscaling the background x%d with %s', [Upsampler.Config.Scale,
+      Opt.BackgroundFile]));
+    StartTime := Now();
+    Result.Copy(Image);
+    Result.Mul(1 / 255);
+    Upsampler.Upscale(Result, Result);
+    Result.Mul(255);
+    WriteLn(Format('  %dx%d in %.1f s', [Result.SizeX, Result.SizeY,
+      (Now() - StartTime) * 86400.0]));
+  finally
+    Upsampler.Free;
+  end;
+end;
+
+procedure SaveFaces(const Prefix, Kind: string; Faces: TNNetVolumeList);
+var
+  FacePos: integer;
+  FileName: string;
+begin
+  for FacePos := 0 to Faces.Count - 1 do
+  begin
+    FileName := Format('%s_%s_%.2d.png', [Prefix, Kind, FacePos]);
+    if not SaveImageFromVolumeIntoFile(Faces[FacePos], FileName) then
+      raise Exception.Create('could not save ' + FileName);
+  end;
+end;
+
+// Whole photo: detect, align, restore and paste every face (RestoreFacesInImage).
+procedure RestorePhotoFile(const Opt: TFaceRestorationOptions;
+  const Device: TComputeDevice);
+var
+  Restorer, Detector: TNNet;
+  RestorerConfig: TGFPGANConfig;
+  DetectorConfig: TRetinaFaceConfig;
+  Image, Background, Output: TNNetVolume;
+  Crops, RestoredFaces: TNNetVolumeList;
+  FaceCount: integer;
+  StartTime: TDateTime;
+begin
+  Image := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  Crops := TNNetVolumeList.Create(true);
+  RestoredFaces := TNNetVolumeList.Create(true);
+  Background := nil;
+  Restorer := nil;
+  Detector := nil;
+  try
+    if not LoadImageFromFileIntoVolume(Opt.InputFile, Image) then
+      raise Exception.Create('could not load ' + Opt.InputFile);
+    if Image.Depth > 3 then Image.ReSize(Image.SizeX, Image.SizeY, 3);
+    StartTime := Now();
+    // facexlib runs the detector at the photo's own size.
+    Detector := BuildRetinaFaceFromSafeTensors(Opt.DetectorFile, Image.SizeX,
+      Image.SizeY, DetectorConfig, {pTrainable=}false);
+    WriteLn(RetinaFaceConfigToString(DetectorConfig));
+    WriteLn(Format('  loaded in %.1f s', [(Now() - StartTime) * 86400.0]));
+    EnableDevice(Detector, Device);
+    Restorer := LoadRestorer(Opt, Device, RestorerConfig);
+    if Opt.BackgroundFile <> '' then
+      Background := UpscaleBackground(Opt, Device, Image);
+    if Opt.Seed >= 0 then RestartRandSeed(Opt.Seed);
+    WriteLn(Format('Restoring the faces of a %dx%d photo on %s, upscale %g',
+      [Image.SizeX, Image.SizeY, ComputeText(Opt, Device), Opt.Upscale]));
+    StartTime := Now();
+    FaceCount := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
+      RestorerConfig, Image, Background, Output, Opt.Upscale,
+      Opt.DetectionThreshold, Opt.MinEyeDistance, Opt.MaxFaces, Crops,
+      RestoredFaces);
+    WriteLn(Format('  %d face(s) in %.1f s', [FaceCount,
+      (Now() - StartTime) * 86400.0]));
+    if Opt.SaveFacesPrefix <> '' then
+    begin
+      SaveFaces(Opt.SaveFacesPrefix, 'cropped', Crops);
+      SaveFaces(Opt.SaveFacesPrefix, 'restored', RestoredFaces);
+    end;
+    if not SaveImageFromVolumeIntoFile(Output, Opt.OutputFile) then
+      raise Exception.Create('could not save ' + Opt.OutputFile);
+    WriteLn(Format('  %dx%d -> %s', [Output.SizeX, Output.SizeY,
+      Opt.OutputFile]));
+  finally
+    Detector.Free;
+    Restorer.Free;
+    Background.Free;
+    RestoredFaces.Free;
+    Crops.Free;
+    Output.Free;
+    Image.Free;
+  end;
+end;
+
+procedure RunOptions(const Opt: TFaceRestorationOptions);
+var
+  Device: TComputeDevice;
+begin
+  SelectComputeDevice(Opt, Device);
+  try
+    if Opt.IsAligned then RestoreAlignedFile(Opt, Device)
+    else RestorePhotoFile(Opt, Device);
+  finally
+    {$IFDEF OpenCL}
+    Device.Devices.Free;
+    {$ENDIF}
   end;
 end;
 
@@ -230,17 +432,27 @@ begin
     end;
 end;
 
-// Pico smoke: writes a 40x30 PNG and restores it with the fixture (64x64 net).
-procedure RunFixtureSmoke(const InPng, OutPng: string);
+// Pico smokes: a 40x30 crop through --aligned, then a 256x192 photo through
+// the whole-photo path (the random detector finds random "faces").
+procedure RunFixtureSmoke(const InPng, OutPng, PhotoPng, PhotoOutPng: string);
 var
   Img: TNNetVolume;
   Opt: TFaceRestorationOptions;
+  X, Y, Channel: integer;
 begin
   Img := TNNetVolume.Create;
   try
     MakeTinyImage(Img, 40, 30);
     if not SaveImageFromVolumeIntoFile(Img, InPng) then
       raise Exception.Create('could not save ' + InPng);
+    Img.ReSize(256, 192, 3);
+    for Y := 0 to 191 do
+      for X := 0 to 255 do
+        for Channel := 0 to 2 do
+          Img[X, Y, Channel] := Round(128 + 90 * Sin(X * 0.15 + Channel) *
+            Cos(Y * 0.125));
+    if not SaveImageFromVolumeIntoFile(Img, PhotoPng) then
+      raise Exception.Create('could not save ' + PhotoPng);
   finally
     Img.Free;
   end;
@@ -250,7 +462,15 @@ begin
   Opt.InputFile := InPng;
   Opt.OutputFile := OutPng;
   Opt.NoiseMode := snmConst;
-  RestoreFile(Opt);
+  Opt.IsAligned := true;
+  RunOptions(Opt);
+  Opt.IsAligned := false;
+  Opt.DetectorFile := FixturesDir + 'tiny_retinaface_mobilenet.pth';
+  Opt.InputFile := PhotoPng;
+  Opt.OutputFile := PhotoOutPng;
+  Opt.DetectionThreshold := 0.5;
+  Opt.MaxFaces := 3;
+  RunOptions(Opt);
 end;
 
 var
@@ -259,12 +479,13 @@ begin
   try
     if not ParseOptions(Options) then exit;
     if Options.ModelFile <> '' then
-      RestoreFile(Options)
+      RunOptions(Options)
     else
     begin
       WriteLn('GFPGAN face restoration smoke (random pico weights)');
       WriteLn('===================================================');
-      RunFixtureSmoke('gfpgan_in.png', 'gfpgan_out.png');
+      RunFixtureSmoke('gfpgan_in.png', 'gfpgan_out.png', 'gfpgan_photo_in.png',
+        'gfpgan_photo_out.png');
       WriteLn('Done.');
     end;
   except

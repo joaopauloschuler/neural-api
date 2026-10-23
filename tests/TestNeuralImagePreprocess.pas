@@ -120,6 +120,20 @@ type
     // Hysteresis keeps a weak edge 8-connected to a strong one and drops a
     // weak edge with no strong pixel.
     procedure TestCannyEdgesHysteresis;
+    // A known rotation + scale + shift is recovered from 5 points; the inverse
+    // round-trips; with clean points the LMedS variant equals least squares.
+    procedure TestSimilarityTransformRecoversKnown;
+    // 5 face landmarks onto the FFHQ template: cv2.estimateAffinePartial2D
+    // (LMEDS) numbers, also with one landmark moved far enough to be dropped.
+    procedure TestSimilarityTransformMatchesCV2;
+    // WarpImageAffine of a 7x5 RGB image with a gray border against a float
+    // cv2.warpAffine oracle (cv2 itself rounds coordinates to 1/32 pixel).
+    procedure TestWarpImageAffineMatchesFloatOracle;
+    // cv2.resize INTER_LANCZOS4 of a float32 5x4 image to 10x8, 15x12 and 3x3.
+    procedure TestResizeImageLanczos4CV2MatchesCV2;
+    // cv2.erode (0 = 3x3, 2, 4) and cv2.GaussianBlur(k, 0) (3, 9, 11) of a
+    // 9x7 float mask.
+    procedure TestErodeAndGaussianBlurCV2MatchCV2;
   end;
 
 implementation
@@ -1647,6 +1661,238 @@ begin
   finally
     Edges.Free;
     Image.Free;
+  end;
+end;
+
+// value(x, y, c) = (x*MulX + y*MulY + c*MulC) mod 256 on a W x H x Depth image.
+procedure FillModuloImage(Image: TNNetVolume; SizeX, SizeY, Depth, MulX, MulY,
+  MulC: integer);
+var
+  X, Y, Channel: integer;
+begin
+  Image.ReSize(SizeX, SizeY, Depth);
+  for Y := 0 to SizeY - 1 do
+    for X := 0 to SizeX - 1 do
+      for Channel := 0 to Depth - 1 do
+        Image[X, Y, Channel] := (X * MulX + Y * MulY + Channel * MulC) mod 256;
+end;
+
+procedure AssertAffineMatrix(const Msg: string; const Expected: array of double;
+  const Actual: TImageAffineMatrix; Tolerance: double);
+var
+  ElementPos: integer;
+begin
+  for ElementPos := 0 to 5 do
+    TAssert.AssertEquals(Msg + ' [' + IntToStr(ElementPos) + ']', Expected[ElementPos],
+      Actual[ElementPos], Tolerance);
+end;
+
+procedure TTestNeuralImagePreprocess.TestSimilarityTransformRecoversKnown;
+const
+  csX: array[0..4] of double = (61.3, 93.7, 78.2, 64.9, 92.2);
+  csY: array[0..4] of double = (72.8, 70.1, 91.5, 108.4, 106.6);
+var
+  Known, Estimated, Robust, RoundTrip, Inverse: TImageAffineMatrix;
+  DestX, DestY: array[0..4] of double;
+  PointPos: integer;
+begin
+  Known[0] := 1.3 * Cos(0.2); Known[1] := -1.3 * Sin(0.2); Known[2] := 5;
+  Known[3] := 1.3 * Sin(0.2); Known[4] := 1.3 * Cos(0.2); Known[5] := -7;
+  for PointPos := 0 to 4 do
+  begin
+    DestX[PointPos] := Known[0] * csX[PointPos] + Known[1] * csY[PointPos] + Known[2];
+    DestY[PointPos] := Known[3] * csX[PointPos] + Known[4] * csY[PointPos] + Known[5];
+  end;
+  Estimated := EstimateSimilarityTransform(csX, csY, DestX, DestY);
+  AssertAffineMatrix('least squares', Known, Estimated, 1e-9);
+  Robust := EstimateSimilarityTransformLMedS(csX, csY, DestX, DestY);
+  AssertAffineMatrix('LMedS', Known, Robust, 1e-9);
+  Inverse := InvertImageAffineMatrix(Known);
+  // Inverse after Known is the identity.
+  RoundTrip[0] := Inverse[0] * Known[0] + Inverse[1] * Known[3];
+  RoundTrip[1] := Inverse[0] * Known[1] + Inverse[1] * Known[4];
+  RoundTrip[2] := Inverse[0] * Known[2] + Inverse[1] * Known[5] + Inverse[2];
+  RoundTrip[3] := Inverse[3] * Known[0] + Inverse[4] * Known[3];
+  RoundTrip[4] := Inverse[3] * Known[1] + Inverse[4] * Known[4];
+  RoundTrip[5] := Inverse[3] * Known[2] + Inverse[4] * Known[5] + Inverse[5];
+  AssertAffineMatrix('inverse', [1, 0, 0, 0, 1, 0], RoundTrip, 1e-12);
+end;
+
+procedure TTestNeuralImagePreprocess.TestSimilarityTransformMatchesCV2;
+const
+  csX: array[0..4] of double = (61.3, 93.7, 78.2, 64.9, 92.2);
+  csY: array[0..4] of double = (72.8, 70.1, 91.5, 108.4, 106.6);
+  csTemplateX: array[0..4] of double = (192.98138, 318.90277, 256.63416,
+    201.26117, 313.08905);
+  csTemplateY: array[0..4] of double = (239.94708, 240.1936, 314.01935,
+    371.41043, 371.15118);
+  // cv2 4.10 estimateAffinePartial2D(method=LMEDS)[0]; cv2 rounds the points
+  // to float32, hence the 5e-5 tolerance.
+  csCV2Clean: array[0..5] of double = (3.7661942007, -0.1656064972,
+    -22.5306949058, 0.1656064972, 3.7661942007, -44.0884489685);
+  // The nose moved by (+30, -25): cv2 drops it as an outlier.
+  csCV2Outlier: array[0..5] of double = (3.7657039691, -0.1653803211,
+    -22.4630491176, 0.1653803211, 3.7657039691, -44.1645881508);
+  // numpy closed-form least squares of all 5 points (float64).
+  csLeastSquaresClean: array[0..5] of double = (3.7661940602, -0.1656061338,
+    -22.5307230344, 0.1656061338, 3.7661940602, -44.0884089307);
+var
+  OutlierX, OutlierY: array[0..4] of double;
+  PointPos: integer;
+begin
+  AssertAffineMatrix('least squares = numpy', csLeastSquaresClean,
+    EstimateSimilarityTransform(csX, csY, csTemplateX, csTemplateY), 1e-8);
+  AssertAffineMatrix('LMedS clean = cv2', csCV2Clean,
+    EstimateSimilarityTransformLMedS(csX, csY, csTemplateX, csTemplateY), 5e-5);
+  for PointPos := 0 to 4 do
+  begin
+    OutlierX[PointPos] := csX[PointPos];
+    OutlierY[PointPos] := csY[PointPos];
+  end;
+  OutlierX[2] := OutlierX[2] + 30;
+  OutlierY[2] := OutlierY[2] - 25;
+  AssertAffineMatrix('LMedS outlier = cv2', csCV2Outlier,
+    EstimateSimilarityTransformLMedS(OutlierX, OutlierY, csTemplateX,
+    csTemplateY), 5e-5);
+  AssertTrue('plain least squares keeps the outlier',
+    Abs(EstimateSimilarityTransform(OutlierX, OutlierY, csTemplateX,
+    csTemplateY)[2] - csCV2Outlier[2]) > 10);
+end;
+
+procedure TTestNeuralImagePreprocess.TestWarpImageAffineMatchesFloatOracle;
+const
+  // numpy float64 cv2.warpAffine(INTER_LINEAR, BORDER_CONSTANT) semantics.
+  csPixelX: array[0..5] of integer = (0, 3, 5, 7, 2, 6);
+  csPixelY: array[0..5] of integer = (0, 2, 4, 6, 5, 1);
+  csPixels: array[0..5, 0..2] of double = (
+    (149.6306504611, 174.2673169921, 90.9922432448),
+    (59.9845893993, 112.9845893993, 165.9845893993),
+    (105.5284658581, 158.5284658581, 59.0110767035),
+    (96.4228186634, 129.3196019307, 162.6029855198),
+    (132, 133, 135),
+    (236.0013977954, 39.6308037767, 92.603291955));
+  csSum = 21975.829929980282;
+var
+  Image, Warped: TNNetVolume;
+  Matrix: TImageAffineMatrix;
+  PixelPos, Channel: integer;
+begin
+  Image := TNNetVolume.Create;
+  Warped := TNNetVolume.Create;
+  try
+    FillModuloImage(Image, 7, 5, 3, 37, 91, 53);
+    Matrix[0] := 1.3 * Cos(0.4); Matrix[1] := -1.3 * Sin(0.4); Matrix[2] := 1.7;
+    Matrix[3] := 1.3 * Sin(0.4); Matrix[4] := 1.3 * Cos(0.4); Matrix[5] := -2.2;
+    WarpImageAffine(Image, Warped, Matrix, 8, 7, [132, 133, 135]);
+    AssertEquals('width', 8, Warped.SizeX);
+    AssertEquals('height', 7, Warped.SizeY);
+    AssertEquals('depth', 3, Warped.Depth);
+    for PixelPos := 0 to 5 do
+      for Channel := 0 to 2 do
+        AssertEquals(Format('pixel (%d,%d,%d)', [csPixelX[PixelPos],
+          csPixelY[PixelPos], Channel]), csPixels[PixelPos, Channel],
+          Warped[csPixelX[PixelPos], csPixelY[PixelPos], Channel], 1e-4);
+    // GetSum accumulates in single.
+    AssertEquals('sum', csSum, Warped.GetSum(), csSum * 1e-6);
+  finally
+    Warped.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestResizeImageLanczos4CV2MatchesCV2;
+const
+  csSizes: array[0..2, 0..1] of integer = ((10, 8), (15, 12), (3, 3));
+  csSums: array[0..2] of double = (28332.796250224113, 63760.29971283674,
+    3156.4869422912598);
+  // cv2 4.10 at (2, 1), at the last pixel and at (0, 0).
+  csPixels: array[0..2, 0..2, 0..2] of double = (
+    ((33.498577, 69.972664, 131.45172), (92.07607, 133.42291, 162.21442),
+     (-8.501168, 38.410713, 82.78556)),
+    ((7.293399, 50.2934, 93.2934), (95.13215, 135.21355, 162.35149),
+     (-9.177448, 37.92198, 82.648476)),
+    ((134.94568, 116.59711, 62.53772), (69.02842, 86.17246, 143.34836),
+     (15.592037, 54.181152, 101.65164)));
+var
+  Image, Resized: TNNetVolume;
+  SizePos, Channel, LastX, LastY: integer;
+begin
+  Image := TNNetVolume.Create;
+  Resized := TNNetVolume.Create;
+  try
+    FillModuloImage(Image, 5, 4, 3, 29, 71, 43);
+    for SizePos := 0 to 2 do
+    begin
+      ResizeImageLanczos4CV2(Image, Resized, csSizes[SizePos, 0],
+        csSizes[SizePos, 1]);
+      LastX := csSizes[SizePos, 0] - 1;
+      LastY := csSizes[SizePos, 1] - 1;
+      AssertEquals('width', csSizes[SizePos, 0], Resized.SizeX);
+      AssertEquals('height', csSizes[SizePos, 1], Resized.SizeY);
+      AssertEquals('sum ' + IntToStr(SizePos), csSums[SizePos],
+        Resized.GetSum(), csSums[SizePos] * 1e-6);
+      for Channel := 0 to 2 do
+      begin
+        AssertEquals('(2,1)', csPixels[SizePos, 0, Channel],
+          Resized[2, 1, Channel], 1e-3);
+        AssertEquals('last', csPixels[SizePos, 1, Channel],
+          Resized[LastX, LastY, Channel], 1e-3);
+        AssertEquals('(0,0)', csPixels[SizePos, 2, Channel],
+          Resized[0, 0, Channel], 1e-3);
+      end;
+    end;
+    ResizeImageLanczos4CV2(Image, Resized, 5, 4);
+    AssertEquals('same size copies', 0, Resized.SumDiff(Image), 0);
+  finally
+    Resized.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestErodeAndGaussianBlurCV2MatchCV2;
+const
+  // cv2 4.10 sums and values at (4, 3), (8, 0), (0, 6).
+  csErodeSizes: array[0..3] of integer = (0, 2, 4, 3);
+  csErodeSums: array[0..3] of double = (18.03529462404549, 23.05098100192845,
+    11.956863041967154, 18.03529462404549);
+  csErodePixels: array[0..3, 0..2] of double = (
+    (0.42745098, 0.46666667, 0.5686275), (0.42745098, 0.46666667, 0.5686275),
+    (0.24705882, 0.4, 0.45490196), (0.42745098, 0.46666667, 0.5686275));
+  // cv2 4.10 GaussianBlur sums and values at (4, 3), (0, 0), (8, 6).
+  csBlurSizes: array[0..2] of integer = (3, 9, 11);
+  csBlurSums: array[0..2] of double = (32.77255008369684, 33.63855728507042,
+    33.78414648771286);
+  csBlurPixels: array[0..2, 0..2] of double = (
+    (0.60784316, 0.09019608, 0.121568635), (0.5794731, 0.23394608, 0.500674),
+    (0.5666165, 0.27718127, 0.55454963));
+var
+  Mask, Filtered: TNNetVolume;
+  SizePos: integer;
+begin
+  Mask := TNNetVolume.Create;
+  Filtered := TNNetVolume.Create;
+  try
+    FillModuloImage(Mask, 9, 7, 1, 17, 29, 0);
+    Mask.Divi(255);
+    for SizePos := 0 to 3 do
+    begin
+      ErodeImage(Mask, Filtered, csErodeSizes[SizePos], csErodeSizes[SizePos]);
+      AssertEquals('erode sum', csErodeSums[SizePos], Filtered.GetSum(), 1e-5);
+      AssertEquals('erode (4,3)', csErodePixels[SizePos, 0], Filtered[4, 3, 0], 1e-6);
+      AssertEquals('erode (8,0)', csErodePixels[SizePos, 1], Filtered[8, 0, 0], 1e-6);
+      AssertEquals('erode (0,6)', csErodePixels[SizePos, 2], Filtered[0, 6, 0], 1e-6);
+    end;
+    for SizePos := 0 to 2 do
+    begin
+      GaussianBlurImageCV2(Mask, Filtered, csBlurSizes[SizePos]);
+      AssertEquals('blur sum', csBlurSums[SizePos], Filtered.GetSum(), 1e-5);
+      AssertEquals('blur (4,3)', csBlurPixels[SizePos, 0], Filtered[4, 3, 0], 1e-6);
+      AssertEquals('blur (0,0)', csBlurPixels[SizePos, 1], Filtered[0, 0, 0], 1e-6);
+      AssertEquals('blur (8,6)', csBlurPixels[SizePos, 2], Filtered[8, 6, 0], 1e-6);
+    end;
+  finally
+    Filtered.Free;
+    Mask.Free;
   end;
 end;
 

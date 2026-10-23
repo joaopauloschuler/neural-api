@@ -1526,6 +1526,12 @@ type
     procedure TestRetinaFaceResNet50Parity;
     procedure TestRetinaFaceResizedInput;
     procedure TestRetinaFaceOpenCLParity;
+    // FaceAlignmentMatrix + AlignWarpFace + PasteFaceIntoImage against a numpy
+    // port of facexlib (float warp, cv2 4.10 erode / GaussianBlur / Lanczos4).
+    procedure TestFacePasteMatchesFacexlibOracle;
+    // Pico RetinaFace + pico GFPGAN through RestoreFacesInImage: shapes, and the
+    // canvas outside every pasted face equals the Lanczos4 background.
+    procedure TestRestoreFacesInImagePicoSmoke;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -55370,6 +55376,273 @@ begin
     Large.Free;
     Small.Free;
     NN.Free;
+  end;
+end;
+
+// value(x, y, c) = (x*MulX + y*MulY + c*MulC) mod 256.
+procedure FillFaceTestImage(Image: TNNetVolume; SizeX, SizeY, MulX, MulY,
+  MulC: integer);
+var
+  X, Y, Channel: integer;
+begin
+  Image.ReSize(SizeX, SizeY, 3);
+  for Y := 0 to SizeY - 1 do
+    for X := 0 to SizeX - 1 do
+      for Channel := 0 to 2 do
+        Image[X, Y, Channel] := (X * MulX + Y * MulY + Channel * MulC) mod 256;
+end;
+
+function SumInDouble(Volume: TNNetVolume): double;
+var
+  ElementPos: integer;
+begin
+  Result := 0;
+  for ElementPos := 0 to Volume.Size - 1 do
+    Result := Result + Volume.FData[ElementPos];
+end;
+
+procedure TTestNeuralPretrained.TestFacePasteMatchesFacexlibOracle;
+type
+  TPasteCase = record
+    SizeX, SizeY, FaceSize: integer;
+    Upscale: TNeuralFloat;
+    LandmarkX, LandmarkY: array[0..4] of double;
+    Matrix: array[0..5] of double;
+    CropSum: double;
+    CropPixels: array[0..1, 0..2] of double;   // crop (5, 3) and (0, FaceSize - 1)
+    OutSum, BackgroundSum: double;
+    ChangedX1, ChangedX2, ChangedY1, ChangedY2, ChangedCount: integer;
+    PixelX, PixelY: array[0..2] of integer;
+    Pixels: array[0..2, 0..2] of double;
+  end;
+const
+  // /tmp oracle: facexlib align_warp_face + paste_faces_to_input_image
+  // (use_parse=False) with a float warpAffine, cv2 4.10 for the rest.
+  csCases: array[0..1] of TPasteCase = (
+    (SizeX: 90; SizeY: 72; FaceSize: 32; Upscale: 2;
+     LandmarkX: (29.2, 47.6, 38.5, 30.8, 46.4);
+     LandmarkY: (22.1, 21.0, 31.9, 40.7, 39.9);
+     Matrix: (0.4363278201, -0.0113793192, -0.4086400276, 0.0113793192,
+       0.4363278201, 5.1923948626);
+     CropSum: 395004.35386469075;
+     CropPixels: ((132, 133, 135), (175.3699065576, 221.2055951319, 53.3699065576));
+     OutSum: 9899650.79553653; BackgroundSum: 9912219.212150216;
+     ChangedX1: 0; ChangedX2: 152; ChangedY1: 0; ChangedY2: 123;
+     ChangedCount: 18362;
+     PixelX: (75, 2, 75); PixelY: (60, 60, 122);
+     Pixels: ((39.4143015056, 140.4142968927, 191.7649315631),
+       (221.5569857451, 86.5341384203, 96.7522349325),
+       (69.8381958008, 95.1376037598, 154.4393310547))),
+    (SizeX: 48; SizeY: 40; FaceSize: 16; Upscale: 1;
+     LandmarkX: (21.0, 27.9, 24.2, 21.6, 27.2);
+     LandmarkY: (14.3, 14.9, 18.6, 22.4, 22.8);
+     // cv2 LMEDS drops a landmark here (plain least squares: a = 0.54112031).
+     Matrix: (0.5342629428, 0.0484903286, -5.8024402295, -0.0484903286,
+       0.5342629428, 0.8901480316);
+     CropSum: 97895.16597815641;
+     CropPixels: ((176.284095175, 111.4774186909, 54.284095175),
+       (27.1186370554, 94.1186370554, 161.1186370554));
+     OutSum: 718215.6240891801; BackgroundSum: 733568.0;
+     ChangedX1: 8; ChangedX2: 41; ChangedY1: 0; ChangedY2: 32;
+     ChangedCount: 1011;
+     PixelX: (24, 10, 24); PixelY: (15, 15, 31);
+     Pixels: ((106.1636919726, 92.7800907108, 193.7800907108),
+       (84.3373282535, 130.6296379291, 182.4157424738),
+       (29.8471795917, 94.3555999994, 158.8640204072))));
+var
+  Image, Face, Crop, Canvas, Background: TNNetVolume;
+  Detection: TRetinaFaceDetection;
+  Matrix: TImageAffineMatrix;
+  PasteCase: TPasteCase;
+  CasePos, PointPos, ElementPos, X, Y, Channel, ChangedCount: integer;
+  ChangedX1, ChangedX2, ChangedY1, ChangedY2: integer;
+  Changed: boolean;
+begin
+  Image := TNNetVolume.Create;
+  Face := TNNetVolume.Create;
+  Crop := TNNetVolume.Create;
+  Canvas := TNNetVolume.Create;
+  Background := TNNetVolume.Create;
+  try
+    for CasePos := 0 to 1 do
+      begin
+        PasteCase := csCases[CasePos];
+        FillFaceTestImage(Image, PasteCase.SizeX, PasteCase.SizeY, 23, 41, 67);
+        FillFaceTestImage(Face, PasteCase.FaceSize, PasteCase.FaceSize, 13, 19, 101);
+        FillChar(Detection, SizeOf(Detection), 0);
+        for PointPos := 0 to 4 do
+        begin
+          Detection.LandmarkX[PointPos] := PasteCase.LandmarkX[PointPos];
+          Detection.LandmarkY[PointPos] := PasteCase.LandmarkY[PointPos];
+        end;
+        Matrix := FaceAlignmentMatrix(Detection, PasteCase.FaceSize);
+        for ElementPos := 0 to 5 do
+          AssertEquals('matrix (cv2 rounds points to float32)',
+            PasteCase.Matrix[ElementPos], Matrix[ElementPos], 5e-6);
+        AlignWarpFace(Image, Matrix, PasteCase.FaceSize, Crop);
+        AssertEquals('crop size', PasteCase.FaceSize, Crop.SizeX);
+        AssertEquals('crop sum', PasteCase.CropSum, SumInDouble(Crop), PasteCase.CropSum * 1e-6);
+        for Channel := 0 to 2 do
+        begin
+          AssertEquals('crop (5,3)', PasteCase.CropPixels[0, Channel], Crop[5, 3, Channel], 1e-3);
+          AssertEquals('crop (0,F-1)', PasteCase.CropPixels[1, Channel],
+            Crop[0, PasteCase.FaceSize - 1, Channel], 1e-3);
+        end;
+        ResizeImageLanczos4CV2(Image, Canvas, Trunc(PasteCase.SizeX * PasteCase.Upscale),
+          Trunc(PasteCase.SizeY * PasteCase.Upscale));
+        Background.Copy(Canvas);
+        AssertEquals('background sum', PasteCase.BackgroundSum, SumInDouble(Background),
+          PasteCase.BackgroundSum * 1e-6);
+        PasteFaceIntoImage(Face, Matrix, PasteCase.Upscale, Canvas);
+        AssertEquals('canvas size', Trunc(PasteCase.SizeX * PasteCase.Upscale), Canvas.SizeX);
+        AssertEquals('out sum', PasteCase.OutSum, SumInDouble(Canvas), PasteCase.OutSum * 1e-6);
+        for PointPos := 0 to 2 do
+          for Channel := 0 to 2 do
+            AssertEquals(Format('out (%d,%d,%d)', [PasteCase.PixelX[PointPos],
+              PasteCase.PixelY[PointPos], Channel]), PasteCase.Pixels[PointPos, Channel],
+              Canvas[PasteCase.PixelX[PointPos], PasteCase.PixelY[PointPos], Channel], 2e-3);
+        ChangedCount := 0;
+        ChangedX1 := MaxInt; ChangedX2 := -1; ChangedY1 := MaxInt; ChangedY2 := -1;
+        for Y := 0 to Canvas.SizeY - 1 do
+          for X := 0 to Canvas.SizeX - 1 do
+          begin
+            Changed := false;
+            for Channel := 0 to 2 do
+              if Canvas[X, Y, Channel] <> Background[X, Y, Channel] then
+                Changed := true;
+            if Changed then
+            begin
+              Inc(ChangedCount);
+              ChangedX1 := Min(ChangedX1, X); ChangedX2 := Max(ChangedX2, X);
+              ChangedY1 := Min(ChangedY1, Y); ChangedY2 := Max(ChangedY2, Y);
+            end;
+          end;
+        WriteLn(Format('  face paste case %d: %d changed pixels (oracle %d), ' +
+          'box %d..%d x %d..%d', [CasePos, ChangedCount,
+          PasteCase.ChangedCount, ChangedX1, ChangedX2, ChangedY1, ChangedY2]));
+        AssertEquals('changed x1', PasteCase.ChangedX1, ChangedX1);
+        AssertEquals('changed x2', PasteCase.ChangedX2, ChangedX2);
+        AssertEquals('changed y1', PasteCase.ChangedY1, ChangedY1);
+        AssertEquals('changed y2', PasteCase.ChangedY2, ChangedY2);
+        AssertEquals('changed count', PasteCase.ChangedCount, ChangedCount);
+      end;
+  finally
+    Background.Free;
+    Canvas.Free;
+    Crop.Free;
+    Face.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestRestoreFacesInImagePicoSmoke;
+const
+  csUpscale = 2;
+var
+  DetectorConfig: TRetinaFaceConfig;
+  RestorerConfig: TGFPGANConfig;
+  Detector, Restorer: TNNet;
+  Image, Output, Background: TNNetVolume;
+  Crops, RestoredFaces: TNNetVolumeList;
+  Faces: TRetinaFaceDetectionArray;
+  FaceToCanvas: array of TImageAffineMatrix;
+  Margins: array of integer;
+  FaceCount, FacePos, ElementPos, X, Y, Channel, CornerPos, OutsideCount: integer;
+  CornerX, CornerY, MappedX, MappedY: double;
+  BoxX1, BoxY1, BoxX2, BoxY2: array of double;
+  IsOutside: boolean;
+begin
+  Detector := BuildRetinaFaceFromSafeTensors(
+    FixturePath('tiny_retinaface_mobilenet.pth'), 256, 192, DetectorConfig, false);
+  Restorer := BuildGFPGANFromSafeTensors(FixturePath('tiny_gfpgan.pth'),
+    RestorerConfig, {pTrainable=}false, FixturePath('tiny_gfpgan_config.json'),
+    snmConst);
+  Image := TNNetVolume.Create(256, 192, 3);
+  Output := TNNetVolume.Create;
+  Background := TNNetVolume.Create;
+  Crops := TNNetVolumeList.Create(true);
+  RestoredFaces := TNNetVolumeList.Create(true);
+  try
+    for Y := 0 to 191 do
+      for X := 0 to 255 do
+        for Channel := 0 to 2 do
+          Image[X, Y, Channel] := 128 + 90 * Sin(X * 0.15 + Channel) *
+            Cos(Y * 0.125);
+    FaceCount := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
+      RestorerConfig, Image, nil, Output, csUpscale, 0.5, 5, 3, Crops,
+      RestoredFaces);
+    AssertTrue('some faces', FaceCount > 0);
+    AssertTrue('MaxFaces', FaceCount <= 3);
+    AssertEquals('crops', FaceCount, Crops.Count);
+    AssertEquals('restored', FaceCount, RestoredFaces.Count);
+    AssertEquals('crop size', RestorerConfig.OutSize, Crops[0].SizeX);
+    AssertEquals('restored size', RestorerConfig.OutSize, RestoredFaces[0].SizeY);
+    AssertEquals('output width', 512, Output.SizeX);
+    AssertEquals('output height', 384, Output.SizeY);
+    AssertEquals('output depth', 3, Output.Depth);
+    ResizeImageLanczos4CV2(Image, Background, 512, 384);
+    AssertTrue('the faces change the canvas', Output.SumDiff(Background) > 0);
+    // The canvas boxes the face squares land on, grown by the feathering margin.
+    Faces := FilterFacesByEyeDistance(DetectRetinaFaceFaces(Detector,
+      DetectorConfig, Image, 0.5, 0.4, 3), 5);
+    AssertEquals('same faces', FaceCount, Length(Faces));
+    SetLength(FaceToCanvas, FaceCount);
+    SetLength(Margins, FaceCount);
+    SetLength(BoxX1, FaceCount); SetLength(BoxY1, FaceCount);
+    SetLength(BoxX2, FaceCount); SetLength(BoxY2, FaceCount);
+    for FacePos := 0 to FaceCount - 1 do
+    begin
+      FaceToCanvas[FacePos] := InvertImageAffineMatrix(
+        FaceAlignmentMatrix(Faces[FacePos], RestorerConfig.OutSize));
+      for ElementPos := 0 to 5 do
+        FaceToCanvas[FacePos][ElementPos] := FaceToCanvas[FacePos][ElementPos] *
+          csUpscale;
+      FaceToCanvas[FacePos][2] := FaceToCanvas[FacePos][2] + 0.5 * csUpscale;
+      FaceToCanvas[FacePos][5] := FaceToCanvas[FacePos][5] + 0.5 * csUpscale;
+      Margins[FacePos] := Ceil(Sqrt(Abs(FaceToCanvas[FacePos][0] *
+        FaceToCanvas[FacePos][4] - FaceToCanvas[FacePos][1] *
+        FaceToCanvas[FacePos][3])) * (RestorerConfig.OutSize + 2) / 20) + 4;
+      BoxX1[FacePos] := MaxDouble; BoxY1[FacePos] := MaxDouble;
+      BoxX2[FacePos] := -MaxDouble; BoxY2[FacePos] := -MaxDouble;
+      for CornerPos := 0 to 3 do
+      begin
+        if Odd(CornerPos) then CornerX := RestorerConfig.OutSize else CornerX := -1;
+        if CornerPos >= 2 then CornerY := RestorerConfig.OutSize else CornerY := -1;
+        MappedX := FaceToCanvas[FacePos][0] * CornerX +
+          FaceToCanvas[FacePos][1] * CornerY + FaceToCanvas[FacePos][2];
+        MappedY := FaceToCanvas[FacePos][3] * CornerX +
+          FaceToCanvas[FacePos][4] * CornerY + FaceToCanvas[FacePos][5];
+        BoxX1[FacePos] := Min(BoxX1[FacePos], MappedX - Margins[FacePos]);
+        BoxX2[FacePos] := Max(BoxX2[FacePos], MappedX + Margins[FacePos]);
+        BoxY1[FacePos] := Min(BoxY1[FacePos], MappedY - Margins[FacePos]);
+        BoxY2[FacePos] := Max(BoxY2[FacePos], MappedY + Margins[FacePos]);
+      end;
+    end;
+    OutsideCount := 0;
+    for Y := 0 to Output.SizeY - 1 do
+      for X := 0 to Output.SizeX - 1 do
+      begin
+        IsOutside := true;
+        for FacePos := 0 to FaceCount - 1 do
+          if (X >= BoxX1[FacePos] - 1) and (X <= BoxX2[FacePos] + 1) and
+             (Y >= BoxY1[FacePos] - 1) and (Y <= BoxY2[FacePos] + 1) then
+            IsOutside := false;
+        if not IsOutside then continue;
+        Inc(OutsideCount);
+        for Channel := 0 to 2 do
+          AssertEquals(Format('untouched (%d,%d,%d)', [X, Y, Channel]),
+            Background[X, Y, Channel], Output[X, Y, Channel], 0);
+      end;
+    WriteLn('  RestoreFacesInImage pico: ', FaceCount, ' faces, ', OutsideCount,
+      ' of ', Output.SizeX * Output.SizeY, ' canvas pixels outside every face box');
+  finally
+    RestoredFaces.Free;
+    Crops.Free;
+    Background.Free;
+    Output.Free;
+    Image.Free;
+    Restorer.Free;
+    Detector.Free;
   end;
 end;
 
