@@ -572,10 +572,10 @@ rather than acted on.
             are mapped with diffusers parity): UniPCMultistepScheduler (smUniPC
             has only a numpy oracle; diffusers takes N of N+1 points like DPM),
             PNDM PRK warm-up, DDPMScheduler (smDDPM ignores the stride).
-            Continuous sigmas for img2img and the 4-channel inpaint blend
-            (NoiseImageLatents / AfterStep take an integer timestep, so those
-            runs keep integer timesteps), Euler sigma_min / sigma_max
-            overrides and final_sigmas_type "sigma_min" (noticed, not done).
+            Continuous sigmas for the 4-channel inpaint blend (AfterStep takes
+            an integer timestep, so those runs keep integer timesteps), Euler
+            sigma_min / sigma_max overrides and final_sigmas_type "sigma_min"
+            (noticed, not done).
       - [ ] Latent Consistency Models follow-ups (LCM-LoRA sampling
             `--sampler lcm` on TNNetLCMScheduler, 1a31f710; LCM-distilled
             UNets via time_cond_proj_dim, 0bfbb06b):
@@ -805,32 +805,9 @@ rather than acted on.
             TestStableDiffusionSAG*: pico parity vs diffusers with reference
             numbers hardcoded from an ad hoc run; tools/make_pico_sd_pipeline_fixture.py
             has no SAG mode).
-      - [ ] Prompt-to-Prompt editing in TStableDiffusionPipeline (Hertz et al.
-            2022, arXiv:2208.01626). Edits a generated or real image by changing
-            words in its prompt while the layout stays fixed: today img2img /
-            InstructPix2Pix are the only edit routes, and both redraw the layout.
-        - [X] Null-text inversion (Mokady et al. 2022) for
-              TStableDiffusionPipeline: per-step optimized unconditional
-              embeds on top of `InvertImage`, so a real image reconstructs
-              under CFG (guidance 7.5) and Prompt-to-Prompt edits of it
-              (`DenoiseEdit` from the inverted latents) stay faithful; today
-              `--invert-image` with `--edit-prompt` is only faithful at
-              guidance 1. Steps, each its own commit:
-          - [X] (a) Gradient of the SD UNet output with respect to its text
-                (encoder_hidden_states) input: check whether `TNNet.Backpropagate`
-                already leaves the error on the text `TNNetInput` (the attn2 K/V
-                projections read it); if not, add it. Test: numerical gradient
-                on the pico UNet (tests/fixtures/tiny_sd15) at a few embed entries.
-          - [X] (b) `NullTextInversion(Image, PromptEmbeds, Steps, Guidance,
-                InnerSteps = 10, LearningRate = 1e-2)` on TStableDiffusionPipeline:
-                the reference loop of Mokady et al. (google/prompt-to-prompt
-                null_text_w_ptp.ipynb): per step, Adam on the uncond embeds to
-                match the DDIM-inverted trajectory latent of step t-1 under CFG,
-                with the early stop `loss < 1e-5 + i * 2e-5`. Returns one uncond
-                embed per step. Parity vs an ad hoc torch run of that loop on the
-                pico folder (numbers hardcoded, no new tool).
-          - [X] (c) `RunSteps` / `DenoiseEdit` take a per-step uncond embed list;
-                `--null-text` in examples/StableDiffusion with `--invert-image`.
+      - [ ] Prompt-to-Prompt editing follow-ups in TStableDiffusionPipeline
+            (Hertz et al. 2022, arXiv:2208.01626; `--edit-prompt`,
+            `--invert-image`, `--null-text`):
         - [ ] Prompt-to-Prompt on a real checkpoint (SD 1.5) on the user's
               GPU box: swap, refine and reweight from a seed and from an
               inverted photo; LocalBlend (the reference's mask that limits
@@ -849,36 +826,9 @@ rather than acted on.
           - [ ] One CLI run builds the UNet twice (trainable for the inversion,
                 inference for sampling back), reading the weights twice.
 - [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
-      Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`): relight
-      a cut-out subject from a text prompt ("sunset over the sea, warm rim
-      light") and an optional light direction or background photo. The pieces
-      exist: `TStableDiffusionImageConditioner.PredictWithExtraChannels` (the
-      InstructPix2Pix / inpainting latent concat), `TStableDiffusionImg2Img`,
-      Karras sigmas and `BiRefNetRemoveBackground` (examples/BackgroundRemoval).
-      Steps, each ending green with a commit:
-      - [X] (a) Load: `TNNetOffsetMergeReader` (base + offset per tensor, a
-            4-D offset wider in dim 1 widens the base with zero channels;
-            strict both ways) under the LoRA chain of
-            `BuildSDUNetFromSafeTensorsEx(..., OffsetFile)`;
-            `SDUNetOffsetInChannels`; `TStableDiffusionPipeline.UNetOffsetFile`.
-      - [X] (b) `TStableDiffusionICLight` (a `TStableDiffusionImg2Img`):
-            RGBA cut-out or RGB + `SetMatte`, `SetBackground` (fbc),
-            `LightDirection` gradient start at `Strength` 0.9,
-            `ICLightStepCount`; concat on every pass, both CFG branches.
-      - [X] (c) `TStableDiffusionICLight.Relight`: low-res pass, then decode,
-            `ICLightHighResSide` (x1.5, multiple of 64), `EncodeInitImage`,
-            img2img at `HighResStrength` 0.5 with the concat re-encoded.
-      - [X] (d) Sampler: `TNNetDiffusionScheduler.DPMSolverAlgorithm =
-            dpaSDEDPMSolverPP` (diffusers `sde-dpmsolver++`, read from
-            `algorithm_type`), `--sampler dpm++2m-sde`; TestSDEDPMSolverVsDiffusers.
-      - [X] (e) Pico parity vs diffusers + the reference hook
-            (TestICLightOffsetMerge, TestStableDiffusionICLightParity,
-            TestStableDiffusionICLightBackgroundParity,
-            TestStableDiffusionICLightHighRes, numbers hardcoded);
-            examples/StableDiffusion `--relight PNG --iclight FILE`, `--light`,
-            `--relight-background`, `--birefnet` (RMBG-1.4 not ported; RGBA
-            alpha or BiRefNet / RMBG-2.0), `--highres-scale/-strength`,
-            `--relight-added-prompt`, README section.
+      Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`):
+      `TStableDiffusionICLight` (`Relight`) and examples/StableDiffusion
+      `--relight PNG --iclight FILE` landed; open:
       - [ ] (f) Real run on the user's GPU box (fc and fbc, `--int8` too). The
             img2img start / highres pass now follow the truncated Karras
             schedule (fed30990), so check the highres output there.
@@ -1174,16 +1124,10 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
-      (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
-      advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
-      plumbing, tests in tests/TestNeuralGRPO.pas). ORPO / SimPO / KTO
-      loss-formula deltas LANDED on TNeuralDPOTrainer as a TNeuralPreferenceLossMode
-      (plmSimPO/plmORPO are reference-free via CreateReferenceFree; plmKTO uses a
-      reference, paired-batch simplification documented in the unit header), tests
-      in tests/TestNeuralPreference.pas; Bradley-Terry TNeuralRewardModelTrainer
-      also exists. REMAINING: a full
-      unpaired-batch KTO variant (current KTO uses the paired pair-mean KL point).
+- [ ] Preference-optimization follow-up on TNeuralDPOTrainer
+      (neural/neuraldpo.pas, TNeuralPreferenceLossMode plmKTO, paired-batch
+      simplification documented in the unit header): a full unpaired-batch KTO
+      variant (current KTO uses the paired pair-mean KL point).
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (rebuild the same
       architecture at a new width) — large early-epoch throughput win for LM
@@ -1249,28 +1193,16 @@ rather than acted on.
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
 - [ ] HiFi-GAN neural vocoder importer follow-ups (`BuildHiFiGANFromSafeTensors[Ex]`
-      LANDED + `ReadHiFiGANConfigFromJSONFile`/`HiFiGANConfigToString` +
-      `THiFiGANConfig` + the `TNNetHiFiGAN` channel-major holder
-      (Synthesize / SynthesizeVolume); mel-spectrogram -> waveform, the reusable
-      synthesis backend shared by Tacotron2 / FastSpeech2 / SpeechT5 / Bark /
-      VITS-style models). The generator is implemented as a self-contained
-      convolutional holder (like TEnCodecModel) doing the conv_pre ->
-      ConvTranspose1d-upsample + MRF (AVERAGE of num_kernels dilated ResBlocks) ->
-      conv_post -> tanh math directly on channel-major arrays; conv weights fold
-      weight_norm g/v at import (or load plain folded `.weight` as SpeechT5HifiGan
-      ships). Discriminators skipped (training-only). Parity-gated < 1e-4 against an
-      HF SpeechT5HifiGan float64 oracle (tools/make_pico_hifigan_fixture.py ->
-      tests/fixtures/tiny_hifigan*, TestHiFiGANSynthesisParity). Open follow-ups:
+      + the `TNNetHiFiGAN` channel-major holder; conv weights fold weight_norm
+      g/v at import; parity-gated only on the pico fixture,
+      TestHiFiGANSynthesisParity). Open follow-ups:
   - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
         SpeechT5HifiGan generator (weight_norm fold path) and write it via
         SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
-- [ ] AVX (and optional OpenCL) acceleration for the channel-major conv1d inner
-      loops in the self-contained audio holders — `TEnCodecModel`, `TNNetHiFiGAN`,
-      `TNNetVits`, `TNNetMimi`, and the MusicGen EnCodec decode path. These holders
-      deliberately do the conv1d / ConvTranspose1d math DIRECTLY on channel-major
-      arrays (not via TNNet layers).
-      Forward conv1d (commit 8e15052) and ConvTranspose1d (commit 2873a1f; Mimi
-      30c2342, DAC 8277d25) are AVX-vectorized in all of these holders. REMAINING:
+- [ ] OpenCL acceleration for the channel-major conv1d inner loops in the
+      self-contained audio holders. These holders deliberately do the conv1d /
+      ConvTranspose1d math DIRECTLY on channel-major arrays (not via TNNet
+      layers). REMAINING:
   - [ ] OpenCL offload of the Mimi (`RunMimiConv`) / DAC (`RunDACConv`) holders —
         blocked on a Double-precision shared dot-product kernel (their oracle gate
         is `< 1e-4` against a float64 reference; a Float kernel would not hold it).
@@ -1285,31 +1217,11 @@ rather than acted on.
       pair the decoder with the real (By)T5 encoder + DAC decoder to a WAVEFORM
       end-to-end (all three importable in-tree); the real parler-tts-mini-v1
       checkpoint key mapping + tokenizers; classifier-free guidance; sampling controls.
-- [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
-      LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
-      record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
-      FlowReverse / Synthesize) + examples/TextToSpeech) — the FIRST text-to-speech
-      model in the library (model_type `vits`: facebook/mms-tts-* and
-      kakao-enterprise/vits-ljs; Kim et al. 2021). Like the HiFi-GAN vocoder it is a
-      self-contained channel-major holder doing the INFERENCE math directly (conv1d /
-      relative-position attention / WaveNet residual stacks). All four stages landed
-      and parity-gated `< 1e-4` vs the HF `VitsModel` float64 oracle
-      (`TestVitsSynthesisParity`, `tools/make_pico_vits_fixture.py` ->
-      `tests/fixtures/tiny_vits*`): (1) the conditional-prior normalizing FLOW run in
-      reverse — VITS's residual coupling is RealNVP/Glow ADDITIVE coupling
-      (`log_stddev≡0`, so `second_half -= mean(first_half)` with the mean from a
-      `conv_pre`->WaveNet->`conv_post` stack, weight_norm g/v folded) — note this
-      REUSES the WaveNet/coupling math directly rather than the generic
-      `TNNetAffineCoupling`/`TNNetInvertible1x1Conv` Glow layers (VITS's coupling is
-      its own WaveNet-conditioned variant, not a layer-graph fit); (2) the HiFi-GAN
-      DECODER reused from `TNNetHiFiGAN` via a shared `BuildVitsDecoderInto` (loaded
-      under the `decoder.` key prefix, bias-free `conv_post`); (3) the
-      relative-position text encoder + the DETERMINISTIC duration predictor + the
-      monotonic length-regulator expansion; (4) the full text->waveform graph (the
-      prior noise `z` is an EXPLICIT input so the parity test is deterministic). The
-      posterior encoder (training-only) is dropped from the committed fixture and
-      never required. Example writes a smoke WAV via `SaveVolumeToWav16`. Open
-      follow-ups:
+- [ ] VITS / MMS-TTS text-to-speech importer follow-ups
+      (`BuildVitsFromSafeTensors[Ex]` + the `TNNetVits` channel-major holder +
+      examples/TextToSpeech; model_type `vits`: facebook/mms-tts-* and
+      kakao-enterprise/vits-ljs; parity-gated only on the pico fixture,
+      `TestVitsSynthesisParity`). Open follow-ups:
   - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
         global-conditioning `cond` convs into the WaveNet/duration/decoder) —
         rejected loudly.
@@ -1430,20 +1342,10 @@ rather than acted on.
       guidance strength sweep on the cond/uncond DiT pass.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
-      + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
-      dual-encoder (two nets, shared L2-normalized space, `exp(logit_scale_a)*cosine`),
-      but genuinely distinct: the audio tower is an HTS-AT Swin transformer over a
-      log-mel spectrogram (PURE REUSE of the landed Swin window machinery —
-      `TNNetWindowAttention`/`TNNetGatherTokens`/`SwinBuildWindowLayout`/
-      `SwinSetWindowBias`/patch-merge — under the `clap_audio_model` key spelling, plus
-      a Conv2d patch-embed + token mean-pool + 2-layer `ClapProjectionLayer`), and the
-      text tower is RoBERTa (built inline like `BuildBertFromSafeTensors` + BERT pooler
-      + 2-layer projection). The HF `BatchNorm2d`(mel) + `reshape_mel2img` freq<->time
-      transpose are folded into `ClapBatchNormMelImage` (caller supplies the
-      `(time,mel,1)` image). NO new leaf layers. Reuses `ClipExtractEmbedding`/
-      `ClipSimilarity` + new `ClapSimilarityMatrix`. Pico parity `< 1e-4` on BOTH
-      embeddings vs the float64 HF `ClapModel` oracle (`TestClapParity`, generator
-      `tools/clap_tiny_fixture.py`, committed `tests/fixtures/tiny_clap.*`).
+      + examples/ZeroShotAudioTag — LANDED: HTS-AT Swin audio tower over a log-mel
+      image (the HF `BatchNorm2d`(mel) + `reshape_mel2img` folded into
+      `ClapBatchNormMelImage`, caller supplies the `(time,mel,1)` image) + RoBERTa
+      text tower; pico parity `TestClapParity` (`tools/clap_tiny_fixture.py`).
       Follow-ups:
   - [ ] "fused" CLAP (`enable_fusion = true`, clap-htsat-FUSED): the local/global
         mel-fusion patch-embed (`mel_conv2d` + the attention-feature-fusion block) is
@@ -1494,20 +1396,11 @@ rather than acted on.
         large head lists and falls back to all-heads otherwise; no config-plumbing
         + fixture yet).
 - [ ] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
-      `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED.
-      New leaf layer `TNNetSincConv1D` (SincNet band-pass, kernels materialized from two
-      scalars (low_freq, band) per filter, Hamming-windowed; full forward+BPTT, input &
-      weight numerical-gradient tests `TestSincConv1D*`, README layer row). Importer
-      pipeline: SincConv front-end → abs/MaxPool/TokenLayerNorm → Conv+ReLU/MaxPool/
-      TokenLayerNorm → bidirectional `TNNetMinLSTM` trunk (forward + time-reversed concat)
-      → linear → per-frame 7-class **powerset** head + `PyannotePowersetDecode` to a
-      per-speaker binary activity matrix. Parity-gated `< 1e-4` (observed ~2e-7) vs a
-      hand-written numpy float64 forward oracle on a pico fixture
-      (`tools/make_pico_pyannote_fixture.py` → `tests/fixtures/tiny_pyannote*`,
-      `TestPyannoteParity`) — the `pyannote.audio` python package is NOT installed here, so
-      the oracle reimplements the exact forward math on a re-randomized fixture.
-      `examples/SpeakerDiarization` synthesizes a two-tone clip, prints a speaker-activity
-      timeline + RTTM lines, saves a WAV via `SaveVolumeToWav16`. Open follow-ups:
+      `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED
+      (SincConv front-end + bidirectional `TNNetMinLSTM` trunk + per-frame powerset
+      head + `PyannotePowersetDecode`; pico parity `TestPyannoteParity` vs a numpy
+      float64 oracle, since the `pyannote.audio` python package is NOT installed
+      here; examples/SpeakerDiarization). Open follow-ups:
   - [ ] Real `pyannote/segmentation-3.0` checkpoint key-mapping (the on-disk tensor
         names + the actual conv-stack depths/strides) instead of the pico fixture's
         re-keyed names, verified against a real `pyannote.audio` float64 oracle once the
@@ -1520,8 +1413,8 @@ rather than acted on.
       new leaves `TNNetTDNNConv1D`/`TNNetAttentiveStatsPooling`, builder
       `TNNet.AddSERes2Block`, examples/SpeakerVerification, pico parity TestEcapaParity
       <1e-4 LANDED): real speechbrain/spkrec-ecapa-voxceleb checkpoint key-mapping
-      (BatchNorm1d eval-mode stats, SpeechBrain TDNN naming — the pico SE block uses
-      the simplified `/N²` AvgChannel scaling) + a VoxCeleb EER smoke (network/RAM-gated).
+      (BatchNorm1d eval-mode stats, SpeechBrain TDNN naming) + a VoxCeleb EER smoke
+      (network/RAM-gated).
 - [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
       wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
@@ -2356,7 +2249,7 @@ rather than acted on.
       - [ ] `BuildCoTrackerFromSafeTensors[Ex]` + `CoTrackerPredictTracks` in
             neural/neuralpretrained.pas (offline mode: the whole clip in one
             window). The checkpoint is a torch `.pth` with no safetensors copy
-            and the library has no `.pth` reader, so a one-off conversion and
+            (the torch.save zip reader neural/neuraltorchbin.pas can read it);
             a pico fixture plus oracle are needed: ask the user before adding
             the Python tool. Parity test against the reference
             `CoTrackerThreeOffline` forward on the pico fixture (tracks and
