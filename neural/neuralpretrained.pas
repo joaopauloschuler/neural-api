@@ -13515,7 +13515,7 @@ type
     FWeightsFile: string;
     FPhrases: array of string;
     // 4 per phrase: x0, y0, x1, y1 in [0, 1].
-    FBoxes: TNeuralFloatDynArr;
+    FBoxes: array of double;
     FScheduledSamplingBeta: double;
     FPositionConfig: TGLIGENPositionNetConfig;
     FPositionNet, FBoxFourierNet: TNNet;
@@ -13537,9 +13537,12 @@ type
     constructor Create(const WeightsFile: string);
     destructor Destroy(); override;
     // One grounded phrase; at most csGLIGENMaxObjects (diffusers drops the rest).
-    procedure AddBox(const Phrase: string; X0, Y0, X1, Y1: TNeuralFloat);
+    procedure AddBox(const Phrase: string; X0, Y0, X1, Y1: double);
     procedure ClearBoxes();
     function BoxCount(): integer;
+    // diffusers draw_inpaint_mask_from_boxes: Mask (GridX, GridY, 1) is 0 on
+    // the cells [Trunc(x0 * GridX), Trunc(x1 * GridX)) x (y alike) of every box, 1 elsewhere.
+    procedure DrawInpaintKeepMask(GridX, GridY: integer; Mask: TNNetVolume);
     function UNetGLIGENFile(): string; override;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
       Latents: TNNetVolume; TextSeqLen: integer); override;
@@ -13551,6 +13554,47 @@ type
     // and of the others, from the last BeginDenoise.
     property PromptObjects: TNNetVolume read FPromptObjects;
     property UncondObjects: TNNetVolume read FUncondObjects;
+  end;
+
+  // diffusers StableDiffusionGLIGENPipeline with gligen_inpaint_image
+  // (gligen-1-4-inpainting-text-box): a 9-channel UNet sees latents | the
+  // sampled image latents outside the GLIGEN boxes | that keep mask; before
+  // every step the kept region takes the image latents noised to the step's
+  // timestep. Starts from noise; add the GLIGEN conditioner beside it in a
+  // TStableDiffusionMultiConditioner.
+  TStableDiffusionGLIGENInpainter = class(TStableDiffusionImg2Img)
+  private
+    FGLIGEN: TStableDiffusionGLIGEN;
+    // (GridX, GridY, 1) keep mask; per latent channel, 1 - keep (InpaintBlend's).
+    FKeepMask, FRegenerateMask: TNNetVolume;
+    // masked image latents | keep mask, the UNet's extra input channels.
+    FExtraChannels: TNNetVolume;
+    FNoisedImageLatents, FStepNoise: TNNetVolume;
+    FOnStepNoise: TStableDiffusionNoiseEvent;
+  protected
+    // diffusers target_size_center_crop: the centered crop of the latent
+    // grid's aspect, PIL Lanczos (8-bit) to the output size, then [-1, 1].
+    procedure ResizeSourceImage(Latents, VaeImage: TNNetVolume); override;
+    procedure EncodeImage(VaeImage, Latents: TNNetVolume); override;
+  public
+    // GLIGEN (not owned) gives the boxes the mask is drawn from.
+    constructor Create(GLIGEN: TStableDiffusionGLIGEN);
+    destructor Destroy(); override;
+    function AcceptsUNetInChannels(InChannels,
+      LatentChannels: integer): boolean; override;
+    function StartsFromImage(): boolean; override;
+    function AcceptsSigmaSchedule(): boolean; override;
+    procedure PredictGuidedNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, PromptEmbeds: TNNetVolume; Timestep: TNeuralFloat;
+      Pred: TNNetVolume); override;
+    procedure PredictNoise(UNet: TNNet; const Config: TSDUNetConfig;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs; Pred: TNNetVolume); override;
+    // The (GridX, GridY, 1) keep mask of the last BeginDenoise.
+    property KeepMask: TNNetVolume read FKeepMask;
+    // The unit noise that re-noises the kept region each step; nil: global RNG.
+    property OnStepNoise: TStableDiffusionNoiseEvent read FOnStepNoise
+      write FOnStepNoise;
   end;
 
   // Several conditioners (not owned) in one Denoise: ControlNets and
@@ -99700,6 +99744,7 @@ begin
     (ClassName = 'StableDiffusionControlNetPipeline') or
     (ClassName = 'StableDiffusionAdapterPipeline') or
     (ClassName = 'StableDiffusionInpaintPipeline') or
+    (ClassName = 'StableDiffusionGLIGENPipeline') or
     (ClassName = 'StableDiffusionImg2ImgPipeline') or
     (ClassName = 'StableDiffusionInstructPix2PixPipeline') or
     (ClassName = 'StableDiffusionDepth2ImgPipeline') or
@@ -102398,7 +102443,7 @@ begin
 end;
 
 procedure TStableDiffusionGLIGEN.AddBox(const Phrase: string;
-  X0, Y0, X1, Y1: TNeuralFloat);
+  X0, Y0, X1, Y1: double);
 var
   BoxPos: integer;
 begin
@@ -102424,6 +102469,25 @@ begin
   Result := Length(FPhrases);
 end;
 
+procedure TStableDiffusionGLIGEN.DrawInpaintKeepMask(GridX, GridY: integer;
+  Mask: TNNetVolume);
+var
+  BoxPos, MaxBoxPos, X, Y, MaxX, MaxY: integer;
+begin
+  Mask.ReSize(GridX, GridY, 1);
+  Mask.Fill(1);
+  MaxBoxPos := BoxCount() - 1;
+  for BoxPos := 0 to MaxBoxPos do
+  begin
+    // Python int() of the box edges times the grid: rows [y0, y1), columns [x0, x1).
+    MaxX := Min(Trunc(FBoxes[4 * BoxPos + 2] * GridX), GridX) - 1;
+    MaxY := Min(Trunc(FBoxes[4 * BoxPos + 3] * GridY), GridY) - 1;
+    for Y := Max(Trunc(FBoxes[4 * BoxPos + 1] * GridY), 0) to MaxY do
+      for X := Max(Trunc(FBoxes[4 * BoxPos] * GridX), 0) to MaxX do
+        Mask.FData[Mask.GetRawPos(X, Y)] := 0;
+  end;
+end;
+
 function TStableDiffusionGLIGEN.UNetGLIGENFile(): string;
 begin
   Result := FWeightsFile;
@@ -102447,7 +102511,8 @@ begin
     begin
       Move(FPooled.FData[SlotPos * PositiveDim], FPositionInput.FData[RowStart],
         PositiveDim * csNeuralFloatSize);
-      GLIGENBoxEmbedding(FBoxFourierNet, FBoxes[4 * SlotPos .. 4 * SlotPos + 3],
+      GLIGENBoxEmbedding(FBoxFourierNet, [FBoxes[4 * SlotPos],
+        FBoxes[4 * SlotPos + 1], FBoxes[4 * SlotPos + 2], FBoxes[4 * SlotPos + 3]],
         FPositionInput, RowStart + PositiveDim);
     end
     else
@@ -102556,6 +102621,139 @@ begin
     FreeAndNil(FPositionNet);
     FreeAndNil(FBoxFourierNet);
   end;
+end;
+
+constructor TStableDiffusionGLIGENInpainter.Create(
+  GLIGEN: TStableDiffusionGLIGEN);
+begin
+  inherited Create();
+  FGLIGEN := GLIGEN;
+  FStrength := 1;
+  FKeepMask := TNNetVolume.Create();
+  FRegenerateMask := TNNetVolume.Create();
+  FExtraChannels := TNNetVolume.Create();
+  FNoisedImageLatents := TNNetVolume.Create();
+  FStepNoise := TNNetVolume.Create();
+end;
+
+destructor TStableDiffusionGLIGENInpainter.Destroy();
+begin
+  FStepNoise.Free;
+  FNoisedImageLatents.Free;
+  FExtraChannels.Free;
+  FRegenerateMask.Free;
+  FKeepMask.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionGLIGENInpainter.ResizeSourceImage(Latents,
+  VaeImage: TNNetVolume);
+var
+  Rgb, Cropped: TNNetVolume;
+  Width, Height, SourceWidth, SourceHeight, Left, Top, Right,
+    Bottom: integer;
+  CropWidth, CropHeight: double;
+begin
+  Width := Latents.SizeX * FPipeline.VaeScaleFactor;
+  Height := Latents.SizeY * FPipeline.VaeScaleFactor;
+  Rgb := TNNetVolume.Create();
+  Cropped := TNNetVolume.Create();
+  try
+    ConvertAndResizeImagePIL(FSourceImage, Rgb, FSourceImage.SizeX,
+      FSourceImage.SizeY, 3, {ClipToByteRange=}false, 0, 255);
+    SourceWidth := Rgb.SizeX;
+    SourceHeight := Rgb.SizeY;
+    if SourceWidth * Height > SourceHeight * Width then
+    begin
+      CropHeight := SourceHeight;
+      CropWidth := SourceHeight * Width / Height;
+    end
+    else
+    begin
+      CropWidth := SourceWidth;
+      CropHeight := SourceWidth * Height / Width;
+    end;
+    // PIL crop rounds each edge half to even, as Round does.
+    Left := Round((SourceWidth - CropWidth) / 2);
+    Right := Round((SourceWidth + CropWidth) / 2);
+    Top := Round((SourceHeight - CropHeight) / 2);
+    Bottom := Round((SourceHeight + CropHeight) / 2);
+    Cropped.CopyCropping(Rgb, Left, Top, Right - Left, Bottom - Top);
+    if (Cropped.SizeX <> Width) or (Cropped.SizeY <> Height) then
+      ResizeImagePIL(Cropped, VaeImage, Width, Height, irfLanczos,
+        {RoundToBytes=}true)
+    else
+    begin
+      VaeImage.ReSize(Cropped);
+      VaeImage.Copy(Cropped);
+    end;
+    VaeImage.Mul(2 / 255);
+    VaeImage.Add(-1);
+  finally
+    Cropped.Free;
+    Rgb.Free;
+  end;
+end;
+
+procedure TStableDiffusionGLIGENInpainter.EncodeImage(VaeImage,
+  Latents: TNNetVolume);
+begin
+  if FGLIGEN.BoxCount() = 0 then
+    ImportError('TStableDiffusionGLIGENInpainter: the GLIGEN conditioner ' +
+      'has no boxes to inpaint.');
+  inherited EncodeImage(VaeImage, Latents);
+  FGLIGEN.DrawInpaintKeepMask(Latents.SizeX, Latents.SizeY, FKeepMask);
+  // FRegenerateMask holds the keep mask per channel until it is inverted.
+  DiffusersMaskToLatentGrid(FKeepMask, 1, Latents.Depth, FRegenerateMask);
+  FNoisedImageLatents.ReSize(FImageLatents);
+  FNoisedImageLatents.Copy(FImageLatents);
+  FNoisedImageLatents.Mul(FRegenerateMask);
+  FExtraChannels.AddLayers(FNoisedImageLatents, FKeepMask);
+  FRegenerateMask.Mul(-1);
+  FRegenerateMask.Add(1);
+  FStepNoise.ReSize(FImageLatents);
+end;
+
+function TStableDiffusionGLIGENInpainter.AcceptsUNetInChannels(InChannels,
+  LatentChannels: integer): boolean;
+begin
+  Result := InChannels = 2 * LatentChannels + 1;
+end;
+
+function TStableDiffusionGLIGENInpainter.StartsFromImage(): boolean;
+begin
+  Result := false;
+end;
+
+function TStableDiffusionGLIGENInpainter.AcceptsSigmaSchedule(): boolean;
+begin
+  // The kept region is noised at each integer timestep.
+  Result := false;
+end;
+
+procedure TStableDiffusionGLIGENInpainter.PredictGuidedNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, PromptEmbeds: TNNetVolume;
+  Timestep: TNeuralFloat; Pred: TNNetVolume);
+begin
+  if not Assigned(FPipeline.FUNetInputs.GLIGENObjects) then
+    ImportError('TStableDiffusionGLIGENInpainter: the UNet has no GLIGEN ' +
+      'fusers; add the GLIGEN conditioner beside it.');
+  if Assigned(FOnStepNoise) then FOnStepNoise(FPipeline.FStepPos, FStepNoise)
+  else FStepNoise.RandomizeGaussian(1.0);
+  FPipeline.Scheduler.AddNoise(FImageLatents, FNoisedImageLatents,
+    Round(Timestep) + 1, nil, FStepNoise);
+  InpaintBlend(Latents, FNoisedImageLatents, FRegenerateMask);
+  inherited PredictGuidedNoise(UNet, Config, Latents, PromptEmbeds, Timestep,
+    Pred);
+end;
+
+procedure TStableDiffusionGLIGENInpainter.PredictNoise(UNet: TNNet;
+  const Config: TSDUNetConfig; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs;
+  Pred: TNNetVolume);
+begin
+  PredictWithExtraChannels(UNet, Config, Latents, FExtraChannels, Embeds,
+    Timestep, Pred);
 end;
 
 procedure TStableDiffusionMultiConditioner.CollectConditioners(

@@ -61,9 +61,10 @@ type
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
     function CreateSD15Pipeline(): TStableDiffusionPipeline;
-    // The GLIGEN conditioner of a tiny_sd15_gligen_io.json oracle's boxes.
-    function CreateSD15GLIGEN(Oracle: TJSONObject;
-      Beta: double): TStableDiffusionGLIGEN;
+    // The GLIGEN conditioner of an oracle's boxes over a fixture folder's
+    // GLIGEN tensors.
+    function CreateSD15GLIGEN(Oracle: TJSONObject; Beta: double;
+      const WeightsFolder: string = 'tiny_sd15_gligen'): TStableDiffusionGLIGEN;
     // A kept pipeline generates at A, B (an odd latent grid), A; each image must
     // match a fresh pipeline's and the size changes read no weights file.
     procedure CheckSD15KeptSizeChange(SizeChangeCase: TSD15SizeChangeCase;
@@ -1374,6 +1375,10 @@ type
     // StableDiffusionGLIGENPipeline steps + image for CFG / no CFG and two
     // scheduled-sampling betas, per-stage and with kept components.
     procedure TestStableDiffusionGLIGENPipelineParity;
+    // StableDiffusionGLIGENPipeline with gligen_inpaint_image
+    // (tiny_sd15_gligen_inpaint_io.json): the box keep mask, then steps + image
+    // with injected VAE sample and step noise, CFG with beta 0.5 and no CFG.
+    procedure TestStableDiffusionGLIGENInpaintParity;
     procedure TestSDUNetConditioningInputsLayout;
     procedure TestStableDiffusionIPAdapterControlNetParity;
     procedure TestStableDiffusionControlNetGuidanceWindowParity;
@@ -47053,13 +47058,13 @@ begin
 end;
 
 function TTestNeuralPretrained.CreateSD15GLIGEN(Oracle: TJSONObject;
-  Beta: double): TStableDiffusionGLIGEN;
+  Beta: double; const WeightsFolder: string): TStableDiffusionGLIGEN;
 var
   Phrases, Boxes, Box: TJSONArray;
   PhrasePos: integer;
 begin
   Result := TStableDiffusionGLIGEN.Create(FixturePath(
-    'tiny_sd15_gligen/diffusion_pytorch_model.safetensors'));
+    WeightsFolder + '/diffusion_pytorch_model.safetensors'));
   Result.ScheduledSamplingBeta := Beta;
   Phrases := Oracle.Arrays['phrases'];
   Boxes := Oracle.Arrays['boxes'];
@@ -47290,6 +47295,71 @@ begin
     Initial.Free;
     Embeds.Free;
     Pipeline.Free;
+    GLIGEN.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionGLIGENInpaintParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  GLIGEN: TStableDiffusionGLIGEN;
+  Inpainter: TStableDiffusionGLIGENInpainter;
+  Multi: TStableDiffusionMultiConditioner;
+  Oracle, Entry: TJSONObject;
+  Cases, KeepMaskRows: TJSONArray;
+  SourceImage, SampleNoise: TNNetVolume;
+  CasePos, X, Y: integer;
+  MaskDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_gligen_inpaint_io.json');
+  Oracle := TJSONObject(FSD15Oracle);
+  Pipeline := TStableDiffusionPipeline.Create(ExtractFileDir(FixturePath(
+    'tiny_sd15_inpaint/model_index.json')));
+  GLIGEN := CreateSD15GLIGEN(Oracle, 0.3, 'tiny_sd15_gligen_inpaint');
+  Inpainter := TStableDiffusionGLIGENInpainter.Create(GLIGEN);
+  Multi := TStableDiffusionMultiConditioner.Create();
+  SourceImage := TNNetVolume.Create;
+  SampleNoise := TNNetVolume.Create;
+  try
+    LoadNestedOracleVolume(Oracle.Arrays['inpaint_image'], false, SourceImage);
+    Inpainter.SetImage(SourceImage);
+    LoadNestedOracleVolume(Oracle.Arrays['image_sample_noise'], true,
+      SampleNoise);
+    Inpainter.SetSampleNoise(SampleNoise);
+    Inpainter.OnStepNoise := @SD15StepNoise;
+    Multi.Add(GLIGEN);
+    Multi.Add(Inpainter);
+    Pipeline.Conditioner := Multi;
+    Cases := Oracle.Arrays['cases'];
+    AssertEquals('cases', 2, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      Entry := Cases.Objects[CasePos];
+      GLIGEN.ScheduledSamplingBeta := Entry.Get('scheduled_sampling_beta', 0.0);
+      CheckSD15ConditionedParity(Pipeline, Entry);
+    end;
+    KeepMaskRows := Oracle.Arrays['keep_mask'];
+    AssertEquals('keep mask rows', KeepMaskRows.Count, Inpainter.KeepMask.SizeY);
+    MaskDiff := 0;
+    for Y := 0 to KeepMaskRows.Count - 1 do
+    begin
+      AssertEquals('keep mask columns', KeepMaskRows.Arrays[Y].Count,
+        Inpainter.KeepMask.SizeX);
+      for X := 0 to KeepMaskRows.Arrays[Y].Count - 1 do
+        MaskDiff := Max(MaskDiff, Abs(KeepMaskRows.Arrays[Y].Floats[X] -
+          Inpainter.KeepMask[X, Y, 0]));
+    end;
+    AssertTrue('keep mask max |diff| = ' + FloatToStr(MaskDiff), MaskDiff = 0);
+    AssertTrue('the boxes cut the mask', (Inpainter.KeepMask.GetMin() = 0) and
+      (Inpainter.KeepMask.GetMax() = 1));
+  finally
+    Pipeline.Conditioner := nil;
+    SampleNoise.Free;
+    SourceImage.Free;
+    Pipeline.Free;
+    Multi.Free;
+    Inpainter.Free;
     GLIGEN.Free;
     FreeAndNil(FSD15Oracle);
   end;

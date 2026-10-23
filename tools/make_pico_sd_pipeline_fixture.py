@@ -48,6 +48,19 @@ transformers class (nothing downloaded), saved with the real folder layout:
     (all masks 0), one gated UNet call (unet_check), and per GLIGEN_CASES entry
     (guidance scale, gligen_scheduled_sampling_beta) the timesteps,
     latents_after and the decoded image.
+  tests/fixtures/tiny_sd15_gligen_inpaint/diffusion_pytorch_model.safetensors
+    the same kind of fuser.* and position_net.* tensors over the 9-channel UNet
+    of tests/fixtures/tiny_sd15_inpaint (made by
+    make_pico_sd_conditioning_fixtures.py; run that first).
+  tests/fixtures/tiny_sd15_gligen_inpaint_io.json
+    StableDiffusionGLIGENPipeline with gligen_inpaint_image (the
+    gligen-1-4-inpainting-text-box recipe) on that UNet, DDIM,
+    GLIGEN_INPAINT_STEPS steps: a GLIGEN_INPAINT_IMAGE_WIDTH x
+    GLIGEN_INPAINT_IMAGE_HEIGHT byte image (center-cropped and Lanczos-resized
+    to 16x16 by the pipeline; vae_image is that, in [-1, 1]), the keep mask
+    drawn from the boxes, the injected VAE sample noise and per-step noise
+    (step_noise, the randn_like of the kept-region re-noising) and per
+    GLIGEN_INPAINT_CASES entry the timesteps, latents_after and the image.
   tests/fixtures/tiny_sd15_nonsquare_io.json
     the DDIM run of tiny_sd15_pipeline_io.json at NONSQUARE_WIDTH x
     NONSQUARE_HEIGHT: latents (C,H,W), unet_cond_0 (the conditional UNet
@@ -109,10 +122,12 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --pag-only
   python tools/make_pico_sd_pipeline_fixture.py --karras-only
   python tools/make_pico_sd_pipeline_fixture.py --gligen-only
+  python tools/make_pico_sd_pipeline_fixture.py --gligen-inpaint-only
 (--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only /
 --freeu-only / --pag-only / --karras-only / --gligen-only keep the committed
 folder and rewrite only the sampler / non-square / odd-size / LCM / FreeU / PAG /
-Karras / GLIGEN files; --lcm-distilled-only
+Karras / GLIGEN files; --gligen-inpaint-only the GLIGEN inpainting tensors and
+file; --lcm-distilled-only
 rewrites the distilled UNet folder and its file.)
 """
 import json
@@ -138,6 +153,8 @@ import diffusers.schedulers.scheduling_lcm as lcm_module
 import diffusers.schedulers.scheduling_euler_ancestral_discrete as euler_a_module
 from diffusers.pipelines.deprecated.stable_diffusion_gligen.pipeline_stable_diffusion_gligen import (
     StableDiffusionGLIGENPipeline)
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from PIL import Image
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -157,6 +174,9 @@ PAG_FILE = os.path.join(FIXTURES, "tiny_sd15_pag_io.json")
 KARRAS_FILE = os.path.join(FIXTURES, "tiny_sd15_karras_io.json")
 GLIGEN_DIR = os.path.join(FIXTURES, "tiny_sd15_gligen")
 GLIGEN_FILE = os.path.join(FIXTURES, "tiny_sd15_gligen_io.json")
+INPAINT_DIR = os.path.join(FIXTURES, "tiny_sd15_inpaint")
+GLIGEN_INPAINT_DIR = os.path.join(FIXTURES, "tiny_sd15_gligen_inpaint")
+GLIGEN_INPAINT_FILE = os.path.join(FIXTURES, "tiny_sd15_gligen_inpaint_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -205,6 +225,11 @@ GLIGEN_UNET_CHECK_TIMESTEP = 499
 # name, guidance_scale, gligen_scheduled_sampling_beta: the fuser runs for the
 # first int(beta * 4) steps, 2 and 1 here.
 GLIGEN_CASES = [("cfg_beta_half", GUIDANCE, 0.5), ("no_cfg_beta_default", 1.0, 0.3)]
+GLIGEN_INPAINT_STEPS = 3
+GLIGEN_INPAINT_IMAGE_WIDTH = 25    # center crop to 20: PIL rounds the edges 2.5, 22.5 to even
+GLIGEN_INPAINT_IMAGE_HEIGHT = 20
+# The fuser runs for int(beta * 3) steps: 1 and 3.
+GLIGEN_INPAINT_CASES = [("cfg_beta_half", GUIDANCE, 0.5), ("no_cfg_beta_one", 1.0, 1.0)]
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
     "a photo of an astronaut riding a horse on mars",
@@ -778,10 +803,10 @@ def make_lcm_distilled_oracle():
         json.dump(payload, f)
 
 
-def build_gligen_unet(base_unet):
-    """tiny_sd15's UNet as attention_type "gated" with random fuser and
-    position_net tensors; saves those tensors alone to GLIGEN_DIR."""
-    torch.manual_seed(SEED + 70)
+def build_gligen_unet(base_unet, folder=GLIGEN_DIR, seed=SEED + 70):
+    """base_unet as attention_type "gated" with random fuser and position_net
+    tensors; saves those tensors alone to folder."""
+    torch.manual_seed(seed)
     config = dict(base_unet.config)
     config["attention_type"] = "gated"
     unet = UNet2DConditionModel.from_config(config)
@@ -798,11 +823,11 @@ def build_gligen_unet(base_unet):
             else:
                 param.add_(torch.randn_like(param) * 0.05)
     state = unet.state_dict()
-    if os.path.isdir(GLIGEN_DIR):
-        shutil.rmtree(GLIGEN_DIR)
-    os.makedirs(GLIGEN_DIR)
+    if os.path.isdir(folder):
+        shutil.rmtree(folder)
+    os.makedirs(folder)
     save_file({key: state[key].to(torch.float32).contiguous() for key in missing},
-              os.path.join(GLIGEN_DIR, "diffusion_pytorch_model.safetensors"),
+              os.path.join(folder, "diffusion_pytorch_model.safetensors"),
               metadata={"format": "pt"})
     return unet
 
@@ -876,7 +901,83 @@ def make_gligen_oracle():
         json.dump(payload, f)
 
 
+def make_gligen_inpaint_oracle():
+    base = StableDiffusionPipeline.from_pretrained(INPAINT_DIR, safety_checker=None)
+    assert base.unet.config.in_channels == 9
+    unet = build_gligen_unet(base.unet, GLIGEN_INPAINT_DIR, SEED + 71).to(torch.float64)
+    pipe = StableDiffusionGLIGENPipeline(
+        vae=base.vae.to(torch.float64), text_encoder=base.text_encoder.to(torch.float64),
+        tokenizer=base.tokenizer, unet=unet, scheduler=base.scheduler,
+        safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+    pipe.set_progress_bar_config(disable=True)
+    generator = torch.Generator().manual_seed(SEED + 72)
+    levels = torch.randint(0, 256, (GLIGEN_INPAINT_IMAGE_HEIGHT,
+                                    GLIGEN_INPAINT_IMAGE_WIDTH, 3), generator=generator)
+    image = Image.fromarray(levels.to(torch.uint8).numpy(), "RGB")
+    grid = IMAGE_SIZE // pipe.vae_scale_factor
+    # 4-channel latents skip the pipeline's randn_like redraw of 9-channel ones.
+    latents = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    sample_noise = torch.randn((1, 4, grid, grid), generator=generator,
+                               dtype=torch.float64)
+    step_noise = [torch.randn((1, 4, grid, grid), generator=generator,
+                              dtype=torch.float64) for _ in range(GLIGEN_INPAINT_STEPS)]
+    vae_image = pipe.image_processor.preprocess(
+        pipe.target_size_center_crop(image, pipe.vae.config.sample_size))
+    keep_mask = pipe.draw_inpaint_mask_from_boxes(GLIGEN_BOXES, (grid, grid))
+    original_sample = DiagonalGaussianDistribution.sample
+    original_randn_like = torch.randn_like
+    drawn = []
+
+    def injected_randn_like(tensor, *args, **kwargs):
+        assert tuple(tensor.shape) == (1, 4, grid, grid), tensor.shape
+        drawn.append(len(drawn))
+        return step_noise[len(drawn) - 1].clone()
+    DiagonalGaussianDistribution.sample = (
+        lambda self, generator=None: self.mean + self.std * sample_noise)
+    torch.randn_like = injected_randn_like
+    cases = []
+    try:
+        for name, guidance, beta in GLIGEN_INPAINT_CASES:
+            after = []
+            drawn.clear()
+
+            def on_step(_step, _t, step_latents):
+                after.append(rounded(chw(step_latents[0])))
+            result = pipe(PROMPT, height=IMAGE_SIZE, width=IMAGE_SIZE,
+                          num_inference_steps=GLIGEN_INPAINT_STEPS,
+                          guidance_scale=guidance,
+                          gligen_scheduled_sampling_beta=beta,
+                          gligen_phrases=GLIGEN_PHRASES, gligen_boxes=GLIGEN_BOXES,
+                          gligen_inpaint_image=image, latents=latents.clone(),
+                          output_type="np", callback=on_step, callback_steps=1)
+            assert len(drawn) == GLIGEN_INPAINT_STEPS, drawn
+            cases.append({"name": name, "guidance_scale": guidance,
+                          "scheduled_sampling_beta": beta,
+                          "timesteps": [int(t) for t in pipe.scheduler.timesteps],
+                          "latents_after": after,
+                          "image": rounded(result.images[0].tolist())})
+            print("GLIGEN inpaint", name, cases[-1]["timesteps"])
+    finally:
+        DiagonalGaussianDistribution.sample = original_sample
+        torch.randn_like = original_randn_like
+    payload = {"width": IMAGE_SIZE, "height": IMAGE_SIZE,
+               "steps": GLIGEN_INPAINT_STEPS, "prompt": PROMPT,
+               "phrases": GLIGEN_PHRASES, "boxes": GLIGEN_BOXES,
+               "inpaint_image": levels.tolist(),
+               "vae_image": rounded(vae_image[0].permute(1, 2, 0).tolist()),
+               "keep_mask": keep_mask.tolist(),
+               "latents": rounded(chw(latents[0])),
+               "image_sample_noise": rounded(chw(sample_noise[0])),
+               "step_noise": [rounded(chw(noise[0])) for noise in step_noise],
+               "cases": cases}
+    with open(GLIGEN_INPAINT_FILE, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
+    if "--gligen-inpaint-only" in sys.argv:
+        make_gligen_inpaint_oracle()
+        sys.exit(0)
     if "--gligen-only" in sys.argv:
         make_gligen_oracle()
         sys.exit(0)
@@ -913,3 +1014,4 @@ if __name__ == "__main__":
     make_pag_oracle()
     make_karras_oracle()
     make_gligen_oracle()
+    make_gligen_inpaint_oracle()

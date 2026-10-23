@@ -222,8 +222,32 @@ position_net tensors (`TestStableDiffusionGLIGENPositionNetParity`,
 `TestStableDiffusionGLIGENUNetParity`, `TestStableDiffusionGLIGENPipelineParity`:
 CFG with beta 0.5 and no CFG with beta 0.3, max |diff| below 2e-5). No real
 GLIGEN checkpoint has been run yet. The text-image variant
-(`gligen-1-4-generation-text-image-box`) and GLIGEN inpainting are not
-supported.
+(`gligen-1-4-generation-text-image-box`) is not supported.
+
+`--gligen-inpaint-image PNG` with the GLIGEN inpainting checkpoint
+(`masterful/gligen-1-4-inpainting-text-box`, a 9-channel UNet) regenerates
+only the boxes of the image, as diffusers `StableDiffusionGLIGENPipeline`
+with `gligen_inpaint_image` (`TStableDiffusionGLIGENInpainter`, added beside
+`TStableDiffusionGLIGEN` in a `TStableDiffusionMultiConditioner`). The image
+is center-cropped to the output aspect and Lanczos-resized to the output size
+(512x512 by default, diffusers' only size), then VAE-encoded (sampled). The
+keep mask is 0 on the latent cells inside any box and 1 elsewhere. The UNet
+sees `latents | image latents * mask | mask`, and before every step the kept
+region is replaced by the image latents noised to that step's timestep (fresh
+noise each step). The run starts from pure noise, and the kept region is not
+pasted back after the last step, as in diffusers:
+
+```
+StableDiffusion --model ~/models/gligen-1-4-inpainting-text-box \
+  --gligen ~/models/gligen-1-4-inpainting-text-box/unet/diffusion_pytorch_model.safetensors \
+  --prompt "a birthday cake" --box "a birthday cake:0.2,0.4,0.8,0.9" \
+  --gligen-inpaint-image table.png
+```
+
+Tested against diffusers float64 on a pico 9-channel UNet
+(`TestStableDiffusionGLIGENInpaintParity`: a 25x20 image cropped and resized
+to 16x16, injected VAE sample and step noise, CFG with beta 0.5 and no CFG
+with beta 1, max |diff| below 1e-4). No real checkpoint has been run yet.
 
 `--init-image PNG [--strength S]` turns the run into image-to-image, as
 diffusers `StableDiffusionImg2ImgPipeline` (`TStableDiffusionImg2Img`). The
@@ -735,6 +759,9 @@ StableDiffusion [--model DIR] [options]
   --box "PHRASE:X0,Y0,X1,Y1" a --gligen phrase and its normalized box (0..1,
                     origin top-left); repeatable, at most 30
   --gligen-beta B   ground the first int(B * steps) steps (default 0.3)
+  --gligen-inpaint-image PNG  regenerate only the --box regions of this image
+                    (a GLIGEN inpainting folder, 9-channel UNet); the image is
+                    center-cropped and resized to the output size
   --init-image PNG  image-to-image from this image; the output takes its size
                     (rounded down to the VAE factor) unless --width/--height
   --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);

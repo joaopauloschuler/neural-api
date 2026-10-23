@@ -44,7 +44,9 @@ StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
 phrase inside its box (normalized xyxy, 0..1, origin top-left) through a GLIGEN
 text-box UNet file such as masterful/gligen-1-4-generation-text-box, as diffusers
 StableDiffusionGLIGENPipeline; --gligen-beta B (default 0.3) grounds the first
-int(B * steps) steps.
+int(B * steps) steps. --gligen-inpaint-image PNG with a GLIGEN inpainting folder
+(masterful/gligen-1-4-inpainting-text-box) regenerates only the boxes of the
+image (diffusers gligen_inpaint_image).
 --upscale-image PNG [--noise-level N] upscales the image 4x with an x4
 upscaler folder such as stabilityai/stable-diffusion-x4-upscaler (diffusers
 StableDiffusionUpscalePipeline; default 75 steps, guidance 9.0).
@@ -100,6 +102,8 @@ type
     GLIGENFile: string;
     GLIGENBoxes: array of string;
     GLIGENBeta: double;
+    // --gligen-inpaint-image ('' for none).
+    GLIGENInpaintImageFile: string;
     // --init-image ('' for text-to-image), its --strength and --depth-image.
     InitImageFile, DepthImageFile: string;
     Strength: double;
@@ -305,6 +309,11 @@ begin
   WriteLn('                    origin top-left); repeatable, at most 30');
   WriteLn('  --gligen-beta B   ground the first int(B * steps) steps (default ',
     '0.3)');
+  WriteLn('  --gligen-inpaint-image PNG  regenerate only the --box regions of ',
+    'this image');
+  WriteLn('                    (a GLIGEN inpainting folder, 9-channel UNet); ',
+    'the image is');
+  WriteLn('                    center-cropped and resized to the output size');
   WriteLn('  --init-image PNG  image-to-image from this image; the output ',
     'takes its size');
   WriteLn('                    (rounded down to the VAE factor) unless ',
@@ -447,6 +456,7 @@ begin
   Opt.GLIGENFile := '';
   Opt.GLIGENBoxes := nil;
   Opt.GLIGENBeta := 0.3;
+  Opt.GLIGENInpaintImageFile := '';
   Opt.InitImageFile := '';
   Opt.DepthImageFile := '';
   Opt.Strength := -1;
@@ -529,6 +539,8 @@ begin
     end
     else if Arg = '--gligen-beta' then
       Opt.GLIGENBeta := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--gligen-inpaint-image' then
+      Opt.GLIGENInpaintImageFile := NextArg()
     else if Arg = '--init-image' then Opt.InitImageFile := NextArg()
     else if Arg = '--depth-image' then Opt.DepthImageFile := NextArg()
     else if Arg = '--strength' then
@@ -594,6 +606,12 @@ begin
     raise Exception.Create('--gligen and --box go together');
   if (Opt.GLIGENBeta < 0) or (Opt.GLIGENBeta > 1) then
     raise Exception.Create('--gligen-beta must be in [0, 1]');
+  if (Opt.GLIGENInpaintImageFile <> '') and (Opt.GLIGENFile = '') then
+    raise Exception.Create('--gligen-inpaint-image needs --gligen and --box');
+  if (Opt.GLIGENInpaintImageFile <> '') and ((Opt.InitImageFile <> '') or
+    (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '')) then
+    raise Exception.Create('--gligen-inpaint-image cannot be combined with ' +
+      '--init-image, --edit-image or --upscale-image');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
     raise Exception.Create('--strength needs --init-image');
   if (Opt.DepthImageFile <> '') and (Opt.InitImageFile = '') then
@@ -636,7 +654,7 @@ end;
 
 // Splits a --box value "PHRASE:X0,Y0,X1,Y1" at its last ':'.
 procedure SplitBoxSpec(const Spec: string; out Phrase: string;
-  out Box: array of TNeuralFloat);
+  out Box: array of double);
 var
   ColonPos, CoordPos: integer;
   Coords: TStringArray;
@@ -670,6 +688,7 @@ var
   GLIGEN: TStableDiffusionGLIGEN;
   Multi: TStableDiffusionMultiConditioner;
   Img2Img: TStableDiffusionImg2Img;
+  GLIGENInpainter: TStableDiffusionGLIGENInpainter;
   Depth2Img: TStableDiffusionDepth2Img;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
   Upscaler: TStableDiffusionUpscaler;
@@ -680,7 +699,7 @@ var
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
   BoxPos: integer;
   BoxPhrase: string;
-  Box: array[0..3] of TNeuralFloat;
+  Box: array[0..3] of double;
   PerturbedGuidance: TNNetPerturbedGuidance;
   SelfAttentionNames: TStringArray;
   PAGLayerIndices: TNeuralIntegerArray;
@@ -941,6 +960,17 @@ begin
         GLIGEN.AddBox(BoxPhrase, Box[0], Box[1], Box[2], Box[3]);
         WriteLn(Format('  box:    "%s" at %.3f,%.3f - %.3f,%.3f',
           [BoxPhrase, Box[0], Box[1], Box[2], Box[3]]));
+      end;
+      if Opt.GLIGENInpaintImageFile <> '' then
+      begin
+        GLIGENInpainter := TStableDiffusionGLIGENInpainter.Create(GLIGEN);
+        ImageConditioner := GLIGENInpainter;
+        if not LoadImageFromFileIntoVolume(Opt.GLIGENInpaintImageFile, Image) then
+          raise Exception.Create('could not load ' + Opt.GLIGENInpaintImageFile);
+        GLIGENInpainter.SetImage(Image);
+        WriteLn(Format('GLIGEN inpaint image: %s (%dx%d), the boxes ' +
+          'regenerated', [Opt.GLIGENInpaintImageFile, Image.SizeX,
+          Image.SizeY]));
       end;
     end;
     if Assigned(IPAdapter) or Assigned(GLIGEN) then

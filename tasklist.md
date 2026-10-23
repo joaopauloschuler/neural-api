@@ -779,12 +779,13 @@ rather than acted on.
             has no SAG mode).
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
-      vs after the gates close.
+      vs after the gates close; and `gligen-1-4-inpainting-text-box` with
+      `--gligen-inpaint-image` (only the boxes change).
 - [X] GLIGEN: skip the fuser branch once its gates close (it now still runs and
       adds zeros for the last `(1 - beta) * steps` steps).
 - [ ] GLIGEN text-image variant (`gligen-1-4-generation-text-image-box`:
       `linears_text` / `linears_image`, CLIP image embeddings as grounding).
-- [ ] GLIGEN inpainting (`gligen-1-4-inpainting-text-box`: 9-channel UNet
+- [X] GLIGEN inpainting (`gligen-1-4-inpainting-text-box`: 9-channel UNet
       input with the box-masked image latents, diffusers
       `gligen_inpaint_image`).
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
