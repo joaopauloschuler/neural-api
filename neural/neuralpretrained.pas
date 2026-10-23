@@ -10895,6 +10895,7 @@ type
     UseSE: boolean;        // squeeze-excite present
     SEChannels: integer;   // SE reduced dim (fc1 out); ignored when not UseSE
     UseHardSwish: boolean; // true = hard-swish, false = ReLU for this block
+    Dilation: integer;     // depthwise dilation (0/1 = none; >1 forces stride 1)
   end;
 
   TMobileNetV3Config = record
@@ -15911,6 +15912,72 @@ procedure DDColorComposeOutput(Image, AB: TNNetVolume; Colorized: TNNetVolume);
 // DDColorPrepareInput -> NN.Compute -> DDColorComposeOutput.
 procedure DDColorColorize(NN: TNNet; const Config: TDDColorConfig;
   Image, Colorized: TNNetVolume);
+
+// ---------------------------------------------------------------------------
+// ROBUST VIDEO MATTING IMPORT (Lin et al. WACV 2022, PeterL1n/RobustVideoMatting
+// rvm_mobilenetv3.pth; GPL-3.0 weights, loaded at run time only). One TNNet per
+// frame size: frame (W, H, 3) RGB in [0,1] -> bilinear downsample by
+// DownsampleRatio -> MobileNetV3-Large (last stage dilated) -> LR-ASPP ->
+// recurrent decoder (ConvGRU on half the channels at 1/16, 1/8, 1/4, 1/2) ->
+// fgr residual + alpha, then (ratio < 1) the Deep Guided Filter refiner back to
+// full size. Output (W, H, 4) = clamped foreground RGB + alpha. The four GRU
+// states enter as extra TNNetInput layers; TRVMMatting carries them between
+// frames. The low-res net and the refiner share one graph so one Compute runs
+// a frame and the OpenCL path keeps every intermediate resident.
+// Coded by Claude (AI).
+type
+  TRVMConfig = record
+    Variant: string;                         // 'mobilenetv3'
+    Backbone: TMobileNetV3Config;            // inferred from the checkpoint
+    FeatureChannels: array[0..3] of integer; // f1, f2, f3 widths + LR-ASPP width
+    DecoderChannels: array[0..3] of integer; // decode3, decode2, decode1, decode0
+    RefinerHidden: integer;                  // DGF hid_channels (16); 0 = absent
+    FrameWidth, FrameHeight: integer;        // full-resolution net input
+    // torch interpolate(scale_factor); exact parity needs Frame*Ratio integral.
+    DownsampleRatio: double;
+    BnEps: TNeuralFloat;                     // decoder/LR-ASPP/refiner BN eps
+  end;
+
+// Reads every width from the checkpoint shapes (MobileNetV3 variant only) and
+// sets the frame size and downsample ratio (0 < ratio <= 1).
+function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  FrameWidth, FrameHeight: integer; DownsampleRatio: double): TRVMConfig;
+
+function RVMConfigToString(const Config: TRVMConfig): string;
+
+// Builds the RVM matting net for Config and loads every weight (caller owns
+// Reader). Layer 0 is the frame; TNNetInput #1..#4 are the r4..r1 GRU states.
+function BuildRVM(Reader: TNNetSafeTensorsReader; const Config: TRVMConfig;
+  pTrainable: boolean = true): TNNet;
+
+function BuildRVMFromSafeTensorsEx(const FileName: string;
+  const Config: TRVMConfig; pTrainable: boolean = true): TNNet;
+
+// Same with the config inferred from the .pth / .safetensors checkpoint.
+function BuildRVMFromSafeTensors(const FileName: string;
+  FrameWidth, FrameHeight: integer; DownsampleRatio: double;
+  out Config: TRVMConfig; pTrainable: boolean = true): TNNet;
+
+type
+  // Per-frame driver of a BuildRVM net: copies the four GRU outputs back into
+  // the state inputs after each frame, so consecutive Step calls are a video.
+  TRVMMatting = class(TObject)
+  private
+    FNet: TNNet;
+    FOwnsNet: boolean;
+    // Decoder order: [0] = r4 (1/16) .. [3] = r1 (1/2).
+    FStateInputs, FGRUCells: array[0..3] of TNNetLayer;
+  public
+    constructor Create(Net: TNNet; pOwnsNet: boolean = true);
+    destructor Destroy(); override;
+    // Zeroes the recurrent state (the first frame of a new clip).
+    procedure ResetState();
+    // Frame (W, H, 3) RGB in [0,1] -> Matte (W, H, 4) foreground RGB + alpha.
+    procedure Step(Frame, Matte: TNNetVolume);
+    // Level 1..4 = r1..r4 after the last Step (host copy).
+    function HiddenState(Level: integer): TNNetVolume;
+    property Net: TNNet read FNet;
+  end;
 
 // ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
@@ -69683,6 +69750,7 @@ begin
       Result.Blocks[i].UseSE := BObj.Get('se', false);
       Result.Blocks[i].SEChannels := BObj.Get('se_channels', 0);
       Result.Blocks[i].UseHardSwish := BObj.Get('hswish', false);
+      Result.Blocks[i].Dilation := BObj.Get('dilation', 1);
       if (Result.Blocks[i].ExpChannels < 1) or
          (Result.Blocks[i].OutChannels < 1) then
         ImportError('MobileNetV3 import: blocks[' + IntToStr(i) +
@@ -69725,21 +69793,20 @@ begin
     ', bn_eps=' + FloatToStr(Config.BnEps);
 end;
 
-// Loads a torchvision DEPTHWISE Conv2d (weight [C,1,kh,kw], groups==C, bias
-// False) into a CAI TNNetDepthwiseConv. The depthwise layer has NO per-output-
-// channel bias (one neuron, weight volume (k,k,C)), so the following BatchNorm
-// is folded as: the per-channel SCALE multiplies that channel's weights, and
-// the per-channel SHIFT is returned in OutShift[] for the caller to load into a
-// following TNNetChannelBias. The neuron weight layout is w[(ky*k+kx)*C + c].
+// Loads a torch depthwise Conv2d [C,1,K,K] into a TNNetDepthwiseConv, folding BN
+// BnPrefix ('' = none) scale in and returning its shift; Dilation spreads the taps.
 procedure LoadMobileNetDepthwiseFoldBN(Reader: TNNetSafeTensorsReader;
   DwLayer: TNNetLayer; const ConvWName, BnPrefix: string;
-  Channels, K: integer; BnEps: TNeuralFloat; out OutShift: TNNetVolume);
+  Channels, K: integer; BnEps: TNeuralFloat; out OutShift: TNNetVolume;
+  Dilation: integer = 1);
 var
   W, Gamma, Beta, Mean, Var_, WVol: TNNetVolume;
-  c, ky, kx, srcIdx, dstIdx: integer;
-  ChannelsM1, KM1: integer;
+  c, ky, kx, srcIdx, dstIdx, RowIdx: integer;
+  ChannelsM1, KM1, KernelExtent, TapStep: integer;
   Scale, Denom: TNeuralFloat;
 begin
+  if Dilation < 1 then Dilation := 1;
+  KernelExtent := (K - 1) * Dilation + 1;
   EnsureWritableImportWeights(DwLayer);
   if not Reader.HasTensor(ConvWName) then
     ImportError('MobileNetV3 import: missing tensor "' + ConvWName + '".');
@@ -69755,10 +69822,10 @@ begin
     ImportError('MobileNetV3 import: internal error - depthwise "' +
       ConvWName + '" target has ' + IntToStr(DwLayer.Neurons.Count) +
       ' neurons, expected 1.');
-  if DwLayer.FArrNeurons[0].Weights.Size <> K * K * Channels then
+  if DwLayer.FArrNeurons[0].Weights.Size <> KernelExtent * KernelExtent * Channels then
     ImportError('MobileNetV3 import: internal error - depthwise "' +
       ConvWName + '" neuron has ' + IntToStr(DwLayer.FArrNeurons[0].Weights.Size) +
-      ' weights, expected ' + IntToStr(K * K * Channels) + '.');
+      ' weights, expected ' + IntToStr(KernelExtent * KernelExtent * Channels) + '.');
   W := TNNetVolume.Create;
   Gamma := TNNetVolume.Create;
   Beta := TNNetVolume.Create;
@@ -69768,34 +69835,50 @@ begin
   OutShift.ReSize(1, 1, Channels);
   try
     Reader.LoadTensorFlat(ConvWName, W);
-    Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
-    Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
-    Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
-    Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
-    if (Gamma.Size <> Channels) or (Beta.Size <> Channels) or
-       (Mean.Size <> Channels) or (Var_.Size <> Channels) then
-      ImportError('MobileNetV3 import: BatchNorm "' + BnPrefix +
-        '" parameters must each have ' + IntToStr(Channels) + ' elements.');
+    if BnPrefix <> '' then
+    begin
+      Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+      Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+      Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+      Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+      if (Gamma.Size <> Channels) or (Beta.Size <> Channels) or
+         (Mean.Size <> Channels) or (Var_.Size <> Channels) then
+        ImportError('MobileNetV3 import: BatchNorm "' + BnPrefix +
+          '" parameters must each have ' + IntToStr(Channels) + ' elements.');
+    end;
     ChannelsM1 := Channels - 1;
     KM1 := K - 1;
+    TapStep := Dilation * Channels;
     WVol := DwLayer.FArrNeurons[0].Weights;
+    if Dilation > 1 then WVol.Fill(0);
     for c := 0 to ChannelsM1 do
     begin
-      Denom := Sqrt(Var_.FData[c] + BnEps);
-      Scale := Gamma.FData[c] / Denom;
-      OutShift.FData[c] := Beta.FData[c] - Gamma.FData[c] * Mean.FData[c] / Denom;
-      // torch [c,0,ky,kx] -> CAI w[(ky*K+kx)*C + c], scaled per channel. The
-      // source is contiguous in (ky,kx); the destination steps by Channels
-      // per kernel slot (#9/#12).
+      if BnPrefix <> '' then
+      begin
+        Denom := Sqrt(Var_.FData[c] + BnEps);
+        Scale := Gamma.FData[c] / Denom;
+        OutShift.FData[c] := Beta.FData[c] - Gamma.FData[c] * Mean.FData[c] / Denom;
+      end
+      else
+      begin
+        Scale := 1;
+        OutShift.FData[c] := 0;
+      end;
+      // torch [c,0,ky,kx] -> CAI w[(ky*D*E+kx*D)*C + c] (E = kernel extent),
+      // scaled per channel; the destination steps D*C per tap (#9/#12).
       srcIdx := c * K * K;
-      dstIdx := c;
+      RowIdx := c;
       for ky := 0 to KM1 do
+      begin
+        dstIdx := RowIdx;
         for kx := 0 to KM1 do
         begin
           WVol.FData[dstIdx] := W.FData[srcIdx] * Scale;
           Inc(srcIdx);
-          Inc(dstIdx, Channels);
+          Inc(dstIdx, TapStep);
         end;
+        Inc(RowIdx, TapStep * KernelExtent);
+      end;
     end;
     DwLayer.FlushWeightCache();
   finally
@@ -69862,7 +69945,7 @@ procedure AddMobileNetMBConv(NN: TNNet; const Blk: TMobileNetV3Block;
   InChannels: integer; out Refs: TMobileNetBlockLayers);
 var
   Input, Branch, Pooled, Gate: TNNetLayer;
-  Pad: integer;
+  KernelExtent, DwStride: integer;
 
   function ActLayer: TNNetLayer;
   begin
@@ -69875,7 +69958,17 @@ begin
   Refs.HasExpand := Blk.ExpChannels <> InChannels;
   Refs.HasSE := Blk.UseSE;
   Refs.HasResidual := (Blk.Stride = 1) and (InChannels = Blk.OutChannels);
-  Pad := Blk.Kernel div 2;
+  // torchvision: a dilated depthwise runs at stride 1 with "same" padding.
+  if Blk.Dilation > 1 then
+  begin
+    KernelExtent := (Blk.Kernel - 1) * Blk.Dilation + 1;
+    DwStride := 1;
+  end
+  else
+  begin
+    KernelExtent := Blk.Kernel;
+    DwStride := Blk.Stride;
+  end;
   Input := NN.GetLastLayer();
   // 1) expand 1x1 (skipped when exp == in) -> BN(folded into conv bias) -> act
   if Refs.HasExpand then
@@ -69886,7 +69979,8 @@ begin
   end;
   // 2) depthwise kxk (stride) -> BN(scale folded in weights, shift via bias)
   Refs.Dw := NN.AddLayer(
-    TNNetDepthwiseConvLinear.Create({multiplier=}1, Blk.Kernel, Pad, Blk.Stride));
+    TNNetDepthwiseConvLinear.Create({multiplier=}1, KernelExtent,
+      KernelExtent div 2, DwStride));
   Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create());
   NN.AddLayer(ActLayer);
   // 3) squeeze-excite: pool -> 1x1 reduce -> ReLU -> 1x1 expand -> h-sigmoid
@@ -69912,43 +70006,127 @@ begin
     NN.AddLayer(TNNetSum.Create([Branch, Input]));
 end;
 
+type
+  TMobileNetV3Trunk = record
+    StemConv, HeadConv, HeadOutput: TNNetLayer;
+    Blocks: array of TMobileNetBlockLayers;
+    BlockOutputs: array of TNNetLayer;  // last layer of each MBConv block
+  end;
+
+// Adds the stem conv, every MBConv block and the 1x1 head conv + hard-swish
+// (torchvision features.*) after NN's last layer.
+procedure AddMobileNetV3Trunk(NN: TNNet; const Config: TMobileNetV3Config;
+  pTrainable: boolean; out Trunk: TMobileNetV3Trunk);
+var
+  i, InChannels, BlocksHi: integer;
+begin
+  SetLength(Trunk.Blocks, Length(Config.Blocks));
+  SetLength(Trunk.BlockOutputs, Length(Config.Blocks));
+  BlocksHi := High(Config.Blocks);
+  // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> hard-swish.
+  Trunk.StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+    Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetHardSwish.Create());
+  InChannels := Config.StemWidth;
+  for i := 0 to BlocksHi do
+  begin
+    AddMobileNetMBConv(NN, Config.Blocks[i], InChannels, Trunk.Blocks[i]);
+    Trunk.BlockOutputs[i] := NN.GetLastLayer();
+    InChannels := Config.Blocks[i].OutChannels;
+  end;
+  Trunk.HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+    Config.HeadConvWidth, 1, 0, 1, 0).SetTrainable(pTrainable));
+  Trunk.HeadOutput := NN.AddLayer(TNNetHardSwish.Create());
+end;
+
+// Loads the AddMobileNetV3Trunk weights from the torchvision keys
+// Prefix + 'features.{i}...', folding every BatchNorm.
+procedure LoadMobileNetV3Trunk(Reader: TNNetSafeTensorsReader;
+  const Config: TMobileNetV3Config; const Prefix: string;
+  const Trunk: TMobileNetV3Trunk);
+var
+  i, InChannels, LastFeatIdx, BlocksHi: integer;
+  BlockPrefix, P: string;
+  Shift: TNNetVolume;
+begin
+  BlocksHi := High(Config.Blocks);
+  // features.0.0 = stem conv, features.0.1 = stem BN.
+  LoadResNetConvFoldBN(Reader, Trunk.StemConv, Prefix + 'features.0.0.weight',
+    Prefix + 'features.0.1', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
+  InChannels := Config.StemWidth;
+  for i := 0 to BlocksHi do
+  begin
+    // MBConv body keys: features.{i+1}.block.{j}...; j advances over the
+    // optional expand sub-block (ConvNormActivation = .0 conv .1 bn), the
+    // depthwise sub-block, the optional SE module, and the project sub-block.
+    BlockPrefix := Prefix + 'features.' + IntToStr(i + 1) + '.block.';
+    if Trunk.Blocks[i].HasExpand then
+    begin
+      LoadResNetConvFoldBN(Reader, Trunk.Blocks[i].Expand,
+        BlockPrefix + '0.0.weight', BlockPrefix + '0.1',
+        Config.Blocks[i].ExpChannels, InChannels, 1, Config.BnEps);
+      P := BlockPrefix + '1';   // depthwise sub-block index
+    end
+    else
+      P := BlockPrefix + '0';
+    LoadMobileNetDepthwiseFoldBN(Reader, Trunk.Blocks[i].Dw,
+      P + '.0.weight', P + '.1',
+      Config.Blocks[i].ExpChannels, Config.Blocks[i].Kernel,
+      Config.BnEps, Shift, Config.Blocks[i].Dilation);
+    LoadChannelBiasFromShift(Trunk.Blocks[i].DwBias, Shift);
+    if Trunk.Blocks[i].HasSE then
+    begin
+      // torchvision SqueezeExcitation (depthwise idx + 1): fc1 (reduce) /
+      // fc2 (expand), 1x1 convs with bias; project = depthwise idx + 2.
+      if Trunk.Blocks[i].HasExpand then P := BlockPrefix + '2'
+      else P := BlockPrefix + '1';
+      LoadMobileNetSEConv(Reader, Trunk.Blocks[i].SEReduce,
+        P + '.fc1.weight', P + '.fc1.bias',
+        Config.Blocks[i].SEChannels, Config.Blocks[i].ExpChannels);
+      LoadMobileNetSEConv(Reader, Trunk.Blocks[i].SEExpand,
+        P + '.fc2.weight', P + '.fc2.bias',
+        Config.Blocks[i].ExpChannels, Config.Blocks[i].SEChannels);
+      if Trunk.Blocks[i].HasExpand then P := BlockPrefix + '3'
+      else P := BlockPrefix + '2';
+    end
+    else
+    begin
+      if Trunk.Blocks[i].HasExpand then P := BlockPrefix + '2'
+      else P := BlockPrefix + '1';
+    end;
+    // project sub-block (P set above): conv .0 + BN .1, NO activation.
+    LoadResNetConvFoldBN(Reader, Trunk.Blocks[i].Project,
+      P + '.0.weight', P + '.1',
+      Config.Blocks[i].OutChannels, Config.Blocks[i].ExpChannels, 1,
+      Config.BnEps);
+    InChannels := Config.Blocks[i].OutChannels;
+  end;
+  // head conv+BN: features.{last}.0 / .1
+  LastFeatIdx := Length(Config.Blocks) + 1;
+  LoadResNetConvFoldBN(Reader, Trunk.HeadConv,
+    Prefix + 'features.' + IntToStr(LastFeatIdx) + '.0.weight',
+    Prefix + 'features.' + IntToStr(LastFeatIdx) + '.1',
+    Config.HeadConvWidth, InChannels, 1, Config.BnEps);
+end;
+
 function BuildMobileNetV3(Reader: TNNetSafeTensorsReader;
   const Config: TMobileNetV3Config; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
-  StemConv, HeadConv, FC0, FC1: TNNetLayer;
-  BlockRefs: array of TMobileNetBlockLayers;
-  i, InChannels, LastFeatIdx: integer;
-  BlocksHi: integer;
-  Prefix, P: string;
-  Shift: TNNetVolume;
+  FC0, FC1: TNNetLayer;
+  Trunk: TMobileNetV3Trunk;
 begin
   if Config.NumChannels < 1 then
     ImportError('MobileNetV3 import: num_channels must be >= 1.');
   if Config.NumLabels < 1 then
     ImportError('MobileNetV3 import: num_labels must be >= 1.');
-  SetLength(BlockRefs, Length(Config.Blocks));
-  BlocksHi := High(Config.Blocks);
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
     NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels));
-    // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> hard-swish.
-    StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0).SetTrainable(pTrainable));
-    NN.AddLayer(TNNetHardSwish.Create());
-    InChannels := Config.StemWidth;
-    for i := 0 to BlocksHi do
-    begin
-      AddMobileNetMBConv(NN, Config.Blocks[i], InChannels, BlockRefs[i]);
-      InChannels := Config.Blocks[i].OutChannels;
-    end;
-    // Head: conv 1x1 +BN +hard-swish -> global avg pool -> Linear -> hard-swish
-    //       -> Linear(num_labels).
-    HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
-      Config.HeadConvWidth, 1, 0, 1, 0).SetTrainable(pTrainable));
-    NN.AddLayer(TNNetHardSwish.Create());
+    AddMobileNetV3Trunk(NN, Config, pTrainable, Trunk);
+    // Head: global avg pool -> Linear -> hard-swish -> Linear(num_labels).
     NN.AddLayer(TNNetAvgChannel.Create());
     FC0 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.ClassifierHidden).SetTrainable(pTrainable));
     NN.AddLayer(TNNetHardSwish.Create());
@@ -69956,65 +70134,7 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
-    // features.0.0 = stem conv, features.0.1 = stem BN.
-    LoadResNetConvFoldBN(Reader, StemConv, 'features.0.0.weight',
-      'features.0.1', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
-    InChannels := Config.StemWidth;
-    for i := 0 to BlocksHi do
-    begin
-      // MBConv body keys: features.{i+1}.block.{j}...; j advances over the
-      // optional expand sub-block (ConvNormActivation = .0 conv .1 bn), the
-      // depthwise sub-block, the optional SE module, and the project sub-block.
-      Prefix := 'features.' + IntToStr(i + 1) + '.block.';
-      // expand (j=0) when present, then depthwise; else depthwise is j=0.
-      if BlockRefs[i].HasExpand then
-      begin
-        LoadResNetConvFoldBN(Reader, BlockRefs[i].Expand,
-          Prefix + '0.0.weight', Prefix + '0.1',
-          Config.Blocks[i].ExpChannels, InChannels, 1, Config.BnEps);
-        P := Prefix + '1';   // depthwise sub-block index
-      end
-      else
-        P := Prefix + '0';
-      LoadMobileNetDepthwiseFoldBN(Reader, BlockRefs[i].Dw,
-        P + '.0.weight', P + '.1',
-        Config.Blocks[i].ExpChannels, Config.Blocks[i].Kernel,
-        Config.BnEps, Shift);
-      LoadChannelBiasFromShift(BlockRefs[i].DwBias, Shift);
-      if BlockRefs[i].HasSE then
-      begin
-        // SE module sub-block index = depthwise idx + 1; project = + 2.
-        // torchvision SqueezeExcitation: fc1 (reduce) / fc2 (expand), 1x1 convs
-        // with bias.
-        if BlockRefs[i].HasExpand then P := Prefix + '2'
-        else P := Prefix + '1';
-        LoadMobileNetSEConv(Reader, BlockRefs[i].SEReduce,
-          P + '.fc1.weight', P + '.fc1.bias',
-          Config.Blocks[i].SEChannels, Config.Blocks[i].ExpChannels);
-        LoadMobileNetSEConv(Reader, BlockRefs[i].SEExpand,
-          P + '.fc2.weight', P + '.fc2.bias',
-          Config.Blocks[i].ExpChannels, Config.Blocks[i].SEChannels);
-        if BlockRefs[i].HasExpand then P := Prefix + '3'
-        else P := Prefix + '2';
-      end
-      else
-      begin
-        if BlockRefs[i].HasExpand then P := Prefix + '2'
-        else P := Prefix + '1';
-      end;
-      // project sub-block (P set above): conv .0 + BN .1, NO activation.
-      LoadResNetConvFoldBN(Reader, BlockRefs[i].Project,
-        P + '.0.weight', P + '.1',
-        Config.Blocks[i].OutChannels, Config.Blocks[i].ExpChannels, 1,
-        Config.BnEps);
-      InChannels := Config.Blocks[i].OutChannels;
-    end;
-    // head conv+BN: features.{last}.0 / .1
-    LastFeatIdx := Length(Config.Blocks) + 1;
-    LoadResNetConvFoldBN(Reader, HeadConv,
-      'features.' + IntToStr(LastFeatIdx) + '.0.weight',
-      'features.' + IntToStr(LastFeatIdx) + '.1',
-      Config.HeadConvWidth, InChannels, 1, Config.BnEps);
+    LoadMobileNetV3Trunk(Reader, Config, '', Trunk);
     // classifier.0 (Linear, with bias) -> hard-swish -> classifier.3 (Linear).
     LoadLlamaLinearWeights(Reader, FC0, 'classifier.0.weight',
       Config.HeadConvWidth, Config.ClassifierHidden, 0, -1, 0,
@@ -108678,6 +108798,565 @@ function BuildGRUFromSafeTensors(const FileName, Prefix: string;
 begin
   Result := BuildTorchRNNFromSafeTensors(FileName, Prefix, InputSize, Hidden,
     NumLayers, SeqLen, Bidirectional, {UseGRU=}True);
+end;
+
+// ===========================================================================
+// ROBUST VIDEO MATTING IMPORT
+// ===========================================================================
+
+const
+  csRVMImporter = 'RVM import';
+  csRVMBlockCount = 15;
+  // MobileNetV3LargeEncoder per-block stride, hard-swish flag and dilation.
+  csRVMBlockStride: array[0..csRVMBlockCount - 1] of integer =
+    (1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 1, 1, 2, 1, 1);
+  csRVMBlockHardSwish: array[0..csRVMBlockCount - 1] of boolean =
+    (false, false, false, false, false, false, true, true, true, true, true,
+     true, true, true, true);
+  csRVMBlockDilation: array[0..csRVMBlockCount - 1] of integer =
+    (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2);
+  // Blocks whose outputs are f1 (1/2), f2 (1/4), f3 (1/8): features[1]/[3]/[6].
+  csRVMFeatureBlocks: array[0..2] of integer = (0, 2, 5);
+  csRVMImageMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  csRVMImageStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+
+function RVMDim(Reader: TNNetSafeTensorsReader; const Name: string;
+  Axis: integer): integer;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError(csRVMImporter + ': missing tensor "' + Name + '".');
+  Result := Reader.DimSize(Name, Axis);
+end;
+
+function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  FrameWidth, FrameHeight: integer; DownsampleRatio: double): TRVMConfig;
+var
+  BlockPos, InChannels, DwIdx, ProjIdx: integer;
+  BlockPrefix: string;
+begin
+  if not Reader.HasTensor('backbone.features.0.0.weight') then
+  begin
+    if Reader.HasTensor('backbone.conv1.weight') then
+      ImportError(csRVMImporter + ': the ResNet-50 variant is not supported yet.');
+    ImportError(csRVMImporter + ': "backbone.features.0.0.weight" not found; ' +
+      'not a RobustVideoMatting MobileNetV3 checkpoint.');
+  end;
+  if (FrameWidth < 1) or (FrameHeight < 1) then
+    ImportError(csRVMImporter + ': frame size must be positive.');
+  if (DownsampleRatio <= 0) or (DownsampleRatio > 1) then
+    ImportError(csRVMImporter + ': downsample ratio must be in (0, 1].');
+  Result.Variant := 'mobilenetv3';
+  Result.FrameWidth := FrameWidth;
+  Result.FrameHeight := FrameHeight;
+  Result.DownsampleRatio := DownsampleRatio;
+  Result.BnEps := 0.00001;
+  with Result.Backbone do
+  begin
+    Variant := 'large';
+    ModelType := 'mobilenet_v3';
+    NumChannels := 3;
+    ImageSize := 0;
+    NumLabels := 0;
+    ClassifierHidden := 0;
+    BnEps := 0.001;
+    StemWidth := RVMDim(Reader, 'backbone.features.0.0.weight', 0);
+    SetLength(Blocks, csRVMBlockCount);
+  end;
+  InChannels := Result.Backbone.StemWidth;
+  for BlockPos := 0 to csRVMBlockCount - 1 do
+    with Result.Backbone.Blocks[BlockPos] do
+    begin
+      BlockPrefix := 'backbone.features.' + IntToStr(BlockPos + 1) + '.block.';
+      // The expand 1x1 is absent when exp == in; block.0 is then the depthwise.
+      if RVMDim(Reader, BlockPrefix + '0.0.weight', 1) <> 1 then
+      begin
+        ExpChannels := Reader.DimSize(BlockPrefix + '0.0.weight', 0);
+        DwIdx := 1;
+      end
+      else
+      begin
+        ExpChannels := InChannels;
+        DwIdx := 0;
+      end;
+      Kernel := RVMDim(Reader, BlockPrefix + IntToStr(DwIdx) + '.0.weight', 2);
+      UseSE := Reader.HasTensor(BlockPrefix + IntToStr(DwIdx + 1) + '.fc1.weight');
+      if UseSE then
+      begin
+        SEChannels := Reader.DimSize(BlockPrefix + IntToStr(DwIdx + 1) +
+          '.fc1.weight', 0);
+        ProjIdx := DwIdx + 2;
+      end
+      else
+      begin
+        SEChannels := 0;
+        ProjIdx := DwIdx + 1;
+      end;
+      OutChannels := RVMDim(Reader, BlockPrefix + IntToStr(ProjIdx) + '.0.weight', 0);
+      Stride := csRVMBlockStride[BlockPos];
+      UseHardSwish := csRVMBlockHardSwish[BlockPos];
+      Dilation := csRVMBlockDilation[BlockPos];
+      InChannels := OutChannels;
+    end;
+  if Reader.HasTensor('backbone.features.' + IntToStr(csRVMBlockCount + 1) +
+    '.block.0.0.weight') then
+    ImportError(csRVMImporter + ': the backbone has more than ' +
+      IntToStr(csRVMBlockCount) + ' MBConv blocks.');
+  Result.Backbone.HeadConvWidth := RVMDim(Reader, 'backbone.features.' +
+    IntToStr(csRVMBlockCount + 1) + '.0.weight', 0);
+  for BlockPos := 0 to 2 do
+    Result.FeatureChannels[BlockPos] :=
+      Result.Backbone.Blocks[csRVMFeatureBlocks[BlockPos]].OutChannels;
+  Result.FeatureChannels[3] := RVMDim(Reader, 'aspp.aspp1.0.weight', 0);
+  Result.DecoderChannels[0] := RVMDim(Reader, 'decoder.decode3.conv.0.weight', 0);
+  Result.DecoderChannels[1] := RVMDim(Reader, 'decoder.decode2.conv.0.weight', 0);
+  Result.DecoderChannels[2] := RVMDim(Reader, 'decoder.decode1.conv.0.weight', 0);
+  Result.DecoderChannels[3] := RVMDim(Reader, 'decoder.decode0.conv.0.weight', 0);
+  if Reader.HasTensor('refiner.conv.0.weight') then
+    Result.RefinerHidden := Reader.DimSize('refiner.conv.0.weight', 0)
+  else
+    Result.RefinerHidden := 0;
+end;
+
+function RVMConfigToString(const Config: TRVMConfig): string;
+begin
+  Result := 'RVM ' + Config.Variant + ' config: stem=' +
+    IntToStr(Config.Backbone.StemWidth) + ', head_conv=' +
+    IntToStr(Config.Backbone.HeadConvWidth) + ', features=[' +
+    IntToStr(Config.FeatureChannels[0]) + ',' + IntToStr(Config.FeatureChannels[1]) +
+    ',' + IntToStr(Config.FeatureChannels[2]) + ',' +
+    IntToStr(Config.FeatureChannels[3]) + '], decoder=[' +
+    IntToStr(Config.DecoderChannels[0]) + ',' + IntToStr(Config.DecoderChannels[1]) +
+    ',' + IntToStr(Config.DecoderChannels[2]) + ',' +
+    IntToStr(Config.DecoderChannels[3]) + '], refiner_hidden=' +
+    IntToStr(Config.RefinerHidden) + ', frame=' + IntToStr(Config.FrameWidth) +
+    'x' + IntToStr(Config.FrameHeight) + ', downsample_ratio=' +
+    FloatToStr(Config.DownsampleRatio);
+end;
+
+// Loads an RVM ConvGRU (ih: Conv2d(2C, 2C) -> [r ; z] over [x ; h], hh:
+// Conv2d(2C, C) over [x ; r*h]) into a TNNetConvGRUCell, whose taps read [h ; x].
+procedure RVMLoadConvGRU(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Prefix: string; HiddenC: integer);
+const
+  K = 3;
+  KK = K * K;
+var
+  Gates, GatesBias, Candidate, CandidateBias, Src, SrcBias, WVol, BVol: TNNetVolume;
+  GatePos, OutPos, TapPos, ChannelPos, SrcRow, SrcChannel, DstPos: integer;
+  ZC, MaxOutPos, MaxTapPos, MaxChannelPos: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  ZC := 2 * HiddenC;
+  if (RVMDim(Reader, Prefix + 'ih.0.weight', 0) <> ZC) or
+     (Reader.DimSize(Prefix + 'ih.0.weight', 1) <> ZC) or
+     (Reader.DimSize(Prefix + 'ih.0.weight', 2) <> K) or
+     (RVMDim(Reader, Prefix + 'hh.0.weight', 0) <> HiddenC) or
+     (Reader.DimSize(Prefix + 'hh.0.weight', 1) <> ZC) then
+    ImportError(csRVMImporter + ': "' + Prefix + 'ih/hh" must be [' +
+      IntToStr(ZC) + ',' + IntToStr(ZC) + ',3,3] / [' + IntToStr(HiddenC) +
+      ',' + IntToStr(ZC) + ',3,3], got ' + Reader.ShapeAsString(Prefix +
+      'ih.0.weight') + ' / ' + Reader.ShapeAsString(Prefix + 'hh.0.weight'));
+  Gates := TNNetVolume.Create;
+  GatesBias := TNNetVolume.Create;
+  Candidate := TNNetVolume.Create;
+  CandidateBias := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Prefix + 'ih.0.weight', Gates);
+    Reader.LoadTensorFlat(Prefix + 'ih.0.bias', GatesBias);
+    Reader.LoadTensorFlat(Prefix + 'hh.0.weight', Candidate);
+    Reader.LoadTensorFlat(Prefix + 'hh.0.bias', CandidateBias);
+    MaxOutPos := HiddenC - 1;
+    MaxTapPos := KK - 1;
+    MaxChannelPos := ZC - 1;
+    // Cell neurons: [0]=Wz [1]=Wr [2]=Wq, [3..5] their biases. ih rows are
+    // [r ; z], so z reads rows C..2C-1 and r rows 0..C-1.
+    for GatePos := 0 to 2 do
+    begin
+      case GatePos of
+        0: begin Src := Gates; SrcBias := GatesBias; SrcRow := HiddenC; end;
+        1: begin Src := Gates; SrcBias := GatesBias; SrcRow := 0; end;
+      else begin Src := Candidate; SrcBias := CandidateBias; SrcRow := 0; end;
+      end;
+      WVol := Layer.FArrNeurons[GatePos].Weights;
+      BVol := Layer.FArrNeurons[GatePos + 3].Weights;
+      DstPos := 0;
+      for OutPos := 0 to MaxOutPos do
+      begin
+        for TapPos := 0 to MaxTapPos do
+          for ChannelPos := 0 to MaxChannelPos do
+          begin
+            // cell channel c < C is h (torch C + c); c >= C is x (torch c - C).
+            if ChannelPos < HiddenC then SrcChannel := ChannelPos + HiddenC
+            else SrcChannel := ChannelPos - HiddenC;
+            WVol.FData[DstPos] :=
+              Src.FData[((SrcRow + OutPos) * ZC + SrcChannel) * KK + TapPos];
+            Inc(DstPos);
+          end;
+        BVol.FData[OutPos] := SrcBias.FData[SrcRow + OutPos];
+      end;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    Gates.Free; GatesBias.Free; Candidate.Free; CandidateBias.Free;
+  end;
+end;
+
+// Writes the constant 1x1 conv Out[o] = sum_c Coefs[o * InCh + c] * In[c].
+procedure RVMWriteFixedPointwise(Layer: TNNetLayer;
+  const Coefs: array of TNeuralFloat; OutCh, InCh: integer);
+var
+  OutPos, MaxOutPos: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  MaxOutPos := OutCh - 1;
+  for OutPos := 0 to MaxOutPos do
+  begin
+    Move(Coefs[OutPos * InCh], Layer.FArrNeurons[OutPos].Weights.FData[0],
+      InCh * csNeuralFloatSize);
+    Layer.FArrNeurons[OutPos].BiasWeight := 0;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads the trained DGF box filter (depthwise 3x3, no bias); Sign -1 negates it.
+procedure RVMLoadBoxFilter(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  Sign: TNeuralFloat);
+var
+  Shift: TNNetVolume;
+begin
+  LoadMobileNetDepthwiseFoldBN(Reader, Layer, 'refiner.box_filter.weight', '',
+    4, 3, 0, Shift);
+  Shift.Free;
+  if Sign <> 1 then
+  begin
+    Layer.FArrNeurons[0].Weights.Mul(Sign);
+    Layer.FlushWeightCache();
+  end;
+end;
+
+function BuildRVM(Reader: TNNetSafeTensorsReader; const Config: TRVMConfig;
+  pTrainable: boolean = true): TNNet;
+const
+  // [RGB ; mean(RGB)] and [RGB ; 0] as 1x1 convs over a frame.
+  csRVMWithMean: array[0..11] of TNeuralFloat =
+    (1, 0, 0,  0, 1, 0,  0, 0, 1,  1/3, 1/3, 1/3);
+  csRVMWithZero: array[0..11] of TNeuralFloat =
+    (1, 0, 0,  0, 1, 0,  0, 0, 1,  0, 0, 0);
+var
+  NN: TNNet;
+  Frame, Small, Pooled, Gate, Aspp1, Aspp2, ProjMat, Hid, X, Up, Merged: TNNetLayer;
+  BaseX, MeanX, NegMeanX, MeanY, BoxXY, BoxXX, Cov, Variance: TNNetLayer;
+  Refine1, Refine2, RefineConv, RefineA, RefineB, FineX, FineSrc, Combined: TNNetLayer;
+  Sources: array[0..3] of TNNetLayer;  // s0 (low-res frame), s1, s2, s3
+  Features: array[0..3] of TNNetLayer; // f1, f2, f3, LR-ASPP output
+  UpConvs: array[0..3] of TNNetLayer;  // decode3, decode2, decode1, decode0 conv
+  GRUs: array[0..3] of TNNetLayer;     // decode4, decode3, decode2, decode1
+  Decode0Conv2: TNNetLayer;
+  Trunk: TMobileNetV3Trunk;
+  Values: TNNetVolume;
+  LowWidth, LowHeight, Level, Channel, HalfC, InCh: integer;
+  HasRefiner: boolean;
+
+  // x = [a ; b] -> [a ; GRU(b, h)] with h a new TNNetInput state.
+  function AddGRUBlock(Source: TNNetLayer; Channels, GRUPos: integer): TNNetLayer;
+  var
+    KeptHalf, GRUHalf, State: TNNetLayer;
+  begin
+    if Odd(Channels) then
+      ImportError(csRVMImporter + ': decoder width ' + IntToStr(Channels) +
+        ' must be even (ConvGRU on half the channels).');
+    HalfC := Channels div 2;
+    KeptHalf := NN.AddLayerAfter(TNNetSplitChannels.Create(0, HalfC), Source);
+    GRUHalf := NN.AddLayerAfter(TNNetSplitChannels.Create(HalfC, HalfC), Source);
+    State := NN.AddLayer(TNNetInput.Create(Source.Output.SizeX,
+      Source.Output.SizeY, HalfC));
+    NN.AddLayer(TNNetDeepConcat.Create([State, GRUHalf]));
+    GRUs[GRUPos] := NN.AddLayer(TNNetConvGRUCell.Create(HalfC, HalfC, 3));
+    Result := NN.AddLayer(TNNetDeepConcat.Create([KeptHalf, GRUs[GRUPos]]));
+  end;
+
+  // Bilinear 2x of Source cropped to Target's grid (nn.Upsample + slicing).
+  function AddUpsampleTo(Source, Target: TNNetLayer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(TNNetBilinearUpsample.Create(2), Source);
+    if (Result.Output.SizeX <> Target.Output.SizeX) or
+       (Result.Output.SizeY <> Target.Output.SizeY) then
+      Result := NN.AddLayer(TNNetCrop.Create(0, 0, Target.Output.SizeX,
+        Target.Output.SizeY));
+  end;
+
+begin
+  if Config.Variant <> 'mobilenetv3' then
+    ImportError(csRVMImporter + ': unsupported variant "' + Config.Variant + '".');
+  if Length(Config.Backbone.Blocks) <> csRVMBlockCount then
+    ImportError(csRVMImporter + ': the backbone config needs ' +
+      IntToStr(csRVMBlockCount) + ' blocks.');
+  HasRefiner := Config.DownsampleRatio < 1;
+  if HasRefiner then
+  begin
+    // torch interpolate(scale_factor=r) sizes the output floor(size * r).
+    LowWidth := Trunc(Config.FrameWidth * Config.DownsampleRatio);
+    LowHeight := Trunc(Config.FrameHeight * Config.DownsampleRatio);
+    if (LowWidth < 1) or (LowHeight < 1) then
+      ImportError(csRVMImporter + ': the downsampled frame is empty.');
+    if Config.RefinerHidden < 1 then
+      ImportError(csRVMImporter + ': downsample ratio < 1 needs the ' +
+        'deep_guided_filter refiner, which this checkpoint lacks.');
+    if not Reader.HasTensor('refiner.box_filter.weight') then
+      ImportError(csRVMImporter + ': only the deep_guided_filter refiner is ' +
+        'supported.');
+  end;
+  NN := TNNet.Create();
+  Values := TNNetVolume.Create(3, 1, 1);
+  try try
+    // ---------------- Architecture ----------------
+    Frame := NN.AddLayer(TNNetInput.Create(Config.FrameWidth, Config.FrameHeight, 3));
+    if HasRefiner then
+      Small := NN.AddLayer(TNNetBilinearResize.Create(LowWidth, LowHeight, 0))
+    else
+      Small := Frame;
+    // torchvision normalize(x, mean, std) feeds the backbone only.
+    NN.AddLayerAfter(TNNetChannelMul.Create(), Small);
+    for Channel := 0 to 2 do
+      Values.FData[Channel] := 1 / csRVMImageStd[Channel];
+    WriteChannelVector(NN.GetLastLayer(), Values, 3);
+    NN.AddLayer(TNNetChannelBias.Create());
+    for Channel := 0 to 2 do
+      Values.FData[Channel] := -csRVMImageMean[Channel] / csRVMImageStd[Channel];
+    WriteChannelVector(NN.GetLastLayer(), Values, 3);
+    AddMobileNetV3Trunk(NN, Config.Backbone, pTrainable, Trunk);
+    for Level := 0 to 2 do
+      Features[Level] := Trunk.BlockOutputs[csRVMFeatureBlocks[Level]];
+    // LR-ASPP: ReLU(BN(conv1x1 x)) * sigmoid(conv1x1(avgpool x)).
+    Aspp1 := NN.AddLayerAfter(TNNetConvolutionReLU.Create(
+      Config.FeatureChannels[3], 1, 0, 1, 0).SetTrainable(pTrainable),
+      Trunk.HeadOutput);
+    Pooled := NN.AddLayerAfter(TNNetAvgChannel.Create(), Trunk.HeadOutput);
+    Aspp2 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(
+      Config.FeatureChannels[3], 1, 0, 1, 0).SetTrainable(pTrainable), Pooled);
+    Gate := NN.AddLayer(TNNetSigmoid.Create());
+    Features[3] := NN.AddLayer(TNNetChannelMulByLayer.Create(Aspp1, Gate));
+    // s1..s3: AvgPool2d(2, 2, ceil_mode=True, count_include_pad=False).
+    Sources[0] := Small;
+    for Level := 1 to 3 do
+      Sources[Level] := NN.AddLayerAfter(TNNetGridAvgPool.Create(2, 2, 0, 1),
+        Sources[Level - 1]);
+    // Recurrent decoder.
+    X := AddGRUBlock(Features[3], Config.FeatureChannels[3], 0);
+    for Level := 0 to 2 do
+    begin
+      Up := AddUpsampleTo(X, Sources[3 - Level]);
+      NN.AddLayer(TNNetDeepConcat.Create([Up, Features[2 - Level],
+        Sources[3 - Level]]));
+      UpConvs[Level] := NN.AddLayer(TNNetConvolutionReLU.Create(
+        Config.DecoderChannels[Level], 3, 1, 1, 0).SetTrainable(pTrainable));
+      X := AddGRUBlock(UpConvs[Level], Config.DecoderChannels[Level], Level + 1);
+    end;
+    Up := AddUpsampleTo(X, Sources[0]);
+    NN.AddLayer(TNNetDeepConcat.Create([Up, Sources[0]]));
+    UpConvs[3] := NN.AddLayer(TNNetConvolutionReLU.Create(
+      Config.DecoderChannels[3], 3, 1, 1, 0).SetTrainable(pTrainable));
+    Decode0Conv2 := NN.AddLayer(TNNetConvolutionReLU.Create(
+      Config.DecoderChannels[3], 3, 1, 1, 0).SetTrainable(pTrainable));
+    Hid := Decode0Conv2;
+    // project_mat: [fgr residual (3) ; alpha (1)].
+    ProjMat := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0).
+      SetTrainable(pTrainable), Hid);
+    FineSrc := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Frame);
+    if HasRefiner then
+    begin
+      // Deep Guided Filter: A, b fitted at low res, then A * [src ; mean] + b.
+      BaseX := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Small);
+      MeanX := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), BaseX);
+      NegMeanX := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), BaseX);
+      MeanY := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), ProjMat);
+      NN.AddLayer(TNNetCellMulByCell.Create(BaseX, ProjMat));
+      BoxXY := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1));
+      NN.AddLayer(TNNetCellMulByCell.Create(BaseX, BaseX));
+      BoxXX := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1));
+      Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, MeanY));
+      Cov := NN.AddLayer(TNNetSum.Create([BoxXY, Merged]));
+      Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, MeanX));
+      Variance := NN.AddLayer(TNNetSum.Create([BoxXX, Merged]));
+      NN.AddLayer(TNNetDeepConcat.Create([Cov, Variance, Hid]));
+      Refine1 := NN.AddLayer(TNNetConvolutionReLU.Create(Config.RefinerHidden,
+        1, 0, 1, 0).SetTrainable(pTrainable));
+      Refine2 := NN.AddLayer(TNNetConvolutionReLU.Create(Config.RefinerHidden,
+        1, 0, 1, 0).SetTrainable(pTrainable));
+      RefineConv := NN.AddLayer(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0).
+        SetTrainable(pTrainable));
+      Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, RefineConv));
+      RefineB := NN.AddLayer(TNNetSum.Create([MeanY, Merged]));
+      RefineA := NN.AddLayerAfter(TNNetBilinearResize.Create(Config.FrameWidth,
+        Config.FrameHeight, 0), RefineConv);
+      RefineB := NN.AddLayerAfter(TNNetBilinearResize.Create(Config.FrameWidth,
+        Config.FrameHeight, 0), RefineB);
+      FineX := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Frame);
+      Merged := NN.AddLayer(TNNetCellMulByCell.Create(RefineA, FineX));
+      Combined := NN.AddLayer(TNNetSum.Create([Merged, RefineB, FineSrc]));
+    end
+    else
+      Combined := NN.AddLayer(TNNetSum.Create([ProjMat, FineSrc]));
+    // fgr = residual + src and alpha, both clamped to [0, 1].
+    NN.AddLayerAfter(TNNetClamp.Create(0, 1), Combined);
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    LoadMobileNetV3Trunk(Reader, Config.Backbone, 'backbone.', Trunk);
+    LoadResNetConvFoldBN(Reader, Aspp1, 'aspp.aspp1.0.weight', 'aspp.aspp1.1',
+      Config.FeatureChannels[3], Config.Backbone.HeadConvWidth, 1, Config.BnEps);
+    LoadResNetConvFoldBN(Reader, Aspp2, 'aspp.aspp2.1.weight', '',
+      Config.FeatureChannels[3], Config.Backbone.HeadConvWidth, 1, 0);
+    RVMLoadConvGRU(Reader, GRUs[0], 'decoder.decode4.gru.',
+      Config.FeatureChannels[3] div 2);
+    InCh := Config.FeatureChannels[3];
+    for Level := 0 to 2 do
+    begin
+      LoadResNetConvFoldBN(Reader, UpConvs[Level],
+        'decoder.decode' + IntToStr(3 - Level) + '.conv.0.weight',
+        'decoder.decode' + IntToStr(3 - Level) + '.conv.1',
+        Config.DecoderChannels[Level],
+        InCh + Config.FeatureChannels[2 - Level] + 3, 3, Config.BnEps);
+      RVMLoadConvGRU(Reader, GRUs[Level + 1],
+        'decoder.decode' + IntToStr(3 - Level) + '.gru.',
+        Config.DecoderChannels[Level] div 2);
+      InCh := Config.DecoderChannels[Level];
+    end;
+    LoadResNetConvFoldBN(Reader, UpConvs[3], 'decoder.decode0.conv.0.weight',
+      'decoder.decode0.conv.1', Config.DecoderChannels[3], InCh + 3, 3,
+      Config.BnEps);
+    LoadResNetConvFoldBN(Reader, Decode0Conv2, 'decoder.decode0.conv.3.weight',
+      'decoder.decode0.conv.4', Config.DecoderChannels[3],
+      Config.DecoderChannels[3], 3, Config.BnEps);
+    LoadResNetConvFoldBN(Reader, ProjMat, 'project_mat.conv.weight', '', 4,
+      Config.DecoderChannels[3], 1, 0);
+    LoadResNetConvBias(Reader, ProjMat, 'project_mat.conv.bias', 4);
+    RVMWriteFixedPointwise(FineSrc, csRVMWithZero, 4, 3);
+    if HasRefiner then
+    begin
+      RVMWriteFixedPointwise(BaseX, csRVMWithMean, 4, 3);
+      RVMWriteFixedPointwise(FineX, csRVMWithMean, 4, 3);
+      RVMLoadBoxFilter(Reader, MeanX, 1);
+      RVMLoadBoxFilter(Reader, NegMeanX, -1);
+      RVMLoadBoxFilter(Reader, MeanY, 1);
+      RVMLoadBoxFilter(Reader, BoxXY, 1);
+      RVMLoadBoxFilter(Reader, BoxXX, 1);
+      LoadResNetConvFoldBN(Reader, Refine1, 'refiner.conv.0.weight',
+        'refiner.conv.1', Config.RefinerHidden,
+        8 + Config.DecoderChannels[3], 1, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, Refine2, 'refiner.conv.3.weight',
+        'refiner.conv.4', Config.RefinerHidden, Config.RefinerHidden, 1,
+        Config.BnEps);
+      LoadResNetConvFoldBN(Reader, RefineConv, 'refiner.conv.6.weight', '', 4,
+        Config.RefinerHidden, 1, 0);
+      LoadResNetConvBias(Reader, RefineConv, 'refiner.conv.6.bias', 4);
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+  finally
+    Values.Free;
+  end;
+end;
+
+function BuildRVMFromSafeTensorsEx(const FileName: string;
+  const Config: TRVMConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRVM(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRVMFromSafeTensors(const FileName: string;
+  FrameWidth, FrameHeight: integer; DownsampleRatio: double;
+  out Config: TRVMConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Config := InferRVMConfigFromTensors(Reader, FrameWidth, FrameHeight,
+      DownsampleRatio);
+    Result := BuildRVM(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+{ TRVMMatting }
+
+constructor TRVMMatting.Create(Net: TNNet; pOwnsNet: boolean);
+var
+  LayerPos, MaxLayerPos, InputCnt, CellCnt: integer;
+begin
+  inherited Create();
+  FNet := Net;
+  FOwnsNet := pOwnsNet;
+  InputCnt := 0;
+  CellCnt := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  // BuildRVM adds each state input just before its cell, both in decoder order.
+  for LayerPos := 1 to MaxLayerPos do
+    if (Net.Layers[LayerPos] is TNNetInput) and (InputCnt < 4) then
+    begin
+      FStateInputs[InputCnt] := Net.Layers[LayerPos];
+      Inc(InputCnt);
+    end
+    else if (Net.Layers[LayerPos] is TNNetConvGRUCell) and (CellCnt < 4) then
+    begin
+      FGRUCells[CellCnt] := Net.Layers[LayerPos];
+      Inc(CellCnt);
+    end;
+  if (InputCnt <> 4) or (CellCnt <> 4) then
+    ImportError(csRVMImporter + ': TRVMMatting needs a BuildRVM net (4 state ' +
+      'inputs and 4 ConvGRU cells), found ' + IntToStr(InputCnt) + ' and ' +
+      IntToStr(CellCnt) + '.');
+  ResetState();
+end;
+
+destructor TRVMMatting.Destroy();
+begin
+  if FOwnsNet then FNet.Free;
+  inherited Destroy();
+end;
+
+procedure TRVMMatting.ResetState();
+var
+  StatePos: integer;
+begin
+  for StatePos := 0 to 3 do
+  begin
+    FStateInputs[StatePos].Output.Fill(0);
+    FStateInputs[StatePos].MarkOutputWrittenOnRAM();
+  end;
+end;
+
+procedure TRVMMatting.Step(Frame, Matte: TNNetVolume);
+var
+  StatePos: integer;
+begin
+  FNet.Compute(Frame);
+  for StatePos := 0 to 3 do
+  begin
+    FGRUCells[StatePos].ForceOutputOnRAM();
+    FStateInputs[StatePos].Output.CopyNoChecks(FGRUCells[StatePos].Output);
+    FStateInputs[StatePos].MarkOutputWrittenOnRAM();
+  end;
+  FNet.GetOutput(Matte);
+end;
+
+function TRVMMatting.HiddenState(Level: integer): TNNetVolume;
+begin
+  if (Level < 1) or (Level > 4) then
+    ImportError(csRVMImporter + ': hidden state level must be 1..4.');
+  Result := FStateInputs[4 - Level].Output;
 end;
 
 {$IFDEF OpenCL}

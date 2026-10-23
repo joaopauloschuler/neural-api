@@ -361,35 +361,40 @@ rather than acted on.
       box (`--gpu`, also CPU) and compare the mask with the official
       `transformers` remote-code output before README calls it supported.
 
-- [ ] Robust Video Matting importer (`BuildRVMFromSafeTensors[Ex]`, Lin et al.
-      WACV 2022, arXiv:2108.11515, PeterL1n/RobustVideoMatting
-      `rvm_mobilenetv3.pth` / `rvm_resnet50.pth` through `TNNetTorchBinReader`;
-      the weights are GPL-3.0, so load them at run time and never ship them)
-      + examples/VideoMatting. Turns a webcam-style frame sequence into a
-      temporally consistent alpha matte and foreground: the recurrent state
-      carries across frames, so there is no per-frame flicker, and it runs at
-      real-time sizes where BiRefNet (one image, Swin-L) cannot. Architecture:
-      MobileNetV3-Large encoder (reuse `BuildMobileNetV3`, exposing the 1/2,
-      1/4, 1/8, 1/16 features, last stage dilated) or ResNet-50 (reuse the
-      ResNet importer), an LR-ASPP head (1x1 conv + global-pool sigmoid gate:
-      `TNNetAvgChannel` + `TNNetCellMulByCell`), a recurrent decoder whose
-      blocks run a ConvGRU on HALF the channels (reuse `TNNetConvGRUCell`: the
-      gate equations match, only the [x ; h] concat order differs, so permute
-      the input-channel slices at load), bilinear 2x upsampling
-      (`TNNetBilinearUpsample`), and a projection to fgr residual (3) + alpha (1).
-      High resolution goes through the Deep Guided Filter refiner
-      (`downsample_ratio`): box filters of the low-res image/prediction, a
-      small 1x1 conv stack for A and b, bilinear A/b upsample, then
-      `A * hr_image + b`. `TNNetBoxFilter` landed (47705a13) for the
-      fast_guided_filter refiner; the DGF `box_filter` is a TRAINED depthwise
-      3x3 conv in both checkpoints (not 1/9), so load it as one. Per-frame API
-      `RVMStep(Net, Frame, State)` keeps the four hidden maps between calls
-      (same holder pattern as the other recurrent decode paths). The example
-      reads a numbered PNG/JPG frame folder and writes RGBA frames, a green-
-      screen composite and an optional `--gif` (neuralgif.pas). Pico parity vs
-      the official `model/model.py` in the ~/x venv over 3 frames (so the
-      recurrent state is exercised), an OpenCL forward test, then a real
-      checkpoint run on the GPU box before README calls it supported.
+- [ ] Robust Video Matting (Lin et al. WACV 2022, arXiv:2108.11515,
+      PeterL1n/RobustVideoMatting; `rvm_mobilenetv3.pth` is GPL-3.0, so load it
+      at run time and never ship it).
+  - [x] MobileNetV3 importer landed: `InferRVMConfigFromTensors`,
+        `BuildRVM[FromSafeTensors[Ex]]` and the per-frame `TRVMMatting`
+        (`Step(Frame, Matte)`, `ResetState`, `HiddenState(1..4)`) in
+        neuralpretrained.pas. One TNNet per (frame size, downsample_ratio):
+        frame (W, H, 3) RGB [0,1] -> (W, H, 4) clamped fgr RGB + alpha; the
+        four ConvGRU states are TNNetInput #1..#4 that `Step` refills. Pico
+        parity 1.2e-7 over 3 frames (DGF) and 2 frames (ratio 1), OpenCL vs
+        CPU 1.2e-7 (208/228 layers forced on OpenCL); the real
+        `rvm_mobilenetv3.pth` matched the official model.py to 2.9e-6 on a
+        128x96 frame at ratio 0.5 over 3 frames (one-off check, not a test).
+  - [ ] examples/VideoMatting: read a numbered PNG/JPG frame folder, build
+        `BuildRVMFromSafeTensors(File, W, H, Ratio, Config)` from the first
+        frame's size, wrap it in `TRVMMatting`, call `Step` per frame and write
+        RGBA PNGs (alpha = channel 3), a green-screen composite
+        (fgr*alpha + green*(1-alpha)) and an optional `--gif` (neuralgif.pas).
+        `--ratio` default per the RVM README table (portrait: 0.25 at 1080p,
+        0.375 at 720p, 1 up to 512x512; check the table); exact torch parity needs W*ratio and H*ratio integral
+        (the net's resize maps In/Out, torch maps 1/ratio). Frames of a
+        different size need a new net (state resets). With no arguments, run a
+        <1 s smoke on tests/fixtures/tiny_rvm_mobilenetv3.pth. List cthreads
+        first in uses. Then a real-checkpoint run on the GPU box (`--gpu`)
+        before README calls it supported.
+  - [ ] ResNet-50 variant (`rvm_resnet50.pth`): needs the ResNet trunk with
+        f1..f4 taps and a dilation-2 layer4. 2-D dilation is emulated today by
+        a zero-filled (K-1)*D+1 kernel (LoadMobileNetDepthwiseFoldBN); for
+        layer4's full 3x3 convs that is a 5x5 conv, so a native dilated conv
+        would pay off first. The MobileNetV3 path also pays 81 vs 25 taps in
+        its three dilated 5x5 depthwise blocks at 1/16 resolution.
+  - [ ] fast_guided_filter refiner (TNNetBoxFilter) and segmentation_pass
+        (project_seg) are not wired; the importer rejects a checkpoint
+        without `refiner.box_filter.weight` when the ratio is < 1.
 
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct

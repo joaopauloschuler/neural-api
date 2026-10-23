@@ -194,6 +194,9 @@ type
     // a*b*; with pRoundTrip a save/load copy must reproduce the output exactly.
     function DDColorParityMaxDiff(const WeightsFile: string;
       pRoundTrip: boolean; out Config: TDDColorConfig): double;
+    function RVMSequenceMaxDiff(const Prefix: string;
+      FrameWidth, FrameHeight: integer; Ratio: double; Frames: integer;
+      out Config: TRVMConfig): double;
     function GFPGANParityMaxDiff(const WeightsFile, IOFile, ConfigFile: string;
       pRoundTrip: boolean; out Config: TGFPGANConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
@@ -1501,6 +1504,10 @@ type
     procedure TestDDColorOpenCLParity;
     // pInputSize builds a square net input regardless of config.json input_size.
     procedure TestDDColorInputSizeOverride;
+    procedure TestRVMParity;
+    procedure TestRVMNoRefinerParity;
+    procedure TestRVMRoundTrip;
+    procedure TestRVMOpenCLParity;
     procedure TestCLIPSegConfigFromJSONFile;
     procedure TestCLIPSegParity;
     procedure TestCLIPSegComplexUpsampleParity;
@@ -54884,6 +54891,216 @@ begin
     IO.Free;
     NNCPU.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Builds the pico RVM for one tiny_rvm_mobilenetv3_io.safetensors sequence and
+// returns the max |diff| of the RGBA matte and the r1..r4 states over Frames.
+function TTestNeuralPretrained.RVMSequenceMaxDiff(const Prefix: string;
+  FrameWidth, FrameHeight: integer; Ratio: double; Frames: integer;
+  out Config: TRVMConfig): double;
+var
+  Matting: TRVMMatting;
+  IO: TNNetSafeTensorsReader;
+  Frame, Matte, Expected, Fgr, Pha, State: TNNetVolume;
+  FramePos, Level, X, Y, Channel: integer;
+  Tag: string;
+begin
+  Result := 0;
+  Matting := TRVMMatting.Create(BuildRVMFromSafeTensors(
+    FixturePath('tiny_rvm_mobilenetv3.pth'), FrameWidth, FrameHeight, Ratio,
+    Config, {pTrainable=}false));
+  IO := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_rvm_mobilenetv3_io.safetensors'));
+  Frame := TNNetVolume.Create;
+  Matte := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Fgr := TNNetVolume.Create;
+  Pha := TNNetVolume.Create;
+  State := TNNetVolume.Create;
+  try
+    for FramePos := 0 to Frames - 1 do
+    begin
+      Tag := IntToStr(FramePos);
+      LoadDDColorTorchImage(IO, Prefix + '_src' + Tag, Frame);
+      LoadDDColorTorchImage(IO, Prefix + '_fgr' + Tag, Fgr);
+      LoadDDColorTorchImage(IO, Prefix + '_pha' + Tag, Pha);
+      Expected.ReSize(Fgr.SizeX, Fgr.SizeY, 4);
+      for Y := 0 to Fgr.SizeY - 1 do
+        for X := 0 to Fgr.SizeX - 1 do
+        begin
+          for Channel := 0 to 2 do
+            Expected[X, Y, Channel] := Fgr[X, Y, Channel];
+          Expected[X, Y, 3] := Pha[X, Y, 0];
+        end;
+      Matting.Step(Frame, Matte);
+      Result := Max(Result, MaxAbsVolumeDiff(Matte, Expected));
+      for Level := 1 to 4 do
+      begin
+        LoadDDColorTorchImage(IO, Prefix + '_r' + IntToStr(Level) + '_' + Tag,
+          State);
+        Result := Max(Result, MaxAbsVolumeDiff(Matting.HiddenState(Level), State));
+      end;
+    end;
+  finally
+    State.Free;
+    Pha.Free;
+    Fgr.Free;
+    Expected.Free;
+    Matte.Free;
+    Frame.Free;
+    IO.Free;
+    Matting.Free;
+  end;
+end;
+
+// tiny_rvm_mobilenetv3.*: the official model/model.py with a 15-block pico
+// MobileNetV3 (dilated last stage), random BN stats and box filter, float64 torch;
+// 3 frames of 44x36 at downsample_ratio 0.5, so the GRU state and the DGF refiner run.
+procedure TTestNeuralPretrained.TestRVMParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('dgf', 44, 36, 0.5, 3, Config);
+  WriteLn('  RVM pico (DGF, 3 frames) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+  AssertEquals('stem width', 8, Config.Backbone.StemWidth);
+  AssertEquals('head conv width', 144, Config.Backbone.HeadConvWidth);
+  AssertEquals('block 13 kernel', 5, Config.Backbone.Blocks[12].Kernel);
+  AssertEquals('block 13 dilation', 2, Config.Backbone.Blocks[12].Dilation);
+  AssertTrue('block 4 has SE', Config.Backbone.Blocks[3].UseSE);
+  AssertEquals('LR-ASPP width', 16, Config.FeatureChannels[3]);
+  AssertEquals('decode2 width', 12, Config.DecoderChannels[1]);
+  AssertEquals('refiner hidden', 8, Config.RefinerHidden);
+end;
+
+// downsample_ratio 1: no resize and no refiner, 2 frames of 22x18.
+procedure TTestNeuralPretrained.TestRVMNoRefinerParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('full', 22, 18, 1, 2, Config);
+  WriteLn('  RVM pico (ratio 1, 2 frames) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// A saved and reloaded net drives TRVMMatting to the same matte.
+procedure TTestNeuralPretrained.TestRVMRoundTrip;
+var
+  Config: TRVMConfig;
+  NN, Reloaded: TNNet;
+  Original, Restored: TRVMMatting;
+  Frame, MatteA, MatteB: TNNetVolume;
+  FramePos: integer;
+begin
+  NN := BuildRVMFromSafeTensors(FixturePath('tiny_rvm_mobilenetv3.pth'),
+    44, 36, 0.5, Config, {pTrainable=}false);
+  Reloaded := TNNet.Create();
+  Reloaded.LoadFromString(NN.SaveToString());
+  Reloaded.SetTrainable();
+  Original := TRVMMatting.Create(NN);
+  Restored := TRVMMatting.Create(Reloaded);
+  Frame := TNNetVolume.Create(44, 36, 3);
+  MatteA := TNNetVolume.Create;
+  MatteB := TNNetVolume.Create;
+  try
+    for FramePos := 0 to 1 do
+    begin
+      Frame.FillForDebug();
+      Frame.Mul(0.5 + 0.1 * FramePos);
+      Frame.Add(0.3);
+      Original.Step(Frame, MatteA);
+      Restored.Step(Frame, MatteB);
+      AssertEquals('frame ' + IntToStr(FramePos) + ' round trip', 0,
+        MaxAbsVolumeDiff(MatteA, MatteB), 1e-6);
+    end;
+    Original.ResetState();
+    Original.Step(Frame, MatteB);
+    Restored.ResetState();
+    Restored.Step(Frame, MatteA);
+    AssertEquals('ResetState restarts the clip', 0,
+      MaxAbsVolumeDiff(MatteA, MatteB), 1e-6);
+  finally
+    MatteB.Free;
+    MatteA.Free;
+    Frame.Free;
+    Restored.Free;
+    Original.Free;
+  end;
+end;
+
+// The pico net under EnableOpenCL, then also ForceOpenCL, against the host net
+// frame by frame over the 3-frame DGF sequence (state carried on both).
+procedure TTestNeuralPretrained.TestRVMOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TRVMConfig;
+  OnOpenCL, OnHost: TRVMMatting;
+  IO: TNNetSafeTensorsReader;
+  Frame, MatteCL, MatteCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  FramePos, LayerPos, OpenCLLayerCnt: integer;
+  FrameDiff, MaxDiff: double;
+  Forced: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  OnHost := TRVMMatting.Create(BuildRVMFromSafeTensors(
+    FixturePath('tiny_rvm_mobilenetv3.pth'), 44, 36, 0.5, Config, false));
+  OnOpenCL := TRVMMatting.Create(BuildRVMFromSafeTensors(
+    FixturePath('tiny_rvm_mobilenetv3.pth'), 44, 36, 0.5, Config, false));
+  IO := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_rvm_mobilenetv3_io.safetensors'));
+  Frame := TNNetVolume.Create;
+  MatteCL := TNNetVolume.Create;
+  MatteCPU := TNNetVolume.Create;
+  try
+    OnOpenCL.Net.EnableOpenCL(PlatformId, DeviceId);
+    MaxDiff := 0;
+    for Forced := false to true do
+    begin
+      OnOpenCL.Net.ForceOpenCL(Forced);
+      OnHost.ResetState();
+      OnOpenCL.ResetState();
+      for FramePos := 0 to 2 do
+      begin
+        LoadDDColorTorchImage(IO, 'dgf_src' + IntToStr(FramePos), Frame);
+        OnHost.Step(Frame, MatteCPU);
+        OnOpenCL.Step(Frame, MatteCL);
+        FrameDiff := MaxAbsVolumeDiff(MatteCL, MatteCPU);
+        WriteLn('  RVM OpenCL force=', Forced, ' frame ', FramePos,
+          ' max|diff| = ', FrameDiff:0:9);
+        MaxDiff := Max(MaxDiff, FrameDiff);
+      end;
+    end;
+    OpenCLLayerCnt := 0;
+    for LayerPos := 0 to OnOpenCL.Net.CountLayers() - 1 do
+      if OnOpenCL.Net.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+    WriteLn('  RVM layers that ran on OpenCL: ', OpenCLLayerCnt, ' of ',
+      OnOpenCL.Net.CountLayers());
+    AssertTrue('some layers run on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue('matte OpenCL vs CPU max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    MatteCPU.Free;
+    MatteCL.Free;
+    Frame.Free;
+    IO.Free;
+    OnOpenCL.Free;
+    OnHost.Free;
   end;
 end;
 {$ELSE}

@@ -1713,15 +1713,18 @@ type
   // branches of an Inception module. Padding is conceptual (no buffer is
   // materialized): out-of-bounds taps are simply skipped and excluded from the
   // divisor. This is the torchvision Inception-v3 pool branch.
-  // Pool/Stride/Padding round-trip via FStruct[0..2] (CreateLayer wires
-  // Create(St[0],St[1],St[2])).
+  // pCeilMode <> 0 sizes the output like AvgPool2d(ceil_mode=True): the last
+  // window may run past the input and averages only its real cells.
+  // Pool/Stride/Padding/CeilMode round-trip via FStruct[0..3].
   // Coded by Claude (AI).
   TNNetGridAvgPool = class(TNNetLayer)
   private
-    FPoolSize, FStride, FPadding: integer;
+    FPoolSize, FStride, FPadding, FCeilMode: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); reintroduce; override;
+    function PooledSize(InSize: integer): integer;
   public
-    constructor Create(pPoolSize: integer; pStride: integer = 1; pPadding: integer = 0); reintroduce; overload;
+    constructor Create(pPoolSize: integer; pStride: integer = 1; pPadding: integer = 0;
+      pCeilMode: integer = 0); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -63664,15 +63667,33 @@ end;
 { TNNetGridAvgPool }
 
 constructor TNNetGridAvgPool.Create(pPoolSize: integer; pStride: integer = 1;
-  pPadding: integer = 0);
+  pPadding: integer = 0; pCeilMode: integer = 0);
 begin
   inherited Create();
   FPoolSize := pPoolSize;
   FStride := pStride;
   FPadding := pPadding;
+  FCeilMode := pCeilMode;
   FStruct[0] := pPoolSize;
   FStruct[1] := pStride;
   FStruct[2] := pPadding;
+  FStruct[3] := pCeilMode;
+end;
+
+// torch pooling_output_shape: in ceil mode a window must still start inside
+// the input or the left padding.
+function TNNetGridAvgPool.PooledSize(InSize: integer): integer;
+var
+  Span: integer;
+begin
+  Span := InSize + 2 * FPadding - FPoolSize;
+  if FCeilMode = 0 then
+    Result := Span div FStride + 1
+  else
+  begin
+    Result := (Span + FStride - 1) div FStride + 1;
+    if (Result - 1) * FStride >= InSize + FPadding then Dec(Result);
+  end;
 end;
 
 procedure TNNetGridAvgPool.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -63680,8 +63701,8 @@ var
   OutX, OutY: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
-  OutX := (pPrevLayer.Output.SizeX - FPoolSize + 2*FPadding) div FStride + 1;
-  OutY := (pPrevLayer.Output.SizeY - FPoolSize + 2*FPadding) div FStride + 1;
+  OutX := PooledSize(pPrevLayer.Output.SizeX);
+  OutY := PooledSize(pPrevLayer.Output.SizeY);
   FOutput.ReSize(OutX, OutY, pPrevLayer.Output.Depth);
   SetOutputErrorSize(OutX, OutY, pPrevLayer.Output.Depth);
 end;
@@ -142440,7 +142461,7 @@ begin
       'TNNetMaxPoolPortable' :      Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]);
       'TNNetMinPool' :              Result := TNNetMinPool.Create(St[0], St[1], St[2]);
       'TNNetAvgPool' :              Result := TNNetAvgPool.Create(St[0]);
-      'TNNetGridAvgPool' :          Result := TNNetGridAvgPool.Create(St[0], St[1], St[2]);
+      'TNNetGridAvgPool' :          Result := TNNetGridAvgPool.Create(St[0], St[1], St[2], St[3]);
       'TNNetLpPool' :               Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetSoftPool' :             Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetStochasticPool' :       Result := TNNetStochasticPool.Create(St[0], St[1], St[2]);
@@ -142899,7 +142920,7 @@ begin
       if S[0] = 'TNNetMaxPoolPortable' then Result := TNNetMaxPoolPortable.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetMinPool' then Result := TNNetMinPool.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetAvgPool' then Result := TNNetAvgPool.Create(St[0]) else
-      if S[0] = 'TNNetGridAvgPool' then Result := TNNetGridAvgPool.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetGridAvgPool' then Result := TNNetGridAvgPool.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetLpPool' then Result := TNNetLpPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetSoftPool' then Result := TNNetSoftPool.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetStochasticPool' then Result := TNNetStochasticPool.Create(St[0], St[1], St[2]) else

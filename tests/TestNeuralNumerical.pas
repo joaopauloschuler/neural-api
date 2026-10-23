@@ -99,6 +99,9 @@ type
     procedure TestAvgPoolNumericalPrecision;
     procedure TestGridAvgPoolPaddedForward;
     procedure TestGridAvgPoolPaddedGradientCheck;
+    // AvgPool2d(2, 2, ceil_mode=True): odd sizes keep a partial last window.
+    procedure TestGridAvgPoolCeilModeForward;
+    procedure TestGridAvgPoolCeilModeGradientCheck;
     procedure TestMinPoolWithNegatives;
     procedure TestMinPoolStridedForwardReference;
     procedure TestPoolingWithOddDimensions;
@@ -9476,6 +9479,53 @@ begin
   // counts padding) shows up as a mismatch against central differences.
   LayerInputGradientCheck(Self, TNNetGridAvgPool.Create(3, 1, 1),
     'GridAvgPool padded', 4, 4, 2, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGridAvgPoolCeilModeForward;
+var
+  NN, Reloaded: TNNet;
+  Input: TNNetVolume;
+  X, Y: integer;
+begin
+  // 5x3 -> 3x2: the last column and row windows hold 1 or 2 real cells and are
+  // divided by that count (count_include_pad=False).
+  NN := TNNet.Create();
+  Reloaded := TNNet.Create();
+  Input := TNNetVolume.Create(5, 3, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 3, 1));
+    NN.AddLayer(TNNetGridAvgPool.Create(2, 2, 0, 1));
+    for Y := 0 to 2 do
+      for X := 0 to 4 do
+        Input[X, Y, 0] := Y * 5 + X + 1;
+    NN.Compute(Input);
+    AssertEquals('ceil SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('ceil SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    // (0,0): 1, 2, 6, 7.
+    AssertEquals('full window', 4, NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    // (2,0): 5, 10.
+    AssertEquals('last column', 7.5, NN.GetLastLayer.Output[2, 0, 0], 0.0001);
+    // (1,1): 13, 14.
+    AssertEquals('last row', 13.5, NN.GetLastLayer.Output[1, 1, 0], 0.0001);
+    // (2,1): 15 alone.
+    AssertEquals('corner', 15, NN.GetLastLayer.Output[2, 1, 0], 0.0001);
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.Compute(Input);
+    AssertEquals('round trip keeps ceil mode', 3,
+      Reloaded.GetLastLayer.Output.SizeX);
+    AssertEquals('round trip corner', 15, Reloaded.GetLastLayer.Output[2, 1, 0],
+      0.0001);
+  finally
+    Reloaded.Free;
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridAvgPoolCeilModeGradientCheck;
+begin
+  LayerInputGradientCheck(Self, TNNetGridAvgPool.Create(2, 2, 0, 1),
+    'GridAvgPool ceil mode', 5, 3, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSoftPoolGradientCheck;
