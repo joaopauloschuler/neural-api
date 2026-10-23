@@ -1285,6 +1285,9 @@ type
     procedure TestFastSAMPromptSelection;
     procedure TestYoloSegOpenCLParity;
     procedure TestYoloSegNativeMasks;
+    procedure TestByteTrackKalmanPredictUpdate;
+    procedure TestByteTrackerSyntheticSequence;
+    procedure TestByteTrackerLostBufferAndReset;
     procedure TestFastSAMTextSelection;
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
@@ -57071,6 +57074,222 @@ begin
     Masks.Free;
     Proto.Free;
     Head.Free;
+  end;
+end;
+
+// ByteTrackKalman initiate/predict/update against hand-computed values. With
+// h = 40 each axis is an independent 2-state filter: initiate pos var (2 h/20)^2
+// = 16, vel var (10 h/160)^2 = 6.25; predict adds (h/20)^2 = 4 and (h/160)^2 =
+// 0.0625, so P(x,x) = 26.25, P(x,vx) = 6.25, P(vx,vx) = 6.3125; update adds R =
+// (h/20)^2 = 4, so S = 30.25 and the x gain is 26.25 / 30.25.
+procedure TTestNeuralPretrained.TestByteTrackKalmanPredictUpdate;
+const
+  // Typed so the expected values below are computed in Double.
+  PredictedVarX: Double = 26.25;
+  PredictedCovXVX: Double = 6.25;
+  PredictedVarVX: Double = 6.3125;
+  InnovationVarX: Double = 30.25;
+  PredictedVarA: Double = 2.000001e-4;
+var
+  Kalman: TByteTrackKalman;
+begin
+  ByteTrackKalmanInitiate(Kalman, 100, 50, 0.5, 40);
+  AssertEquals('initiate cx', 100, Kalman.Mean[0], 0);
+  AssertEquals('initiate vx', 0, Kalman.Mean[4], 0);
+  AssertEquals('initiate var x', 16, Kalman.Covariance[0, 0], 1e-12);
+  AssertEquals('initiate var a', 1e-4, Kalman.Covariance[2, 2], 1e-16);
+  AssertEquals('initiate var vx', 6.25, Kalman.Covariance[4, 4], 1e-12);
+  AssertEquals('initiate var va', 1e-10, Kalman.Covariance[6, 6], 1e-20);
+  AssertEquals('initiate cov x,vx', 0, Kalman.Covariance[0, 4], 0);
+  Kalman.Mean[4] := 3;
+  ByteTrackKalmanPredict(Kalman);
+  AssertEquals('predict cx', 103, Kalman.Mean[0], 1e-12);
+  AssertEquals('predict vx', 3, Kalman.Mean[4], 1e-12);
+  AssertEquals('predict h', 40, Kalman.Mean[3], 1e-12);
+  AssertEquals('predict var x', 26.25, Kalman.Covariance[0, 0], 1e-12);
+  AssertEquals('predict cov x,vx', 6.25, Kalman.Covariance[0, 4], 1e-12);
+  AssertEquals('predict cov vx,x', 6.25, Kalman.Covariance[4, 0], 1e-12);
+  AssertEquals('predict var vx', 6.3125, Kalman.Covariance[4, 4], 1e-12);
+  AssertEquals('predict var a', PredictedVarA, Kalman.Covariance[2, 2], 1e-15);
+  AssertEquals('predict cov x,y', 0, Kalman.Covariance[0, 1], 0);
+  ByteTrackKalmanUpdate(Kalman, 107, 50, 0.5, 40);
+  AssertEquals('update cx', 103 + 4 * PredictedVarX / InnovationVarX,
+    Kalman.Mean[0], 1e-10);
+  AssertEquals('update vx', 3 + 4 * PredictedCovXVX / InnovationVarX,
+    Kalman.Mean[4], 1e-10);
+  AssertEquals('update cy', 50, Kalman.Mean[1], 1e-10);
+  AssertEquals('update a', 0.5, Kalman.Mean[2], 1e-12);
+  AssertEquals('update var x', PredictedVarX * 4 / InnovationVarX,
+    Kalman.Covariance[0, 0], 1e-10);
+  AssertEquals('update cov x,vx', PredictedCovXVX * 4 / InnovationVarX,
+    Kalman.Covariance[0, 4], 1e-10);
+  AssertEquals('update var vx', PredictedVarVX - Sqr(PredictedCovXVX) / InnovationVarX,
+    Kalman.Covariance[4, 4], 1e-10);
+  AssertEquals('update var a', PredictedVarA - Sqr(PredictedVarA) / (PredictedVarA + 1e-2),
+    Kalman.Covariance[2, 2], 1e-14);
+  AssertEquals('update cov x,y', 0, Kalman.Covariance[0, 1], 1e-14);
+end;
+
+// TByteTracker on a fixed 15-frame sequence of 40x80 boxes, ids derived by
+// following byte_tracker.py: A (right 10 px/frame) and B (left) cross at frame
+// 11 and keep their ids; A's frame-5 score 0.3 is recovered by the low-score
+// step; C misses frames 4-6 and is refound as id 3; D (frame 8) is born
+// unconfirmed and shows from frame 9; the one-frame E spends id 5 and never
+// shows, so F (frame 11) is id 6 from frame 12; G (0.55 < det_thresh 0.6) is
+// never born and the low-score H never matches.
+procedure TTestNeuralPretrained.TestByteTrackerSyntheticSequence;
+const
+  ObjectCount = 8;
+  FrameCount = 15;
+  ObjX1: array[0..ObjectCount - 1] of TNeuralFloat =
+    (100, 300, 600, 800, 800, 1000, 1000, 1200);
+  ObjY1: array[0..ObjectCount - 1] of TNeuralFloat =
+    (100, 130, 100, 300, 600, 600, 100, 100);
+  ObjVX: array[0..ObjectCount - 1] of TNeuralFloat = (10, -10, 0, 0, 0, 0, 0, 0);
+  ObjScore: array[0..ObjectCount - 1] of TNeuralFloat =
+    (0.9, 0.85, 0.9, 0.8, 0.7, 0.75, 0.55, 0.2);
+  ObjClass: array[0..ObjectCount - 1] of integer = (0, 0, 2, 1, 3, 5, 0, 0);
+  ObjFirstFrame: array[0..ObjectCount - 1] of integer = (1, 1, 1, 8, 9, 11, 2, 1);
+  ObjLastFrame: array[0..ObjectCount - 1] of integer =
+    (15, 15, 15, 15, 9, 15, 15, 15);
+  ObjTrackId: array[0..ObjectCount - 1] of integer = (1, 2, 3, 4, 0, 6, 0, 0);
+  ObjFirstShown: array[0..ObjectCount - 1] of integer = (1, 1, 1, 9, 0, 12, 0, 0);
+  // The Kalman box trails A and B while the velocity settles: worst 2.04 px at frame 3.
+  BoxTolerance = 2.1;
+var
+  Tracker: TByteTracker;
+  Dets: TYoloDetectionArray;
+  Tracked: TByteTrackedBoxArray;
+  ObjDet: array[0..ObjectCount - 1] of integer;
+  Frame, Obj, DetCount, OutPos, ExpectedCount, PrevTrackId: integer;
+  IsPresent, IsShown: boolean;
+  Msg: string;
+begin
+  Tracker := TByteTracker.Create;
+  try
+    for Frame := 1 to FrameCount do
+    begin
+      SetLength(Dets, ObjectCount);
+      DetCount := 0;
+      for Obj := 0 to ObjectCount - 1 do
+      begin
+        ObjDet[Obj] := -1;
+        IsPresent := (Frame >= ObjFirstFrame[Obj]) and (Frame <= ObjLastFrame[Obj]) and
+          not ((Obj = 2) and (Frame >= 4) and (Frame <= 6));
+        if not IsPresent then Continue;
+        ObjDet[Obj] := DetCount;
+        Dets[DetCount].ClassId := ObjClass[Obj];
+        Dets[DetCount].Score := ObjScore[Obj];
+        if (Obj = 0) and (Frame = 5) then Dets[DetCount].Score := 0.3;
+        Dets[DetCount].X1 := ObjX1[Obj] + ObjVX[Obj] * (Frame - 1);
+        Dets[DetCount].Y1 := ObjY1[Obj];
+        Dets[DetCount].X2 := Dets[DetCount].X1 + 40;
+        Dets[DetCount].Y2 := Dets[DetCount].Y1 + 80;
+        Dets[DetCount].CellIndex := Obj;
+        Inc(DetCount);
+      end;
+      SetLength(Dets, DetCount);
+      Tracked := Tracker.Update(Dets);
+      AssertEquals('frame id', Frame, Tracker.FrameId);
+      ExpectedCount := 0;
+      for Obj := 0 to ObjectCount - 1 do
+      begin
+        IsShown := (ObjTrackId[Obj] > 0) and (ObjDet[Obj] >= 0) and
+          (Frame >= ObjFirstShown[Obj]);
+        if not IsShown then Continue;
+        Inc(ExpectedCount);
+        Msg := Format('frame %d object %d', [Frame, Obj]);
+        OutPos := 0;
+        while (OutPos < Length(Tracked)) and
+          (Tracked[OutPos].TrackId <> ObjTrackId[Obj]) do Inc(OutPos);
+        AssertTrue(Msg + ' tracked', OutPos < Length(Tracked));
+        AssertEquals(Msg + ' class', ObjClass[Obj], Tracked[OutPos].ClassId);
+        AssertEquals(Msg + ' score', Dets[ObjDet[Obj]].Score, Tracked[OutPos].Score, 0);
+        AssertEquals(Msg + ' x1', Dets[ObjDet[Obj]].X1, Tracked[OutPos].X1, BoxTolerance);
+        AssertEquals(Msg + ' y1', Dets[ObjDet[Obj]].Y1, Tracked[OutPos].Y1, BoxTolerance);
+        AssertEquals(Msg + ' x2', Dets[ObjDet[Obj]].X2, Tracked[OutPos].X2, BoxTolerance);
+        AssertEquals(Msg + ' y2', Dets[ObjDet[Obj]].Y2, Tracked[OutPos].Y2, BoxTolerance);
+      end;
+      AssertEquals(Format('frame %d output count', [Frame]), ExpectedCount,
+        Length(Tracked));
+      // tracked_stracks order: survivors, then births, then refound; ascending here.
+      PrevTrackId := 0;
+      for OutPos := 0 to High(Tracked) do
+      begin
+        AssertTrue(Format('frame %d output order', [Frame]),
+          Tracked[OutPos].TrackId > PrevTrackId);
+        PrevTrackId := Tracked[OutPos].TrackId;
+      end;
+      if Frame = 1 then
+        AssertEquals('frame 1 box is the detection', 100, Tracked[0].X1, 1e-4);
+      // Frame 2 from a zero-velocity start: x gain 105/121 for h = 80 (S = 105 + 16).
+      if Frame = 2 then
+      begin
+        AssertEquals('frame 2 A x1', 100 + 10 * 105 / 121, Tracked[0].X1, 1e-3);
+        AssertEquals('frame 2 B x1', 300 - 10 * 105 / 121, Tracked[1].X1, 1e-3);
+        AssertEquals('frame 2 A width', 40, Tracked[0].X2 - Tracked[0].X1, 1e-3);
+      end;
+      // Frame 3: predicted var x 56.58 (S 72.58), cx 130.744 + 9.256 * 56.58 / 72.58.
+      if Frame = 3 then
+        AssertEquals('frame 3 A x1', 117.9595, Tracked[0].X1, 1e-3);
+    end;
+  finally
+    Tracker.Free;
+  end;
+end;
+
+// max_time_lost = Trunc(30 / 30 * 3) = 3: a track last seen at frame 1 is marked
+// removed at frame 5 but, as in byte_tracker.py, stays in lost_stracks one more
+// frame, so it is refound at frame 6 and not at frame 7 (a new unconfirmed id 2
+// instead). A score of exactly track_thresh is neither high nor low. Reset restarts ids.
+procedure TTestNeuralPretrained.TestByteTrackerLostBufferAndReset;
+var
+  Tracker: TByteTracker;
+  Box, NoDets: TYoloDetectionArray;
+  Tracked: TByteTrackedBoxArray;
+  Frame: integer;
+begin
+  SetLength(Box, 1);
+  Box[0].ClassId := 7;
+  Box[0].Score := 0.9;
+  Box[0].X1 := 50;
+  Box[0].Y1 := 50;
+  Box[0].X2 := 90;
+  Box[0].Y2 := 130;
+  Box[0].CellIndex := 0;
+  NoDets := nil;
+  Tracker := TByteTracker.Create(0.5, 0.8, {TrackBuffer=}3, {FrameRate=}30);
+  try
+    Tracked := Tracker.Update(Box);
+    AssertEquals('frame 1 count', 1, Length(Tracked));
+    AssertEquals('frame 1 id', 1, Tracked[0].TrackId);
+    AssertEquals('frame 1 class', 7, Tracked[0].ClassId);
+    for Frame := 2 to 5 do
+      AssertEquals('lost frames show nothing', 0, Length(Tracker.Update(NoDets)));
+    Tracked := Tracker.Update(Box);
+    AssertEquals('frame 6 refound count', 1, Length(Tracked));
+    AssertEquals('frame 6 refound id', 1, Tracked[0].TrackId);
+
+    Tracker.Reset;
+    AssertEquals('reset frame id', 0, Tracker.FrameId);
+    Tracked := Tracker.Update(Box);
+    AssertEquals('after reset id', 1, Tracked[0].TrackId);
+    for Frame := 2 to 6 do Tracker.Update(NoDets);
+    AssertEquals('frame 7 new track unconfirmed', 0, Length(Tracker.Update(Box)));
+    Tracked := Tracker.Update(Box);
+    AssertEquals('frame 8 count', 1, Length(Tracked));
+    AssertEquals('frame 8 new id', 2, Tracked[0].TrackId);
+
+    Tracker.Reset;
+    Box[0].Score := 0.5;
+    AssertEquals('score at track_thresh dropped', 0, Length(Tracker.Update(Box)));
+    Box[0].Score := 0.9;
+    AssertEquals('frame 2 birth unconfirmed', 0, Length(Tracker.Update(Box)));
+    Tracked := Tracker.Update(Box);
+    AssertEquals('frame 3 count', 1, Length(Tracked));
+    AssertEquals('threshold box spent no id', 1, Tracked[0].TrackId);
+  finally
+    Tracker.Free;
   end;
 end;
 

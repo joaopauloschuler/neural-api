@@ -16716,6 +16716,78 @@ procedure ScaleYoloBoxesToImage(var Dets: TYoloDetectionArray; NetSize,
   ImageWidth, ImageHeight: integer);
 
 type
+  // ByteTrack/SORT constant-velocity state: (cx, cy, a = w/h, h) and their
+  // velocities, in float64 like the reference kalman_filter.py.
+  TByteTrackKalman = record
+    Mean: array[0..7] of Double;
+    Covariance: array[0..7, 0..7] of Double;
+  end;
+
+// kalman_filter.py initiate: Mean := (CX, CY, Aspect, Height, 0, 0, 0, 0) with
+// the diagonal covariance scaled by Height.
+procedure ByteTrackKalmanInitiate(out Kalman: TByteTrackKalman;
+  CX, CY, Aspect, Height: Double);
+// kalman_filter.py predict / multi_predict: one dt = 1 constant-velocity step.
+procedure ByteTrackKalmanPredict(var Kalman: TByteTrackKalman);
+// kalman_filter.py update: corrects Kalman with the measured box (CX, CY, Aspect, Height).
+procedure ByteTrackKalmanUpdate(var Kalman: TByteTrackKalman;
+  CX, CY, Aspect, Height: Double);
+
+type
+  TByteTrackState = (btsTracked, btsLost, btsRemoved);
+
+  // One STrack of TByteTracker; the box is the Kalman mean.
+  TByteTrack = class
+  public
+    Kalman: TByteTrackKalman;
+    TrackId, ClassId, FrameId, StartFrame: integer;
+    Score: TNeuralFloat;
+    State: TByteTrackState;
+    IsActivated: boolean;
+    // True once BYTETracker.removed_stracks would hold this track id.
+    IsInRemovedList: boolean;
+    procedure GetBox(out X1, Y1, X2, Y2: TNeuralFloat);
+  end;
+  TByteTrackArray = array of TByteTrack;
+
+  // One TByteTracker.Update output: the Kalman xyxy box of an activated track,
+  // with the class id and score of the detection it last matched.
+  TByteTrackedBox = record
+    TrackId, ClassId: integer;
+    Score: TNeuralFloat;
+    X1, Y1, X2, Y2: TNeuralFloat;
+  end;
+  TByteTrackedBoxArray = array of TByteTrackedBox;
+
+  // ByteTrack (Zhang et al. ECCV 2022) multi-object tracker, a port of the official
+  // byte_tracker.py BYTETracker (mot20 = False). Class-agnostic; ids start at 1 per instance.
+  TByteTracker = class
+  private
+    FTrackThreshold, FMatchThreshold, FDetectionThreshold: Double;
+    FMaxTimeLost, FFrameId, FLastTrackId: integer;
+    FTracked, FLost: TByteTrackArray;
+    FCost, FExtendedCost: array of TNeuralFloat;
+    FAssignmentWork: TNeuralAssignmentWork;
+    procedure BuildIoUCost(const Tracks: TByteTrackArray;
+      const Detections: TYoloDetectionArray; const DetIndices: TNeuralIntegerArray;
+      FuseScore: boolean);
+    procedure AssignWithCostLimit(Rows, Cols: integer; CostLimit: Double;
+      out RowToCol, ColToRow: TNeuralIntegerArray);
+    procedure ApplyDetection(Track: TByteTrack; const Detection: TYoloDetection);
+  public
+    // TrackBuffer frames at 30 fps: max_time_lost = Trunc(FrameRate / 30 * TrackBuffer).
+    constructor Create(TrackThreshold: Double = 0.5; MatchThreshold: Double = 0.8;
+      TrackBuffer: integer = 30; FrameRate: integer = 30);
+    destructor Destroy; override;
+    // Frees every track; the next Update is frame 1 and the next id is 1.
+    procedure Reset;
+    // BYTETracker.update on one frame of pixel-space detections; returns the
+    // activated tracked boxes in the official tracked_stracks order.
+    function Update(const Detections: TYoloDetectionArray): TByteTrackedBoxArray;
+    property FrameId: integer read FFrameId;
+  end;
+
+type
   // ultralytics LetterBox geometry: the resize gain and where the resized
   // photo (ContentX x ContentY) sits inside the square net input.
   TYoloLetterbox = record
@@ -95417,6 +95489,493 @@ begin
     Dets[DetPos].X2 := EnsureRange((Dets[DetPos].X2 - PadX) / Gain, 0, ImageWidth);
     Dets[DetPos].Y2 := EnsureRange((Dets[DetPos].Y2 - PadY) / Gain, 0, ImageHeight);
   end;
+end;
+
+const
+  csByteTrackStdWeightPosition: Double = 1 / 20;
+  csByteTrackStdWeightVelocity: Double = 1 / 160;
+
+procedure ByteTrackKalmanInitiate(out Kalman: TByteTrackKalman;
+  CX, CY, Aspect, Height: Double);
+var
+  StateStd: array[0..7] of Double;
+  StatePos: integer;
+begin
+  FillChar(Kalman, SizeOf(Kalman), 0);
+  Kalman.Mean[0] := CX;
+  Kalman.Mean[1] := CY;
+  Kalman.Mean[2] := Aspect;
+  Kalman.Mean[3] := Height;
+  StateStd[0] := 2 * csByteTrackStdWeightPosition * Height;
+  StateStd[1] := StateStd[0];
+  StateStd[2] := 1e-2;
+  StateStd[3] := StateStd[0];
+  StateStd[4] := 10 * csByteTrackStdWeightVelocity * Height;
+  StateStd[5] := StateStd[4];
+  StateStd[6] := 1e-5;
+  StateStd[7] := StateStd[4];
+  for StatePos := 0 to 7 do
+    Kalman.Covariance[StatePos, StatePos] := Sqr(StateStd[StatePos]);
+end;
+
+procedure ByteTrackKalmanPredict(var Kalman: TByteTrackKalman);
+var
+  MotionStd: array[0..7] of Double;
+  MovedRows: array[0..7, 0..7] of Double;
+  RowPos, ColPos: integer;
+begin
+  // The motion noise scales with the height BEFORE the step, as in predict().
+  MotionStd[0] := csByteTrackStdWeightPosition * Kalman.Mean[3];
+  MotionStd[1] := MotionStd[0];
+  MotionStd[2] := 1e-2;
+  MotionStd[3] := MotionStd[0];
+  MotionStd[4] := csByteTrackStdWeightVelocity * Kalman.Mean[3];
+  MotionStd[5] := MotionStd[4];
+  MotionStd[6] := 1e-5;
+  MotionStd[7] := MotionStd[4];
+  for RowPos := 0 to 3 do
+    Kalman.Mean[RowPos] := Kalman.Mean[RowPos] + Kalman.Mean[RowPos + 4];
+  // F P F^T with F = [[I, I], [0, I]]: add the velocity rows, then columns.
+  for RowPos := 0 to 7 do
+    for ColPos := 0 to 7 do
+      if RowPos < 4 then
+        MovedRows[RowPos, ColPos] := Kalman.Covariance[RowPos, ColPos] +
+          Kalman.Covariance[RowPos + 4, ColPos]
+      else
+        MovedRows[RowPos, ColPos] := Kalman.Covariance[RowPos, ColPos];
+  for RowPos := 0 to 7 do
+    for ColPos := 0 to 7 do
+      if ColPos < 4 then
+        Kalman.Covariance[RowPos, ColPos] := MovedRows[RowPos, ColPos] +
+          MovedRows[RowPos, ColPos + 4]
+      else
+        Kalman.Covariance[RowPos, ColPos] := MovedRows[RowPos, ColPos];
+  for RowPos := 0 to 7 do
+    Kalman.Covariance[RowPos, RowPos] := Kalman.Covariance[RowPos, RowPos] +
+      Sqr(MotionStd[RowPos]);
+end;
+
+procedure ByteTrackKalmanUpdate(var Kalman: TByteTrackKalman;
+  CX, CY, Aspect, Height: Double);
+var
+  Projected, Lower: array[0..3, 0..3] of Double;
+  Gain, GainTimesProjected: array[0..7, 0..3] of Double;
+  Innovation, Solved: array[0..3] of Double;
+  MeasurementStd, Sum: Double;
+  RowPos, ColPos, InnerPos: integer;
+begin
+  FillChar(Lower, SizeOf(Lower), 0);
+  FillChar(Gain, SizeOf(Gain), 0);
+  FillChar(Solved, SizeOf(Solved), 0);
+  MeasurementStd := csByteTrackStdWeightPosition * Kalman.Mean[3];
+  for RowPos := 0 to 3 do
+    for ColPos := 0 to 3 do
+      Projected[RowPos, ColPos] := Kalman.Covariance[RowPos, ColPos];
+  Projected[0, 0] := Projected[0, 0] + Sqr(MeasurementStd);
+  Projected[1, 1] := Projected[1, 1] + Sqr(MeasurementStd);
+  Projected[2, 2] := Projected[2, 2] + Sqr(1e-1);
+  Projected[3, 3] := Projected[3, 3] + Sqr(MeasurementStd);
+  // cho_factor: Projected = Lower Lower^T.
+  for RowPos := 0 to 3 do
+    for ColPos := 0 to RowPos do
+    begin
+      Sum := Projected[RowPos, ColPos];
+      for InnerPos := 0 to ColPos - 1 do
+        Sum := Sum - Lower[RowPos, InnerPos] * Lower[ColPos, InnerPos];
+      if RowPos = ColPos then
+        Lower[RowPos, RowPos] := Sqrt(Sum)
+      else
+        Lower[RowPos, ColPos] := Sum / Lower[ColPos, ColPos];
+    end;
+  // cho_solve: row RowPos of the gain solves Projected x = (H P)[:, RowPos].
+  for RowPos := 0 to 7 do
+  begin
+    for ColPos := 0 to 3 do
+    begin
+      Sum := Kalman.Covariance[ColPos, RowPos];
+      for InnerPos := 0 to ColPos - 1 do
+        Sum := Sum - Lower[ColPos, InnerPos] * Solved[InnerPos];
+      Solved[ColPos] := Sum / Lower[ColPos, ColPos];
+    end;
+    for ColPos := 3 downto 0 do
+    begin
+      Sum := Solved[ColPos];
+      for InnerPos := ColPos + 1 to 3 do
+        Sum := Sum - Lower[InnerPos, ColPos] * Gain[RowPos, InnerPos];
+      Gain[RowPos, ColPos] := Sum / Lower[ColPos, ColPos];
+    end;
+  end;
+  Innovation[0] := CX - Kalman.Mean[0];
+  Innovation[1] := CY - Kalman.Mean[1];
+  Innovation[2] := Aspect - Kalman.Mean[2];
+  Innovation[3] := Height - Kalman.Mean[3];
+  for RowPos := 0 to 7 do
+  begin
+    Sum := Kalman.Mean[RowPos];
+    for ColPos := 0 to 3 do
+      Sum := Sum + Gain[RowPos, ColPos] * Innovation[ColPos];
+    Kalman.Mean[RowPos] := Sum;
+  end;
+  // covariance - K S K^T, the form of the reference update().
+  for RowPos := 0 to 7 do
+    for ColPos := 0 to 3 do
+    begin
+      Sum := 0;
+      for InnerPos := 0 to 3 do
+        Sum := Sum + Gain[RowPos, InnerPos] * Projected[InnerPos, ColPos];
+      GainTimesProjected[RowPos, ColPos] := Sum;
+    end;
+  for RowPos := 0 to 7 do
+    for ColPos := 0 to 7 do
+    begin
+      Sum := 0;
+      for InnerPos := 0 to 3 do
+        Sum := Sum + GainTimesProjected[RowPos, InnerPos] * Gain[ColPos, InnerPos];
+      Kalman.Covariance[RowPos, ColPos] := Kalman.Covariance[RowPos, ColPos] - Sum;
+    end;
+end;
+
+// cython_bbox bbox_overlaps (the official iou_distance): +1 pixel on x2 and y2.
+function ByteTrackBoxIoU(AX1, AY1, AX2, AY2,
+  BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
+begin
+  Result := NeuralBoxIoU(AX1, AY1, AX2 + 1, AY2 + 1, BX1, BY1, BX2 + 1, BY2 + 1);
+end;
+
+procedure ByteTrackDetectionToXYAH(const Detection: TYoloDetection;
+  out CX, CY, Aspect, Height: Double);
+var
+  Width: Double;
+begin
+  Width := Detection.X2 - Detection.X1;
+  Height := Detection.Y2 - Detection.Y1;
+  CX := Detection.X1 + Width / 2;
+  CY := Detection.Y1 + Height / 2;
+  Aspect := Width / Height;
+end;
+
+procedure AppendByteTrack(var Tracks: TByteTrackArray; Track: TByteTrack);
+begin
+  SetLength(Tracks, Length(Tracks) + 1);
+  Tracks[High(Tracks)] := Track;
+end;
+
+procedure AppendByteTrackIndex(var Indices: TNeuralIntegerArray; Index: integer);
+begin
+  SetLength(Indices, Length(Indices) + 1);
+  Indices[High(Indices)] := Index;
+end;
+
+function ByteTrackArrayContains(const Tracks: TByteTrackArray;
+  Track: TByteTrack): boolean;
+var
+  TrackPos, MaxTrackPos: integer;
+begin
+  Result := False;
+  MaxTrackPos := High(Tracks);
+  for TrackPos := 0 to MaxTrackPos do
+    if Tracks[TrackPos] = Track then Exit(True);
+end;
+
+procedure TByteTrack.GetBox(out X1, Y1, X2, Y2: TNeuralFloat);
+var
+  Left, Top, Width, Height: Double;
+begin
+  Height := Kalman.Mean[3];
+  Width := Kalman.Mean[2] * Height;
+  Left := Kalman.Mean[0] - Width / 2;
+  Top := Kalman.Mean[1] - Height / 2;
+  X1 := Left;
+  Y1 := Top;
+  X2 := Left + Width;
+  Y2 := Top + Height;
+end;
+
+constructor TByteTracker.Create(TrackThreshold: Double; MatchThreshold: Double;
+  TrackBuffer: integer; FrameRate: integer);
+begin
+  inherited Create;
+  FTrackThreshold := TrackThreshold;
+  FMatchThreshold := MatchThreshold;
+  FDetectionThreshold := TrackThreshold + 0.1;
+  FMaxTimeLost := Trunc(FrameRate / 30.0 * TrackBuffer);
+end;
+
+destructor TByteTracker.Destroy;
+begin
+  Reset;
+  inherited Destroy;
+end;
+
+procedure TByteTracker.Reset;
+var
+  TrackPos, MaxTrackPos: integer;
+begin
+  MaxTrackPos := High(FTracked);
+  for TrackPos := 0 to MaxTrackPos do FTracked[TrackPos].Free;
+  MaxTrackPos := High(FLost);
+  for TrackPos := 0 to MaxTrackPos do FLost[TrackPos].Free;
+  FTracked := nil;
+  FLost := nil;
+  FFrameId := 0;
+  FLastTrackId := 0;
+end;
+
+procedure TByteTracker.BuildIoUCost(const Tracks: TByteTrackArray;
+  const Detections: TYoloDetectionArray; const DetIndices: TNeuralIntegerArray;
+  FuseScore: boolean);
+var
+  TrackPos, MaxTrackPos, DetPos, MaxDetPos, DetCount, DetIndex, RowBase: integer;
+  X1, Y1, X2, Y2, IoU: TNeuralFloat;
+begin
+  DetCount := Length(DetIndices);
+  if Length(FCost) < Length(Tracks) * DetCount then
+    SetLength(FCost, Length(Tracks) * DetCount);
+  MaxTrackPos := High(Tracks);
+  MaxDetPos := DetCount - 1;
+  for TrackPos := 0 to MaxTrackPos do
+  begin
+    Tracks[TrackPos].GetBox(X1, Y1, X2, Y2);
+    RowBase := TrackPos * DetCount;
+    for DetPos := 0 to MaxDetPos do
+    begin
+      DetIndex := DetIndices[DetPos];
+      IoU := ByteTrackBoxIoU(X1, Y1, X2, Y2, Detections[DetIndex].X1,
+        Detections[DetIndex].Y1, Detections[DetIndex].X2, Detections[DetIndex].Y2);
+      if FuseScore then IoU := IoU * Detections[DetIndex].Score;
+      FCost[RowBase + DetPos] := 1 - IoU;
+    end;
+  end;
+end;
+
+procedure TByteTracker.AssignWithCostLimit(Rows, Cols: integer;
+  CostLimit: Double; out RowToCol, ColToRow: TNeuralIntegerArray);
+var
+  ExtendedCols, RowPos, MaxRowPos, ColPos, MaxColPos, MaxExtendedColPos: integer;
+  ExtendedRowToCol: TNeuralIntegerArray;
+begin
+  SetLength(RowToCol, Rows);
+  SetLength(ColToRow, Cols);
+  MaxRowPos := Rows - 1;
+  MaxColPos := Cols - 1;
+  for RowPos := 0 to MaxRowPos do RowToCol[RowPos] := -1;
+  for ColPos := 0 to MaxColPos do ColToRow[ColPos] := -1;
+  if (Rows = 0) or (Cols = 0) then Exit;
+  // lapjv(extend_cost=True, cost_limit): Rows dummy columns at CostLimit each, so
+  // a pair is taken only when its cost beats leaving its row and column unmatched.
+  ExtendedCols := Cols + Rows;
+  MaxExtendedColPos := ExtendedCols - 1;
+  if Length(FExtendedCost) < Rows * ExtendedCols then
+    SetLength(FExtendedCost, Rows * ExtendedCols);
+  for RowPos := 0 to MaxRowPos do
+    for ColPos := 0 to MaxExtendedColPos do
+      if ColPos < Cols then
+        FExtendedCost[RowPos * ExtendedCols + ColPos] := FCost[RowPos * Cols + ColPos]
+      else
+        FExtendedCost[RowPos * ExtendedCols + ColPos] := CostLimit;
+  SetLength(ExtendedRowToCol, Rows);
+  NeuralLinearSumAssignment(FExtendedCost, Rows, ExtendedCols, ExtendedRowToCol,
+    FAssignmentWork);
+  for RowPos := 0 to MaxRowPos do
+  begin
+    ColPos := ExtendedRowToCol[RowPos];
+    if (ColPos >= 0) and (ColPos < Cols) and
+      (FCost[RowPos * Cols + ColPos] < CostLimit) then
+    begin
+      RowToCol[RowPos] := ColPos;
+      ColToRow[ColPos] := RowPos;
+    end;
+  end;
+end;
+
+procedure TByteTracker.ApplyDetection(Track: TByteTrack;
+  const Detection: TYoloDetection);
+var
+  CX, CY, Aspect, Height: Double;
+begin
+  ByteTrackDetectionToXYAH(Detection, CX, CY, Aspect, Height);
+  ByteTrackKalmanUpdate(Track.Kalman, CX, CY, Aspect, Height);
+  Track.State := btsTracked;
+  Track.IsActivated := True;
+  Track.FrameId := FFrameId;
+  Track.Score := Detection.Score;
+  Track.ClassId := Detection.ClassId;
+end;
+
+function TByteTracker.Update(const Detections: TYoloDetectionArray): TByteTrackedBoxArray;
+var
+  HighDetIndices, LowDetIndices, RemainHighDetIndices: TNeuralIntegerArray;
+  RowToCol, ColToRow: TNeuralIntegerArray;
+  Pool, Unconfirmed, RemainTracked, Births, Refound, NewlyLost, Removed: TByteTrackArray;
+  NewTracked, NewLost, OldTracks: TByteTrackArray;
+  IsDuplicateTracked, IsDuplicateLost: array of boolean;
+  Track: TByteTrack;
+  DetPos, MaxDetPos, TrackPos, MaxTrackPos, LostPos, MaxLostPos: integer;
+  OutputCount: integer;
+  CX, CY, Aspect, Height: Double;
+  AX1, AY1, AX2, AY2, BX1, BY1, BX2, BY2: TNeuralFloat;
+begin
+  Inc(FFrameId);
+  // Official split: high = score > track_thresh, low = 0.1 < score < track_thresh.
+  MaxDetPos := High(Detections);
+  for DetPos := 0 to MaxDetPos do
+  begin
+    if Detections[DetPos].Y2 <= Detections[DetPos].Y1 then Continue;
+    if Detections[DetPos].Score > FTrackThreshold then
+      AppendByteTrackIndex(HighDetIndices, DetPos)
+    else if (Detections[DetPos].Score > 0.1) and
+      (Detections[DetPos].Score < FTrackThreshold) then
+      AppendByteTrackIndex(LowDetIndices, DetPos);
+  end;
+  for Track in FTracked do
+    if Track.IsActivated then
+      AppendByteTrack(Pool, Track)
+    else
+      AppendByteTrack(Unconfirmed, Track);
+  for Track in FLost do AppendByteTrack(Pool, Track);
+  // multi_predict: unconfirmed tracks are not predicted; non-tracked ones lose vh.
+  for Track in Pool do
+  begin
+    if Track.State <> btsTracked then Track.Kalman.Mean[7] := 0;
+    ByteTrackKalmanPredict(Track.Kalman);
+  end;
+  // Step 2: high-score detections vs tracked + lost, IoU fused with the score.
+  BuildIoUCost(Pool, Detections, HighDetIndices, True);
+  AssignWithCostLimit(Length(Pool), Length(HighDetIndices), FMatchThreshold,
+    RowToCol, ColToRow);
+  MaxTrackPos := High(Pool);
+  for TrackPos := 0 to MaxTrackPos do
+  begin
+    Track := Pool[TrackPos];
+    if RowToCol[TrackPos] >= 0 then
+    begin
+      if Track.State <> btsTracked then AppendByteTrack(Refound, Track);
+      ApplyDetection(Track, Detections[HighDetIndices[RowToCol[TrackPos]]]);
+    end
+    else if Track.State = btsTracked then
+      AppendByteTrack(RemainTracked, Track);
+  end;
+  MaxDetPos := High(HighDetIndices);
+  for DetPos := 0 to MaxDetPos do
+    if ColToRow[DetPos] < 0 then
+      AppendByteTrackIndex(RemainHighDetIndices, HighDetIndices[DetPos]);
+  // Step 3: low-score detections vs the still unmatched tracked tracks, plain IoU.
+  BuildIoUCost(RemainTracked, Detections, LowDetIndices, False);
+  AssignWithCostLimit(Length(RemainTracked), Length(LowDetIndices), 0.5,
+    RowToCol, ColToRow);
+  MaxTrackPos := High(RemainTracked);
+  for TrackPos := 0 to MaxTrackPos do
+    if RowToCol[TrackPos] >= 0 then
+      ApplyDetection(RemainTracked[TrackPos],
+        Detections[LowDetIndices[RowToCol[TrackPos]]])
+    else
+    begin
+      RemainTracked[TrackPos].State := btsLost;
+      AppendByteTrack(NewlyLost, RemainTracked[TrackPos]);
+    end;
+  // Unconfirmed tracks (one frame old) vs the high-score leftovers.
+  BuildIoUCost(Unconfirmed, Detections, RemainHighDetIndices, True);
+  AssignWithCostLimit(Length(Unconfirmed), Length(RemainHighDetIndices), 0.7,
+    RowToCol, ColToRow);
+  MaxTrackPos := High(Unconfirmed);
+  for TrackPos := 0 to MaxTrackPos do
+    if RowToCol[TrackPos] >= 0 then
+      ApplyDetection(Unconfirmed[TrackPos],
+        Detections[RemainHighDetIndices[RowToCol[TrackPos]]])
+    else
+    begin
+      Unconfirmed[TrackPos].State := btsRemoved;
+      AppendByteTrack(Removed, Unconfirmed[TrackPos]);
+    end;
+  // Step 4: births; an id is spent even if the track is never confirmed.
+  MaxDetPos := High(RemainHighDetIndices);
+  for DetPos := 0 to MaxDetPos do
+    if (ColToRow[DetPos] < 0) and
+      (Detections[RemainHighDetIndices[DetPos]].Score >= FDetectionThreshold) then
+    begin
+      Track := TByteTrack.Create;
+      Inc(FLastTrackId);
+      Track.TrackId := FLastTrackId;
+      ByteTrackDetectionToXYAH(Detections[RemainHighDetIndices[DetPos]],
+        CX, CY, Aspect, Height);
+      ByteTrackKalmanInitiate(Track.Kalman, CX, CY, Aspect, Height);
+      Track.State := btsTracked;
+      Track.IsActivated := FFrameId = 1;
+      Track.FrameId := FFrameId;
+      Track.StartFrame := FFrameId;
+      Track.Score := Detections[RemainHighDetIndices[DetPos]].Score;
+      Track.ClassId := Detections[RemainHighDetIndices[DetPos]].ClassId;
+      AppendByteTrack(Births, Track);
+    end;
+  // Step 5: lost tracks past max_time_lost.
+  for Track in FLost do
+    if FFrameId - Track.FrameId > FMaxTimeLost then
+    begin
+      Track.State := btsRemoved;
+      AppendByteTrack(Removed, Track);
+    end;
+  for Track in FTracked do
+    if Track.State = btsTracked then AppendByteTrack(NewTracked, Track);
+  for Track in Births do AppendByteTrack(NewTracked, Track);
+  for Track in Refound do AppendByteTrack(NewTracked, Track);
+  // sub_stracks against removed_stracks BEFORE this frame's removals join it, so
+  // a track timed out here stays lost (and matchable) for one more frame.
+  for Track in FLost do
+    if (Track.State <> btsTracked) and not Track.IsInRemovedList then
+      AppendByteTrack(NewLost, Track);
+  for Track in NewlyLost do
+    if not Track.IsInRemovedList then AppendByteTrack(NewLost, Track);
+  for Track in Removed do Track.IsInRemovedList := True;
+  // remove_duplicate_stracks: of a pair with IoU distance < 0.15 the younger goes.
+  SetLength(IsDuplicateTracked, Length(NewTracked));
+  SetLength(IsDuplicateLost, Length(NewLost));
+  MaxTrackPos := High(NewTracked);
+  MaxLostPos := High(NewLost);
+  for TrackPos := 0 to MaxTrackPos do IsDuplicateTracked[TrackPos] := False;
+  for LostPos := 0 to MaxLostPos do IsDuplicateLost[LostPos] := False;
+  for TrackPos := 0 to MaxTrackPos do
+  begin
+    NewTracked[TrackPos].GetBox(AX1, AY1, AX2, AY2);
+    for LostPos := 0 to MaxLostPos do
+    begin
+      NewLost[LostPos].GetBox(BX1, BY1, BX2, BY2);
+      if 1 - ByteTrackBoxIoU(AX1, AY1, AX2, AY2, BX1, BY1, BX2, BY2) < 0.15 then
+      begin
+        if NewTracked[TrackPos].FrameId - NewTracked[TrackPos].StartFrame >
+          NewLost[LostPos].FrameId - NewLost[LostPos].StartFrame then
+          IsDuplicateLost[LostPos] := True
+        else
+          IsDuplicateTracked[TrackPos] := True;
+      end;
+    end;
+  end;
+  for Track in FTracked do AppendByteTrack(OldTracks, Track);
+  for Track in FLost do AppendByteTrack(OldTracks, Track);
+  for Track in Births do AppendByteTrack(OldTracks, Track);
+  FTracked := nil;
+  FLost := nil;
+  for TrackPos := 0 to MaxTrackPos do
+    if not IsDuplicateTracked[TrackPos] then AppendByteTrack(FTracked, NewTracked[TrackPos]);
+  for LostPos := 0 to MaxLostPos do
+    if not IsDuplicateLost[LostPos] then AppendByteTrack(FLost, NewLost[LostPos]);
+  for Track in OldTracks do
+    if not ByteTrackArrayContains(FTracked, Track) and
+      not ByteTrackArrayContains(FLost, Track) then
+      Track.Free;
+  Result := nil;
+  SetLength(Result, Length(FTracked));
+  OutputCount := 0;
+  for Track in FTracked do
+    if Track.IsActivated then
+    begin
+      Result[OutputCount].TrackId := Track.TrackId;
+      Result[OutputCount].ClassId := Track.ClassId;
+      Result[OutputCount].Score := Track.Score;
+      Track.GetBox(Result[OutputCount].X1, Result[OutputCount].Y1,
+        Result[OutputCount].X2, Result[OutputCount].Y2);
+      Inc(OutputCount);
+    end;
+  SetLength(Result, OutputCount);
 end;
 
 procedure LetterboxYoloImage(Image, NetInput: TNNetVolume; Size: integer;

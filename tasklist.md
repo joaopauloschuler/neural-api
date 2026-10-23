@@ -2207,16 +2207,22 @@ rather than acted on.
             the cost matrix exactly by default; `GreedyMatching` (saved in
             FStruct[1]) keeps the greedy path. `TestDETRSetPredictionLossExactVsGreedy`
             pins a 2x2 case where the two differ (L1 0.4 vs 0.6).
-      - [ ] `TByteTracker` (a plain class, not a layer) in neuralpretrained.pas
-            next to the YOLO helpers: constant-velocity xyah Kalman per
-            track (the ByteTrack/SORT 8-state filter), two-stage association
-            (high-score boxes first, then low-score boxes against the still
-            unmatched tracks), IoU cost through `NeuralBoxIoU`, track birth /
-            lost buffer / removal, defaults from the official BYTETracker
-            (track_thresh 0.5, match_thresh 0.8, track_buffer 30). Input is a
-            `TYoloDetectionArray` per frame; output adds a stable track id.
-            Parity: a fixed synthetic detection sequence vs the reference
-            byte_tracker.py logic (ids and boxes per frame).
+      - [X] `TByteTracker` in neuralpretrained.pas next to the YOLO helpers:
+            port of the official ifzhang byte_tracker.py BYTETracker (mot20 =
+            False, so fuse_score in the first and unconfirmed stages),
+            `ByteTrackKalmanInitiate/Predict/Update` (float64 xyah filter),
+            `Update(TYoloDetectionArray): TByteTrackedBoxArray` (track id,
+            class id, score, Kalman box), `Reset`, per-instance ids from 1.
+            lapjv cost_limit emulated by `NeuralLinearSumAssignment` on Rows x
+            (Cols + Rows) with dummy columns at the limit; ties among equal
+            optimal assignments may resolve differently and a pair at exactly
+            the limit is rejected. IoU keeps cython_bbox's +1 pixel. Kept
+            official quirks: score == track_thresh is dropped, unconfirmed
+            births spend an id, a timed-out lost track stays matchable one
+            more frame. Deviation: boxes with y2 <= y1 are skipped. Tested by
+            `TestByteTrackKalmanPredictUpdate`, `TestByteTrackerSyntheticSequence`,
+            `TestByteTrackerLostBufferAndReset`; no run against the Python
+            reference.
       - [ ] examples/ObjectTracking: a folder of frames (move the
             `ListFrames` routine of examples/VideoMatting into a shared unit
             so both examples use one copy) -> YOLO per frame -> tracker ->
