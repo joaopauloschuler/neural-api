@@ -380,9 +380,13 @@ rather than acted on.
         1.7 GB RSS on CPU (dev box). Find which activations dominate (the
         full-res refiner maps?) before 720p/1080p runs; check the low-memory
         mode and whether the full-res layers can drop their outputs early.
-  - [ ] `TNNetBoxFilter` OpenCL forward reuses `cai_pool2d` (O(r^2) taps per
-        output). If a fast_guided_filter refiner with a large radius is wired,
-        add a separable two-pass (row then column running-sum) kernel.
+  - [X] `TNNetBoxFilter` OpenCL forward: separable `cai_box_filter_pass`
+        launched twice (rows into a scratch buffer sized at arm / resize time,
+        then columns) by `TNNetBoxFilterCL`; a direct clipped (2r+1)-tap sum
+        per pass (no running-sum drift, every work-item independent), so
+        2(2r+1) taps per output instead of (2r+1)^2. Parity vs CPU <= 3.6e-7
+        over 9 shapes incl. r = 0 and radii past both sides
+        (BoxFilterOpenCLParity). The GPU-box throughput is unmeasured.
   - [X] fast_guided_filter refiner and segmentation_pass: `TRVMConfig.Refiner`
         (auto: fast_guided_filter when `refiner.box_filter.weight` is absent,
         since that refiner has no weights; overridable) and

@@ -3784,6 +3784,38 @@ __kernel void cai_pool2d
   }
 }
 
+// One pass of the separable TNNetBoxFilter (zero padding, fixed divisor): each
+// output cell sums its clipped (2r+1)-tap window along ONE axis and scales it.
+// The axis is given by its element stride and length in the depth-contiguous
+// volume: rows FAxisStride = Depth, FAxisLength = SizeX; columns FAxisStride =
+// SizeX*Depth, FAxisLength = SizeY. A direct sum (not a running sum) keeps every
+// work-item independent and free of float drift: 2(2r+1) taps per output for
+// the two passes against (2r+1)^2 for one 2-D window. Global size = FTotal.
+__kernel void cai_box_filter_pass
+(
+  const int FTotal,
+  const int FAxisStride,
+  const int FAxisLength,
+  const int FRadius,
+  const float FScale,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int gid = get_global_id(0);
+  if (gid >= FTotal) return;
+  const int pos = (gid / FAxisStride) % FAxisLength;
+  int firstTap = pos - FRadius;
+  if (firstTap < 0) firstTap = 0;
+  int lastTap = pos + FRadius;
+  if (lastTap > FAxisLength - 1) lastTap = FAxisLength - 1;
+  const int lineBase = gid - pos * FAxisStride;
+  float s = 0.0f;
+  for (int tap = firstTap; tap <= lastTap; tap++)
+    s += FSrc[lineBase + tap * FAxisStride];
+  FDst[gid] = s * FScale;
+}
+
 // Token-gather embedding forward (TNNetEmbedding). The weight table FW is laid out
 // row-per-token, depth-contiguous (row t, embedding index e at FW[t*FEmbeddingSize + e]),
 // exactly FNeurons[0].Weights in the TVolume convention. FTokenRows holds one resolved

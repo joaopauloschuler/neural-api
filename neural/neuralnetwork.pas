@@ -6021,6 +6021,32 @@ type
     FOutputKernel: TNeuralKernel;
   end;
 
+  /// OpenCL forward helper for TNNetBoxFilter: two cai_box_filter_pass launches
+  // (rows into a scratch buffer, then columns) on one queue. Coded by Claude (AI).
+  TNNetBoxFilterCL = class(TNNetKernelCL)
+  private
+    // Persistent buffers (grow-only): uploaded source, row-pass scratch, result.
+    FBufX, FBufMid, FBufY: cl_mem;
+    FCapX, FCapMid, FCapY: csize_t;
+    // The kernel that wrote FBufY; nil before the first forward.
+    FOutputKernel: TNeuralKernel;
+    procedure RunPass(Total, AxisStride, AxisLength, Radius: integer;
+      Scale: TNeuralFloat; Src, Dst: cl_mem);
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Sizes the scratch and result buffers for Output (call at arm / resize time).
+    procedure PrepareBuffers(Output: TNNetVolume);
+    // Y := box filter of X (SizeX x SizeY x Depth of Y); pExternalSrc is bound.
+    procedure Filter(X, Y: TNNetVolume; Radius: integer;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    // The queue both passes run on (set from Create, unlike OutputKernel).
+    function ForwardKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   /// OpenCL forward helper for TNNetRoIAlign (cai_roi_align): one work-item per
   // output cell averages its bilinear samples. Coded by Claude (AI).
   TNNetRoIAlignCL = class(TNNetKernelCL)
@@ -17961,7 +17987,7 @@ type
       // SizeX*Depth zeros, read in place of an out-of-range tap.
       FZeroRow: TNNetVolume;
       {$IFDEF OpenCL}
-      FPool2DCL: TNNetPool2DCL;
+      FBoxFilterCL: TNNetBoxFilterCL;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // Dest columns StartX..FinX := box filter of Source; Dest may be Source only
@@ -17988,6 +18014,7 @@ type
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
       {$ENDIF}
       property Radius: integer read FRadius;
   end;
@@ -42415,6 +42442,90 @@ begin
     FKernel.ReadBuffer(bufY, Y, CL_TRUE);
   end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
+end;
+
+{ TNNetBoxFilterCL }
+
+constructor TNNetBoxFilterCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_box_filter_pass');
+end;
+
+destructor TNNetBoxFilterCL.Destroy();
+begin
+  if Assigned(FBufX) then clReleaseMemObject(FBufX);
+  if Assigned(FBufMid) then clReleaseMemObject(FBufMid);
+  if Assigned(FBufY) then clReleaseMemObject(FBufY);
+  inherited Destroy();
+end;
+
+procedure TNNetBoxFilterCL.PrepareBuffers(Output: TNNetVolume);
+begin
+  if Output.Size < 1 then exit;
+  FKernel.EnsureOutputBuffer(FBufMid, FCapMid, Output);
+  FKernel.EnsureOutputBuffer(FBufY, FCapY, Output);
+end;
+
+procedure TNNetBoxFilterCL.RunPass(Total, AxisStride, AxisLength,
+  Radius: integer; Scale: TNeuralFloat; Src, Dst: cl_mem);
+var
+  k: cl_kernel;
+  fScale: single;
+begin
+  k := FKernel.Kernel;
+  fScale := Scale;
+  clSetKernelArg(k, 0, csLongintSize, @Total);
+  clSetKernelArg(k, 1, csLongintSize, @AxisStride);
+  clSetKernelArg(k, 2, csLongintSize, @AxisLength);
+  clSetKernelArg(k, 3, csLongintSize, @Radius);
+  clSetKernelArg(k, 4, csNeuralFloatSize, @fScale);
+  clSetKernelArg(k, 5, csCLMemSize, @Src);
+  clSetKernelArg(k, 6, csCLMemSize, @Dst);
+  FKernel.RunKernel(k, Total);
+end;
+
+procedure TNNetBoxFilterCL.Filter(X, Y: TNNetVolume; Radius: integer;
+  pExternalSrc: cl_mem; pKeepResultOnOpenCL: boolean);
+var
+  bufX, bufMid, bufY: cl_mem;
+begin
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  // Sized by PrepareBuffers; these only reallocate if Y outgrew them.
+  bufMid := FKernel.EnsureOutputBuffer(FBufMid, FCapMid, Y);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  // Both passes on one in-order queue: the column pass sees the whole row pass.
+  RunPass(Y.Size, Y.Depth, Y.SizeX, Radius, 1, bufX, bufMid);
+  RunPass(Y.Size, Y.SizeX * Y.Depth, Y.SizeY, Radius, 1 / Sqr(2 * Radius + 1),
+    bufMid, bufY);
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+end;
+
+function TNNetBoxFilterCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetBoxFilterCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
+function TNNetBoxFilterCL.ForwardKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetBoxFilterCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufX) + OpenCLMemBytes(FBufMid) +
+    OpenCLMemBytes(FBufY);
 end;
 
 { TNNetRoIAlignCL }
@@ -99617,7 +99728,7 @@ end;
 destructor TNNetBoxFilter.Destroy();
 begin
   {$IFDEF OpenCL}
-  if Assigned(FPool2DCL) then FreeAndNil(FPool2DCL);
+  if Assigned(FBoxFilterCL) then FreeAndNil(FBoxFilterCL);
   {$ENDIF}
   FZeroRow.Free;
   FRowPass.Free;
@@ -99632,6 +99743,7 @@ begin
   FZeroRow.Fill(0);
   {$IFDEF OpenCL}
   FShouldOpenCL := (Int64(FOutput.Size) >= cNeuralOpenCLMinWork);
+  if Assigned(FBoxFilterCL) then FBoxFilterCL.PrepareBuffers(FOutput);
   {$ENDIF}
 end;
 
@@ -99729,46 +99841,52 @@ end;
 {$IFDEF OpenCL}
 function TNNetBoxFilter.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FPool2DCL) and FHasOpenCL and
+  Result := Assigned(FBoxFilterCL) and FHasOpenCL and
     (FShouldOpenCL or FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
 
 procedure TNNetBoxFilter.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
-  if Assigned(FNN) and not Assigned(FPool2DCL) then
-    FPool2DCL := TNNetPool2DCL.Create(FNN);
+  if Assigned(FNN) and not Assigned(FBoxFilterCL) then
+    FBoxFilterCL := TNNetBoxFilterCL.Create(FNN);
+  if Assigned(FBoxFilterCL) then FBoxFilterCL.PrepareBuffers(FOutput);
 end;
 
 procedure TNNetBoxFilter.DisableOpenCL();
 begin
-  // FPool2DCL owns the buffer a kept output lives in.
+  // FBoxFilterCL owns the buffer a kept output lives in.
   ForceOutputOnRAM();
   FOutputOnOpenCL := false;
   inherited DisableOpenCL();
-  FreeAndNil(FPool2DCL);
+  FreeAndNil(FBoxFilterCL);
 end;
 
 function TNNetBoxFilter.OpenCLOutputBuffer(): cl_mem;
 begin
-  if Assigned(FPool2DCL) then Result := FPool2DCL.ResultBuffer()
+  if Assigned(FBoxFilterCL) then Result := FBoxFilterCL.ResultBuffer()
   else Result := nil;
 end;
 
 function TNNetBoxFilter.OpenCLOutputKernel(): TNeuralKernel;
 begin
-  if Assigned(FPool2DCL) then Result := FPool2DCL.OutputKernel()
+  if Assigned(FBoxFilterCL) then Result := FBoxFilterCL.OutputKernel()
   else Result := nil;
+end;
+
+function TNNetBoxFilter.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FBoxFilterCL) then Result := Result + FBoxFilterCL.BufferBytes();
 end;
 {$ENDIF}
 
-// cai_pool2d at stride 1, padding r and the full (2r+1)^2 divisor is this map.
+// Two separable cai_box_filter_pass launches (rows, then columns).
 function TNNetBoxFilter.ComputeOnOpenCL(StartTime: double): boolean;
 {$IFDEF OpenCL}
 var
   SourceBuffer: cl_mem;
   KeepOnOpenCL: boolean;
-  WindowSize: integer;
 {$ENDIF}
 begin
   Result := false;
@@ -99779,7 +99897,7 @@ begin
     if PrevOutputOnOpenCL() then
     begin
       SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
-      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FPool2DCL.OutputKernel());
+      FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FBoxFilterCL.ForwardKernel());
     end
     else
     begin
@@ -99788,11 +99906,8 @@ begin
     end;
     // A trainable forward reads the result back for the host backward.
     KeepOnOpenCL := not FIsTrainable;
-    WindowSize := 2 * FRadius + 1;
-    FPool2DCL.Pool(FPrevLayer.FOutput, FOutput,
-      FOutput.SizeX, FOutput.SizeY, FOutput.Depth,
-      FOutput.SizeX, FOutput.SizeY, WindowSize, {Stride=}1, {Reduce=}1,
-      Sqr(WindowSize), SourceBuffer, KeepOnOpenCL, FRadius);
+    FBoxFilterCL.Filter(FPrevLayer.FOutput, FOutput, FRadius, SourceBuffer,
+      KeepOnOpenCL);
     FOutputOnOpenCL := KeepOnOpenCL;
     FOutputOnRAM := not KeepOnOpenCL;
     FForwardTime := FForwardTime + (Now() - StartTime);

@@ -92698,16 +92698,17 @@ begin
   end;
 end;
 
-// TNNetBoxFilter under ForceOpenCL (cai_pool2d) vs the host forward, non-square
-// maps incl. 1-wide sides and windows wider than the map. Coded by Claude (AI).
+// TNNetBoxFilter under ForceOpenCL (two cai_box_filter_pass launches) vs the host
+// forward: odd non-square maps, 1-wide sides, radius 0 and radii past both sides.
+// Coded by Claude (AI).
 procedure TTestNeuralNumerical.BoxFilterOpenCLParity;
 {$IFDEF OpenCL}
 const
-  CaseCount = 5;
-  SizeXs: array[0..CaseCount - 1] of integer = (7, 8, 1, 6, 9);
-  SizeYs: array[0..CaseCount - 1] of integer = (5, 3, 4, 1, 6);
-  Depths: array[0..CaseCount - 1] of integer = (3, 6, 3, 5, 4);
-  Radii: array[0..CaseCount - 1] of integer = (1, 2, 1, 2, 3);
+  CaseCount = 9;
+  SizeXs: array[0..CaseCount - 1] of integer = (7, 8, 1, 6, 9, 5, 13, 1, 11);
+  SizeYs: array[0..CaseCount - 1] of integer = (5, 3, 4, 1, 6, 4, 7, 1, 9);
+  Depths: array[0..CaseCount - 1] of integer = (3, 6, 3, 5, 4, 2, 5, 3, 1);
+  Radii: array[0..CaseCount - 1] of integer = (1, 2, 1, 2, 3, 6, 4, 2, 0);
 var
   NN: TNNet;
   InputA, InputB, OutCPUA, OutCPUB: TNNetVolume;
