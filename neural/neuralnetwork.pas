@@ -491,6 +491,14 @@ type
     SourceBoundCnt, SourcePulledToRAMCnt, ActivationUploadedCnt,
       StaleSuspectCnt, OutputResidentCnt: Int64;
   end;
+  // A half copy of a layer's OpenCL output that one int8 FP16 consumer cast
+  // during forward pass Pass, so the other consumers bind it (TNNet.ShareOpenCLHalfSourceCopies).
+  TNNetOpenCLHalfCopy = record
+    Pass: Int64;
+    SourceBuffer, HalfBuffer: cl_mem;
+    ElementCount: integer;
+    CastQueue: cl_command_queue;
+  end;
   {$ENDIF}
 
   /// neural network layer
@@ -636,6 +644,7 @@ type
       FOutputOnOpenCL: boolean;     // output is in device memory
       FOutputOnRAM: boolean;        // output is in host memory (FOutput.FData)
       FErrorOnOpenCL: boolean;      // gradient is in device memory
+      FOpenCLHalfCopy: TNNetOpenCLHalfCopy;
       // cai_gather_copy helper of a layer whose HasGatherCopyPlan is True, made
       // by EnableOpenCL; nil on every other layer.
       FGatherCopyCL: TNNetGatherCopyCL;
@@ -802,6 +811,16 @@ type
       // pSource.Output written (blocking) into pUploadBuffer, which is returned.
       function BindOrUploadOpenCLOperand(pSource: TNNetLayer;
         pConsumerKernel: TNeuralKernel; pUploadBuffer: cl_mem): cl_mem;
+      // The half copy of pSourceBuffer (this layer's output, pElementCount
+      // floats) cast earlier in forward pass pPass on pConsumerKernel's queue; nil when none.
+      function OpenCLHalfOutputCopy(pPass: Int64; pSourceBuffer: cl_mem;
+        pElementCount: integer; pConsumerKernel: TNeuralKernel): cl_mem;
+      // Records pHalfBuffer, cast from pSourceBuffer on pCastKernel's queue, as
+      // this layer's half output copy for forward pass pPass.
+      procedure PublishOpenCLHalfOutputCopy(pPass: Int64; pSourceBuffer,
+        pHalfBuffer: cl_mem; pElementCount: integer; pCastKernel: TNeuralKernel);
+      // cai_f32_to_half launches of this layer's FDotCL so far (0 without one).
+      function OpenCLCastFP16LaunchCount(): integer;
       // Tiled-GEMM launches of this layer's FDotCL so far (0 without one): the
       // test hook proving a window forward took the tiled int8/int4 kernel.
       function OpenCLTiledGemmLaunchCount(): integer;
@@ -20522,8 +20541,7 @@ type
       procedure PrepareForwardPass(FromLayerIdx: integer); virtual;
       {$IFDEF OpenCL}
       // Called after every forward, also one that raised. Does nothing here.
-      procedure ClearOverwrittenOutputFlags(FromLayerIdx,
-        EndLayerIdx: integer); virtual;
+      procedure FinishForwardPass(FromLayerIdx, EndLayerIdx: integer); virtual;
       // Waits for the commands already on the net's OpenCL queue. Does nothing here.
       procedure DrainOpenCLQueue(); virtual;
       {$ENDIF}
@@ -20730,16 +20748,21 @@ type
       // shared output buffer.
       FOpenCLOutputPlan: TNNetOutputSlotPlan;
       FOpenCLOutputSlots: array of cl_mem;
+      FShareOpenCLHalfSourceCopies: boolean;
+      // The running forward pass, unique across nets, while its int8 FP16
+      // consumers share half source copies; 0 otherwise (see PrepareForwardPass).
+      FOpenCLHalfCopyPass: Int64;
       // Gives each layer that CanShareOpenCLOutput a net-owned buffer reused by
       // liveness when ShareOpenCLOutputsByLiveness; the arming routines call it.
       procedure PlanOpenCLOutputSharing();
       // Drops the plan and the net's references; DisableOpenCL and Destroy call it.
       procedure ReleaseOpenCLOutputSlots();
-    protected
       // Clears the residency flag of every OpenCL or host output a layer in the
       // range overwrote.
-      procedure ClearOverwrittenOutputFlags(FromLayerIdx,
-        EndLayerIdx: integer); override;
+      procedure ClearOverwrittenOutputFlags(FromLayerIdx, EndLayerIdx: integer);
+    protected
+      // ClearOverwrittenOutputFlags, and ends the half source copies of the pass.
+      procedure FinishForwardPass(FromLayerIdx, EndLayerIdx: integer); override;
       // Waits for the net's shared queue (FDotProductKernel).
       procedure DrainOpenCLQueue(); override;
     private
@@ -22782,6 +22805,10 @@ type
       // queue only). Caller requirements: see TNNet.PlanOutputSlotsByLiveness.
       property ShareOpenCLOutputsByLiveness: boolean
         read FShareOpenCLOutputsByLiveness write FShareOpenCLOutputsByLiveness;
+      // True (default): the int8 FP16 consumers of one resident source bind one
+      // half copy per forward instead of each casting it (one shared queue only).
+      property ShareOpenCLHalfSourceCopies: boolean
+        read FShareOpenCLHalfSourceCopies write FShareOpenCLHalfSourceCopies;
       {$ENDIF}
       // Layers sharing another layer's host FOutput storage now, the shared
       // storage's bytes, and the bytes those outputs would take unshared.
@@ -25575,6 +25602,10 @@ function SelectKthSmallest(var Arr: array of TNeuralFloat;
   N, K: integer): TNeuralFloat; forward;
 
 {$IFDEF OpenCL}
+var
+  // Source of TNNet.FOpenCLHalfCopyPass: one id per forward pass of any net.
+  OpenCLHalfCopyPassCounter: Int64 = 0;
+
 // Work threshold (output-element MACs) gating the device offload of the
 // conv/elementwise layer family (conv variants, FullConnect's friends, the
 // norms, gates, softmax, RoPE, ...). Correctness is independent of it (the CPU
@@ -119927,8 +119958,9 @@ procedure TNNetConvolution.ComputeOpenCLQuantized(pPrevOutputBuffer: cl_mem;
   pIm2ColSrcBuffer: cl_mem);
 var
   ActOpcode: integer;
-  ActivationFunctionInOpenCL, OpenCLIm2Col: boolean;
+  ActivationFunctionInOpenCL, OpenCLIm2Col, SharesHalfSource: boolean;
   BiasVol: TNNetVolume;
+  HalfSourceBuffer: cl_mem;
 begin
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
@@ -119938,13 +119970,30 @@ begin
   if (pPrevOutputBuffer <> nil) or (pIm2ColSrcBuffer <> nil) then
     FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
   if OpenCLIm2Col then BuildIm2ColOnOpenCL(pIm2ColSrcBuffer);
+  // Every int8 FP16 consumer of one source binds the half copy the first one cast.
+  SharesHalfSource := (pPrevOutputBuffer <> nil) and FDotCL.FP16Activations and
+    (FNN.FOpenCLHalfCopyPass <> 0);
+  if SharesHalfSource then
+    HalfSourceBuffer := FPrevLayer.OpenCLHalfOutputCopy(FNN.FOpenCLHalfCopyPass,
+      pPrevOutputBuffer, FInputPrepared.Size, FDotCL.DotProductKernel)
+  else HalfSourceBuffer := nil;
 
   if FQuantInt4 then
     FDotCL.ComputeInt4(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
       BiasVol, {NewVBias}false, pPrevOutputBuffer)
+  else if HalfSourceBuffer <> nil then
+    FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}true,
+      BiasVol, {NewVBias}false, HalfSourceBuffer, {pExternalVBsIsHalf}true)
   else
+  begin
     FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
       BiasVol, {NewVBias}false, pPrevOutputBuffer);
+    // ComputeInt8 has just narrowed the bound source into its half B buffer.
+    if SharesHalfSource then
+      FPrevLayer.PublishOpenCLHalfOutputCopy(FNN.FOpenCLHalfCopyPass,
+        pPrevOutputBuffer, FDotCL.InputBufferBsFP16, FInputPrepared.Size,
+        FDotCL.DotProductKernel);
+  end;
 
   if ActivationFunctionInOpenCL then
   begin
@@ -124253,7 +124302,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetExecutionPlanner.ClearOverwrittenOutputFlags(FromLayerIdx,
+procedure TNNetExecutionPlanner.FinishForwardPass(FromLayerIdx,
   EndLayerIdx: integer);
 begin
 end;
@@ -124341,6 +124390,7 @@ begin
   FDotProductKernel := nil;
   FSharedKernels := nil;
   FOpenCLOwned := nil;
+  FShareOpenCLHalfSourceCopies := true;
   {$ENDIF}
 end;
 
@@ -145242,7 +145292,7 @@ begin
   end;
   {$IFDEF OpenCL}
   finally
-    ClearOverwrittenOutputFlags(FromLayerIdx, LastLayer);
+    FinishForwardPass(FromLayerIdx, LastLayer);
   end;
   {$ENDIF}
 end;
@@ -145883,7 +145933,7 @@ begin
   FSchedPool.StartProc({$IFDEF FPC}@RunInferenceSchedulerWorker{$ELSE}RunInferenceSchedulerWorker{$ENDIF});
   {$IFDEF OpenCL}
   finally
-    ClearOverwrittenOutputFlags(FromLayerIdx, LastLayer);
+    FinishForwardPass(FromLayerIdx, LastLayer);
   end;
   {$ENDIF}
   // StartProc joins (waits for every worker), so the pass is complete here:
@@ -147096,6 +147146,14 @@ begin
   FOpenCLOutputPlan := Default(TNNetOutputSlotPlan);
 end;
 
+// With the pass id at 0, a layer computed outside a forward pass (a direct
+// Compute loop) neither reads nor publishes a half source copy.
+procedure TNNet.FinishForwardPass(FromLayerIdx, EndLayerIdx: integer);
+begin
+  FOpenCLHalfCopyPass := 0;
+  ClearOverwrittenOutputFlags(FromLayerIdx, EndLayerIdx);
+end;
+
 // The overwritten data is gone, so a later ForceOutputOnRAM on such a layer
 // downloads its intact OpenCL copy or returns false, never another layer's output.
 procedure TNNet.ClearOverwrittenOutputFlags(FromLayerIdx,
@@ -147499,15 +147557,28 @@ var
 begin
   if FShareHostOutputsByLiveness or (FHostOutputPlanLayerCount >= 0) then
     PlanHostOutputSharing();
-  if FromLayerIdx <= 0 then exit;
-  HasSharedOutputs := Length(FHostOutputPlan.SlotBytes) > 0;
+  if FromLayerIdx > 0 then
+  begin
+    HasSharedOutputs := Length(FHostOutputPlan.SlotBytes) > 0;
+    {$IFDEF OpenCL}
+    HasSharedOutputs := HasSharedOutputs or (Length(FOpenCLOutputSlots) > 0);
+    {$ENDIF}
+    if HasSharedOutputs then
+      raise Exception.Create('TNNet.Compute: a forward from layer ' +
+        IntToStr(FromLayerIdx) + ' is refused while outputs are shared by ' +
+        'liveness: the last pass may have overwritten what it reads.');
+  end;
   {$IFDEF OpenCL}
-  HasSharedOutputs := HasSharedOutputs or (Length(FOpenCLOutputSlots) > 0);
+  // A fresh id per pass stands for every source's output version: within one
+  // pass each layer writes its output once, so a copy cast in it stays valid.
+  // Per-layer queues would need an event between the cast and each reader.
+  if FShareOpenCLHalfSourceCopies and FOpenCLFP16 and FHasSharedKernel and
+    Assigned(FDotProductKernel) then
+    FOpenCLHalfCopyPass :=
+      {$IFDEF FPC}InterLockedIncrement64{$ELSE}AtomicIncrement{$ENDIF}(
+      OpenCLHalfCopyPassCounter)
+  else FOpenCLHalfCopyPass := 0;
   {$ENDIF}
-  if HasSharedOutputs then
-    raise Exception.Create('TNNet.Compute: a forward from layer ' +
-      IntToStr(FromLayerIdx) + ' is refused while outputs are shared by ' +
-      'liveness: the last pass may have overwritten what it reads.');
 end;
 
 procedure TNNet.MulWeightsGlorotBengio(V: TNeuralFloat);
@@ -149806,6 +149877,34 @@ begin
   end;
 end;
 
+// Keyed by this layer and the pass, not by the buffer: liveness sharing hands
+// one cl_mem to several producers within a pass.
+function TNNetLayer.OpenCLHalfOutputCopy(pPass: Int64; pSourceBuffer: cl_mem;
+  pElementCount: integer; pConsumerKernel: TNeuralKernel): cl_mem;
+begin
+  if (FOpenCLHalfCopy.Pass = pPass) and
+    (FOpenCLHalfCopy.SourceBuffer = pSourceBuffer) and
+    (FOpenCLHalfCopy.ElementCount = pElementCount) and
+    (FOpenCLHalfCopy.CastQueue = pConsumerKernel.Commands)
+    then Result := FOpenCLHalfCopy.HalfBuffer
+    else Result := nil;
+end;
+
+procedure TNNetLayer.PublishOpenCLHalfOutputCopy(pPass: Int64; pSourceBuffer,
+  pHalfBuffer: cl_mem; pElementCount: integer; pCastKernel: TNeuralKernel);
+begin
+  FOpenCLHalfCopy.Pass := pPass;
+  FOpenCLHalfCopy.SourceBuffer := pSourceBuffer;
+  FOpenCLHalfCopy.HalfBuffer := pHalfBuffer;
+  FOpenCLHalfCopy.ElementCount := pElementCount;
+  FOpenCLHalfCopy.CastQueue := pCastKernel.Commands;
+end;
+
+function TNNetLayer.OpenCLCastFP16LaunchCount(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.CastFP16LaunchCount else Result := 0;
+end;
+
 function TNNetLayer.OpenCLTiledGemmLaunchCount(): integer;
 begin
   if Assigned(FDotCL) then Result := FDotCL.TiledGemmLaunchCount else Result := 0;
@@ -150095,6 +150194,7 @@ begin
   {$IFDEF OpenCL}
   FOutputOnRAM := true;
   FOutputOnOpenCL := false;
+  FOpenCLHalfCopy.Pass := 0;
   {$ENDIF}
 end;
 

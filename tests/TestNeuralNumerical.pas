@@ -682,6 +682,9 @@ type
     // (upsample, space/depth, pixel shuffle, flip, pad, crop): they reuse each
     // other's buffers and the output equals the unshared and the CPU nets.
     procedure TestGatherCopyShareOutputsByLiveness;
+    // Int8 FP16 consumers of one resident source share one half copy per
+    // forward (TNNet.ShareOpenCLHalfSourceCopies): casts counted, parity exact.
+    procedure TestFP16HalfSourceCopyShared;
     // SuperPoint-shaped net with a pinned PadXY host tap: under sharing, the tap
     // and the unread descriptor head keep their own buffers and outputs.
     procedure TestGatherCopyHostTapsShareOutputsByLiveness;
@@ -81060,6 +81063,193 @@ begin
     NetOff.Free;
     NetCPU.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestFP16HalfSourceCopyShared;
+{$IFDEF OpenCL}
+const
+  cDepth = 16;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function BuildNet(pTwoSources: boolean): TNNet;
+  var
+    A, C1, C2, B, D1, D2: TNNetLayer;
+    LayerCnt, NeuronCnt, WeightCnt: integer;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(4, 4, cDepth));
+    A := Result.AddLayer(TNNetPointwiseConvLinear.Create(cDepth));
+    C1 := Result.AddLayer(TNNetPointwiseConvLinear.Create(cDepth));
+    C2 := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(cDepth), A);
+    Result.AddLayer(TNNetSum.Create([C1, C2]));
+    if pTwoSources then
+    begin
+      B := Result.AddLayer(TNNetPointwiseConvLinear.Create(cDepth));
+      D1 := Result.AddLayer(TNNetPointwiseConvLinear.Create(cDepth));
+      D2 := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(cDepth), B);
+      Result.AddLayer(TNNetSum.Create([D1, D2]));
+    end;
+    Result.SetTrainable(false, {pLowMemory=}false);
+    for LayerCnt := 0 to Result.GetLastLayerIdx() do
+    begin
+      for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+      begin
+        for WeightCnt := 0 to
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+          Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+            0.1 * Sin(LayerCnt * 1.3 + NeuronCnt * 0.7 + WeightCnt * 0.31);
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+          0.1 * Cos(LayerCnt + NeuronCnt * 0.13);
+      end;
+      Result.Layers[LayerCnt].FlushWeightCache();
+    end;
+    Result.QuantizeWeightsInt8();
+  end;
+
+  function CastLaunches(NN: TNNet): integer;
+  var
+    LayerCnt: integer;
+  begin
+    Result := 0;
+    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+      Result := Result + NN.Layers[LayerCnt].OpenCLCastFP16LaunchCount();
+  end;
+
+  // pSources counts the distinct resident sources (the input included) and
+  // pConsumers their int8 FP16 consumers: the casts per forward with and without sharing.
+  procedure RunCase(const aName: string; pTwoSources, pLiveness,
+    pSharedKernel: boolean; pSources, pConsumers: integer);
+  var
+    NetCPU, NetOff, NetOn: TNNet;
+    Inputs: array[0..1] of TNNetVolume;
+    OutCPU: array[0..1] of TNNetVolume;
+    PassPos, InputPos, LayerCnt, OtherCnt, CastsOn, CastsOff, ReusedCount: integer;
+    Diff, MaxAbs: TNeuralFloat;
+  begin
+    NetCPU := BuildNet(pTwoSources);
+    NetOff := BuildNet(pTwoSources);
+    NetOn := BuildNet(pTwoSources);
+    for InputPos := 0 to 1 do
+    begin
+      Inputs[InputPos] := TNNetVolume.Create(4, 4, cDepth);
+      OutCPU[InputPos] := TNNetVolume.Create();
+    end;
+    try
+      for LayerCnt := 0 to Inputs[0].Size - 1 do
+      begin
+        Inputs[0].Raw[LayerCnt] := 0.7 * Sin(LayerCnt * 0.037) + 0.05;
+        Inputs[1].Raw[LayerCnt] := 0.6 * Cos(LayerCnt * 0.051) - 0.1;
+      end;
+      for InputPos := 0 to 1 do
+      begin
+        NetCPU.Compute(Inputs[InputPos]);
+        NetCPU.GetOutput(OutCPU[InputPos]);
+      end;
+      NetOff.OpenCLFP16 := true;
+      NetOff.ShareOpenCLHalfSourceCopies := false;
+      NetOff.ShareOpenCLOutputsByLiveness := pLiveness;
+      NetOff.EnableOpenCL(PlatformId, DeviceId, pSharedKernel);
+      NetOff.ForceOpenCL(true);
+      NetOn.OpenCLFP16 := true;
+      NetOn.ShareOpenCLOutputsByLiveness := pLiveness;
+      NetOn.EnableOpenCL(PlatformId, DeviceId, pSharedKernel);
+      NetOn.ForceOpenCL(true);
+      AssertTrue(aName + ': sharing is the default', NetOn.ShareOpenCLHalfSourceCopies);
+      for LayerCnt := 1 to NetOn.GetLastLayerIdx() do
+        if NetOn.Layers[LayerCnt] is TNNetPointwiseConvLinear then
+          AssertTrue(aName + ': layer ' + IntToStr(LayerCnt) + ' took the FP16 route',
+            TNNetPointwiseConvLinear(NetOn.Layers[LayerCnt]).FP16Active);
+      if pLiveness then
+      begin
+        // A later source writes into an earlier source's buffer within one pass.
+        ReusedCount := 0;
+        for LayerCnt := 1 to NetOn.GetLastLayerIdx() do
+          for OtherCnt := LayerCnt + 1 to NetOn.GetLastLayerIdx() do
+            if Assigned(NetOn.Layers[LayerCnt].OpenCLOutputBuffer()) and
+              (NetOn.Layers[LayerCnt].OpenCLOutputBuffer() =
+               NetOn.Layers[OtherCnt].OpenCLOutputBuffer()) then
+              Inc(ReusedCount);
+        AssertTrue(aName + ': layers reuse each other''s OpenCL buffers',
+          ReusedCount > 0);
+      end;
+      // Input 0, input 1, input 0: a stale half copy would repeat the last pass.
+      for PassPos := 0 to 2 do
+      begin
+        InputPos := PassPos mod 2;
+        CastsOff := CastLaunches(NetOff);
+        CastsOn := CastLaunches(NetOn);
+        NetOff.Compute(Inputs[InputPos]);
+        NetOn.Compute(Inputs[InputPos]);
+        CastsOff := CastLaunches(NetOff) - CastsOff;
+        CastsOn := CastLaunches(NetOn) - CastsOn;
+        if pSharedKernel then
+          AssertEquals(aName + ': casts with sharing, pass ' + IntToStr(PassPos),
+            pSources, CastsOn)
+        else
+          AssertEquals(aName + ': per-layer queues share nothing, pass ' +
+            IntToStr(PassPos), pConsumers, CastsOn);
+        AssertEquals(aName + ': casts without sharing, pass ' + IntToStr(PassPos),
+          pConsumers, CastsOff);
+        Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+          NetOff.GetLastLayer().Output);
+        AssertEquals(aName + ': shared vs per-consumer casts, pass ' +
+          IntToStr(PassPos), 0, Diff, 0);
+        MaxAbs := OutCPU[InputPos].GetMaxAbs();
+        Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, OutCPU[InputPos]);
+        AssertTrue(aName + ': OpenCL vs CPU, pass ' + IntToStr(PassPos) + ': ' +
+          FloatToStr(Diff), Diff < 1e-2 * (MaxAbs + 1));
+      end;
+      WriteLn('  FP16HalfSourceCopy ', aName, ': casts per forward ', CastsOn,
+        ' shared vs ', CastsOff, ' per consumer');
+      if not pLiveness then
+      begin
+        // A direct Compute loop runs outside a forward pass: no half copy is
+        // shared there, so the new input reaches both consumers.
+        for InputPos := 0 to 1 do
+        begin
+          NetOn.Layers[0].Output.Copy(Inputs[1]);
+          NetOn.Layers[0].MarkOutputWrittenOnRAM();
+          CastsOn := CastLaunches(NetOn);
+          for LayerCnt := 1 to NetOn.GetLastLayerIdx() do
+            NetOn.Layers[LayerCnt].Compute();
+          AssertEquals(aName + ': casts of a direct Compute loop', pConsumers,
+            CastLaunches(NetOn) - CastsOn);
+        end;
+        NetOn.GetLastLayer().ForceOutputOnRAM();
+        MaxAbs := OutCPU[1].GetMaxAbs();
+        Diff := MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output, OutCPU[1]);
+        AssertTrue(aName + ': direct Compute loop vs CPU: ' + FloatToStr(Diff),
+          Diff < 1e-2 * (MaxAbs + 1));
+      end;
+    finally
+      for InputPos := 0 to 1 do
+      begin
+        OutCPU[InputPos].Free;
+        Inputs[InputPos].Free;
+      end;
+      NetOn.Free;
+      NetOff.Free;
+      NetCPU.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Sources: the input and A (+ the first sum and B); consumers: A, C1, C2 (+ B, D1, D2).
+  RunCase('one source, two consumers', false, false, true, 2, 3);
+  RunCase('two sources, liveness sharing', true, true, true, 4, 6);
+  RunCase('per-layer queues', false, false, false, 2, 3);
 end;
 {$ELSE}
 begin

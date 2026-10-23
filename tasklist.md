@@ -2284,26 +2284,15 @@ dev box proves parity; throughput numbers have to come from the GPU box.
         device forward; it is not on any fused-bank path today.
   - [ ] A top-k gate with 32 < k < experts stays on the host
         (`CAI_TOPK_GATE_MAX_K`, the kernel's private selection buffers).
-- [ ] `--experimental-fp16`: narrow each resident FP32 source to half ONCE per forward,
-      not once per consumer. `TDotProductSharedKernel.PrepareInt8BOperand` calls
-      `CastBOperandToFP16` (`cai_f32_to_half`) into the layer's own
-      `FInputBufferBsFP16` on every forward, so consumers sharing one source
-      each re-cast it: in a Qwen3.5/3.8 block the attention norm feeds Q/K/V and
-      the post-attention norm feeds gate/up, which is five casts (and five half
-      buffers) for two distinct sources, up to ~337 extra launches per token on
-      the 27B. The user's 27B A/B (2026-08-24) showed host enqueue is now the
-      limit (+12% enqueue in FP16 mode, `TNNetPointwiseConvLinear` +31%), so
-      launch count is what pays. Proposed: a net-level cache of the narrowed
-      copy keyed by source `cl_mem` plus a version counter the producing layer
-      bumps when it rewrites its output; consumers bind the cached half buffer
-      instead of casting. Rejected alternative: producers emitting a half
-      output directly (larger, and non-int8 consumers still need the FP32
-      copy). Traps: the per-layer queues of `--no-gpu-shared-kernel` need an
-      event or the shared queue between the cast and every reader; output
-      sharing by liveness (`CanShareOpenCLOutput`) reuses a `cl_mem` across
-      producers, so the key must not be the buffer alone. Test: PoCL parity of
-      a two-consumer net with the cache on vs off, plus a launch-count check;
-      the throughput number comes from the GPU box.
+- [ ] GPU-box check of `TNNet.ShareOpenCLHalfSourceCopies` (on by default): in
+      `--experimental-fp16` the int8 FP16 consumers of one resident source now
+      bind the half copy the first consumer cast in the same forward pass
+      (`TNNetLayer.OpenCLHalfOutputCopy`), so a Qwen3.5/3.8 block casts 2
+      sources instead of once per each of the 5 consumers. PoCL proves parity and the cast count
+      (`TestFP16HalfSourceCopyShared`); measure the 27B decode tok/s in
+      `--experimental-fp16` against the parent commit. Open follow-ups:
+  - [ ] Per-layer queues (`--no-gpu-shared-kernel`) share nothing: sharing
+        there needs an event between the cast and each reader on another queue.
 
 ### Real device-side work still running on the host
 

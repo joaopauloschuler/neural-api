@@ -458,6 +458,7 @@ type
       FSplitKFP16Kernel: cl_kernel;
       FSplitKReduceFP16Kernel: cl_kernel;
       FCastFP16Kernel: cl_kernel;
+      FCastFP16LaunchCount: integer;
       /// Last (shape, buffer, kernel) tuple bound into the split-K entry points
       /// by BindSplitKInvariantArgs. The split-K handles are per-instance, so
       /// eleven of the sixteen arguments survive from launch to launch and are
@@ -595,9 +596,10 @@ type
       /// The B operand ComputeInt8 binds. In FP16 mode this narrows whatever the
       /// caller supplied into FInputBufferBsFP16 first; NewVBs = false means the
       /// caller's cai_im2col_h already wrote that buffer, so nothing is done.
-      /// Coded by Claude (AI).
+      /// pExternalVBsIsHalf: pExternalVBs is already half and is bound as is.
       function PrepareInt8BOperand(VBs: TNNetVolume; NewVBs: boolean;
-        pExternalVBs: cl_mem; var err: integer): cl_mem;
+        pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean;
+        var err: integer): cl_mem;
       /// Uploads VBias (one float per A row, else raises) into the resident
       /// grow-only bias buffer when needed; returns UseBias (0 for nil). Coded by Claude (AI).
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
@@ -645,7 +647,7 @@ type
       /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
-        pExternalVBs: cl_mem);
+        pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean);
 
     public
       constructor Create(DotProductKernel: TNeuralKernel;
@@ -737,10 +739,11 @@ type
       /// Int8 twin of Compute: same B upload, fused bias and activation
       /// semantics, but the A operand is the resident code buffer and the
       /// per-row scales ride as kernel arg 10 (deferred dequantization).
-      /// Coded by Claude (AI).
+      /// pExternalVBsIsHalf (FP16 mode only): pExternalVBs is bound without a cast.
       procedure ComputeInt8(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
-        NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+        NewVBias: boolean = true; pExternalVBs: cl_mem = nil;
+        pExternalVBsIsHalf: boolean = false);
       /// Arms the Q4_0 weight mode: pPacked is NumAs*pSize/2 bytes in the
       /// layout packed[a + p*NumAs] (p = k/2, low nibble = code k, high = code
       /// k+1, biased +8); pBlockScales is NumAs*pSize/32 floats in the layout
@@ -796,6 +799,11 @@ type
       /// True after a successful PrepareForComputeInt4 (cleared by
       /// UnprepareForCompute); the int4 layers gate their device route on it.
       property Int4Ready: boolean read FInt4Ready;
+      /// The resolved FP16 activation verdict, the half B buffer the last
+      /// narrowing wrote, and the cai_f32_to_half launches so far (test hook).
+      property FP16Activations: boolean read FFP16Activations;
+      property InputBufferBsFP16: cl_mem read FInputBufferBsFP16;
+      property CastFP16LaunchCount: integer read FCastFP16LaunchCount;
       /// The resident weight codes (nil when unarmed) and whether they are a
       /// retained reference to another instance's buffer: the test hooks that
       /// prove a borrower created no second copy.
@@ -2847,12 +2855,28 @@ begin
   Result := Result or clSetKernelArg(k, 1, csCLMemSize, @pSrcFP32);
   Result := Result or clSetKernelArg(k, 2, csCLMemSize, @FInputBufferBsFP16);
   // Same in-order queue as the GEMM that reads it, so no wait is needed.
-  if Result = CL_SUCCESS then FDotProductKernel.RunKernel(k, ElementCount);
+  if Result = CL_SUCCESS then
+  begin
+    FDotProductKernel.RunKernel(k, ElementCount);
+    Inc(FCastFP16LaunchCount);
+  end;
 end;
 
 function TDotProductSharedKernel.PrepareInt8BOperand(VBs: TNNetVolume;
-  NewVBs: boolean; pExternalVBs: cl_mem; var err: integer): cl_mem;
+  NewVBs: boolean; pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean;
+  var err: integer): cl_mem;
 begin
+  if pExternalVBsIsHalf then
+  begin
+    Result := pExternalVBs;
+    if not FFP16Activations then
+    begin
+      ErrorProc('Error: PrepareInt8BOperand - a half B operand needs the ' +
+        'FP16 activation mode.');
+      err := err or CL_INVALID_VALUE;
+    end;
+    exit;
+  end;
   if not FFP16Activations then
   begin
     if pExternalVBs <> nil then Result := pExternalVBs
@@ -2999,7 +3023,8 @@ end;
 
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
-  NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+  NewVBias: boolean = true; pExternalVBs: cl_mem = nil;
+  pExternalVBsIsHalf: boolean = false);
 begin
   if not FInt8Ready then
   begin
@@ -3007,7 +3032,8 @@ begin
       'PrepareForComputeInt8.');
     exit;
   end;
-  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs);
+  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs,
+    pExternalVBsIsHalf);
 end;
 
 procedure TDotProductSharedKernel.ComputeInt4(VBs: TNNetVolume;
@@ -3020,7 +3046,8 @@ begin
       'PrepareForComputeInt4.');
     exit;
   end;
-  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs);
+  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs,
+    {pExternalVBsIsHalf=}false);
 end;
 
 function TDotProductSharedKernel.PrepareBiasOperand(VBias: TNNetVolume;
@@ -3054,7 +3081,7 @@ end;
 
 procedure TDotProductSharedKernel.ComputeResidentCodes(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
-  pExternalVBs: cl_mem);
+  pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean);
 var
   err: integer;
   UseBias: longint;
@@ -3075,7 +3102,8 @@ begin
   UseBias := PrepareBiasOperand(VBias, NewVBias, err);
 
   // Binds (FP32) or narrows into (FP16) the B operand the GEMM below reads.
-  BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs, err);
+  BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs,
+    pExternalVBsIsHalf, err);
 
   // A window of columns: one work-group per (row tile, column tile), each
   // weight code read once per column tile. Only the four arguments below
