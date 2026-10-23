@@ -523,6 +523,25 @@ rather than acted on.
   - [ ] register-token / SwiGLU DINOv2 backbones still rejected by BuildDPT.
   - [ ] real keep_aspect_ratio run (518, ensure_multiple_of 14) with
         DPTPreprocessImage on a photo; the example has no image input yet.
+- [ ] Video Depth Anything importer (temporally consistent depth for long videos;
+      DepthAnything/Video-Depth-Anything, video_depth_anything_vits.pth, Apache-2.0
+      Small). It is the landed Depth Anything V2 stack (DINOv2 encoder per frame ->
+      DPT neck) whose head gains temporal motion modules: self-attention along the
+      FRAME axis per spatial cell with a sinusoidal temporal position embedding,
+      inserted on the coarse reassembled levels and the fusion path (check the exact
+      placement against the reference DPTHeadTemporal). Reuse: BuildDPT /
+      BuildDepthAnythingV2 for the per-frame trunk, neuraltorchbin.pas to read the
+      .pth directly, the landed SDPA over a (NumFrames,1,C) per-cell reshape for the
+      temporal block (share that block with the AnimateDiff motion-module task above
+      instead of coding two). Inference driver: 32-frame windows with overlap and
+      keyframes, per-window least-squares scale+shift alignment of the overlapping
+      frames, then linear blend (one reusable AlignDepthScaleShift routine; check
+      whether MarigoldEnsembleDepth already holds the solver). Pico parity vs the
+      reference float64 forward on a 4-frame clip; examples/VideoDepth reads a folder
+      of frames (same input convention as examples/VideoMatting / ObjectTracking) and
+      writes per-frame colour depth PPMs + an animated GIF via the landed GIF writer,
+      with a README comparing the flicker of per-frame examples/DepthAnythingV2
+      output against the temporal model.
 
 - [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex]
       LANDED, commit a7870a1: diffusers AutoencoderKL decoder — post_quant_conv ->
