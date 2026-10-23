@@ -500,6 +500,29 @@ rather than acted on.
       prompt's token spans. Pico-fixture parity + an examples/GroundingDINODetect
       ("detect: a cat. a remote." -> boxes) demo.
 
+- [ ] YOLO-World v2 real-time open-vocabulary detection on the landed YOLOv8
+      importer (`BuildYoloWorldFromSafeTensors[Ex]`, ultralytics
+      yolov8s-worldv2 / yolov8m-worldv2, Cheng et al. 2024). Same CSP/C2f
+      backbone + PANet neck + DFL box branch as `BuildYoloFromSafeTensors`
+      (reuse it, do not copy it); three changes make it open-vocabulary:
+      (1) the class branch emits per-cell embeddings scored against CLIP text
+      embeddings by a contrastive head (L2-normalised dot product + learned
+      per-level scale/bias), so the class count is the number of prompts;
+      (2) the neck's C2f blocks become max-sigmoid attention blocks
+      (C2fAttn: each cell gets `sigmoid(max over prompts of <cell, text>)` as a
+      channel gate); (3) the text embeddings come from the landed
+      `BuildClipTextTower` (ViT-B/32 text tower). Text embeddings are computed
+      once per prompt list and fed as a second input, so detection speed stays
+      at YOLOv8 level, unlike OWL-ViT / Florence-2. Add the contrastive
+      score to `DecodeYoloDetections` through an optional embedding argument
+      instead of a second decoder; class labels = the prompt strings.
+      Ultralytics ships .pt pickles (AGPL-3.0); read them through
+      neuraltorchbin.pas, or document a safetensors export, as the YOLOv8
+      fixture does. Pico parity < 1e-4 vs a float64 reference
+      forward + `--prompts "person,bus,dog"` in examples/YoloDetect (no new
+      example), README section on the speed/accuracy trade-off vs
+      examples/OpenVocabDetection.
+
 - [ ] SAM 2 promptable image + VIDEO segmentation importer
       (`BuildSAM2FromSafeTensors[Ex]`, e.g. facebook/sam2-hiera-tiny). The landed
       SAM v1 path covers the single-image ViT encoder + mask decoder; SAM 2 adds
