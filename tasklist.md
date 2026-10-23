@@ -2189,6 +2189,39 @@ rather than acted on.
       (all limbs, canvas x0.6, then dots) were written from memory; only the
       cv2 drawing primitives come from a real OpenCV wheel.
 
+- [ ] Multi-object VIDEO tracking: exact assignment + ByteTrack (Zhang et al.
+      ECCV 2022, arXiv:2110.06864) over the landed YOLOv8 detector, plus
+      examples/ObjectTracking (.lpr + .lpi + README.md). Today the library
+      detects per image only (`BuildYolo`, `DecodeYoloDetections`,
+      examples/YoloDetect) and nothing carries identities across frames.
+      - [ ] `NeuralLinearSumAssignment` in neuralvolume.pas next to
+            `NeuralBoxIoU` / `NeuralBoxGIoU`: rectangular min-cost assignment
+            (Jonker-Volgenant / shortest augmenting path, the algorithm of
+            scipy.optimize.linear_sum_assignment), caller-owned work buffers.
+            Tests: random N x M matrices vs brute force at small sizes and vs
+            a scipy oracle in the ~/x venv; ties and N <> M.
+      - [ ] Use it in the DETR set-criterion matcher (neuralnetwork.pas
+            ~3704 documents the "v1: GREEDY, not optimal Hungarian" gap):
+            keep greedy selectable, make exact the default, and pin a case
+            where greedy and optimal assignments differ.
+      - [ ] `TByteTracker` (a plain class, not a layer) in neuralpretrained.pas
+            next to the YOLO helpers: constant-velocity xyah Kalman per
+            track (the ByteTrack/SORT 8-state filter), two-stage association
+            (high-score boxes first, then low-score boxes against the still
+            unmatched tracks), IoU cost through `NeuralBoxIoU`, track birth /
+            lost buffer / removal, defaults from the official BYTETracker
+            (track_thresh 0.5, match_thresh 0.8, track_buffer 30). Input is a
+            `TYoloDetectionArray` per frame; output adds a stable track id.
+            Parity: a fixed synthetic detection sequence vs the reference
+            byte_tracker.py logic (ids and boxes per frame).
+      - [ ] examples/ObjectTracking: a folder of frames (move the
+            `ListFrames` routine of examples/VideoMatting into a shared unit
+            so both examples use one copy) -> YOLO per frame -> tracker ->
+            boxes drawn with one color per id and the id as text, PPM/PNG
+            frames and `--gif` through neuralgif.pas, `--gpu`, `--int8`,
+            `--classes` filter. Mark the README "planned (coded)" until the
+            user runs a real yolov8n on a real clip.
+
 ## OpenCL forward coverage — layers still on the host
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
