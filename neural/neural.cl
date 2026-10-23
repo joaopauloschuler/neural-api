@@ -4764,7 +4764,7 @@ __kernel void cai_deep_concat4
 // -- an InDepth-fold compute overspend that made the device path far slower than
 // the CPU. Here each work-item does exactly its own FFx*FFy MACs, zero waste.
 //   Raw[ox,oy, n*InDepth + d] =
-//       sum_{cy,cx} FW[n][cy,cx,d] * FX[ox*S+cx, oy*S+cy, d]
+//       sum_{cy,cx} FW[n][cy,cx,d] * FX[ox*S+cx*Dil, oy*S+cy*Dil, d]
 // FX is the host-padded input copy (SizeX = FInW, depth = FInDepth), so no bounds
 // checks are needed (output extents were sized to fit). FW is the Mult neurons'
 // weight volumes concatenated, each in its native depth-contiguous raw layout
@@ -4783,6 +4783,7 @@ __kernel void cai_depthwise_conv2d
   const int FFx,
   const int FFy,
   const int FStride,
+  const int FDilation,
   __global const float* FW,
   __global const float* FX,
   __global float* FY
@@ -4801,14 +4802,15 @@ __kernel void cai_depthwise_conv2d
   const int ix0 = ox * FStride;
   const int iy0 = oy * FStride;
   const int wBase = n * (FFx * FFy) * FInDepth + d; // + tap*FInDepth below
+  const int xTapStep = FDilation * FInDepth;
   float acc = 0.0f;
   for (int cy = 0; cy < FFy; cy++)
   {
-    const int iy = iy0 + cy;
+    const int iy = iy0 + cy * FDilation;
     const int xRow = ((FInW * iy) + ix0) * FInDepth + d;
     const int wRow = wBase + (FFx * cy) * FInDepth;
     for (int cx = 0; cx < FFx; cx++)
-      acc = mad(FW[wRow + cx * FInDepth], FX[xRow + cx * FInDepth], acc);
+      acc = mad(FW[wRow + cx * FInDepth], FX[xRow + cx * xTapStep], acc);
   }
   FY[gid] = acc;
 }

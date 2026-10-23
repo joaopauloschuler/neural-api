@@ -209,9 +209,16 @@ type
     // (Y outer / X inner), so a non-square input catches any axis mix-up.
     procedure TestDepthwiseConvForwardMatchesReference;
     procedure TestDepthwiseConvInt8ForwardMatchesFP32;
+    // Dilated taps (torch dilation) on the FP32 and int8 forwards.
+    procedure TestDepthwiseConvDilatedForwardMatchesReference;
+    procedure TestDepthwiseConvDilatedInt8ForwardMatchesFP32;
+    // The dilation survives save/load; a file without it loads as dilation 1.
+    procedure TestDepthwiseConvDilationSaveLoad;
   private
-    // Naive per-tap depthwise reference used by the two tests above.
-    procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer);
+    // Naive per-tap depthwise reference used by the forward tests above.
+    procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer;
+      Dilation: integer = 1);
+    procedure AssertDepthwiseConvInt8MatchesFP32(Dilation: integer);
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
     // QuantizeBanks quantizes ONLY the two bank layers, leaving the reference
@@ -8943,41 +8950,44 @@ begin
   end;
 end;
 
-// Builds Input(7,5,3) -> DepthwiseConvLinear(Multiplier, 3x3, no padding,
-// Stride) on random weights and random input, then recomputes every output
-// element with a naive tap loop. The input is deliberately NON-SQUARE so a
-// swapped X/Y axis shows up as a shape error or a wrong value rather than
+// Builds Input(9,7,3) -> DepthwiseConvLinear(Multiplier, 3x3, no padding,
+// Stride, Dilation) on random weights and random input, then recomputes every
+// output element with a naive tap loop. The input is deliberately NON-SQUARE so
+// a swapped X/Y axis shows up as a shape error or a wrong value rather than
 // cancelling out.
 procedure TTestNeuralLayersExtra.AssertDepthwiseConvMatchesReference(
-  Multiplier, Stride: integer);
+  Multiplier, Stride: integer; Dilation: integer);
 const
-  InX = 7; InY = 5; InD = 3; FeatureSize = 3;
+  InX = 9; InY = 7; InD = 3; FeatureSize = 3;
 var
   NN: TNNet;
   Input: TNNetVolume;
   Layer: TNNetLayer;
   W, Output: TNNetVolume;
   NeuronCnt, ox, oy, d, fx, fy: integer;
-  MaxOutXPos, MaxOutYPos, Expected: integer;
+  MaxOutXPos, MaxOutYPos, Expected, Extent: integer;
   Sum: TNeuralFloat;
   Tag: string;
 begin
-  Tag := 'mult=' + IntToStr(Multiplier) + ' stride=' + IntToStr(Stride);
+  Tag := 'mult=' + IntToStr(Multiplier) + ' stride=' + IntToStr(Stride) +
+    ' dilation=' + IntToStr(Dilation);
+  Extent := Dilation * (FeatureSize - 1) + 1;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(InX, InY, InD);
   try
     NN.AddLayer(TNNetInput.Create(InX, InY, InD));
     Layer := NN.AddLayer(
-      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, Stride));
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, Stride,
+        Dilation));
     for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
       Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
     Input.Randomize();
     NN.Compute(Input);
     Output := Layer.Output;
 
-    Expected := (InX - FeatureSize) div Stride + 1;
+    Expected := (InX - Extent) div Stride + 1;
     AssertEquals('output SizeX (' + Tag + ')', Expected, Output.SizeX);
-    Expected := (InY - FeatureSize) div Stride + 1;
+    Expected := (InY - Extent) div Stride + 1;
     AssertEquals('output SizeY (' + Tag + ')', Expected, Output.SizeY);
     AssertEquals('output depth (' + Tag + ')', Multiplier * InD, Output.Depth);
 
@@ -8993,8 +9003,8 @@ begin
             Sum := 0;
             for fx := 0 to FeatureSize - 1 do
               for fy := 0 to FeatureSize - 1 do
-                Sum := Sum +
-                  Input[ox * Stride + fx, oy * Stride + fy, d] * W[fx, fy, d];
+                Sum := Sum + Input[ox * Stride + fx * Dilation,
+                  oy * Stride + fy * Dilation, d] * W[fx, fy, d];
             AssertEquals('depthwise out[' + IntToStr(ox) + ',' + IntToStr(oy) +
               ',' + IntToStr(NeuronCnt) + ':' + IntToStr(d) + '] (' + Tag + ')',
               Sum, Output[ox, oy, NeuronCnt * InD + d], 1e-4);
@@ -9015,11 +9025,77 @@ begin
   AssertDepthwiseConvMatchesReference(3, 2);
 end;
 
+procedure TTestNeuralLayersExtra.TestDepthwiseConvDilatedForwardMatchesReference;
+begin
+  AssertDepthwiseConvMatchesReference(1, 1, 2);
+  AssertDepthwiseConvMatchesReference(3, 1, 2);
+  AssertDepthwiseConvMatchesReference(2, 2, 2);
+  AssertDepthwiseConvMatchesReference(1, 1, 3);
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvInt8ForwardMatchesFP32;
+begin
+  AssertDepthwiseConvInt8MatchesFP32(1);
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvDilatedInt8ForwardMatchesFP32;
+begin
+  AssertDepthwiseConvInt8MatchesFP32(2);
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvDilationSaveLoad;
+const
+  InX = 9; InY = 7; InD = 3;
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    // Padding (K div 2) * D keeps the size, as torchvision pads a dilated conv.
+    NN.AddLayer(TNNetDepthwiseConvReLU.Create(2, 3, 2, 1, 2));
+    Input.Randomize();
+    NN.Compute(Input);
+    AssertEquals('same-size output X', InX, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('same-size output Y', InY, NN.GetLastLayer.Output.SizeY);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('loaded dilation', 2,
+      TNNetDepthwiseConv(Loaded.GetLastLayer).DilationX);
+    Loaded.Compute(Input);
+    AssertEquals('loaded output size', NN.GetLastLayer.Output.Size,
+      Loaded.GetLastLayer.Output.Size);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('loaded output ' + IntToStr(i),
+        NN.GetLastLayer.Output.FData[i], Loaded.GetLastLayer.Output.FData[i], 1e-6);
+    // A structure saved before the dilation slot existed holds 0 in FStruct[4].
+    Saved := StringReplace(NN.SaveStructureToString(),
+      'TNNetDepthwiseConvReLU:2;3;2;1;2;', 'TNNetDepthwiseConvReLU:2;3;2;1;0;', []);
+    AssertTrue('structure string has the depthwise slots',
+      Pos('TNNetDepthwiseConvReLU:2;3;2;1;0;', Saved) > 0);
+    Loaded.Free;
+    Loaded := TNNet.Create();
+    Loaded.LoadStructureFromString(Saved);
+    AssertEquals('old file loads as dilation 1', 1,
+      TNNetDepthwiseConv(Loaded.GetLastLayer).DilationX);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
 // The int8 forward walks its own nest over the same taps; it must land within
 // quantization drift of the FP32 forward it replaces.
-procedure TTestNeuralLayersExtra.TestDepthwiseConvInt8ForwardMatchesFP32;
+procedure TTestNeuralLayersExtra.AssertDepthwiseConvInt8MatchesFP32(
+  Dilation: integer);
 const
-  InX = 7; InY = 5; InD = 3; FeatureSize = 3; Multiplier = 2;
+  InX = 9; InY = 7; InD = 3; FeatureSize = 3; Multiplier = 2;
 var
   NN: TNNet;
   Input, Reference: TNNetVolume;
@@ -9032,7 +9108,7 @@ begin
   try
     NN.AddLayer(TNNetInput.Create(InX, InY, InD));
     Layer := NN.AddLayer(
-      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, 1));
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, 1, Dilation));
     for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
       Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
     Input.Randomize();

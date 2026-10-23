@@ -226,6 +226,9 @@ type
 
     // Depthwise convolution numerical tests
     procedure TestDepthwiseConvNumerical;
+    // Input + weight gradients of strided and dilated depthwise convolutions.
+    procedure TestDepthwiseConvStridedGradientCheck;
+    procedure TestDepthwiseConvDilatedGradientCheck;
     procedure TestPointwiseConvNumerical;
     procedure TestSeparableConvNumerical;
     
@@ -452,6 +455,7 @@ type
     procedure TestConvWinogradAfterOpenCLResidencyParity;
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
+    procedure TestDepthwiseConvDilatedOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
     // TNNetEmbedding -> TNNetDepthwiseConv1D -> TNNetSiLU with ForceOpenCL off:
     // the conv's own size verdict is False, so only a source already in OpenCL
@@ -8606,6 +8610,28 @@ begin
     InputPlus.Free;
     Desired.Free;
   end;
+end;
+
+// Weight gradients reach ~20 here, where the float32 forward leaves ~5e-4
+// relative noise in the central difference: hence the 0.05 bound.
+procedure TTestNeuralNumerical.TestDepthwiseConvStridedGradientCheck;
+begin
+  RandSeed := 31337;
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetDepthwiseConvLinear.Create(2, 3, 1, 2), 'DepthwiseConv(stride 2)',
+    7, 6, 2, 0.05, true);
+end;
+
+procedure TTestNeuralNumerical.TestDepthwiseConvDilatedGradientCheck;
+begin
+  RandSeed := 31337;
+  // Same-size padding (K div 2) * D, and no padding with stride 2.
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetDepthwiseConvLinear.Create(2, 3, 2, 1, 2), 'DepthwiseConv(dilation 2)',
+    6, 5, 2, 0.05, true);
+  LayerInputAndWeightGradientCheck(Self,
+    TNNetDepthwiseConvLinear.Create(1, 3, 0, 2, 2),
+    'DepthwiseConv(dilation 2, stride 2)', 8, 7, 3, 0.05, true);
 end;
 
 procedure TTestNeuralNumerical.TestMinChannelGradientCheck;
@@ -70996,7 +71022,9 @@ end;
 // Build the depthwise conv (multiplier>1, pad, stride), compute on the CPU,
 // then force the device path (SetNeuralConvOpenCLMinWork(0)) and assert the
 // outputs match within 1e-4. Skips gracefully when no OpenCL device is present.
-procedure TTestNeuralNumerical.TestDepthwiseConvOpenCLParity;
+// CPU forward vs the cai_depthwise_conv2d forward of Input(7,7,5) -> DW layer.
+procedure DepthwiseConvOpenCLParityCheck(ATestCase: TTestCase;
+  Multiplier, FeatureSize, Padding, Stride, Dilation: integer);
 {$IFDEF OpenCL}
 var
   NN: TNNet;
@@ -71009,7 +71037,7 @@ var
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
-    AssertTrue('no OpenCL device: SKIP', true);
+    ATestCase.AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
   RandSeed := 424242;
@@ -71018,9 +71046,9 @@ begin
   OutCPU := TNNetVolume.Create();
   try
     NN.AddLayer(TNNetInput.Create(7, 7, 5, 1));
-    // multiplier 3, 3x3 feature, pad 1, stride 2 -> output depth 5*3=15.
-    // Linear activation so the parity gate is on the raw multiply-add sum.
-    DW := TNNetDepthwiseConvLinear.Create(3, 3, 1, 2);
+    // Linear activation so the parity check is on the raw multiply-add sum.
+    DW := TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, Padding,
+      Stride, Dilation);
     NN.AddLayer(DW);
     InSize := Input.Size;
     for i := 0 to InSize - 1 do
@@ -71037,7 +71065,8 @@ begin
       // resident-weight reuse path (no re-upload). Coded by Claude (AI).
       NN.Compute(Input);
       MaxDiff := 0;
-      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      ATestCase.AssertEquals('output size match', OutCPU.Size,
+        NN.GetLastLayer.Output.Size);
       for i := 0 to OutCPU.Size - 1 do
       begin
         Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
@@ -71046,8 +71075,9 @@ begin
     finally
       NN.ForceOpenCL(False);
     end;
-    WriteLn('  DepthwiseConv OpenCL parity: max|diff|=', MaxDiff:0:9);
-    AssertTrue('DepthwiseConv OpenCL vs CPU parity: max |diff| = ' +
+    WriteLn('  DepthwiseConv OpenCL parity (dilation ', Dilation, '): max|diff|=',
+      MaxDiff:0:9);
+    ATestCase.AssertTrue('DepthwiseConv OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;
@@ -71057,9 +71087,21 @@ begin
 end;
 {$ELSE}
 begin
-  AssertTrue('OpenCL not compiled in: SKIP', true);
+  ATestCase.AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+procedure TTestNeuralNumerical.TestDepthwiseConvOpenCLParity;
+begin
+  // multiplier 3, 3x3 feature, pad 1, stride 2 -> output depth 5*3=15.
+  DepthwiseConvOpenCLParityCheck(Self, 3, 3, 1, 2, 1);
+end;
+
+procedure TTestNeuralNumerical.TestDepthwiseConvDilatedOpenCLParity;
+begin
+  DepthwiseConvOpenCLParityCheck(Self, 2, 3, 2, 1, 2);
+  DepthwiseConvOpenCLParityCheck(Self, 1, 3, 0, 2, 2);
+end;
 
 procedure TTestNeuralNumerical.TestChannelMulByLayerOpenCLParity;
 {$IFDEF OpenCL}

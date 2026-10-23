@@ -69794,19 +69794,15 @@ begin
 end;
 
 // Loads a torch depthwise Conv2d [C,1,K,K] into a TNNetDepthwiseConv, folding BN
-// BnPrefix ('' = none) scale in and returning its shift; Dilation spreads the taps.
+// BnPrefix ('' = none) scale in and returning its shift.
 procedure LoadMobileNetDepthwiseFoldBN(Reader: TNNetSafeTensorsReader;
   DwLayer: TNNetLayer; const ConvWName, BnPrefix: string;
-  Channels, K: integer; BnEps: TNeuralFloat; out OutShift: TNNetVolume;
-  Dilation: integer = 1);
+  Channels, K: integer; BnEps: TNeuralFloat; out OutShift: TNNetVolume);
 var
   W, Gamma, Beta, Mean, Var_, WVol: TNNetVolume;
-  c, ky, kx, srcIdx, dstIdx, RowIdx: integer;
-  ChannelsM1, KM1, KernelExtent, TapStep: integer;
+  c, TapPos, MaxTapPos, srcIdx, dstIdx, ChannelsM1: integer;
   Scale, Denom: TNeuralFloat;
 begin
-  if Dilation < 1 then Dilation := 1;
-  KernelExtent := (K - 1) * Dilation + 1;
   EnsureWritableImportWeights(DwLayer);
   if not Reader.HasTensor(ConvWName) then
     ImportError('MobileNetV3 import: missing tensor "' + ConvWName + '".');
@@ -69822,10 +69818,10 @@ begin
     ImportError('MobileNetV3 import: internal error - depthwise "' +
       ConvWName + '" target has ' + IntToStr(DwLayer.Neurons.Count) +
       ' neurons, expected 1.');
-  if DwLayer.FArrNeurons[0].Weights.Size <> KernelExtent * KernelExtent * Channels then
+  if DwLayer.FArrNeurons[0].Weights.Size <> K * K * Channels then
     ImportError('MobileNetV3 import: internal error - depthwise "' +
       ConvWName + '" neuron has ' + IntToStr(DwLayer.FArrNeurons[0].Weights.Size) +
-      ' weights, expected ' + IntToStr(KernelExtent * KernelExtent * Channels) + '.');
+      ' weights, expected ' + IntToStr(K * K * Channels) + '.');
   W := TNNetVolume.Create;
   Gamma := TNNetVolume.Create;
   Beta := TNNetVolume.Create;
@@ -69847,10 +69843,8 @@ begin
           '" parameters must each have ' + IntToStr(Channels) + ' elements.');
     end;
     ChannelsM1 := Channels - 1;
-    KM1 := K - 1;
-    TapStep := Dilation * Channels;
+    MaxTapPos := K * K - 1;
     WVol := DwLayer.FArrNeurons[0].Weights;
-    if Dilation > 1 then WVol.Fill(0);
     for c := 0 to ChannelsM1 do
     begin
       if BnPrefix <> '' then
@@ -69864,20 +69858,15 @@ begin
         Scale := 1;
         OutShift.FData[c] := 0;
       end;
-      // torch [c,0,ky,kx] -> CAI w[(ky*D*E+kx*D)*C + c] (E = kernel extent),
-      // scaled per channel; the destination steps D*C per tap (#9/#12).
+      // torch [c,0,ky,kx] -> CAI w[(ky*K+kx)*C + c], scaled per channel; the
+      // taps share one row-major order, so the destination steps C per tap.
       srcIdx := c * K * K;
-      RowIdx := c;
-      for ky := 0 to KM1 do
+      dstIdx := c;
+      for TapPos := 0 to MaxTapPos do
       begin
-        dstIdx := RowIdx;
-        for kx := 0 to KM1 do
-        begin
-          WVol.FData[dstIdx] := W.FData[srcIdx] * Scale;
-          Inc(srcIdx);
-          Inc(dstIdx, TapStep);
-        end;
-        Inc(RowIdx, TapStep * KernelExtent);
+        WVol.FData[dstIdx] := W.FData[srcIdx] * Scale;
+        Inc(srcIdx);
+        Inc(dstIdx, Channels);
       end;
     end;
     DwLayer.FlushWeightCache();
@@ -69945,7 +69934,7 @@ procedure AddMobileNetMBConv(NN: TNNet; const Blk: TMobileNetV3Block;
   InChannels: integer; out Refs: TMobileNetBlockLayers);
 var
   Input, Branch, Pooled, Gate: TNNetLayer;
-  KernelExtent, DwStride: integer;
+  DwDilation, DwStride: integer;
 
   function ActLayer: TNNetLayer;
   begin
@@ -69959,16 +69948,9 @@ begin
   Refs.HasSE := Blk.UseSE;
   Refs.HasResidual := (Blk.Stride = 1) and (InChannels = Blk.OutChannels);
   // torchvision: a dilated depthwise runs at stride 1 with "same" padding.
-  if Blk.Dilation > 1 then
-  begin
-    KernelExtent := (Blk.Kernel - 1) * Blk.Dilation + 1;
-    DwStride := 1;
-  end
-  else
-  begin
-    KernelExtent := Blk.Kernel;
-    DwStride := Blk.Stride;
-  end;
+  DwDilation := Max(Blk.Dilation, 1);
+  if DwDilation > 1 then DwStride := 1
+  else DwStride := Blk.Stride;
   Input := NN.GetLastLayer();
   // 1) expand 1x1 (skipped when exp == in) -> BN(folded into conv bias) -> act
   if Refs.HasExpand then
@@ -69979,8 +69961,8 @@ begin
   end;
   // 2) depthwise kxk (stride) -> BN(scale folded in weights, shift via bias)
   Refs.Dw := NN.AddLayer(
-    TNNetDepthwiseConvLinear.Create({multiplier=}1, KernelExtent,
-      KernelExtent div 2, DwStride));
+    TNNetDepthwiseConvLinear.Create({multiplier=}1, Blk.Kernel,
+      (Blk.Kernel div 2) * DwDilation, DwStride, DwDilation));
   Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create());
   NN.AddLayer(ActLayer);
   // 3) squeeze-excite: pool -> 1x1 reduce -> ReLU -> 1x1 expand -> h-sigmoid
@@ -70072,7 +70054,7 @@ begin
     LoadMobileNetDepthwiseFoldBN(Reader, Trunk.Blocks[i].Dw,
       P + '.0.weight', P + '.1',
       Config.Blocks[i].ExpChannels, Config.Blocks[i].Kernel,
-      Config.BnEps, Shift, Config.Blocks[i].Dilation);
+      Config.BnEps, Shift);
     LoadChannelBiasFromShift(Trunk.Blocks[i].DwBias, Shift);
     if Trunk.Blocks[i].HasSE then
     begin

@@ -6189,8 +6189,8 @@ type
     // the pre-activation raw output (caller applies the activation afterwards).
     // NewW=false keeps the resident weight buffer (weights unchanged).
     procedure Compute(PackedW, X, YRaw: TNNetVolume;
-      OutW, OutH, InW, InDepth, Mult, FeatureSizeX, FeatureSizeY, Stride: integer;
-      NewW: boolean = true);
+      OutW, OutH, InW, InDepth, Mult, FeatureSizeX, FeatureSizeY, Stride,
+      Dilation: integer; NewW: boolean = true);
   end;
 
   /// OpenCL forward helper for the depthwise 1-D convolution (TNNetDepthwiseConv1D).
@@ -16868,6 +16868,9 @@ type
       FDilationX: integer;
       // Input columns one output position spans: FDilationX*(FFeatureSizeX-1)+1.
       FFeatureExtentX: integer;
+      // Spacing of the kernel taps along Y, and the input rows they span.
+      FDilationY: integer;
+      FFeatureExtentY: integer;
       // False keeps the X kernel size when it exceeds the padded input (the
       // transposed 1D convolution, whose kernel never has to fit its input).
       FClampKernelToInputX: boolean;
@@ -16898,6 +16901,7 @@ type
       property FeatureSizeY: integer read FFeatureSizeY;
       property PaddingY: integer read FPaddingY;
       property DilationX: integer read FDilationX;
+      property DilationY: integer read FDilationY;
       destructor Destroy(); override;
       procedure InitDefault(); override;
       // The padded input copy Compute builds, not the previous layer's output.
@@ -16920,11 +16924,7 @@ type
     FGemmWDw: TNNetVolume; // packed per-neuron weights (Mult*FFx*FFy*InDepth) to upload
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    procedure BackpropagateCPU(); {$IFDEF Release} inline; {$ENDIF}
     procedure BackpropagateCPUFast();
-    procedure BackpropagateAtOutputPos(OutputX, OutputY, NeuronIdx, PrevX, PrevY: integer; bCanBackPropagate: boolean); {$IFDEF Release} inline; {$ENDIF}
-    procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
-    procedure ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure ComputeCPUFast();
     // Fused int8 forward: streams the per-neuron codes (1 byte/element)
     // against the padded input via MulAddInt8 and applies each neuron's
@@ -16936,7 +16936,9 @@ type
     procedure ComputeOpenCL();
     {$ENDIF}
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); overload; virtual;
+    // pDilation spaces the taps in X and Y (torch dilation); FStruct[4] keeps it.
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer;
+      pDilation: integer = 1); overload; virtual;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -16951,13 +16953,15 @@ type
   /// Depthwise Convolutional layer with Linear activation function.
   TNNetDepthwiseConvLinear = class(TNNetDepthwiseConv)
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); override;
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer;
+      pDilation: integer = 1); override;
   end;
 
   /// Depthwise Convolutional layer with ReLU activation function.
   TNNetDepthwiseConvReLU = class(TNNetDepthwiseConv)
   public
-    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer); override;
+    constructor Create(pMultiplier, pFeatureSize, pInputPadding, pStride: integer;
+      pDilation: integer = 1); override;
   end;
 
   /// This is a base class. Do not use it directly.
@@ -42911,8 +42915,8 @@ begin
 end;
 
 procedure TNNetDepthwiseConvCL.Compute(PackedW, X, YRaw: TNNetVolume;
-  OutW, OutH, InW, InDepth, Mult, FeatureSizeX, FeatureSizeY, Stride: integer;
-  NewW: boolean = true);
+  OutW, OutH, InW, InDepth, Mult, FeatureSizeX, FeatureSizeY, Stride,
+  Dilation: integer; NewW: boolean = true);
 var
   bufW, bufX, bufY: cl_mem;
   k: cl_kernel;
@@ -42932,9 +42936,10 @@ begin
   clSetKernelArg(k, 5, csLongintSize, @FeatureSizeX);
   clSetKernelArg(k, 6, csLongintSize, @FeatureSizeY);
   clSetKernelArg(k, 7, csLongintSize, @Stride);
-  clSetKernelArg(k, 8, csCLMemSize, @bufW);
-  clSetKernelArg(k, 9, csCLMemSize, @bufX);
-  clSetKernelArg(k, 10, csCLMemSize, @bufY);
+  clSetKernelArg(k, 8, csLongintSize, @Dilation);
+  clSetKernelArg(k, 9, csCLMemSize, @bufW);
+  clSetKernelArg(k, 10, csCLMemSize, @bufX);
+  clSetKernelArg(k, 11, csCLMemSize, @bufY);
   // One work-item per output (x, y, output-channel) element.
   FKernel.RunKernel(k, OutW * OutH * Mult * InDepth);
   FKernel.Finish();
@@ -66836,18 +66841,18 @@ end;
 
 { TNNetDepthwiseConvReLU }
 constructor TNNetDepthwiseConvReLU.Create(pMultiplier, pFeatureSize,
-  pInputPadding, pStride: integer);
+  pInputPadding, pStride: integer; pDilation: integer);
 begin
-  inherited Create(pMultiplier, pFeatureSize, pInputPadding, pStride);
+  inherited Create(pMultiplier, pFeatureSize, pInputPadding, pStride, pDilation);
   FActivationFn := @RectifiedLinearUnit;
   FActivationFnDerivative := @RectifiedLinearUnitDerivative;
 end;
 
 { TNNetDepthwiseConvLinear }
 constructor TNNetDepthwiseConvLinear.Create(pMultiplier, pFeatureSize,
-  pInputPadding, pStride: integer);
+  pInputPadding, pStride: integer; pDilation: integer);
 begin
-  inherited Create(pMultiplier, pFeatureSize, pInputPadding, pStride);
+  inherited Create(pMultiplier, pFeatureSize, pInputPadding, pStride, pDilation);
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
 end;
@@ -66870,75 +66875,6 @@ begin
   InitDefault();
 end;
 
-procedure TNNetDepthwiseConv.ComputeCPU();
-var
-  OutputX, OutputY: integer;
-  MaxX, MaxY: integer;
-  NeuronIdx, MaxNeurons: integer;
-begin
-  FOutputRaw.Fill(0.0);
-  MaxX := FOutput.SizeX - 1;
-  MaxY := FOutput.SizeY - 1;
-  MaxNeurons := FNeurons.Count - 1;
-  for OutputX := 0 to MaxX do
-  begin
-    for OutputY := 0 to MaxY do
-    begin
-      for NeuronIdx := 0 to MaxNeurons do
-      begin
-        ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY);
-      end;
-    end;
-  end;
-  ApplyActivationFunctionToOutput();
-  //Write('Raw:');FOutputRaw.PrintDebug();WriteLn;
-  //Write('Output:');FOutput.PrintDebug();WriteLn;
-end;
-
-procedure TNNetDepthwiseConv.BackpropagateCPU();
-var
-  CntX, CntY, NeuronIdx: integer;
-  MaxX, MaxY, MaxNeuronIdx: integer;
-  PrevX, PrevY: integer;
-  bCanBackPropagate: boolean;
-begin
-  MaxX := OutputError.SizeX - 1;
-  MaxY := OutputError.SizeY - 1;
-  MaxNeuronIdx := FNeurons.Count - 1;
-  bCanBackPropagate :=
-    (FPrevLayer.OutputError.Depth = FArrNeurons[0].Weights.Depth) and
-    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
-  if FPadding > 0 then
-  begin
-    FPrevLayerErrorPadded.Fill(0);
-  end;
-  for CntY := 0 to MaxY do
-  begin
-    PrevY := (CntY*FStride);
-    for CntX := 0 to MaxX do
-    begin
-      PrevX := (CntX*FStride);
-      for NeuronIdx := 0 to MaxNeuronIdx do
-      begin
-        BackpropagateAtOutputPos(CntX, CntY, NeuronIdx, PrevX, PrevY, bCanBackPropagate);
-      end;
-    end;
-  end;
-
-  if FPadding > 0 then
-  begin
-    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPadding, FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY, FPrevLayerErrorPadded);
-  end;
-
-  //Write('Error:');FOutputError.PrintDebug();WriteLn;
-  //Write('Error Deriv:');FOutputErrorDeriv.PrintDebug();WriteLn;
-  if (not FBatchUpdate) then
-  begin
-    for NeuronIdx := 0 to MaxNeuronIdx do FArrNeurons[NeuronIdx].UpdateWeights(FInertia);
-    AfterWeightUpdate();
-  end;
-end;
-
 procedure TNNetDepthwiseConv.BackpropagateCPUFast();
 var
   OutputX, OutputY, NeuronIdx: integer;
@@ -66953,6 +66889,8 @@ var
   LocalPrevSizeX, LocalPrevSizeY: integer;
   XInRange: boolean;
   dPos, wPos, inPos, pePos, dStride, wStride, inStride, peStride: integer;
+  inTapXStride, peTapXStride, PrevTapX: integer;
+  InBasePos, PeBasePos, inTapPos, peTapPos: integer;
   {$IFDEF AVX64}
   PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
   localNumElements, MissedElements: integer;
@@ -66974,11 +66912,15 @@ begin
   end;
   LocalPrevSizeX := LocalPrevError.SizeX;
   LocalPrevSizeY := LocalPrevError.SizeY;
-  // #12: feature-row strides (invariant; all neuron weights/deltas share a shape).
+  // #12: tap strides (invariant; all neuron weights/deltas share a shape). The
+  // input and its error advance FDilationY rows per tap row, FDilationX columns
+  // per tap column.
   dStride := FArrNeurons[0].Delta.GetRawPos(0, 1);
   wStride := FArrNeurons[0].Weights.GetRawPos(0, 1);
-  inStride := FInputCopy.GetRawPos(0, 1);
-  peStride := LocalPrevError.GetRawPos(0, 1);
+  inStride := FInputCopy.GetRawPos(0, FDilationY);
+  peStride := LocalPrevError.GetRawPos(0, FDilationY);
+  inTapXStride := FDilationX * FInputCopy.Depth;
+  peTapXStride := FDilationX * LocalPrevError.Depth;
   bCanBackPropagate :=
     (FPrevLayer.OutputError.Depth = FArrNeurons[0].Weights.Depth) and
     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
@@ -66998,11 +66940,13 @@ begin
       // Both previous-layer coordinates only grow with the feature counters, so
       // the lower-bound tests always hold; the upper bounds become a clamped
       // feature-row range (Y) plus one test per feature column (X) (#5/#11).
-      MaxFeatureYInRange := LocalPrevSizeY - 1 - PrevY;
+      MaxFeatureYInRange := (LocalPrevSizeY - 1 - PrevY) div FDilationY;
       if MaxFeatureYInRange > MaxFeatureY then MaxFeatureYInRange := MaxFeatureY;
       for OutputX := 0 to MaxX do
       begin
         PrevX := (OutputX*FStride);
+        InBasePos := FInputCopy.GetRawPos(PrevX, PrevY);
+        PeBasePos := LocalPrevError.GetRawPos(PrevX, PrevY);
         OutputErrorDerivLearningPtr := FOutputError.GetRawPtr(OutputX, OutputY);
         OutputErrorDerivPtr := FOutputErrorDeriv.GetRawPtr(OutputX, OutputY);
           {$IFDEF Debug}
@@ -67011,14 +66955,19 @@ begin
           if FInputCopy.Depth <> LocalWeight.Depth
           then FErrorProc('TNNetDepthwiseConv.BackpropagateAtOutputPos: dephts don''t match at neuron:'+IntToStr(NeuronIdx));
           {$ENDIF}
+          inTapPos := InBasePos;
+          peTapPos := PeBasePos;
+          PrevTapX := PrevX;
           for FeatureCntX := 0 to MaxFeatureX do
           begin
             dPos := LocalDelta.GetRawPos(FeatureCntX, 0);
             wPos := LocalWeight.GetRawPos(FeatureCntX, 0);
-            inPos := FInputCopy.GetRawPos(OutputX + FeatureCntX, OutputY);
-            pePos := LocalPrevError.GetRawPos(PrevX + FeatureCntX, PrevY);
-            XInRange := bCanBackPropagate and
-              (PrevX + FeatureCntX < LocalPrevSizeX);
+            inPos := inTapPos;
+            pePos := peTapPos;
+            XInRange := bCanBackPropagate and (PrevTapX < LocalPrevSizeX);
+            Inc(inTapPos, inTapXStride);
+            Inc(peTapPos, peTapXStride);
+            Inc(PrevTapX, FDilationX);
             for FeatureCntY := 0 to MaxFeatureY do
             begin
               {$IFNDEF AVX64}
@@ -67069,11 +67018,13 @@ begin
       // Both previous-layer coordinates only grow with the feature counters, so
       // the lower-bound tests always hold; the upper bounds become a clamped
       // feature-row range (Y) plus one test per feature column (X) (#5/#11).
-      MaxFeatureYInRange := LocalPrevSizeY - 1 - PrevY;
+      MaxFeatureYInRange := (LocalPrevSizeY - 1 - PrevY) div FDilationY;
       if MaxFeatureYInRange > MaxFeatureY then MaxFeatureYInRange := MaxFeatureY;
       for OutputX := 0 to MaxX do
       begin
         PrevX := (OutputX*FStride);
+        InBasePos := FInputCopy.GetRawPos(PrevX, PrevY);
+        PeBasePos := LocalPrevError.GetRawPos(PrevX, PrevY);
         for NeuronIdx := 0 to MaxNeuronIdx do
         begin
           LocalDelta := FArrNeurons[NeuronIdx].Delta;
@@ -67090,14 +67041,19 @@ begin
           if FInputCopy.Depth <> LocalWeight.Depth
           then FErrorProc('TNNetDepthwiseConv.BackpropagateAtOutputPos: dephts don''t match at neuron:'+IntToStr(NeuronIdx));
           {$ENDIF}
+          inTapPos := InBasePos;
+          peTapPos := PeBasePos;
+          PrevTapX := PrevX;
           for FeatureCntX := 0 to MaxFeatureX do
           begin
             dPos := LocalDelta.GetRawPos(FeatureCntX, 0);
             wPos := LocalWeight.GetRawPos(FeatureCntX, 0);
-            inPos := FInputCopy.GetRawPos(OutputX + FeatureCntX, OutputY);
-            pePos := LocalPrevError.GetRawPos(PrevX + FeatureCntX, PrevY);
-            XInRange := bCanBackPropagate and
-              (PrevX + FeatureCntX < LocalPrevSizeX);
+            inPos := inTapPos;
+            pePos := peTapPos;
+            XInRange := bCanBackPropagate and (PrevTapX < LocalPrevSizeX);
+            Inc(inTapPos, inTapXStride);
+            Inc(peTapPos, peTapXStride);
+            Inc(PrevTapX, FDilationX);
             for FeatureCntY := 0 to MaxFeatureY do
             begin
               TNNetVolume.MulAdd
@@ -67142,128 +67098,6 @@ begin
   end;
 end;
 
-procedure TNNetDepthwiseConv.BackpropagateAtOutputPos(OutputX, OutputY,
-  NeuronIdx, PrevX, PrevY: integer; bCanBackPropagate: boolean);
-var
-  LocalPrevError, LocalDelta, LocalWeight: TNNetVolume;
-  OutputErrorDerivLearningPtr, OutputErrorDerivPtr: pointer;
-  LocalDepth: integer;
-  FeatureCntX, FeatureCntY: integer;
-  PrevPCntX, PrevPCntY: integer;
-  MaxFeatureX, MaxFeatureY: integer;
-  LocalPrevSizeX, LocalPrevSizeY: integer;
-  dPos, wPos, inPos, pePos, dStride, wStride, inStride, peStride: integer;
-begin
-  MaxFeatureX := FFeatureSizeX - 1;
-  MaxFeatureY := FFeatureSizeY - 1;
-  LocalDelta := FArrNeurons[NeuronIdx].Delta;
-  LocalWeight := FArrNeurons[NeuronIdx].Weights;
-  LocalDepth := LocalWeight.Depth * NeuronIdx;
-  OutputErrorDerivLearningPtr := FOutputError.GetRawPtr(OutputX, OutputY, LocalDepth);
-  OutputErrorDerivPtr := FOutputErrorDeriv.GetRawPtr(OutputX, OutputY, LocalDepth);
-  if FPadding > 0 then
-  begin
-    LocalPrevError := FPrevLayerErrorPadded;
-  end
-  else
-  begin
-    LocalPrevError := FPrevLayer.OutputError;
-  end;
-  LocalPrevSizeX := LocalPrevError.SizeX;
-  LocalPrevSizeY := LocalPrevError.SizeY;
-  {$IFDEF Debug}
-  if LocalDelta.Size <> LocalWeight.Size
-  then FErrorProc('TNNetDepthwiseConv.BackpropagateAtOutputPos: deltas don''t match at neuron:'+IntToStr(NeuronIdx));
-  if FInputCopy.Depth <> LocalWeight.Depth
-  then FErrorProc('TNNetDepthwiseConv.BackpropagateAtOutputPos: dephts don''t match at neuron:'+IntToStr(NeuronIdx));
-  {$ENDIF}
-  // #12: carry the FeatureCntY read/write offsets (feature-row strides) instead
-  // of a per-tap GetRawPos multiply; advance all four unconditionally.
-  dStride := LocalDelta.GetRawPos(0, 1);
-  wStride := LocalWeight.GetRawPos(0, 1);
-  inStride := FInputCopy.GetRawPos(0, 1);
-  peStride := LocalPrevError.GetRawPos(0, 1);
-  for FeatureCntX := 0 to MaxFeatureX do
-  begin
-    dPos := LocalDelta.GetRawPos(FeatureCntX, 0);
-    wPos := LocalWeight.GetRawPos(FeatureCntX, 0);
-    inPos := FInputCopy.GetRawPos(OutputX + FeatureCntX, OutputY);
-    pePos := LocalPrevError.GetRawPos(PrevX + FeatureCntX, PrevY);
-    for FeatureCntY := 0 to MaxFeatureY do
-    begin
-      TNNetVolume.MulAdd
-      (
-        LocalDelta.GetRawPtr(dPos),
-        OutputErrorDerivLearningPtr,
-        FInputCopy.GetRawPtr(inPos),
-        LocalDelta.Depth
-      );
-      PrevPCntX := PrevX + FeatureCntX;
-      PrevPCntY := PrevY + FeatureCntY;
-      if
-        bCanBackPropagate and
-        (PrevPCntX >= 0) and
-        (PrevPCntY >= 0) and
-        (PrevPCntX < LocalPrevSizeX) and
-        (PrevPCntY < LocalPrevSizeY)
-      then
-      begin
-        TNNetVolume.MulAdd
-        (
-          LocalPrevError.GetRawPtr(pePos),
-          LocalWeight.GetRawPtr(wPos),
-          OutputErrorDerivPtr,
-          LocalWeight.Depth
-        );
-      end;
-      Inc(dPos, dStride);
-      Inc(wPos, wStride);
-      Inc(inPos, inStride);
-      Inc(pePos, peStride);
-    end;
-  end;
-end;
-
-procedure TNNetDepthwiseConv.ComputeCPUAtOutputPos(NeuronIdx, OutputX, OutputY: integer);
-var
-  LocalW: TNNetVolume;
-  OutputPtr: pointer;
-  OutputDepth: integer;
-  CntX, CntY: integer;
-  MaxX, MaxY: integer;
-  InputX, InputY: integer;
-  WeightDepth, inYStride, wYStride, inPos, wPos: integer;
-begin
-  MaxX := FFeatureSizeX - 1;
-  MaxY := FFeatureSizeY - 1;
-  LocalW := FArrNeurons[NeuronIdx].Weights;
-  OutputDepth := LocalW.Depth * NeuronIdx;
-  OutputPtr := FOutputRaw.GetRawPtr(OutputX, OutputY, OutputDepth);
-  InputX := OutputX * FStride;
-  InputY := OutputY * FStride;
-  WeightDepth := LocalW.Depth;
-  // #12: carry the CntY read offsets (feature-row stride) instead of a per-tap
-  // GetRawPos multiply.
-  inYStride := FInputCopy.GetRawPos(0, 1);
-  wYStride := LocalW.GetRawPos(0, 1);
-  for CntX := 0 to MaxX do
-  begin
-    inPos := FInputCopy.GetRawPos(InputX + CntX, InputY);
-    wPos := LocalW.GetRawPos(CntX, 0);
-    for CntY := 0 to MaxY do
-    begin
-      TNNetVolume.MulAdd(
-        OutputPtr,
-        FInputCopy.GetRawPtr(inPos),
-        LocalW.GetRawPtr(wPos),
-        WeightDepth
-      );
-      Inc(inPos, inYStride);
-      Inc(wPos, wYStride);
-    end;
-  end;
-end;
-
 procedure TNNetDepthwiseConv.ComputeCPUFast();
 var
   OutputX, OutputY: integer;
@@ -67276,7 +67110,7 @@ var
   FeatureSizeXM1, FeatureSizeYM1: integer;
   InputX, InputY: integer;
   WeightDepth: integer;
-  inPos, wPos, inYStride, wYStride: integer;
+  inPos, wPos, inYStride, wYStride, inTapXStride, inTapPos: integer;
   {$IFDEF AVX64}
   PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
   localNumElements, MissedElements: integer;
@@ -67289,9 +67123,10 @@ begin
   FeatureSizeYM1 := FFeatureSizeY - 1;
   MaxNeurons := FNeurons.Count - 1;
   WeightDepth := FArrNeurons[0].Weights.Depth;
-  // #12: feature-row strides; one CntY step advances the input/weight offsets by
-  // exactly one row. FInputCopy is fixed; all neuron weights share one shape.
-  inYStride := FInputCopy.GetRawPos(0, 1);
+  // #12: tap strides; one CntY step advances the input by FDilationY rows and
+  // the weights by one row, one CntX step the input by FDilationX columns.
+  inYStride := FInputCopy.GetRawPos(0, FDilationY);
+  inTapXStride := FDilationX * FInputCopy.Depth;
   wYStride := FArrNeurons[0].Weights.GetRawPos(0, 1);
   {$IFDEF AVX64}
   MissedElements := WeightDepth and 3;
@@ -67313,9 +67148,11 @@ begin
         PtrA := OutputPtr;
         {$ENDIF}
           //WriteLn(InputX,' ', InputY,' ',OutputX,' ',OutputY);
+        inTapPos := FInputCopy.GetRawPos(InputX, InputY);
         for CntX := 0 to FeatureSizeXM1 do
         begin
-          inPos := FInputCopy.GetRawPos(InputX + CntX, InputY);
+          inPos := inTapPos;
+          Inc(inTapPos, inTapXStride);
           wPos := LocalW.GetRawPos(CntX, 0);
           for CntY := 0 to FeatureSizeYM1 do
           begin
@@ -67353,9 +67190,11 @@ begin
           OutputDepth := LocalW.Depth * NeuronIdx;
           OutputPtr := FOutputRaw.GetRawPtr(OutputX, OutputY, OutputDepth);
           //WriteLn(InputX,' ', InputY,' ',OutputX,' ',OutputY);
+          inTapPos := FInputCopy.GetRawPos(InputX, InputY);
           for CntX := 0 to FeatureSizeXM1 do
           begin
-            inPos := FInputCopy.GetRawPos(InputX + CntX, InputY);
+            inPos := inTapPos;
+            Inc(inTapPos, inTapXStride);
             wPos := LocalW.GetRawPos(CntX, 0);
             for CntY := 0 to FeatureSizeYM1 do
             begin
@@ -67389,7 +67228,7 @@ var
   InputX, InputY: integer;
   WeightDepth, WeightDepthM1: integer;
   TapOfs: integer;
-  TapRowStride, InRowStride, InOfs: integer;
+  TapRowStride, InRowStride, InOfs, InTapXStride, InTapOfs: integer;
   RowScale: TNeuralFloat;
   RowPtr: TNeuralInt8ArrPtr;
   CodesPtr: TNeuralInt8ArrPtr;
@@ -67404,9 +67243,10 @@ begin
   WeightDepth := FQuantWSizeD;
   WeightDepthM1 := WeightDepth - 1;
   // Row strides (#12): one CntY step advances the code offset by
-  // FQuantWSizeX*WeightDepth and the input offset by one FInputCopy row.
+  // FQuantWSizeX*WeightDepth and the input offset by FDilationY input rows.
   TapRowStride := FQuantWSizeX * WeightDepth;
-  InRowStride := FInputCopy.GetRawPos(0, 1);
+  InRowStride := FInputCopy.GetRawPos(0, FDilationY);
+  InTapXStride := FDilationX * FInputCopy.Depth;
   CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the nest
   ScalePtr := FQuantTable.ScalePtr;
   // Y outer / X inner (App. E): consecutive OutputX share an input row and
@@ -67424,14 +67264,16 @@ begin
         RowPtr := TNeuralInt8ArrPtr(@CodesPtr^[NeuronIdx * FQuantVectorSize]);
         OutputPtr := FOutputRaw.GetRawPtr(OutputX, OutputY,
           WeightDepth * NeuronIdx);
+        InTapOfs := FInputCopy.GetRawPos(InputX, InputY);
         for CntX := 0 to FeatureSizeXM1 do
         begin
-          // Code offset of tap (CntX, 0, 0) and input offset of (InputX+CntX,
-          // InputY, 0); CntY carries both by their row strides (#12). Same
-          // ((SizeX*y)+x)*Depth layout the FP32 volume used; FQuantWSizeX
-          // snapshots that volume's SizeX at quantize time.
+          // Code offset of tap (CntX, 0, 0) and input offset of
+          // (InputX+CntX*FDilationX, InputY, 0); CntY carries both by their row
+          // strides (#12). Same ((SizeX*y)+x)*Depth layout the FP32 volume
+          // used; FQuantWSizeX snapshots that volume's SizeX at quantize time.
           TapOfs := CntX * WeightDepth;
-          InOfs := FInputCopy.GetRawPos(InputX + CntX, InputY);
+          InOfs := InTapOfs;
+          Inc(InTapOfs, InTapXStride);
           for CntY := 0 to FeatureSizeYM1 do
           begin
             TNNetVolume.MulAddInt8(
@@ -67455,15 +67297,19 @@ begin
 end;
 
 constructor TNNetDepthwiseConv.Create(pMultiplier, pFeatureSize, pInputPadding,
-  pStride: integer);
+  pStride: integer; pDilation: integer);
 begin
   inherited Create(pFeatureSize, pInputPadding, pStride);
+  FDilationX := Max(pDilation, 1);
+  FDilationY := FDilationX;
+  SetFeatureSizeXY(pFeatureSize, pFeatureSize);
   AddNeurons(pMultiplier);
   SetOutputErrorSize(1, 1, 1);
   FStruct[0] := pMultiplier;
   FStruct[1] := pFeatureSize;
   FStruct[2] := pInputPadding;
   FStruct[3] := pStride;
+  FStruct[4] := FDilationX;
   FActivationFn := @HiperbolicTangent;
   FActivationFnDerivative := @HiperbolicTangentDerivative;
 end;
@@ -67553,7 +67399,7 @@ end;
 // kernel (one work-item per output element, NO cross-channel overspend):
 //
 //   Raw[ox,oy, n*InDepth + d] =
-//       sum_{tap}  W_n[tap, d] * InputCopy[ox*S + tapX, oy*S + tapY, d]
+//       sum_{tap}  W_n[tap, d] * InputCopy[ox*S + tapX*Dil, oy*S + tapY*Dil, d]
 //
 // Reduction is over the FT = FeatureSizeX*FeatureSizeY spatial taps; depth d is a
 // FREE (output) index that must match between weight and input (depthwise). The
@@ -67594,7 +67440,8 @@ begin
 
   FDepthwiseCL.Compute(FGemmWDw, FInputCopy, FOutputRaw,
     FOutput.SizeX, FOutput.SizeY, FInputCopy.SizeX, InDepth, Mult,
-    FFeatureSizeX, FFeatureSizeY, FStride, {NewW}FAfterWeightUpdateHasBeenCalled);
+    FFeatureSizeX, FFeatureSizeY, FStride, FDilationX,
+    {NewW}FAfterWeightUpdateHasBeenCalled);
   FAfterWeightUpdateHasBeenCalled := false;
 
   ApplyActivationFunctionToOutput();
@@ -118863,16 +118710,18 @@ begin
   // keeps its 3x3 weights, as in PyTorch. A dilated kernel is never clamped.
   if (FDilationX = 1) and FClampKernelToInputX then
     FFeatureSizeX := Min(FFeatureSizeX, pPrevLayer.Output.SizeX + 2 * FPadding);
-  FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY + 2 * FPaddingY);
+  if FDilationY = 1 then
+    FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY + 2 * FPaddingY);
   SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, pPrevLayer.Output.Depth);
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
   FFeatureSizeXMinus1 := FFeatureSizeX - 1;
   FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
+  FFeatureExtentY := FDilationY * FFeatureSizeYMinus1 + 1;
   FOutputSizeX := CalcOutputSize(pPrevLayer.Output.SizeX, FFeatureExtentX, FPadding, FStride);
   FOutputSizeY := CalcOutputSizeY(pPrevLayer.Output.SizeY);
   if (FOutputSizeX < 1) or (FOutputSizeY < 1) then
     FErrorProc(ClassName + '.SetPrevLayer: the kernel spans ' +
-      IntToStr(FFeatureExtentX) + 'x' + IntToStr(FFeatureSizeY) +
+      IntToStr(FFeatureExtentX) + 'x' + IntToStr(FFeatureExtentY) +
       ' but the padded input is only ' +
       IntToStr(pPrevLayer.Output.SizeX + 2 * FPadding) + 'x' +
       IntToStr(pPrevLayer.Output.SizeY + 2 * FPaddingY) + '.');
@@ -118899,7 +118748,7 @@ end;
 
 function TNNetConvolutionAbstract.CalcOutputSizeY(pInputSizeY: integer): integer;
 begin
-  Result := CalcOutputSize(pInputSizeY, FFeatureSizeY, FPaddingY, FStride);
+  Result := CalcOutputSize(pInputSizeY, FFeatureExtentY, FPaddingY, FStride);
 end;
 
 procedure TNNetConvolution.BackpropagateAtOutputPos(pCanBackpropOnPos: boolean; OutputRawPos, OutputX, OutputY, OutputD, PrevX, PrevY: integer);
@@ -121773,6 +121622,8 @@ begin
   FStride := Max(pStride,1);
   FDilationX := 1;
   FFeatureExtentX := FFeatureSizeX;
+  FDilationY := 1;
+  FFeatureExtentY := FFeatureSizeY;
   FClampKernelToInputX := true;
   FSuppressBias := pSuppressBias;
   if FPadding > 0 then
@@ -121789,6 +121640,7 @@ begin
   FFeatureSizeXMinus1 := FFeatureSizeX - 1;
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
   FFeatureExtentX := FDilationX * FFeatureSizeXMinus1 + 1;
+  FFeatureExtentY := FDilationY * FFeatureSizeYMinus1 + 1;
 end;
 
 destructor TNNetConvolutionAbstract.Destroy();
@@ -131026,7 +130878,7 @@ begin
       begin
         Conv := TNNetConvolutionAbstract(Layer);
         KernelX := Conv.FFeatureExtentX;
-        KernelY := Conv.FFeatureSizeY;
+        KernelY := Conv.FFeatureExtentY;
         PadX := Conv.FPadding;
         PadY := Conv.FPaddingY;
         if Conv.FStride > 0 then
@@ -142450,9 +142302,9 @@ begin
       'TNNetGroupedPointwiseConvHardSwish' : Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]);
       'TNNetConvolutionSharedWeights' : Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]);
       'TNNetDeepEquilibriumSharedConv' : Result := TNNetDeepEquilibriumSharedConv.Create(FLayers[St[5]]);
-      'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]);
-      'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]);
-      'TNNetDepthwiseConvLinear' :  Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]);
+      'TNNetDepthwiseConv' :        Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3], Max(St[4], 1));
+      'TNNetDepthwiseConvReLU' :    Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3], Max(St[4], 1));
+      'TNNetDepthwiseConvLinear' :  Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3], Max(St[4], 1));
       'TNNetPointwiseConv' :        Result := TNNetPointwiseConv.Create(St[0], St[4]);
       'TNNetPointwiseConvReLU' :    Result := TNNetPointwiseConvReLU.Create(St[0], St[4]);
       'TNNetPointwiseConvLinear' :  Result := TNNetPointwiseConvLinear.Create(St[0], St[4]);
@@ -142909,9 +142761,9 @@ begin
       if S[0] = 'TNNetGroupedPointwiseConvHardSwish' then Result := TNNetGroupedPointwiseConvHardSwish.Create({pNumFeatures=}St[0], {pGroups=}St[5], {pSuppressBias=}St[4]) else
       if S[0] = 'TNNetConvolutionSharedWeights' then Result := TNNetConvolutionSharedWeights.Create(FLayers[St[5]]) else
       if S[0] = 'TNNetDeepEquilibriumSharedConv' then Result := TNNetDeepEquilibriumSharedConv.Create(FLayers[St[5]]) else
-      if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3]) else
-      if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3]) else
-      if S[0] = 'TNNetDepthwiseConvLinear' then Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetDepthwiseConv' then Result := TNNetDepthwiseConv.Create(St[0], St[1], St[2], St[3], Max(St[4], 1)) else
+      if S[0] = 'TNNetDepthwiseConvReLU' then Result := TNNetDepthwiseConvReLU.Create(St[0], St[1], St[2], St[3], Max(St[4], 1)) else
+      if S[0] = 'TNNetDepthwiseConvLinear' then Result := TNNetDepthwiseConvLinear.Create(St[0], St[1], St[2], St[3], Max(St[4], 1)) else
       if S[0] = 'TNNetPointwiseConv' then Result := TNNetPointwiseConv.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvReLU' then Result := TNNetPointwiseConvReLU.Create(St[0], St[4]) else
       if S[0] = 'TNNetPointwiseConvLinear' then Result := TNNetPointwiseConvLinear.Create(St[0], St[4]) else
