@@ -67,6 +67,13 @@ the mid-block self-attention concentrates.
 (diffusers DDIMInverseScheduler): the image's VAE latents are walked to noise
 with the prompt, then sampled back with DDIM and the prompt; guidance defaults
 to 1, where the round trip reconstructs the image best.
+--relight PNG --iclight FILE relights a cut-out subject with IC-Light (Zhang
+et al. 2025, lllyasviel/IC-Light gradio_demo.py): the iclight_sd15_fc offset
+is added to the UNet weights, the prompt describes the light, --light
+left|right|top|bottom starts from a light gradient, --relight-background PNG
+(with iclight_sd15_fbc) relights against a background, and a highres pass
+upscales by 1.5. The subject's alpha (RGBA), or --birefnet FILE (BiRefNet /
+RMBG-2.0), mattes it on gray.
 --edit-prompt TEXT runs Prompt-to-Prompt (Hertz et al. 2022, the
 google/prompt-to-prompt controllers): the prompt and the edit prompt sample
 together from one latent with DDIM, and the edit takes the prompt's
@@ -107,6 +114,13 @@ const
   FreeUPresetNames: array[0..1] of string = ('sd15', 'sd21');
   FreeUPresetFactors: array[0..1, 0..3] of TNeuralFloat =
     ((0.9, 0.2, 1.5, 1.6), (0.9, 0.2, 1.4, 1.6));
+  // --light names of TSDLightDirection.
+  LightOptionNames: array[TSDLightDirection] of string =
+    ('none', 'left', 'right', 'top', 'bottom');
+  // IC-Light gradio_demo.py's added and negative prompts.
+  ICLightAddedPrompt = 'best quality';
+  ICLightNegativePrompt = 'lowres, bad anatomy, bad hands, cropped, ' +
+    'worst quality';
 
 type
   TStableDiffusionOptions = record
@@ -140,6 +154,15 @@ type
     // --upscale-image ('' for none) and its --noise-level (< 0: default).
     UpscaleImageFile: string;
     NoiseLevel: integer;
+    // --relight subject ('' for none), --iclight offset, --relight-background,
+    // --birefnet, --light, --relight-added-prompt and the highres pass
+    // (--highres-scale, --highres-strength; < 0: default).
+    RelightImageFile, ICLightFile, RelightBackgroundFile, BiRefNetFile: string;
+    LightDirection: TSDLightDirection;
+    RelightAddedPrompt: string;
+    HighResScale, HighResStrength: double;
+    // True when --negative was given.
+    HasNegativePrompt: boolean;
     // --embedding values: FILE or FILE:TOKEN, in load order.
     Embeddings: array of string;
     // --lora files and their scales, in load order.
@@ -347,7 +370,8 @@ begin
   WriteLn('                    (rounded down to the VAE factor) unless ',
     '--width/--height');
   WriteLn('  --strength S      how much of --init-image to repaint, (0, 1] ',
-    '(default 0.8);');
+    '(default 0.8;');
+  WriteLn('                    --relight --light: 0.9);');
   WriteLn('                    runs the last int(steps * S) steps (lcm: all ',
     'steps over');
   WriteLn('                    the first int(50 * S) LCM timesteps)');
@@ -402,6 +426,29 @@ begin
   WriteLn('  --reweight W=S[,W=S] scale the edit''s cross-attention to the ',
     'words W of');
   WriteLn('                    --edit-prompt by S (any mode)');
+  WriteLn('  --relight PNG     IC-Light: relight this subject as the prompt ',
+    'describes; the');
+  WriteLn('                    alpha of an RGBA file (or --birefnet) mattes it ',
+    'on gray');
+  WriteLn('  --iclight FILE    iclight_sd15_fc.safetensors (or _fbc with ',
+    '--relight-background),');
+  WriteLn('                    added to the UNet weights; any SD 1.5 folder ',
+    'as --model');
+  WriteLn('  --light DIR       left, right, top or bottom: start from that ',
+    'light gradient');
+  WriteLn('                    at --strength (default 0.9); none (default) ',
+    'starts from noise');
+  WriteLn('  --relight-background PNG the background of an fbc offset');
+  WriteLn('  --birefnet FILE   BiRefNet / RMBG-2.0 model.safetensors: matte ',
+    'the --relight');
+  WriteLn('                    image with it instead of its alpha');
+  WriteLn('  --relight-added-prompt TEXT appended to the prompt after ", " ',
+    '(default');
+  WriteLn('                    "best quality"; "" adds nothing)');
+  WriteLn('  --highres-scale S the highres pass size factor, sides rounded to ',
+    'multiples of');
+  WriteLn('                    64 (default 1.5; 0 skips the pass)');
+  WriteLn('  --highres-strength S the highres pass strength (default 0.5)');
   WriteLn('  --noise-level N   noise added to --upscale-image, 0..max_noise_level ',
     '(350;');
   WriteLn('                    default 20); more noise lets the UNet invent ',
@@ -515,6 +562,40 @@ begin
   end;
 end;
 
+// --light value: one of LightOptionNames.
+function ParseLightDirection(const Name: string): TSDLightDirection;
+var
+  Direction: TSDLightDirection;
+begin
+  for Direction := Low(TSDLightDirection) to High(TSDLightDirection) do
+    if LowerCase(Name) = LightOptionNames[Direction] then exit(Direction);
+  raise Exception.Create('--light wants none, left, right, top or bottom, ' +
+    'not "' + Name + '"');
+end;
+
+// ICLight.SetMatte of Image's BiRefNet matte (BiRefNetFile model).
+procedure MatteWithBiRefNet(const BiRefNetFile: string; Image: TNNetVolume;
+  ICLight: TStableDiffusionICLight);
+var
+  NN: TNNet;
+  Config: TBiRefNetConfig;
+  RGB, Mask: TNNetVolume;
+begin
+  NN := nil;
+  RGB := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  try
+    NN := BuildBiRefNetFromSafeTensors(BiRefNetFile, Config, {pTrainable=}false);
+    RGB.CopyChannels(Image, [0, 1, 2]);
+    BiRefNetRemoveBackground(NN, Config, RGB, Mask);
+    ICLight.SetMatte(Mask);
+  finally
+    Mask.Free;
+    RGB.Free;
+    NN.Free;
+  end;
+end;
+
 function ParseOptions(out Opt: TStableDiffusionOptions): boolean;
 var
   ArgPos: integer;
@@ -547,6 +628,15 @@ begin
   Opt.ImageGuidanceScale := -1;
   Opt.UpscaleImageFile := '';
   Opt.NoiseLevel := -1;
+  Opt.RelightImageFile := '';
+  Opt.ICLightFile := '';
+  Opt.RelightBackgroundFile := '';
+  Opt.BiRefNetFile := '';
+  Opt.LightDirection := sdlNone;
+  Opt.RelightAddedPrompt := ICLightAddedPrompt;
+  Opt.HighResScale := -1;
+  Opt.HighResStrength := -1;
+  Opt.HasNegativePrompt := false;
   Opt.InvertImageFile := '';
   Opt.InvertSteps := -1;
   Opt.InvertGuidanceScale := -1;
@@ -587,7 +677,11 @@ begin
     Arg := ParamStr(ArgPos);
     if Arg = '--model' then Opt.ModelFolder := NextArg()
     else if Arg = '--prompt' then Opt.Prompt := NextArg()
-    else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
+    else if Arg = '--negative' then
+    begin
+      Opt.NegativePrompt := NextArg();
+      Opt.HasNegativePrompt := true;
+    end
     else if Arg = '--output' then Opt.OutputFile := NextArg()
     else if Arg = '--steps' then Opt.Steps := StrToInt(NextArg())
     else if Arg = '--width' then Opt.ImageWidth := StrToInt(NextArg())
@@ -641,6 +735,19 @@ begin
     else if Arg = '--image-guidance' then
       Opt.ImageGuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--upscale-image' then Opt.UpscaleImageFile := NextArg()
+    else if Arg = '--relight' then Opt.RelightImageFile := NextArg()
+    else if Arg = '--iclight' then Opt.ICLightFile := NextArg()
+    else if Arg = '--relight-background' then
+      Opt.RelightBackgroundFile := NextArg()
+    else if Arg = '--birefnet' then Opt.BiRefNetFile := NextArg()
+    else if Arg = '--light' then
+      Opt.LightDirection := ParseLightDirection(NextArg())
+    else if Arg = '--relight-added-prompt' then
+      Opt.RelightAddedPrompt := NextArg()
+    else if Arg = '--highres-scale' then
+      Opt.HighResScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--highres-strength' then
+      Opt.HighResStrength := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--noise-level' then Opt.NoiseLevel := StrToInt(NextArg())
     else if Arg = '--invert-image' then Opt.InvertImageFile := NextArg()
     else if Arg = '--invert-steps' then Opt.InvertSteps := StrToInt(NextArg())
@@ -716,8 +823,24 @@ begin
     (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '')) then
     raise Exception.Create('--gligen-inpaint-image cannot be combined with ' +
       '--init-image, --edit-image or --upscale-image');
-  if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
-    raise Exception.Create('--strength needs --init-image');
+  if (Opt.Strength >= 0) and (Opt.InitImageFile = '') and
+    (Opt.RelightImageFile = '') then
+    raise Exception.Create('--strength needs --init-image or --relight');
+  if (Opt.RelightImageFile <> '') <> (Opt.ICLightFile <> '') then
+    raise Exception.Create('--relight and --iclight go together');
+  if (Opt.RelightImageFile = '') and ((Opt.RelightBackgroundFile <> '') or
+    (Opt.BiRefNetFile <> '') or (Opt.LightDirection <> sdlNone) or
+    (Opt.RelightAddedPrompt <> ICLightAddedPrompt) or
+    (Opt.HighResScale >= 0) or (Opt.HighResStrength >= 0)) then
+    raise Exception.Create('--relight-background, --birefnet, --light, ' +
+      '--relight-added-prompt and --highres-* need --relight');
+  if (Opt.RelightImageFile <> '') and ((Opt.InitImageFile <> '') or
+    (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '') or
+    (Opt.InvertImageFile <> '') or (Opt.EditPrompt <> '') or
+    (Opt.GLIGENFile <> '') or (Opt.IPAdapterFile <> '')) then
+    raise Exception.Create('--relight cannot be combined with --init-image, ' +
+      '--edit-image, --upscale-image, --invert-image, --edit-prompt, ' +
+      '--gligen or --ip-adapter');
   if (Opt.DepthImageFile <> '') and (Opt.InitImageFile = '') then
     raise Exception.Create('--depth-image needs --init-image');
   if (Opt.ImageGuidanceScale >= 0) and (Opt.EditImageFile = '') then
@@ -839,7 +962,10 @@ var
   Depth2Img: TStableDiffusionDepth2Img;
   InstructPix2Pix: TStableDiffusionInstructPix2Pix;
   Upscaler: TStableDiffusionUpscaler;
+  ICLight: TStableDiffusionICLight;
   ImageConditioner: TStableDiffusionImageConditioner;
+  RelightPrompt: string;
+  NegativeEmbeds: TNNetVolume;
   Image, PromptEmbeds: TNNetVolume;
   SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken, EditText: string;
@@ -879,6 +1005,7 @@ begin
   Depth2Img := nil;
   InstructPix2Pix := nil;
   Upscaler := nil;
+  ICLight := nil;
   ImageConditioner := nil;
   Image := TNNetVolume.Create;
   PromptEmbeds := TNNetVolume.Create;
@@ -887,6 +1014,7 @@ begin
   Edit := nil;
   EditEmbeds := TNNetVolume.Create;
   EditedImage := TNNetVolume.Create;
+  NegativeEmbeds := TNNetVolume.Create;
   try
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
@@ -949,7 +1077,47 @@ begin
       ImageConditioner := Upscaler;
       SourceImageFile := Opt.UpscaleImageFile;
     end;
-    if Assigned(ImageConditioner) then
+    if Opt.RelightImageFile <> '' then
+    begin
+      Pipeline.UNetOffsetFile := Opt.ICLightFile;
+      ICLight := TStableDiffusionICLight.Create();
+      ImageConditioner := ICLight;
+      if not LoadImageFromFileIntoVolume(Opt.RelightImageFile, Image,
+        {pWithAlpha=}true) then
+        raise Exception.Create('could not load ' + Opt.RelightImageFile);
+      ICLight.SetImage(Image);
+      if Opt.BiRefNetFile <> '' then
+      begin
+        WriteLn('Matting ', Opt.RelightImageFile, ' with ', Opt.BiRefNetFile);
+        MatteWithBiRefNet(Opt.BiRefNetFile, Image, ICLight);
+      end;
+      if Opt.RelightBackgroundFile <> '' then
+      begin
+        if not LoadImageFromFileIntoVolume(Opt.RelightBackgroundFile, Image) then
+          raise Exception.Create('could not load ' + Opt.RelightBackgroundFile);
+        ICLight.SetBackground(Image);
+      end;
+      if not ICLight.AcceptsUNetInChannels(Pipeline.UNetConfig.InChannels,
+        Pipeline.UNetConfig.OutChannels) then
+        raise Exception.Create(Format('--iclight %s widens the UNet to %d ' +
+          'input channels: iclight_sd15_fc (8) relights from the prompt, ' +
+          'iclight_sd15_fbc (12) needs --relight-background',
+          [Opt.ICLightFile, Pipeline.UNetConfig.InChannels]));
+      ICLight.LightDirection := Opt.LightDirection;
+      if Opt.Strength >= 0 then ICLight.Strength := Opt.Strength;
+      if Opt.HighResScale >= 0 then ICLight.HighResScale := Opt.HighResScale;
+      if Opt.HighResStrength >= 0 then
+        ICLight.HighResStrength := Opt.HighResStrength;
+      // gradio_demo.py samples with DPM++ 2M SDE Karras.
+      if Opt.SamplerName = 'auto' then
+      begin
+        Pipeline.Sampler := smDPMSolverPP2M;
+        Pipeline.Scheduler.DPMSolverAlgorithm := dpaSDEDPMSolverPP;
+        if Opt.KarrasSigmas < 0 then Pipeline.KarrasSigmas := true;
+      end;
+      Pipeline.Conditioner := ICLight;
+    end;
+    if Assigned(ImageConditioner) and not Assigned(ICLight) then
     begin
       if not LoadImageFromFileIntoVolume(SourceImageFile, Image) then
         raise Exception.Create('could not load ' + SourceImageFile);
@@ -995,6 +1163,12 @@ begin
       if StepCount < 1 then StepCount := 75;
       if GuidanceScale < 0 then GuidanceScale := 9.0;
     end
+    else if Assigned(ICLight) then
+    begin
+      // gradio_demo.py's defaults.
+      if StepCount < 1 then StepCount := 25;
+      if GuidanceScale < 0 then GuidanceScale := 2.0;
+    end
     else if Opt.InvertImageFile <> '' then
     begin
       // Guidance 1 keeps the inversion and the sampling on the same path.
@@ -1012,6 +1186,14 @@ begin
     if InvertGuidanceScale < 0 then InvertGuidanceScale := 1.0;
     Pipeline.GuidanceScale := GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
+    RelightPrompt := Opt.Prompt;
+    if Assigned(ICLight) then
+    begin
+      if Opt.RelightAddedPrompt <> '' then
+        RelightPrompt := Opt.Prompt + ', ' + Opt.RelightAddedPrompt;
+      if not Opt.HasNegativePrompt then
+        Pipeline.NegativePrompt := ICLightNegativePrompt;
+    end;
     Pipeline.PromptWeighting := Opt.UsePromptWeighting;
     Pipeline.MaxPromptChunkCount := Opt.MaxPromptChunkCount;
     Pipeline.ClipSkip := Opt.ClipSkip;
@@ -1150,6 +1332,31 @@ begin
       WriteLn(Format('Upscale image: %s (%dx%d), noise level %d',
         [Opt.UpscaleImageFile, Image.SizeX, Image.SizeY,
          Upscaler.NoiseLevel]));
+    if Assigned(ICLight) then
+    begin
+      WriteLn(Format('Relight:  %s, IC-Light offset %s (%d-channel UNet)',
+        [Opt.RelightImageFile, Opt.ICLightFile,
+         Pipeline.UNetConfig.InChannels]));
+      if Opt.RelightBackgroundFile <> '' then
+        WriteLn('Background: ', Opt.RelightBackgroundFile);
+      WriteLn('Full prompt: "', RelightPrompt, '"; negative "',
+        Pipeline.NegativePrompt, '"');
+      if ICLight.LightDirection <> sdlNone then
+        WriteLn(Format('Light:    %s gradient, strength %.2f, %d steps of %d',
+          [LightOptionNames[ICLight.LightDirection], ICLight.Strength,
+           ICLightStepCount(StepCount, ICLight.Strength) -
+           TNNetDiffusionScheduler.Img2ImgStartStep(
+           ICLightStepCount(StepCount, ICLight.Strength), ICLight.Strength),
+           ICLightStepCount(StepCount, ICLight.Strength)]))
+      else WriteLn('Light:    none (starts from noise)');
+      if ICLight.HighResScale > 0 then
+        WriteLn(Format('Highres:  %dx%d, strength %.2f',
+          [ICLightHighResSide(ImageWidth, ICLight.HighResScale,
+           ICLight.HighResMultiple), ICLightHighResSide(ImageHeight,
+           ICLight.HighResScale, ICLight.HighResMultiple),
+           ICLight.HighResStrength]))
+      else WriteLn('Highres:  off');
+    end;
     if Opt.IPAdapterFile <> '' then
     begin
       IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
@@ -1262,6 +1469,20 @@ begin
         Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
           StepCount, Seed, Image, InvertedLatents);
       end
+      else if Assigned(ICLight) then
+      begin
+        // Both prompts in one text encoder load.
+        if (ImagePos = 0) and (Pipeline.CFGGuidanceScale > 1) then
+        begin
+          Pipeline.EncodePrompts([RelightPrompt, Pipeline.NegativePrompt],
+            [PromptEmbeds, NegativeEmbeds]);
+          Pipeline.SetNegativePromptEmbeds(NegativeEmbeds);
+        end
+        else if ImagePos = 0 then
+          Pipeline.EncodePrompt(RelightPrompt, PromptEmbeds);
+        ICLight.Relight(Pipeline, PromptEmbeds, ImageWidth, ImageHeight,
+          StepCount, Seed, Image);
+      end
       else if Opt.RepeatCount > 1 then
         Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
           StepCount, Seed, Image)
@@ -1287,6 +1508,7 @@ begin
       {$POP}
     end;
   finally
+    NegativeEmbeds.Free;
     EditedImage.Free;
     EditEmbeds.Free;
     Edit.Free;

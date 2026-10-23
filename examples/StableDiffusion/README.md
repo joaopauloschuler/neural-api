@@ -829,6 +829,69 @@ a plain generation of its prompt bit for bit
 (`TestStableDiffusionPromptToPromptNoReplace`). A real checkpoint has not been
 run with Prompt-to-Prompt yet.
 
+## IC-Light relighting (`--relight`)
+
+`--relight PNG --iclight FILE` relights a cut-out subject with IC-Light
+(Zhang et al., ICLR 2025, `lllyasviel/IC-Light`), as its `gradio_demo.py`
+does (`TStableDiffusionICLight.Relight`). The prompt describes the light
+("sunset over the sea, warm rim light"). `--model` is any SD 1.5 folder; the
+reference uses `stablediffusionapi/realistic-vision-v51`.
+
+* `--iclight` is `iclight_sd15_fc.safetensors` (or `iclight_sd15_fbc` with
+  `--relight-background`). `TStableDiffusionPipeline.UNetOffsetFile` adds it to
+  the UNet weights as they load: `conv_in` grows from 4 to 8 (fc) or 12 (fbc)
+  input channels with zero weights for the new ones, then every tensor reads
+  as base + offset, as `gradio_demo.py` merges `sd_origin[k] + sd_offset[k]`.
+  `--int8` and `--lora` apply to the merged weights.
+* The subject is matted on gray 127 (the reference's `run_rmbg` composite).
+  The reference mattes with `briaai/RMBG-1.4` (IS-Net), which is not ported.
+  This port takes the alpha of an RGBA `--relight` file, or runs BiRefNet /
+  RMBG-2.0 with `--birefnet model.safetensors` (its `config.json` beside it;
+  see `examples/BackgroundRemoval`). An RGB file without `--birefnet` is used
+  as it is, so it should already be on gray.
+* The subject is resized to cover the output size and centre-cropped, then its
+  VAE latent mode (times `scaling_factor`) joins the latents on every UNet
+  pass, the unconditional pass included, as the reference's UNet hook does.
+  With `--relight-background PNG` the background's latents follow it (fbc).
+* `--light left|right|top|bottom` starts from a 255 -> 0 gradient lit from
+  that side, at `--strength` (default 0.9) over `round(steps / strength)`
+  scheduled steps, as the reference; without `--light` the steps start from
+  noise.
+* The highres pass decodes, resizes by `--highres-scale` (default 1.5) to
+  sides rounded to multiples of 64, re-encodes, and runs image-to-image at
+  `--highres-strength` (default 0.5) with the subject re-encoded at the new
+  size. `--highres-scale 0` skips it. The output has the highres size.
+* Defaults follow `gradio_demo.py`: 25 steps, guidance 2.0, DPM++ 2M SDE with
+  Karras sigmas (`--sampler` overrides it), ", best quality" appended to the
+  prompt (`--relight-added-prompt`) and the negative prompt "lowres, bad
+  anatomy, bad hands, cropped, worst quality" unless `--negative` is given.
+  The reference's default size is 512x640 (`--width 512 --height 640`).
+* The light start and the highres pass are image-to-image runs, which sample
+  at integer timesteps here: Karras sigmas apply to the steps from noise only
+  (the `use_karras_sigmas` paragraph above). The reference samples both at
+  Karras sigmas.
+
+```
+StableDiffusion --model ~/models/realistic-vision-v51 \
+  --relight subject_rgba.png --iclight iclight_sd15_fc.safetensors \
+  --prompt "sunset over the sea, warm rim light" --light left \
+  --width 512 --height 640 --gpu
+StableDiffusion --model ~/models/realistic-vision-v51 \
+  --relight subject.png --birefnet ~/models/RMBG-2.0/model.safetensors \
+  --iclight iclight_sd15_fbc.safetensors --relight-background beach.png \
+  --prompt "beach, golden hour"
+```
+
+Tested against diffusers float64 with the reference merge and UNet hook on the
+pico folder `tests/fixtures/tiny_sd15` and formula offsets (numbers hardcoded,
+`< 1e-4`): the merged 8-channel UNet (`TestICLightOffsetMerge`), the subject
+latents from a 20x14 RGBA-matted image, the left-light start latents and the
+first DDIM step at strength 0.9, the first text-to-image step
+(`TestStableDiffusionICLightParity`), the fbc background latents and first
+step (`TestStableDiffusionICLightBackgroundParity`), and the highres re-encode
+(`TestStableDiffusionICLightHighRes`). No real IC-Light checkpoint has been
+run yet.
+
 ## Usage
 
 ```
@@ -885,7 +948,8 @@ StableDiffusion [--model DIR] [options]
                     center-cropped and resized to the output size
   --init-image PNG  image-to-image from this image; the output takes its size
                     (rounded down to the VAE factor) unless --width/--height
-  --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);
+  --strength S      how much of --init-image to repaint, (0, 1] (default 0.8;
+                    --relight --light: 0.9);
                     runs the last int(steps * S) steps (lcm: all steps over the
                     first int(50 * S) LCM timesteps)
   --depth-image PNG depth-to-image: the depth map of --init-image (luma,
@@ -903,6 +967,21 @@ StableDiffusion [--model DIR] [options]
                     factor); default 75 steps, guidance 9.0
   --noise-level N   noise added to --upscale-image, 0..max_noise_level (350;
                     default 20); more noise lets the UNet invent more detail
+  --relight PNG     IC-Light: relight this subject as the prompt describes; the
+                    alpha of an RGBA file (or --birefnet) mattes it on gray
+  --iclight FILE    iclight_sd15_fc.safetensors (or _fbc with
+                    --relight-background), added to the UNet weights; any
+                    SD 1.5 folder as --model
+  --light DIR       left, right, top or bottom: start from that light gradient
+                    at --strength (default 0.9); none (default) starts from noise
+  --relight-background PNG the background of an fbc offset
+  --birefnet FILE   BiRefNet / RMBG-2.0 model.safetensors: matte the --relight
+                    image with it instead of its alpha
+  --relight-added-prompt TEXT appended to the prompt after ", " (default
+                    "best quality"; "" adds nothing)
+  --highres-scale S the highres pass size factor, sides rounded to multiples of
+                    64 (default 1.5; 0 skips the pass)
+  --highres-strength S the highres pass strength (default 0.5)
   --invert-image PNG DDIM inversion: walk this image's latents to noise with the
                     prompt, then sample them back with DDIM; the output takes
                     its size (rounded down to the VAE factor); guidance

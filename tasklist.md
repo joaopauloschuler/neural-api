@@ -842,15 +842,14 @@ rather than acted on.
       - [X] (d) Sampler: `TNNetDiffusionScheduler.DPMSolverAlgorithm =
             dpaSDEDPMSolverPP` (diffusers `sde-dpmsolver++`, read from
             `algorithm_type`), `--sampler dpm++2m-sde`; TestSDEDPMSolverVsDiffusers.
-      - (e) [X] Pico-fixture parity vs diffusers + the reference hook
+      - [X] (e) Pico parity vs diffusers + the reference hook
             (TestICLightOffsetMerge, TestStableDiffusionICLightParity,
             TestStableDiffusionICLightBackgroundParity,
             TestStableDiffusionICLightHighRes, numbers hardcoded);
-            then `--relight` / `--light left|right|top|bottom` /
-            `--relight-background FILE` in examples/StableDiffusion and its
-            README. The reference mattes with `briaai/RMBG-1.4` (IS-Net, not
-            ported); state in the README that BiRefNet / RMBG-2.0 is used
-            instead, or accept a user-supplied RGBA cut-out.
+            examples/StableDiffusion `--relight PNG --iclight FILE`, `--light`,
+            `--relight-background`, `--birefnet` (RMBG-1.4 not ported; RGBA
+            alpha or BiRefNet / RMBG-2.0), `--highres-scale/-strength`,
+            `--relight-added-prompt`, README section.
       - (f) Real run on the user's GPU box (fc and fbc, `--int8` too).
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
