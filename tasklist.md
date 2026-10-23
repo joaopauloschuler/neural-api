@@ -1272,14 +1272,9 @@ rather than acted on.
           rank-1 `MulAdd`s. Batching them needs a [SeqLen][4*Depth] dGates
           scratch and a transposing variant of `PackDotProductRows` (packed A^T
           for dX = dGates W_i, X^T / H^T for the weight gradients).
-        - [X] The per-step recurrent product W_h* h_{t-1} is 4*Depth single-row
-          `DotProduct` calls. DONE c4ef0979: `TNNetVolume.AddDotProductRows`
-          (AVX2 4-row kernel, each h load feeds four rows; per-row `DotProduct`
-          fallback) in `TNNetLSTMCell`, `TNNetGRUCell`, `TNNetSLSTMCell`,
-          `TNNetEchoStateReservoir` and `TNNetPlainOps.RunLSTMDirection`.
-          Measured (1-core VM, noisy): per-step 4 x 256 x 256 product
-          0.052-0.054 -> 0.028-0.043 ms; LSTM cell forward SeqLen 100, In 640,
-          Hidden 256: median ~10.1 -> ~8.7 ms. Follow-ups:
+        - `TNNetVolume.AddDotProductRows` follow-ups (c4ef0979: the AVX2 4-row
+          recurrent GEMV in `TNNetLSTMCell`, `TNNetGRUCell`, `TNNetSLSTMCell`,
+          `TNNetEchoStateReservoir` and `TNNetPlainOps.RunLSTMDirection`):
           - [ ] No plain-AVX / 32-bit asm body: those builds take the per-row
             `DotProduct` path (unchanged speed).
           - [ ] The recurrent GEMV runs on one thread (no row split over the
@@ -1310,33 +1305,16 @@ rather than acted on.
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
   - 2.9 Forward complex STFT follow-ups:
-        - [X] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
-          want `RealFramePowerSpectrum`'s two-factor path with complex output.
-          DONE fbe4661e: `UseFFT` runs
-          `TFFTPlan` on two frames per complex FFT; Create picks it for a power
-          of two >= 128 (no AVX: 32) or any NFFT >= 768 (no AVX: 192), else the
-          direct DFT (Kokoro's 20 stays direct: 0.46 ms direct vs 3.7 ms FFT).
-          AVX2 Release, 16000 samples, hop 5: 256 16.8 -> 9.1 ms, 512 60.3 -> 16.8,
-          1024 374 -> 34, 800 200 -> 185; no AVX: 64 3.9 -> 1.9, 256 136 -> 8.6,
-          400 339 -> 84. The two-factor path with complex output was built and
-          measured NO-GO: slower than the AVX direct DFT at every NFFT 8-1200
-          (400: 118 vs 46 ms), and slower than TFFTPlan where that wins.
         - [ ] `ComputeWhisperLogMel` runs `RealFramePowerSpectrum`'s two-factor
-          path at N = 400; in the STFT A/B above that path was 2.6x slower than
-          an AVX direct DFT over windowed tables. Not measured in log-mel itself.
+          path at N = 400; in the `TNNetForwardSTFT` A/B of fbe4661e that path
+          (with complex output) was 2.6x slower than an AVX direct DFT over
+          windowed tables (400: 118 vs 46 ms). Not measured in log-mel itself.
         - [ ] `TFFTPlan` is scalar Double; a Single AVX radix-2 would move the
           STFT (and inverse STFT) crossovers down.
         - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
           rad need its exact range reduction; the vector `Sin` was not checked
           at that range) on one thread; 41 ms total is small next to the nets.
   - 2.11 Generator follow-up:
-        - [X] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
-          their scratch per call (once per utterance). DONE 2abda4a9: `TNNetInverseSTFT`
-          (neuralaudio) builds window, twiddles and FFT plan once, scratch only
-          grows, no FullWave copy; Kokoro owns one (`FGeneratorISTFT`). The free
-          functions wrap a temporary instance. Test
-          `TestInverseSTFTReuseMatchesFreeFunctions`; Kokoro parity unchanged.
-          5 s utterance iSTFT ~52 -> ~45 ms (1-core VM, noisy).
         - [ ] `ISTFTOverlapAdd` (magnitude + phase, +sin sign) still builds its
           Re/Im volumes per call; no hot caller.
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
@@ -2331,15 +2309,6 @@ rather than acted on.
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
-      - [X] YoloDetect labels boxes with the class id (`DrawBitmapText`): no
-            class names reach `TYoloConfig`; read a `names` / `id2label` map
-            from config.json when present and label with the name. DONE 87f91c9a:
-            `TYoloConfig.ClassNames` (names list or map, else id2label; count
-            = num_classes), `YoloClassLabel` (name, else COCO-80 for an
-            80-class yolov8 without names, else the id); YoloDetect and
-            ObjectTracking tags and logs use it; `DrawBitmapText` draws one `?`
-            per UTF-8 character and look-alikes for & [ ] " ; |. Tests
-            `TestYoloConfigClassNames`, `TestBitmapTextUTF8AndLookAlikes`.
       - [ ] ObjectTracking `--classes` takes ids only; class names (`person,car`)
             could be resolved through `YoloClassLabel`.
       - [ ] The pico YOLO fixture config has no `names`, so the example smoke
@@ -2466,24 +2435,8 @@ dev box proves parity; throughput numbers have to come from the GPU box.
     - [ ] GPU-box: gpt-oss decode tok/s with the resident KV cache against
           the parent of the importer commit (per-head sink heads, host cached
           decode), FP32 and int8 KV.
-    - [X] The uncached full forward of a `TNNetFusedSDPA` has no OpenCL path
-          (`WillOpenCL` needs the cache). DONE 1336ef5a: `RunFlashOnSource`
-          appends the input into the helper's cache buffers as a scratch cache
-          at slot 0 and reuses `ComputeStep` (causal / windowed / non-causal,
-          soft-cap, sinks) or `ComputeStepIdentityScores`, through the
-          inherited `ComputeFlashOpenCL`; source bound, result resident, host
-          fallback. Every fused importer's full forward is on OpenCL now.
-          Tests: `FusedSDPAFullForwardOpenCLParity` (max|diff| <= 1.2e-6 on
-          PoCL), `TestGptOssLogitParityOpenCL` (every fused layer on OpenCL).
-          int8 KV does not apply (the uncached forward is FP32 on both sides).
-    - [ ] GPU-box: gpt-oss prefill tok/s (uncached full forward, e.g. the
-          perplexity run) against the parent of 1336ef5a.
-    - [X] The `--no-fused-attn` fallback keeps the host cached decode. DONE
-          1336ef5a: the base `RunCachedStepOnSource` passes `SinkLogits()` and
-          `TNNetGptOssSinkAttention.CachedStepIsExact` is true for its exact
-          class. Tests: `GptOssSinkAttentionCachedDecodeOpenCLParity` (FP32 and
-          int8 KV, every step on OpenCL, no steady-state transfer) and the
-          per-head leg of `TestGptOssStreamedDecodeOpenCLParity`.
+    - [ ] GPU-box: gpt-oss prefill tok/s (uncached full forward on OpenCL,
+          e.g. the perplexity run) against the parent of 1336ef5a.
     - [ ] No model-level int8-KV parity test for gpt-oss: on the pico a top-2
           routing flip turns int8 rounding into logit jumps, so int8 with sinks
           is covered per layer only (`TestFusedSDPASinkCachedDecodeParity`,
@@ -2640,17 +2593,9 @@ cannot pay for its own transfer.
       (both CPU-only today); when this lands, add `TNNetConvolution` to the
       device-backward list at the top of "OpenCL forward coverage".
 
-- [X] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
-      (the even/odd split trick) to halve the row cost. DONE 106ffb8d:
-      `RealToHalfSpectrum` and `HalfSpectrumToReal` pair channels c, c+1 (forward
-      and backward of rfft2 and irfft2; odd C runs a single-channel tail;
-      `PairChannelRows` = false restores one FFT per channel).
-      OpenCL untouched: its kernels are per-element direct DFTs, no row FFT to pair.
-      AVX2 Release, 100-rep min of 5, noisy 1-core VM: rfft2 64x64x16 1.29 -> 1.09 ms,
-      48x48x16 7.01 -> 4.30 ms, 33x32x15 2.49 -> 1.12 ms; irfft2 64x64x16
-      1.92 -> 1.10 ms, 48x48x16 5.72 -> 4.72 ms.
-  - [ ] A lone channel (C = 1, or the odd tail) still runs a full complex row FFT
-        with Im = 0; the N/2 real-FFT packing would halve it too.
+- [ ] `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` row FFTs: a lone channel
+      (C = 1, or the odd tail of the channel pairing of 106ffb8d) still runs a
+      full complex row FFT with Im = 0; the N/2 real-FFT packing would halve it too.
 - [ ] Decision for the user: inference-time release of the convolution im2col
       matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
       convolution keeps it after the forward in both memory modes (the FP32
