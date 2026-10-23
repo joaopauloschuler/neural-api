@@ -787,42 +787,20 @@ rather than acted on.
             TestStableDiffusionSAG*: pico parity vs diffusers with reference
             numbers hardcoded from an ad hoc run; tools/make_pico_sd_pipeline_fixture.py
             has no SAG mode).
-- [ ] GLIGEN box-grounded layout control for the SD 1.x pipeline (Li et al.
-      CVPR 2023, arXiv:2301.07093; diffusers `StableDiffusionGLIGENPipeline`,
-      checkpoint `masterful/gligen-1-4-generation-text-box`): the user gives
-      phrases + normalized xyxy boxes ("a red car" at [0.1,0.5,0.5,0.9]) and each
-      object lands inside its box, which neither ControlNet nor T2I-Adapter can do
-      from text alone. Port, no hand-made math:
-      - `position_net` (GLIGENTextBoundingboxProjection, text-only): per box a
-        Fourier embedding of xyxy (8 freqs `100^(i/8)`, sin/cos -> 64 values;
-        check whether `TNNetFourierFeatures` with a pinned B matrix reproduces it,
-        permuting the first linear's input rows to match the sin/cos order),
-        concat with the phrase's CLIP `pooler_output` (the EOS token of the
-        existing CLIP text encoder), Linear(768+64,512)-SiLU-Linear(512,512)-
-        SiLU-Linear(512,768); masked slots use `null_positive_feature` /
-        `null_position_feature`; max 30 objects.
-      - `fuser` (GatedSelfAttentionDense) inserted in every UNet
-        BasicTransformerBlock right after attn1: `objs = linear(objs)`;
-        `x += tanh(alpha_attn) * attn(norm1([x; objs]))[:n_visual]`;
-        `x += tanh(alpha_dense) * GEGLU_FF(norm2(x))`. Build it from existing
-        layers: token-axis `TNNetConcat(LV+LO,1,d,[..])` (as in
-        `AddCogVideoXJointAttention`) for the joint K/V with queries from the
-        visual tokens only (same result as cropping), `TNNetGatedResidual`
-        loaded with tanh(alpha) in every channel for both scalar gates, and the
-        existing SD GEGLU FF / `TNNetTokenLayerNorm` builders. Wire it as a
-        `TStableDiffusionConditioner` subclass like `TStableDiffusionIPAdapter`
-        (`fuser.*` and `position_net.*` keys in the UNet file).
-      - Scheduled sampling: the fuser runs only for the first
-        `int(beta*steps)` steps (`gligen_scheduled_sampling_beta`, default 0.3),
-        then becomes the identity (zeroing the gates is correct; skipping the
-        branch is the faster path). Under CFG the unconditional half uses all
-        masks = 0 (null features), not a disabled fuser.
-      - examples/StableDiffusion `--gligen FILE --box "phrase:x0,y0,x1,y1"`
-        (repeatable) + README section; pico parity vs the diffusers float64
-        pipeline (tools/make_pico_sd_pipeline_fixture.py gains a GLIGEN mode; the
-        pipeline is under `diffusers/pipelines/deprecated/` in 0.41). Follow-ups,
-        not in v1: the text-image variant (`gligen-1-4-generation-text-image-box`,
-        CLIP image embeddings as grounding) and GLIGEN inpainting.
+- [X] GLIGEN box-grounded layout control for the SD 1.x pipeline
+      (`TStableDiffusionGLIGEN`, fusers in `BuildSDUNet(GLIGENReader)`,
+      examples/StableDiffusion `--gligen/--box/--gligen-beta`); pico parity vs
+      diffusers float64 (position_net, gated UNet, CFG + no-CFG pipeline).
+- [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
+      on the user's GPU box: boxes land where asked, timing with the fusers on
+      vs after the gates close.
+- [ ] GLIGEN: skip the fuser branch once its gates close (it now still runs and
+      adds zeros for the last `(1 - beta) * steps` steps).
+- [ ] GLIGEN text-image variant (`gligen-1-4-generation-text-image-box`:
+      `linears_text` / `linears_image`, CLIP image embeddings as grounding).
+- [ ] GLIGEN inpainting (`gligen-1-4-inpainting-text-box`: 9-channel UNet
+      input with the box-masked image latents, diffusers
+      `gligen_inpaint_image`).
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):

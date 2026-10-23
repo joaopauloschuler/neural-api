@@ -187,6 +187,43 @@ ip-adapter_sd15 and CLIP vision tower (`TestStableDiffusionIPAdapterParity`,
 `TestStableDiffusionIPAdapterScaleZero`). No real IP-Adapter has been run yet.
 IP-Adapter-Plus, FaceID and SDXL adapters are not supported.
 
+`--gligen FILE --box "PHRASE:X0,Y0,X1,Y1"` (repeatable, at most 30 boxes)
+places each phrase inside its box, as diffusers
+`StableDiffusionGLIGENPipeline` does with
+`masterful/gligen-1-4-generation-text-box` (GLIGEN, Li et al. CVPR 2023;
+`TStableDiffusionGLIGEN`). The box is normalized xyxy (0..1, origin top-left).
+FILE is a GLIGEN text-box UNet `.safetensors`: its `position_net.*` and
+`fuser.*` tensors are read, the rest of the UNet comes from `--model`. That
+checkpoint ships a whole pipeline folder whose UNet file holds both, so FILE is
+its own `unet/diffusion_pytorch_model.safetensors`:
+
+```
+StableDiffusion --model ~/models/gligen-1-4-generation-text-box \
+  --gligen ~/models/gligen-1-4-generation-text-box/unet/diffusion_pytorch_model.safetensors \
+  --prompt "a waterfall and a modern high speed train in a beautiful forest" \
+  --box "a waterfall:0.1387,0.2051,0.4277,0.7090" \
+  --box "a modern high speed train:0.4980,0.4355,0.8516,0.7266"
+```
+
+Each phrase's CLIP `pooler_output` and a sin/cos embedding of its box go
+through `position_net` and become one object token. Every UNet transformer
+block gets a gated self-attention (`fuser`) right after its self-attention:
+the visual tokens attend over themselves plus the object tokens, and a GEGLU
+feed-forward follows; both are added through `tanh(alpha)` gates.
+`--gligen-beta B` (default 0.3, diffusers `gligen_scheduled_sampling_beta`)
+runs the fusers for the first `int(B * steps)` steps only; after that the
+pipeline sets their gates to 0, so the UNet is the plain one. The unguided
+half of CFG fills every object slot with the learned null features, as
+diffusers does.
+
+Tested against diffusers float64 on the pico folder with random fuser and
+position_net tensors (`TestStableDiffusionGLIGENPositionNetParity`,
+`TestStableDiffusionGLIGENUNetParity`, `TestStableDiffusionGLIGENPipelineParity`:
+CFG with beta 0.5 and no CFG with beta 0.3, max |diff| below 2e-5). No real
+GLIGEN checkpoint has been run yet. The text-image variant
+(`gligen-1-4-generation-text-image-box`) and GLIGEN inpainting are not
+supported. The fuser still runs after its gates close; it just adds zeros.
+
 `--init-image PNG [--strength S]` turns the run into image-to-image, as
 diffusers `StableDiffusionImg2ImgPipeline` (`TStableDiffusionImg2Img`). The
 image is VAE-encoded (the latents are sampled: mean + std * noise), noised to
@@ -692,6 +729,11 @@ StableDiffusion [--model DIR] [options]
                     image_encoder/ folder beside it; needs --ip-image
   --ip-image PNG    the image prompt of --ip-adapter
   --ip-scale S      IP-Adapter scale (default 1.0; 0 ignores the image)
+  --gligen FILE     GLIGEN text-box UNet .safetensors (fuser.* and
+                    position_net.*); needs --box
+  --box "PHRASE:X0,Y0,X1,Y1" a --gligen phrase and its normalized box (0..1,
+                    origin top-left); repeatable, at most 30
+  --gligen-beta B   ground the first int(B * steps) steps (default 0.3)
   --init-image PNG  image-to-image from this image; the output takes its size
                     (rounded down to the VAE factor) unless --width/--height
   --strength S      how much of --init-image to repaint, (0, 1] (default 0.8);

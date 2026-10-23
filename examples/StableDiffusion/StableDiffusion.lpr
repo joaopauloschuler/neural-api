@@ -40,6 +40,11 @@ brighter = nearer).
 with an InstructPix2Pix folder such as timbrooks/instruct-pix2pix (diffusers
 StableDiffusionInstructPix2PixPipeline); the output takes the image's size.
 --ip-adapter combines with either (TStableDiffusionMultiConditioner).
+--gligen FILE --box "PHRASE:X0,Y0,X1,Y1" (repeatable, at most 30) places each
+phrase inside its box (normalized xyxy, 0..1, origin top-left) through a GLIGEN
+text-box UNet file such as masterful/gligen-1-4-generation-text-box, as diffusers
+StableDiffusionGLIGENPipeline; --gligen-beta B (default 0.3) grounds the first
+int(B * steps) steps.
 --upscale-image PNG [--noise-level N] upscales the image 4x with an x4
 upscaler folder such as stabilityai/stable-diffusion-x4-upscaler (diffusers
 StableDiffusionUpscalePipeline; default 75 steps, guidance 9.0).
@@ -91,6 +96,10 @@ type
     // --ip-adapter weights file and --ip-image; '' for none.
     IPAdapterFile, IPImageFile: string;
     IPScale: double;
+    // --gligen UNet file ('' for none), its --box specs and --gligen-beta.
+    GLIGENFile: string;
+    GLIGENBoxes: array of string;
+    GLIGENBeta: double;
     // --init-image ('' for text-to-image), its --strength and --depth-image.
     InitImageFile, DepthImageFile: string;
     Strength: double;
@@ -288,6 +297,14 @@ begin
   WriteLn('  --ip-image PNG    the image prompt of --ip-adapter');
   WriteLn('  --ip-scale S      IP-Adapter scale (default 1.0; 0 ignores the ',
     'image)');
+  WriteLn('  --gligen FILE     GLIGEN text-box UNet .safetensors (fuser.* and ',
+    'position_net.*);');
+  WriteLn('                    needs --box');
+  WriteLn('  --box "PHRASE:X0,Y0,X1,Y1" a --gligen phrase and its normalized ',
+    'box (0..1,');
+  WriteLn('                    origin top-left); repeatable, at most 30');
+  WriteLn('  --gligen-beta B   ground the first int(B * steps) steps (default ',
+    '0.3)');
   WriteLn('  --init-image PNG  image-to-image from this image; the output ',
     'takes its size');
   WriteLn('                    (rounded down to the VAE factor) unless ',
@@ -427,6 +444,9 @@ begin
   Opt.IPAdapterFile := '';
   Opt.IPImageFile := '';
   Opt.IPScale := 1.0;
+  Opt.GLIGENFile := '';
+  Opt.GLIGENBoxes := nil;
+  Opt.GLIGENBeta := 0.3;
   Opt.InitImageFile := '';
   Opt.DepthImageFile := '';
   Opt.Strength := -1;
@@ -501,6 +521,14 @@ begin
     else if Arg = '--ip-image' then Opt.IPImageFile := NextArg()
     else if Arg = '--ip-scale' then
       Opt.IPScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--gligen' then Opt.GLIGENFile := NextArg()
+    else if Arg = '--box' then
+    begin
+      SetLength(Opt.GLIGENBoxes, Length(Opt.GLIGENBoxes) + 1);
+      Opt.GLIGENBoxes[High(Opt.GLIGENBoxes)] := NextArg();
+    end
+    else if Arg = '--gligen-beta' then
+      Opt.GLIGENBeta := StrToFloat(NextArg(), DefaultFormatSettings)
     else if Arg = '--init-image' then Opt.InitImageFile := NextArg()
     else if Arg = '--depth-image' then Opt.DepthImageFile := NextArg()
     else if Arg = '--strength' then
@@ -562,6 +590,10 @@ begin
     raise Exception.Create('--sag-scale cannot be combined with --edit-image');
   if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
     raise Exception.Create('--ip-adapter and --ip-image go together');
+  if (Opt.GLIGENFile = '') <> (Length(Opt.GLIGENBoxes) = 0) then
+    raise Exception.Create('--gligen and --box go together');
+  if (Opt.GLIGENBeta < 0) or (Opt.GLIGENBeta > 1) then
+    raise Exception.Create('--gligen-beta must be in [0, 1]');
   if (Opt.Strength >= 0) and (Opt.InitImageFile = '') then
     raise Exception.Create('--strength needs --init-image');
   if (Opt.DepthImageFile <> '') and (Opt.InitImageFile = '') then
@@ -602,6 +634,26 @@ begin
     raise Exception.Create('--embedding ' + Spec + ': empty token');
 end;
 
+// Splits a --box value "PHRASE:X0,Y0,X1,Y1" at its last ':'.
+procedure SplitBoxSpec(const Spec: string; out Phrase: string;
+  out Box: array of TNeuralFloat);
+var
+  ColonPos, CoordPos: integer;
+  Coords: TStringArray;
+begin
+  ColonPos := LastDelimiter(':', Spec);
+  if ColonPos <= 1 then
+    raise Exception.Create('--box ' + Spec + ': expected PHRASE:X0,Y0,X1,Y1');
+  Phrase := Copy(Spec, 1, ColonPos - 1);
+  Coords := Copy(Spec, ColonPos + 1, Length(Spec)).Split([',']);
+  if Length(Coords) <> 4 then
+    raise Exception.Create('--box ' + Spec + ': expected 4 coordinates');
+  for CoordPos := 0 to 3 do
+    Box[CoordPos] := StrToFloat(Trim(Coords[CoordPos]), DefaultFormatSettings);
+  if (Box[0] >= Box[2]) or (Box[1] >= Box[3]) then
+    raise Exception.Create('--box ' + Spec + ': needs X0 < X1 and Y0 < Y1');
+end;
+
 // --output for one image; else Base with _0001, _0002, ... before the extension.
 function ImageFileName(const Base: string; ImagePos, ImageCount: integer): string;
 begin
@@ -615,6 +667,7 @@ var
   Pipeline: TStableDiffusionPipeline;
   Reporter: TStableDiffusionReporter;
   IPAdapter: TStableDiffusionIPAdapter;
+  GLIGEN: TStableDiffusionGLIGEN;
   Multi: TStableDiffusionMultiConditioner;
   Img2Img: TStableDiffusionImg2Img;
   Depth2Img: TStableDiffusionDepth2Img;
@@ -625,6 +678,9 @@ var
   SourceImageFile: string;
   ComputeText, ImageFile, EmbeddingFile, EmbeddingToken: string;
   ImageWidth, ImageHeight, ImagePos, EmbeddingPos, LoRAPos: integer;
+  BoxPos: integer;
+  BoxPhrase: string;
+  Box: array[0..3] of TNeuralFloat;
   PerturbedGuidance: TNNetPerturbedGuidance;
   SelfAttentionNames: TStringArray;
   PAGLayerIndices: TNeuralIntegerArray;
@@ -642,6 +698,7 @@ begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
   IPAdapter := nil;
+  GLIGEN := nil;
   Multi := nil;
   Img2Img := nil;
   Depth2Img := nil;
@@ -861,17 +918,44 @@ begin
         raise Exception.Create('could not load ' + Opt.IPImageFile);
       IPAdapter.SetImage(Image);
       IPAdapter.Scale := Opt.IPScale;
-      if Assigned(ImageConditioner) then
-      begin
-        Multi := TStableDiffusionMultiConditioner.Create();
-        Multi.Add(ImageConditioner);
-        Multi.Add(IPAdapter);
-        Pipeline.Conditioner := Multi;
-      end
-      else Pipeline.Conditioner := IPAdapter;
       WriteLn(Format('IP-Adapter: %s, image %s (%dx%d), scale %.2f',
         [Opt.IPAdapterFile, Opt.IPImageFile, Image.SizeX, Image.SizeY,
          Opt.IPScale]));
+    end;
+    if Opt.GLIGENFile <> '' then
+    begin
+      GLIGEN := TStableDiffusionGLIGEN.Create(Opt.GLIGENFile);
+      GLIGEN.ScheduledSamplingBeta := Opt.GLIGENBeta;
+      WriteLn(Format('GLIGEN:   %s, beta %.2f (%d of %d steps grounded)',
+        [Opt.GLIGENFile, Opt.GLIGENBeta, Trunc(Opt.GLIGENBeta * StepCount),
+         StepCount]));
+      for BoxPos := 0 to High(Opt.GLIGENBoxes) do
+      begin
+        SplitBoxSpec(Opt.GLIGENBoxes[BoxPos], BoxPhrase, Box);
+        if GLIGEN.BoxCount() = csGLIGENMaxObjects then
+        begin
+          WriteLn('Notice:   only the first ', csGLIGENMaxObjects,
+            ' boxes are used');
+          break;
+        end;
+        GLIGEN.AddBox(BoxPhrase, Box[0], Box[1], Box[2], Box[3]);
+        WriteLn(Format('  box:    "%s" at %.3f,%.3f - %.3f,%.3f',
+          [BoxPhrase, Box[0], Box[1], Box[2], Box[3]]));
+      end;
+    end;
+    if Assigned(IPAdapter) or Assigned(GLIGEN) then
+    begin
+      if Ord(Assigned(ImageConditioner)) + Ord(Assigned(IPAdapter)) +
+        Ord(Assigned(GLIGEN)) > 1 then
+      begin
+        Multi := TStableDiffusionMultiConditioner.Create();
+        if Assigned(ImageConditioner) then Multi.Add(ImageConditioner);
+        if Assigned(IPAdapter) then Multi.Add(IPAdapter);
+        if Assigned(GLIGEN) then Multi.Add(GLIGEN);
+        Pipeline.Conditioner := Multi;
+      end
+      else if Assigned(IPAdapter) then Pipeline.Conditioner := IPAdapter
+      else Pipeline.Conditioner := GLIGEN;
     end;
     if Opt.RepeatCount > 1 then
     begin
@@ -922,6 +1006,7 @@ begin
     Image.Free;
     Pipeline.Free;
     Multi.Free;
+    GLIGEN.Free;
     IPAdapter.Free;
     ImageConditioner.Free;
     Reporter.Free;

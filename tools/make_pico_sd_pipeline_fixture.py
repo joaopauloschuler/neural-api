@@ -37,6 +37,17 @@ transformers class (nothing downloaded), saved with the real folder layout:
     scheduler config, the float model timesteps, the sigmas and the latents
     after each step (Euler ones divided by sqrt(sigma_next^2 + 1)). The Euler a
     case injects step_noise (randn_tensor patched).
+  tests/fixtures/tiny_sd15_gligen/diffusion_pytorch_model.safetensors
+    only the fuser.* and position_net.* tensors of a GLIGEN text-box UNet
+    (attention_type "gated") over tiny_sd15's UNet weights: random, perturbed
+    off their init, alpha_attn / alpha_dense drawn from +-[0.3, 1.2].
+  tests/fixtures/tiny_sd15_gligen_io.json
+    StableDiffusionGLIGENPipeline (text-box) on tiny_sd15 plus those tensors,
+    DDIM, GLIGEN_STEPS steps from the fixed latents: the phrases' pooler_output,
+    the position_net objs of the prompt pass and of the CFG unconditional pass
+    (all masks 0), one gated UNet call (unet_check), and per GLIGEN_CASES entry
+    (guidance scale, gligen_scheduled_sampling_beta) the timesteps,
+    latents_after and the decoded image.
   tests/fixtures/tiny_sd15_nonsquare_io.json
     the DDIM run of tiny_sd15_pipeline_io.json at NONSQUARE_WIDTH x
     NONSQUARE_HEIGHT: latents (C,H,W), unet_cond_0 (the conditional UNet
@@ -97,10 +108,11 @@ Usage (from the repo root, inside the `x` venv):
   python tools/make_pico_sd_pipeline_fixture.py --freeu-only
   python tools/make_pico_sd_pipeline_fixture.py --pag-only
   python tools/make_pico_sd_pipeline_fixture.py --karras-only
+  python tools/make_pico_sd_pipeline_fixture.py --gligen-only
 (--samplers-only / --nonsquare-only / --oddsize-only / --lcm-only /
---freeu-only / --pag-only / --karras-only keep the committed folder and
-rewrite only the sampler / non-square / odd-size / LCM / FreeU / PAG / Karras
-files; --lcm-distilled-only
+--freeu-only / --pag-only / --karras-only / --gligen-only keep the committed
+folder and rewrite only the sampler / non-square / odd-size / LCM / FreeU / PAG /
+Karras / GLIGEN files; --lcm-distilled-only
 rewrites the distilled UNet folder and its file.)
 """
 import json
@@ -124,6 +136,8 @@ import diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img as
 import diffusers.pipelines.latent_consistency_models.pipeline_latent_consistency_img2img as lcm_img2img_module
 import diffusers.schedulers.scheduling_lcm as lcm_module
 import diffusers.schedulers.scheduling_euler_ancestral_discrete as euler_a_module
+from diffusers.pipelines.deprecated.stable_diffusion_gligen.pipeline_stable_diffusion_gligen import (
+    StableDiffusionGLIGENPipeline)
 from transformers import CLIPTextConfig, CLIPTextModel, CLIPTokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -141,6 +155,8 @@ FREEU_NONSQUARE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_nonsquare_io.json
 FREEU_ODDSIZE_FILE = os.path.join(FIXTURES, "tiny_sd15_freeu_oddsize_io.json")
 PAG_FILE = os.path.join(FIXTURES, "tiny_sd15_pag_io.json")
 KARRAS_FILE = os.path.join(FIXTURES, "tiny_sd15_karras_io.json")
+GLIGEN_DIR = os.path.join(FIXTURES, "tiny_sd15_gligen")
+GLIGEN_FILE = os.path.join(FIXTURES, "tiny_sd15_gligen_io.json")
 
 SEED = 20261021
 MERGE_COUNT = 120
@@ -182,6 +198,13 @@ KARRAS_CASES = [
      {"timestep_spacing": "linspace"}),
     ("dpm_karras", DPMSolverMultistepScheduler, {"use_karras_sigmas": True}),
 ]
+GLIGEN_STEPS = 4
+GLIGEN_PHRASES = ["an astronaut", "a red horse"]
+GLIGEN_BOXES = [[0.1, 0.05, 0.55, 0.6], [0.4, 0.45, 0.95, 0.9]]
+GLIGEN_UNET_CHECK_TIMESTEP = 499
+# name, guidance_scale, gligen_scheduled_sampling_beta: the fuser runs for the
+# first int(beta * 4) steps, 2 and 1 here.
+GLIGEN_CASES = [("cfg_beta_half", GUIDANCE, 0.5), ("no_cfg_beta_default", 1.0, 0.3)]
 PROMPT = "a photo of an astronaut riding a horse on mars"
 CORPUS = [
     "a photo of an astronaut riding a horse on mars",
@@ -755,7 +778,108 @@ def make_lcm_distilled_oracle():
         json.dump(payload, f)
 
 
+def build_gligen_unet(base_unet):
+    """tiny_sd15's UNet as attention_type "gated" with random fuser and
+    position_net tensors; saves those tensors alone to GLIGEN_DIR."""
+    torch.manual_seed(SEED + 70)
+    config = dict(base_unet.config)
+    config["attention_type"] = "gated"
+    unet = UNet2DConditionModel.from_config(config)
+    missing, unexpected = unet.load_state_dict(base_unet.state_dict(), strict=False)
+    assert not unexpected and missing, unexpected
+    assert all(".fuser." in key or key.startswith("position_net.") for key in missing)
+    with torch.no_grad():
+        for name, param in unet.named_parameters():
+            if name not in missing:
+                continue
+            if name.endswith(("alpha_attn", "alpha_dense")):
+                magnitude = torch.empty(()).uniform_(0.3, 1.2)
+                param.copy_(magnitude if torch.rand(()) < 0.5 else -magnitude)
+            else:
+                param.add_(torch.randn_like(param) * 0.05)
+    state = unet.state_dict()
+    if os.path.isdir(GLIGEN_DIR):
+        shutil.rmtree(GLIGEN_DIR)
+    os.makedirs(GLIGEN_DIR)
+    save_file({key: state[key].to(torch.float32).contiguous() for key in missing},
+              os.path.join(GLIGEN_DIR, "diffusion_pytorch_model.safetensors"),
+              metadata={"format": "pt"})
+    return unet
+
+
+def make_gligen_oracle():
+    base = StableDiffusionPipeline.from_pretrained(PICO_DIR, safety_checker=None)
+    unet = build_gligen_unet(base.unet).to(torch.float64)
+    pipe = StableDiffusionGLIGENPipeline(
+        vae=base.vae.to(torch.float64), text_encoder=base.text_encoder.to(torch.float64),
+        tokenizer=base.tokenizer, unet=unet, scheduler=base.scheduler,
+        safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+    pipe.set_progress_bar_config(disable=True)
+    generator = torch.Generator().manual_seed(SEED)
+    grid = IMAGE_SIZE // pipe.vae_scale_factor
+    latents = torch.randn((1, 4, grid, grid), generator=generator, dtype=torch.float64)
+    # The pipeline's GLIGEN inputs: pooler_output at the first eos (argmax of
+    # the ids: <|endoftext|> is the largest), 30 slots, masks 0 past the phrases.
+    tokens = pipe.tokenizer(GLIGEN_PHRASES, padding=True, return_tensors="pt")
+    assert all(int(row.argmax()) == list(row).index(pipe.tokenizer.eos_token_id)
+               for row in tokens.input_ids)
+    with torch.no_grad():
+        pooled = pipe.text_encoder(**tokens).pooler_output
+    max_objs = 30
+    count = len(GLIGEN_PHRASES)
+    hidden = unet.config.cross_attention_dim
+    boxes = torch.zeros(1, max_objs, 4, dtype=torch.float64)
+    boxes[0, :count] = torch.tensor(GLIGEN_BOXES, dtype=torch.float64)
+    embeddings = torch.zeros(1, max_objs, hidden, dtype=torch.float64)
+    embeddings[0, :count] = pooled
+    masks = torch.zeros(1, max_objs, dtype=torch.float64)
+    masks[0, :count] = 1
+    with torch.no_grad():
+        objs_cond = unet.position_net(boxes, masks, embeddings)
+        objs_uncond = unet.position_net(boxes, torch.zeros_like(masks), embeddings)
+        prompt_embeds, _ = pipe.encode_prompt(PROMPT, "cpu", 1, False, None)
+        gligen = {"boxes": boxes, "positive_embeddings": embeddings, "masks": masks}
+        unet_check = unet(latents, GLIGEN_UNET_CHECK_TIMESTEP,
+                          encoder_hidden_states=prompt_embeds,
+                          cross_attention_kwargs={"gligen": gligen}).sample
+        plain = unet(latents, GLIGEN_UNET_CHECK_TIMESTEP,
+                     encoder_hidden_states=prompt_embeds).sample
+    print("the fusers move the UNet output by", float((unet_check - plain).abs().max()))
+    cases = []
+    for name, guidance, beta in GLIGEN_CASES:
+        after = []
+
+        def on_step(_step, _t, step_latents):
+            after.append(rounded(chw(step_latents[0])))
+        result = pipe(PROMPT, height=IMAGE_SIZE, width=IMAGE_SIZE,
+                      num_inference_steps=GLIGEN_STEPS, guidance_scale=guidance,
+                      gligen_scheduled_sampling_beta=beta,
+                      gligen_phrases=GLIGEN_PHRASES, gligen_boxes=GLIGEN_BOXES,
+                      latents=latents.clone(), output_type="np",
+                      callback=on_step, callback_steps=1)
+        cases.append({"name": name, "guidance_scale": guidance,
+                      "scheduled_sampling_beta": beta,
+                      "timesteps": [int(t) for t in pipe.scheduler.timesteps],
+                      "latents_after": after,
+                      "image": rounded(result.images[0].tolist())})
+        print("GLIGEN", name, cases[-1]["timesteps"])
+    payload = {"width": IMAGE_SIZE, "height": IMAGE_SIZE, "steps": GLIGEN_STEPS,
+               "prompt": PROMPT, "phrases": GLIGEN_PHRASES, "boxes": GLIGEN_BOXES,
+               "latents": rounded(chw(latents[0])),
+               "pooled": rounded(pooled.tolist()),
+               "objs_cond": rounded(objs_cond[0].tolist()),
+               "objs_uncond": rounded(objs_uncond[0].tolist()),
+               "unet_check": {"timestep": GLIGEN_UNET_CHECK_TIMESTEP,
+                              "output": rounded(chw(unet_check[0]))},
+               "cases": cases}
+    with open(GLIGEN_FILE, "w") as f:
+        json.dump(payload, f)
+
+
 if __name__ == "__main__":
+    if "--gligen-only" in sys.argv:
+        make_gligen_oracle()
+        sys.exit(0)
     if "--lcm-distilled-only" in sys.argv:
         make_lcm_distilled_oracle()
         sys.exit(0)
@@ -788,3 +912,4 @@ if __name__ == "__main__":
     make_freeu_oracles()
     make_pag_oracle()
     make_karras_oracle()
+    make_gligen_oracle()

@@ -12001,18 +12001,23 @@ procedure SDUNetSetFreeU(var Config: TSDUNetConfig; Enabled: boolean;
 // IP-Adapter to_k_ip / to_v_ip attention over two more TNNetInputs that
 // SDUNetDenoiseWithIPAdapter fills.
 //
-// The three combine; the extra inputs follow the latent/timestep/text (and
-// LCM guidance, class label, SDXL add_embeds) ones in the order IP-Adapter,
-// adapter, control (SDUNetConditioningInputs finds them).
+// A non-nil GLIGENReader (a GLIGEN text-box UNet file) adds its fuser
+// (GatedSelfAttentionDense) after every attn1, reading the GLIGEN object
+// tokens (csGLIGENMaxObjects, 1, CrossAttentionDim) of one more TNNetInput.
 //
-// pWeightOwner (a UNet of this config and IP-Adapter, any grid, weights final):
-// every weight layer borrows its weights; Reader may be nil, IPAdapterReader
-// gives only shapes.
+// The four combine; the extra inputs follow the latent/timestep/text (and
+// LCM guidance, class label, SDXL add_embeds) ones in the order IP-Adapter,
+// GLIGEN, adapter, control (SDUNetConditioningInputs finds them).
+//
+// pWeightOwner (a UNet of this config, IP-Adapter and GLIGEN, any grid, weights
+// final): every weight layer borrows its weights; Reader may be nil,
+// IPAdapterReader gives only shapes, GLIGENReader only its presence.
 function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
   IPAdapterReader: TNNetSafeTensorsReader = nil;
-  pWeightOwner: TNNet = nil): TNNet; overload;
+  pWeightOwner: TNNet = nil;
+  GLIGENReader: TNNetSafeTensorsReader = nil): TNNet; overload;
 
 type
   // A DeepCache split of a BuildSDUNet forward (Ma et al. 2023): layers
@@ -12033,7 +12038,8 @@ function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   pTrainable: boolean = true; pWithControl: boolean = false;
   pWithAdapter: boolean = false;
   IPAdapterReader: TNNetSafeTensorsReader = nil;
-  pWeightOwner: TNNet = nil): TNNet; overload;
+  pWeightOwner: TNNet = nil;
+  GLIGENReader: TNNetSafeTensorsReader = nil): TNNet; overload;
 
 // IPAdapterFile '' builds no IP-Adapter attention.
 function BuildSDUNetFromSafeTensorsEx(const FileName: string;
@@ -12064,6 +12070,9 @@ type
     // The (1,1,1) class label of a UNet with NumClassEmbeds > 0.
     ClassLabel: TNNetLayer;
     IPKeyTokens, IPValueTokens: TNNetLayer;
+    // The GLIGEN object tokens and every fuser's two TNNetGatedResidual gates.
+    GLIGENObjects: TNNetLayer;
+    GLIGENGates: array of TNNetLayer;
     // One per down block (SDUNetAdapterFeatureCount).
     Adapter: array of TNNetLayer;
     // SDUNetControlDownCount skip inputs, in build order, then the mid one.
@@ -12074,7 +12083,8 @@ type
 // The extra inputs of a UNet built with these BuildSDUNet options; raises
 // unless Net has exactly that many TNNetInputs.
 function SDUNetConditioningInputs(Net: TNNet; const Config: TSDUNetConfig;
-  WithIPAdapter, WithAdapter, WithControl: boolean): TSDUNetConditioningInputs;
+  WithIPAdapter, WithAdapter, WithControl: boolean;
+  WithGLIGEN: boolean = false): TSDUNetConditioningInputs;
 
 // Writes diffusers' LCM w = GuidanceScale - 1, times 1000, into
 // Inputs.GuidanceScale; does nothing when the UNet has no guidance input.
@@ -12341,6 +12351,8 @@ type
     function UNetWithAdapter(): boolean; virtual;
     // The IP-Adapter weights file the UNet's attn2 layers take ('' for none).
     function UNetIPAdapterFile(): string; virtual;
+    // The GLIGEN weights file whose fusers the UNet takes ('' for none).
+    function UNetGLIGENFile(): string; virtual;
     // True when this conditioner can feed a UNet with InChannels inputs.
     function AcceptsUNetInChannels(InChannels,
       LatentChannels: integer): boolean; virtual;
@@ -12439,12 +12451,12 @@ type
     // While kept: the weights of the size-bound nets above, read once at a
     // 1x1 latent grid; each size builds a net borrowing them (BuildWeightOwner).
     FUNetOwner, FVaeDecoderOwner, FVaeEncoderOwner: TNNet;
-    FUNetOwnerIPAdapterFile: string;
+    FUNetOwnerIPAdapterFile, FUNetOwnerGLIGENFile: string;
     FWeightFileLoadCount: integer;
     FTextEncoderSeqLen, FTextEncoderClipSkip: integer;
     FUNetGridX, FUNetGridY, FUNetTextSeqLen: integer;
     FUNetWithControl, FUNetWithAdapter: boolean;
-    FUNetIPAdapterFile: string;
+    FUNetIPAdapterFile, FUNetGLIGENFile: string;
     // During Denoise: the UNet's extra inputs, the conditioners that fill
     // them, and the step running (0-based) out of StepCount.
     FUNetInputs: TSDUNetConditioningInputs;
@@ -12507,16 +12519,16 @@ type
     function UNetStepConfig(GridX, GridY, TextSeqLen: integer): TSDUNetConfig;
     // The kept net of that shape, or a new one (kept when ComponentsLoaded)
     // after starting its load phase; ReleaseComponent ends its use.
-    function AcquireTextEncoder(SeqLen: integer): TNNet;
+    function AcquireTextEncoder(SeqLen, ClipSkip: integer): TNNet;
     function AcquireUNet(GridX, GridY, TextSeqLen: integer;
-      WithControl, WithAdapter: boolean; const IPAdapterFile: string;
-      out DeepCacheLayout: TSDUNetDeepCacheLayout): TNNet;
+      WithControl, WithAdapter: boolean; const IPAdapterFile,
+      GLIGENFile: string; out DeepCacheLayout: TSDUNetDeepCacheLayout): TNNet;
     function AcquireVaeDecoder(GridX, GridY: integer): TNNet;
     function AcquireVaeEncoder(GridX, GridY: integer): TNNet;
     // The UNet / VAE nets read from their weights file (WeightFileLoadCount);
     // pWeightOwner set: the net borrows its weights and nothing is read.
     function BuildUNet(GridX, GridY, TextSeqLen: integer; WithControl,
-      WithAdapter: boolean; const IPAdapterFile: string;
+      WithAdapter: boolean; const IPAdapterFile, GLIGENFile: string;
       out DeepCacheLayout: TSDUNetDeepCacheLayout;
       pWeightOwner: TNNet = nil): TNNet;
     function BuildVaeDecoderNet(GridX, GridY: integer;
@@ -12533,7 +12545,7 @@ type
     // Builds text_encoder/ once for every list; Embeds[i] := its hidden state
     // ClipSkip blocks before the last, through final_layer_norm.
     procedure EncodeTokenIdLists(const TokenLists: array of TNeuralIntegerArray;
-      const Embeds: array of TNNetVolume);
+      const Embeds: array of TNNetVolume; ClipSkip: integer);
     // Prompt's ids without bos/eos after ExpandInversionTokens, one weight per
     // id (ParseSDPromptWeights spans when PromptWeighting, else all 1).
     // Chunk i holds TextIds[ChunkStarts[i] .. ChunkStarts[i + 1] - 1]: runs of
@@ -12635,6 +12647,10 @@ type
     // chunk count of the longest, in one text encoder load.
     procedure EncodePrompts(const Prompts: array of string;
       const Embeds: array of TNNetVolume);
+    // CLIPTextModel pooler_output of each phrase (Length(Phrases), 1, hidden):
+    // the last block's final_layer_norm state at its eos; ClipSkip is ignored.
+    procedure EncodePooledPhrases(const Phrases: array of string;
+      Pooled: TNNetVolume);
     // Replaces the unconditional embeds (NegativePrompt's, encoded on demand).
     procedure SetNegativePromptEmbeds(Embeds: TNNetVolume);
     procedure ClearNegativePrompt();
@@ -12716,7 +12732,7 @@ type
     // RNG (LCM ignores the last step's).
     property OnAncestralNoise: TStableDiffusionNoiseEvent
       read FOnAncestralNoise write FOnAncestralNoise;
-    // ControlNet / T2I-Adapter / IP-Adapter / img2img / inpainting /
+    // ControlNet / T2I-Adapter / IP-Adapter / GLIGEN / img2img / inpainting /
     // InstructPix2Pix (several: TStableDiffusionMultiConditioner) for later
     // Denoise calls; nil runs the plain UNet. Not owned.
     property Conditioner: TStableDiffusionConditioner read FConditioner
@@ -13336,6 +13352,50 @@ procedure SDUNetDenoiseWithIPAdapter(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat;
   KeyTokens, ValueTokens, Noise: TNNetVolume);
 
+// ---------------------------------------------------------------------------
+// GLIGEN BOX-GROUNDED GENERATION (Li et al. CVPR 2023, arXiv:2301.07093;
+// diffusers StableDiffusionGLIGENPipeline, masterful/gligen-1-4-generation-
+// text-box). Each phrase with a normalized xyxy box becomes one object token:
+// position_net (GLIGENTextBoundingboxProjection, text-only) maps the phrase's
+// CLIP pooler_output and the box Fourier embedding through Linear-SiLU-Linear-
+// SiLU-Linear; unused slots of the csGLIGENMaxObjects take null_positive_feature
+// / null_position_feature. BuildSDUNet(GLIGENReader) inserts a fuser
+// (GatedSelfAttentionDense) after every attn1:
+//   objs := linear(objs)
+//   x := x + tanh(alpha_attn) * attn(norm1([x; objs]))[:n_visual]
+//   x := x + tanh(alpha_dense) * GEGLU_FF(norm2(x))
+// built from existing layers (token-axis TNNetConcat, TNNetCrop, per-head
+// TNNetCrossAttention, TNNetGatedResidual holding the tanh gates).
+// ---------------------------------------------------------------------------
+const
+  csGLIGENMaxObjects = 30;
+  // Box Fourier embedding: 100^(f/8) for f < 8, sin and cos, 4 coordinates.
+  csGLIGENFourierFreqs = 8;
+  csGLIGENBoxEmbedDim = csGLIGENFourierFreqs * 2 * 4;
+
+type
+  TGLIGENPositionNetConfig = record
+    PositiveDim: integer;   // phrase embedding width (positive_len)
+    HiddenDim: integer;     // the two hidden Linear widths (512)
+    OutDim: integer;        // object token width (cross_attention_dim)
+  end;
+
+// position_net.linears shapes of a GLIGEN UNet file; raises on the text-image
+// variant (linears_text / linears_image), which is not supported.
+function ReadGLIGENPositionNetConfig(
+  Reader: TNNetSafeTensorsReader): TGLIGENPositionNetConfig;
+// position_net.linears: (csGLIGENMaxObjects, 1, PositiveDim +
+// csGLIGENBoxEmbedDim) [phrase | box embedding] -> (.., 1, OutDim) object tokens.
+function BuildGLIGENPositionNet(Reader: TNNetSafeTensorsReader;
+  const Config: TGLIGENPositionNetConfig; pTrainable: boolean = true): TNNet;
+// TNNetFourierFeatures with B pinned to 100^(f/8) / 2pi on coordinate c of
+// feature f * 4 + c: (1, 1, 4) box -> (1, 1, csGLIGENBoxEmbedDim) [cos | sin].
+function BuildGLIGENBoxFourierNet(): TNNet;
+// diffusers get_fourier_embeds_from_boundingbox of Box (x0, y0, x1, y1) into
+// Dest[DestPos ..], in its (freq, sin|cos, coordinate) order, via FourierNet.
+procedure GLIGENBoxEmbedding(FourierNet: TNNet; const Box: array of TNeuralFloat;
+  Dest: TNNetVolume; DestPos: integer);
+
 type
   // diffusers load_ip_adapter (h94/IP-Adapter ip-adapter_sd15): a CLIP image
   // prompt whose image_proj tokens join every attn2 through to_k_ip / to_v_ip.
@@ -13377,9 +13437,57 @@ type
     property ImageEncoderConfig: TClipConfig read FImageEncoderConfig;
   end;
 
+  // diffusers StableDiffusionGLIGENPipeline (text-box): phrases placed in
+  // boxes through the fusers of a GLIGEN UNet file; the first
+  // Trunc(ScheduledSamplingBeta * steps) steps run them, the rest close their
+  // gates. Passes without sdpiPrompt (CFG's unconditional one) see all slots null.
+  TStableDiffusionGLIGEN = class(TStableDiffusionConditioner)
+  private
+    FWeightsFile: string;
+    FPhrases: array of string;
+    // 4 per phrase: x0, y0, x1, y1 in [0, 1].
+    FBoxes: TNeuralFloatDynArr;
+    FScheduledSamplingBeta: double;
+    FPositionConfig: TGLIGENPositionNetConfig;
+    FPositionNet, FBoxFourierNet: TNNet;
+    FNullPositive, FNullPosition: TNNetVolume;
+    FPooled, FPositionInput, FPromptObjects, FUncondObjects: TNNetVolume;
+    // While the gates are closed: the gate layers and their tanh(alpha).
+    FClosedGates: array of TNNetLayer;
+    FClosedGateValues: TNeuralFloatDynArr;
+    // Objects := position_net of the phrases (WithPhrases) or of null slots.
+    procedure ProjectObjects(WithPhrases: boolean; Objects: TNNetVolume);
+    procedure CloseGates(const Gates: array of TNNetLayer);
+    procedure ReopenGates();
+  protected
+    procedure FillUNetInputs(const UNetInputs: TSDUNetConditioningInputs;
+      Latents, Embeds: TNNetVolume; Timestep: TNeuralFloat;
+      Inputs: TStableDiffusionPassInputs); override;
+  public
+    // WeightsFile: a GLIGEN text-box UNet .safetensors (fuser.* and position_net.*
+    // keys); the base UNet weights stay the pipeline's.
+    constructor Create(const WeightsFile: string);
+    destructor Destroy(); override;
+    // One grounded phrase; at most csGLIGENMaxObjects (diffusers drops the rest).
+    procedure AddBox(const Phrase: string; X0, Y0, X1, Y1: TNeuralFloat);
+    procedure ClearBoxes();
+    function BoxCount(): integer;
+    function UNetGLIGENFile(): string; override;
+    procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
+      Latents: TNNetVolume; TextSeqLen: integer); override;
+    procedure EndDenoise(); override;
+    // diffusers gligen_scheduled_sampling_beta (0.3).
+    property ScheduledSamplingBeta: double read FScheduledSamplingBeta
+      write FScheduledSamplingBeta;
+    // The object tokens (csGLIGENMaxObjects, 1, OutDim) of the prompt passes
+    // and of the others, from the last BeginDenoise.
+    property PromptObjects: TNNetVolume read FPromptObjects;
+    property UncondObjects: TNNetVolume read FUncondObjects;
+  end;
+
   // Several conditioners (not owned) in one Denoise: ControlNets and
   // T2I-Adapters (summed, as diffusers MultiControlNetModel), at most one
-  // IP-Adapter and at most one image conditioner (img2img, inpainting,
+  // IP-Adapter, at most one GLIGEN and at most one image conditioner (img2img, inpainting,
   // InstructPix2Pix), which then owns the start, the guided passes and the steps.
   TStableDiffusionMultiConditioner = class(TStableDiffusionConditioner)
   private
@@ -13391,11 +13499,13 @@ type
     procedure CollectConditioners(
       var Conditioners: TStableDiffusionConditionerArray); override;
   public
-    // Raises on a second IP-Adapter or image conditioner, or a multi one.
+    // Raises on a second IP-Adapter, GLIGEN or image conditioner, or a
+    // multi one.
     procedure Add(Conditioner: TStableDiffusionConditioner);
     function UNetWithControl(): boolean; override;
     function UNetWithAdapter(): boolean; override;
     function UNetIPAdapterFile(): string; override;
+    function UNetGLIGENFile(): string; override;
     function AcceptsUNetInChannels(InChannels,
       LatentChannels: integer): boolean; override;
     procedure BeginDenoise(Pipeline: TStableDiffusionPipeline;
@@ -77171,12 +77281,18 @@ type
     // IP-Adapter to_k_ip / to_v_ip; nil without image tokens.
     KIP, VIP: TNNetLayer;
   end;
+  // One GLIGEN GatedSelfAttentionDense; Linear is nil when the block has none.
+  TSDGLIGENFuserLayers = record
+    Linear, LN1, LN2, AttnGate, FfProj, FfOut, FfGate: TNNetLayer;
+    Attn: TSDCrossAttnLayers;
+  end;
   // One BasicTransformerBlock's layer refs (attn1 / cross-attn / GEGLU FF).
   // Self_QKV is nil when attn1 is a cross-attention (only_cross_attention).
   TSDBasicBlockLayers = record
     LN1, LN2, LN3: TNNetLayer;
     Self_QKV, Self_Out: TNNetLayer;
     Attn1Cross, Cross: TSDCrossAttnLayers;
+    Fuser: TSDGLIGENFuserLayers;
     FfProj, FfOut: TNNetLayer;
   end;
   // One Transformer2DModel: GN + proj_in/out + a STACK of BasicTransformerBlocks
@@ -77292,6 +77408,7 @@ end;
 // cross-attention over TextStates (diffusers only_cross_attention).
 // IPKeyTokens / IPValueTokens (IP-Adapter image tokens; the value ones carry
 // the scale) add per-head attention over to_k_ip / to_v_ip to the attn2 one.
+// GLIGENObjects (GLIGEN object tokens) adds a fuser after every attn1.
 //
 // proj_in/proj_out are built as 1x1 TNNetConvolutionLinear regardless of
 // Config.UseLinearProjection: an nn.Linear over the channel axis and a 1x1 conv
@@ -77301,7 +77418,8 @@ end;
 procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
   TextStates, Input: TNNetLayer; Channels, Depth, Heads: integer;
   OnlyCrossAttention, pTrainable: boolean; out Refs: TSDAttnLayers;
-  IPKeyTokens: TNNetLayer = nil; IPValueTokens: TNNetLayer = nil);
+  IPKeyTokens: TNNetLayer = nil; IPValueTokens: TNNetLayer = nil;
+  GLIGENObjects: TNNetLayer = nil);
 var
   ResidualIn, Tokens, X1, X2, X3, Attn1Out, CrossOut: TNNetLayer;
   HeadOutputs, IPHeadOutputs: array of TNNetLayer;
@@ -77309,10 +77427,10 @@ var
   H, W, HeadDim, Inner, HeadsM1, HeadDimM1, blk: integer;
   DepthM1: integer;
 
-  // diffusers Attention of QueryIn over TextStates, plus the IP-Adapter image
+  // diffusers Attention of QueryIn over KVSource, plus the IP-Adapter image
   // tokens when KeyTokens is set; returns to_out.0.
-  function AddTextAttention(QueryIn, KeyTokens, ValueTokens: TNNetLayer;
-    out AttnRefs: TSDCrossAttnLayers): TNNetLayer;
+  function AddTextAttention(QueryIn, KVSource, KeyTokens,
+    ValueTokens: TNNetLayer; out AttnRefs: TSDCrossAttnLayers): TNNetLayer;
   var
     KSlice, VSlice, QSlice, KVPack, KIPSlice, VIPSlice, CrossHeads: TNNetLayer;
     HeadPos, DimPos: integer;
@@ -77320,9 +77438,9 @@ var
     AttnRefs.Q := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Channels,
       {SuppressBias=}1).SetTrainable(pTrainable), QueryIn);
     AttnRefs.K := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Channels,
-      {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
+      {SuppressBias=}1).SetTrainable(pTrainable), KVSource);
     AttnRefs.V := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Channels,
-      {SuppressBias=}1).SetTrainable(pTrainable), TextStates);
+      {SuppressBias=}1).SetTrainable(pTrainable), KVSource);
     AttnRefs.KIP := nil;
     AttnRefs.VIP := nil;
     if KeyTokens <> nil then
@@ -77364,6 +77482,47 @@ var
     Result := AttnRefs.Out;
   end;
 
+  // diffusers FeedForward(activation_fn="geglu") on the last layer.
+  procedure AddGEGLUFeedForward(out FfProj, FfOut: TNNetLayer);
+  begin
+    FfProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(2 * Inner).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetGEGLUErf.Create() );
+    FfOut := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
+  end;
+
+  // GLIGEN GatedSelfAttentionDense on the visual tokens X; returns its output.
+  function AddGLIGENFuser(X: TNNetLayer;
+    out FuserRefs: TSDGLIGENFuserLayers): TNNetLayer;
+  var
+    VisualCount, ObjectCount: integer;
+    Joint, VisualNormed, XAttn: TNNetLayer;
+  begin
+    VisualCount := X.Output.SizeX;
+    ObjectCount := GLIGENObjects.Output.SizeX;
+    FuserRefs.Linear := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+      Channels).SetTrainable(pTrainable), GLIGENObjects);
+    NN.AddLayer( TNNetConcat.Create(VisualCount + ObjectCount, 1, Channels,
+      [X, FuserRefs.Linear]) );
+    FuserRefs.LN1 := NN.AddLayer(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
+    Joint := FuserRefs.LN1;
+    // Only the visual queries: the [:n_visual] crop of the attention output.
+    VisualNormed := NN.AddLayerAfter( TNNetCrop.Create(0, 0, VisualCount, 1),
+      Joint );
+    AddTextAttention(VisualNormed, Joint, nil, nil, FuserRefs.Attn);
+    FuserRefs.AttnGate := NN.AddLayer(
+      TNNetGatedResidual.Create().SetTrainable(pTrainable) );
+    XAttn := NN.AddLayer( TNNetSum.Create([FuserRefs.AttnGate, X]) );
+    FuserRefs.LN2 := NN.AddLayer(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
+    AddGEGLUFeedForward(FuserRefs.FfProj, FuserRefs.FfOut);
+    FuserRefs.FfGate := NN.AddLayer(
+      TNNetGatedResidual.Create().SetTrainable(pTrainable) );
+    Result := NN.AddLayer( TNNetSum.Create([FuserRefs.FfGate, XAttn]) );
+  end;
+
 begin
   ResidualIn := Input;
   H := ResidualIn.Output.SizeY;
@@ -77396,7 +77555,7 @@ begin
     Refs.Blocks[blk].Self_Out := nil;
     Refs.Blocks[blk].Attn1Cross := Default(TSDCrossAttnLayers);
     if OnlyCrossAttention then
-      Attn1Out := AddTextAttention(Refs.Blocks[blk].LN1, nil, nil,
+      Attn1Out := AddTextAttention(Refs.Blocks[blk].LN1, TextStates, nil, nil,
         Refs.Blocks[blk].Attn1Cross)
     else
     begin
@@ -77407,22 +77566,21 @@ begin
       Attn1Out := Refs.Blocks[blk].Self_Out;
     end;
     X1 := NN.AddLayer( TNNetSum.Create([Attn1Out, Tokens]) );
+    Refs.Blocks[blk].Fuser := Default(TSDGLIGENFuserLayers);
+    if GLIGENObjects <> nil then
+      X1 := AddGLIGENFuser(X1, Refs.Blocks[blk].Fuser);
 
     // ---- cross-attention (pre-norm; K|V from text states) ----
     Refs.Blocks[blk].LN2 := NN.AddLayerAfter(
       TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X1);
-    CrossOut := AddTextAttention(Refs.Blocks[blk].LN2, IPKeyTokens,
-      IPValueTokens, Refs.Blocks[blk].Cross);
+    CrossOut := AddTextAttention(Refs.Blocks[blk].LN2, TextStates,
+      IPKeyTokens, IPValueTokens, Refs.Blocks[blk].Cross);
     X2 := NN.AddLayer( TNNetSum.Create([CrossOut, X1]) );
 
     // ---- GEGLU feed-forward (pre-norm) ----
     Refs.Blocks[blk].LN3 := NN.AddLayerAfter(
       TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X2);
-    Refs.Blocks[blk].FfProj := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(2 * Inner).SetTrainable(pTrainable) );
-    NN.AddLayer( TNNetGEGLUErf.Create() );
-    Refs.Blocks[blk].FfOut := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Channels).SetTrainable(pTrainable) );
+    AddGEGLUFeedForward(Refs.Blocks[blk].FfProj, Refs.Blocks[blk].FfOut);
     X3 := NN.AddLayer( TNNetSum.Create([Refs.Blocks[blk].FfOut, X2]) );
     // the next block (if any) consumes this block's token output.
     Tokens := X3;
@@ -77518,6 +77676,66 @@ begin
   end;
 end;
 
+// The GLIGEN fuser.* tensors of every block of Refs; a gate holds
+// tanh(alpha) in every channel.
+procedure LoadSDGLIGENFusers(Reader: TNNetSafeTensorsReader;
+  const Refs: TSDAttnLayers; const Prefix: string; Channels: integer;
+  const Config: TSDUNetConfig);
+var
+  Inner, BlockPos, MaxBlockPos: integer;
+  FuserPrefix: string;
+  Alpha: TNNetVolume;
+  Fuser: TSDGLIGENFuserLayers;
+
+  procedure LoadGate(Gate: TNNetLayer; const AlphaName: string);
+  begin
+    Reader.LoadTensorFlat(AlphaName, Alpha);
+    if Alpha.Size <> 1 then
+      ImportError('SD UNet import: ' + AlphaName + ' holds ' +
+        IntToStr(Alpha.Size) + ' values, not 1.');
+    Gate.Neurons[0].Weights.Fill(Tanh(Alpha.FData[0]));
+    Gate.FlushWeightCache();
+  end;
+
+begin
+  Inner := 4 * Channels;
+  Alpha := TNNetVolume.Create();
+  try
+    MaxBlockPos := High(Refs.Blocks);
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      FuserPrefix := Prefix + 'transformer_blocks.' + IntToStr(BlockPos) +
+        '.fuser.';
+      Fuser := Refs.Blocks[BlockPos].Fuser;
+      LoadLlamaLinearWeights(Reader, Fuser.Linear, FuserPrefix + 'linear.weight',
+        Config.CrossAttentionDim, Channels, 0, -1, 0,
+        FuserPrefix + 'linear.bias');
+      LoadLayerNormWeights(Reader, Fuser.LN1, FuserPrefix + 'norm1.weight',
+        FuserPrefix + 'norm1.bias', Channels);
+      LoadLayerNormWeights(Reader, Fuser.LN2, FuserPrefix + 'norm2.weight',
+        FuserPrefix + 'norm2.bias', Channels);
+      LoadLlamaLinearWeights(Reader, Fuser.Attn.Q, FuserPrefix + 'attn.to_q.weight',
+        Channels, Channels, 0, -1, 0, '');
+      LoadLlamaLinearWeights(Reader, Fuser.Attn.K, FuserPrefix + 'attn.to_k.weight',
+        Channels, Channels, 0, -1, 0, '');
+      LoadLlamaLinearWeights(Reader, Fuser.Attn.V, FuserPrefix + 'attn.to_v.weight',
+        Channels, Channels, 0, -1, 0, '');
+      LoadLlamaLinearWeights(Reader, Fuser.Attn.Out, FuserPrefix +
+        'attn.to_out.0.weight', Channels, Channels, 0, -1, 0,
+        FuserPrefix + 'attn.to_out.0.bias');
+      LoadLlamaLinearWeights(Reader, Fuser.FfProj, FuserPrefix +
+        'ff.net.0.proj.weight', Channels, 2 * Inner, 0, -1, 0,
+        FuserPrefix + 'ff.net.0.proj.bias');
+      LoadLlamaLinearWeights(Reader, Fuser.FfOut, FuserPrefix + 'ff.net.2.weight',
+        Inner, Channels, 0, -1, 0, FuserPrefix + 'ff.net.2.bias');
+      LoadGate(Fuser.AttnGate, FuserPrefix + 'alpha_attn');
+      LoadGate(Fuser.FfGate, FuserPrefix + 'alpha_dense');
+    end;
+  finally
+    Alpha.Free;
+  end;
+end;
+
 // Returns the SKIP layer for HLayer (a down-path skip source). When pWithControl
 // is true it splices a zero-default control input + TNNetSum(HLayer, ctrl) and
 // returns that Sum, so a ControlNet residual is ADDED into the skip copy that
@@ -77554,12 +77772,13 @@ function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   const Config: TSDUNetConfig; pTrainable: boolean = true;
   pWithControl: boolean = false; pWithAdapter: boolean = false;
   IPAdapterReader: TNNetSafeTensorsReader = nil;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil;
+  GLIGENReader: TNNetSafeTensorsReader = nil): TNNet;
 var
   DeepCacheLayout: TSDUNetDeepCacheLayout;
 begin
   Result := BuildSDUNet(Reader, Config, DeepCacheLayout, pTrainable,
-    pWithControl, pWithAdapter, IPAdapterReader, pWeightOwner);
+    pWithControl, pWithAdapter, IPAdapterReader, pWeightOwner, GLIGENReader);
 end;
 
 // Raises unless every layer after each CachePointIdx reads only the head
@@ -77609,10 +77828,11 @@ function BuildSDUNet(Reader: TNNetSafeTensorsReader;
   pTrainable: boolean = true; pWithControl: boolean = false;
   pWithAdapter: boolean = false;
   IPAdapterReader: TNNetSafeTensorsReader = nil;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil;
+  GLIGENReader: TNNetSafeTensorsReader = nil): TNNet;
 var
   NN: TNNet;
-  IPKeyInput, IPValueInput: TNNetLayer;
+  IPKeyInput, IPValueInput, GLIGENObjects: TNNetLayer;
   IPConfig: TIPAdapterConfig;
   IPKeyId: integer;
   AdapterInputs: array of TNNetLayer;
@@ -77784,6 +78004,10 @@ begin
       IPValueInput := NN.AddLayer( TNNetInput.Create(IPConfig.NumImageTokens, 1,
         Config.CrossAttentionDim) );
     end;
+    GLIGENObjects := nil;
+    if GLIGENReader <> nil then
+      GLIGENObjects := NN.AddLayer( TNNetInput.Create(csGLIGENMaxObjects, 1,
+        Config.CrossAttentionDim) );
 
     // One T2I-Adapter input per down block, ahead of every control input: a
     // block with attention (or the last one) takes it before its downsampler,
@@ -77840,7 +78064,7 @@ begin
           AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
             Config.TransformerLayersPerBlock[i], Config.HeadsPerBlock[i],
             Config.OnlyCrossAttention[i], pTrainable, DownAttn[i][j],
-            IPKeyInput, IPValueInput);
+            IPKeyInput, IPValueInput, GLIGENObjects);
           HLayer := NN.GetLastLayer();
         end;
         // T2I-Adapter: the feature joins the block's last skip and what flows
@@ -77889,7 +78113,7 @@ begin
     AddSDTransformer2D(NN, Config, TextInput, HLayer, MidCh,
       Config.TransformerLayersPerBlock[nM1], Config.HeadsPerBlock[nM1],
       Config.MidBlockOnlyCrossAttention, pTrainable, MidAttn, IPKeyInput,
-      IPValueInput);
+      IPValueInput, GLIGENObjects);
     HLayer := NN.GetLastLayer();
     AddSDResnetBlock(NN, Config, TimeCond, HLayer, MidCh, MidCh, pTrainable,
       MidRes2);
@@ -77937,7 +78161,7 @@ begin
           AddSDTransformer2D(NN, Config, TextInput, HLayer, OutCh,
             Config.TransformerLayersPerBlock[RevIdx], Config.HeadsPerBlock[RevIdx],
             Config.OnlyCrossAttention[RevIdx], pTrainable, UpAttn[i][j],
-            IPKeyInput, IPValueInput);
+            IPKeyInput, IPValueInput, GLIGENObjects);
           HLayer := NN.GetLastLayer();
         end;
       end;
@@ -78101,6 +78325,23 @@ begin
         ImportError('SD UNet import: the IP-Adapter has more cross-attention ' +
           'layers than the unet (' + IntToStr(IPKeyId div 2) + ').');
     end;
+    if GLIGENReader <> nil then
+    begin
+      for i := 0 to nM1 do
+        if Config.DownHasAttn[i] then
+          for j := 0 to NumResnetM1 do
+            LoadSDGLIGENFusers(GLIGENReader, DownAttn[i][j],
+              'down_blocks.' + IntToStr(i) + '.attentions.' + IntToStr(j) + '.',
+              Config.BlockOutChannels[i], Config);
+      LoadSDGLIGENFusers(GLIGENReader, MidAttn, 'mid_block.attentions.0.',
+        MidCh, Config);
+      for i := 0 to nM1 do
+        if Config.UpHasAttn[i] then
+          for j := 0 to NumResnet do
+            LoadSDGLIGENFusers(GLIGENReader, UpAttn[i][j],
+              'up_blocks.' + IntToStr(i) + '.attentions.' + IntToStr(j) + '.',
+              Config.BlockOutChannels[nM1 - i], Config);
+    end;
     Result := NN;
   except
     NN.Free;
@@ -78124,11 +78365,12 @@ function BuildSDUNetFromSafeTensorsWithLayout(const FileName: string;
   const LoRAScales: array of TNeuralFloat;
   out DeepCacheLayout: TSDUNetDeepCacheLayout; pWithControl,
   pWithAdapter: boolean; const IPAdapterFile: string;
-  pTrainable: boolean = false): TNNet;
+  pTrainable: boolean = false; const GLIGENFile: string = ''): TNNet;
 var
-  Reader, IPAdapterReader: TNNetSafeTensorsReader;
+  Reader, IPAdapterReader, GLIGENReader: TNNetSafeTensorsReader;
 begin
   IPAdapterReader := nil;
+  GLIGENReader := nil;
   // The chain owns (and on a raise frees) the plain reader.
   Reader := CreateLoRAMergeChain(CreatePretrainedTensorReader(FileName),
     LoRAFiles, LoRAScales, SDUNetLoRAStripPrefixes, SDUNetLoRASkipPrefixes,
@@ -78136,9 +78378,12 @@ begin
   try
     if IPAdapterFile <> '' then
       IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
+    if GLIGENFile <> '' then
+      GLIGENReader := CreatePretrainedTensorReader(GLIGENFile);
     Result := BuildSDUNet(Reader, Config, DeepCacheLayout, pTrainable,
-      pWithControl, pWithAdapter, IPAdapterReader);
+      pWithControl, pWithAdapter, IPAdapterReader, nil, GLIGENReader);
   finally
+    GLIGENReader.Free;
     IPAdapterReader.Free;
     Reader.Free;
   end;
@@ -78300,11 +78545,12 @@ begin
 end;
 
 function SDUNetConditioningInputs(Net: TNNet; const Config: TSDUNetConfig;
-  WithIPAdapter, WithAdapter, WithControl: boolean): TSDUNetConditioningInputs;
+  WithIPAdapter, WithAdapter, WithControl: boolean;
+  WithGLIGEN: boolean = false): TSDUNetConditioningInputs;
 var
   Inputs: array of TNNetLayer;
   InputCount, LayerPos, MaxLayerPos, NextInput, ExpectedCount: integer;
-  AdapterCount, ControlDownCount: integer;
+  AdapterCount, ControlDownCount, GateCount: integer;
 
   procedure TakeInputs(var Dest: array of TNNetLayer);
   var
@@ -78326,22 +78572,34 @@ begin
   NextInput := SDUNetSkipInputBase(Config);
   ExpectedCount := NextInput + AdapterCount + ControlDownCount;
   if WithIPAdapter then Inc(ExpectedCount, 2);
+  if WithGLIGEN then Inc(ExpectedCount);
   if WithControl then Inc(ExpectedCount);
   SetLength(Inputs, ExpectedCount);
   InputCount := 0;
+  GateCount := 0;
+  Result.GLIGENGates := nil;
   MaxLayerPos := Net.CountLayers() - 1;
   for LayerPos := 0 to MaxLayerPos do
     if Net.Layers[LayerPos] is TNNetInput then
     begin
       if InputCount < ExpectedCount then Inputs[InputCount] := Net.Layers[LayerPos];
       Inc(InputCount);
+    end
+    else if WithGLIGEN and (Net.Layers[LayerPos] is TNNetGatedResidual) then
+    begin
+      if GateCount = Length(Result.GLIGENGates) then
+        SetLength(Result.GLIGENGates, 2 * GateCount + 16);
+      Result.GLIGENGates[GateCount] := Net.Layers[LayerPos];
+      Inc(GateCount);
     end;
+  SetLength(Result.GLIGENGates, GateCount);
   if InputCount <> ExpectedCount then
     ImportError('SDUNetConditioningInputs: the net has ' +
       IntToStr(InputCount) + ' TNNetInput layers, these options build ' +
       IntToStr(ExpectedCount) + '.');
   Result.IPKeyTokens := nil;
   Result.IPValueTokens := nil;
+  Result.GLIGENObjects := nil;
   Result.ControlMid := nil;
   Result.GuidanceScale := nil;
   Result.ClassLabel := nil;
@@ -78353,6 +78611,11 @@ begin
     Result.IPKeyTokens := Inputs[NextInput];
     Result.IPValueTokens := Inputs[NextInput + 1];
     Inc(NextInput, 2);
+  end;
+  if WithGLIGEN then
+  begin
+    Result.GLIGENObjects := Inputs[NextInput];
+    Inc(NextInput);
   end;
   SetLength(Result.Adapter, AdapterCount);
   TakeInputs(Result.Adapter);
@@ -80404,6 +80667,118 @@ begin
   SDUNetCopyIntoInputs(Net, SDUNetSkipInputBase(Config), 2,
     [KeyTokens, ValueTokens], 'SDUNetDenoiseWithIPAdapter: image tokens');
   SDUNetDenoise(Net, Config, Latent, EncStates, t, Noise);
+end;
+
+function ReadGLIGENPositionNetConfig(
+  Reader: TNNetSafeTensorsReader): TGLIGENPositionNetConfig;
+const
+  csFirstName = 'position_net.linears.0.weight';
+  csHiddenName = 'position_net.linears.2.weight';
+  csLastName = 'position_net.linears.4.weight';
+begin
+  if Reader.HasTensor('position_net.linears_text.0.weight') then
+    ImportError('GLIGEN import: the text-image position_net (linears_text / ' +
+      'linears_image) is not supported, only the text-box one.');
+  if not Reader.HasTensor(csFirstName) or not Reader.HasTensor(csHiddenName) or
+    not Reader.HasTensor(csLastName) then
+    ImportError('GLIGEN import: position_net.linears.{0,2,4}.weight not found ' +
+      '(not a GLIGEN text-box unet file).');
+  if (Reader.DimCount(csFirstName) <> 2) or
+    (Reader.DimSize(csFirstName, 1) <= csGLIGENBoxEmbedDim) then
+    ImportError('GLIGEN import: ' + csFirstName + ' has shape ' +
+      Reader.ShapeAsString(csFirstName) + ', expected [hidden, phrase + ' +
+      IntToStr(csGLIGENBoxEmbedDim) + '].');
+  Result.PositiveDim := Reader.DimSize(csFirstName, 1) - csGLIGENBoxEmbedDim;
+  Result.HiddenDim := Reader.DimSize(csFirstName, 0);
+  Result.OutDim := Reader.DimSize(csLastName, 0);
+end;
+
+function BuildGLIGENPositionNet(Reader: TNNetSafeTensorsReader;
+  const Config: TGLIGENPositionNetConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  Linear0, Linear2, Linear4: TNNetLayer;
+begin
+  NN := TNNet.Create;
+  try
+    NN.AddLayer( TNNetInput.Create(csGLIGENMaxObjects, 1,
+      Config.PositiveDim + csGLIGENBoxEmbedDim) );
+    Linear0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+      Config.HiddenDim).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetSiLU.Create() );
+    Linear2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+      Config.HiddenDim).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetSiLU.Create() );
+    Linear4 := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+      Config.OutDim).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+    LoadLlamaLinearWeights(Reader, Linear0, 'position_net.linears.0.weight',
+      Config.PositiveDim + csGLIGENBoxEmbedDim, Config.HiddenDim, 0, -1, 0,
+      'position_net.linears.0.bias');
+    LoadLlamaLinearWeights(Reader, Linear2, 'position_net.linears.2.weight',
+      Config.HiddenDim, Config.HiddenDim, 0, -1, 0,
+      'position_net.linears.2.bias');
+    LoadLlamaLinearWeights(Reader, Linear4, 'position_net.linears.4.weight',
+      Config.HiddenDim, Config.OutDim, 0, -1, 0, 'position_net.linears.4.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildGLIGENBoxFourierNet(): TNNet;
+const
+  csCoordinateCount = 4;
+var
+  Fourier: TNNetFourierFeatures;
+  FreqPos, MaxFreqPos, CoordPos, MaxCoordPos, FeatureCount: integer;
+begin
+  Result := TNNet.Create;
+  try
+    Result.AddLayer( TNNetInput.Create(1, 1, csCoordinateCount) );
+    FeatureCount := csGLIGENFourierFreqs * csCoordinateCount;
+    Fourier := TNNetFourierFeatures.Create(FeatureCount, {pSigma=}0);
+    Result.AddLayer(Fourier);
+    // B[c, f * 4 + c] (flat c * FeatureCount + f * 4 + c): the layer takes
+    // cos/sin of 2 pi z, so 2 pi B z = 100^(f/8) x_c.
+    Fourier.FreqMatrix.Fill(0);
+    MaxFreqPos := csGLIGENFourierFreqs - 1;
+    MaxCoordPos := csCoordinateCount - 1;
+    for CoordPos := 0 to MaxCoordPos do
+      for FreqPos := 0 to MaxFreqPos do
+        Fourier.FreqMatrix.FData[CoordPos * FeatureCount +
+          FreqPos * csCoordinateCount + CoordPos] :=
+          Power(100.0, FreqPos / csGLIGENFourierFreqs) / (2 * Pi);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure GLIGENBoxEmbedding(FourierNet: TNNet; const Box: array of TNeuralFloat;
+  Dest: TNNetVolume; DestPos: integer);
+const
+  csCoordinateCount = 4;
+  csCoordinateBytes = csCoordinateCount * csNeuralFloatSize;
+var
+  Features: TNNetVolume;
+  FreqPos, MaxFreqPos, FeatureCount, CosPos: integer;
+begin
+  FourierNet.Compute(Box);
+  Features := FourierNet.GetLastLayer().Output;
+  FeatureCount := csGLIGENFourierFreqs * csCoordinateCount;
+  MaxFreqPos := csGLIGENFourierFreqs - 1;
+  // The layer gives [cos | sin] per feature f * 4 + c; diffusers wants, per f,
+  // the 4 sines then the 4 cosines.
+  for FreqPos := 0 to MaxFreqPos do
+  begin
+    CosPos := FreqPos * csCoordinateCount;
+    Move(Features.FData[FeatureCount + CosPos],
+      Dest.FData[DestPos + 2 * CosPos], csCoordinateBytes);
+    Move(Features.FData[CosPos],
+      Dest.FData[DestPos + 2 * CosPos + csCoordinateCount], csCoordinateBytes);
+  end;
 end;
 
 function BuildIPAdapter(Reader: TNNetSafeTensorsReader;
@@ -98417,11 +98792,12 @@ begin
   LatentGridFor(Width, Height, GridX, GridY);
   FKeepComponents := true;
   try
-    AcquireTextEncoder(FMaxTokenCount);
+    AcquireTextEncoder(FMaxTokenCount, FClipSkip);
     AcquireUNet(GridX, GridY, FMaxTokenCount,
       ActiveConditioner().UNetWithControl(),
       ActiveConditioner().UNetWithAdapter(),
-      ActiveConditioner().UNetIPAdapterFile(), DeepCacheLayout);
+      ActiveConditioner().UNetIPAdapterFile(),
+      ActiveConditioner().UNetGLIGENFile(), DeepCacheLayout);
     AcquireVaeDecoder(GridX, GridY);
   except
     UnloadComponents();
@@ -98450,14 +98826,15 @@ begin
   Result.TextSeqLen := TextSeqLen;
 end;
 
-function TStableDiffusionPipeline.AcquireTextEncoder(SeqLen: integer): TNNet;
+function TStableDiffusionPipeline.AcquireTextEncoder(SeqLen,
+  ClipSkip: integer): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   ExtraTokenRows: TNNetVolume;
   SkippedConfig: TClipConfig;
 begin
   if Assigned(FTextEncoder) and (FTextEncoderSeqLen = SeqLen) and
-    (FTextEncoderClipSkip = FClipSkip) then
+    (FTextEncoderClipSkip = ClipSkip) then
     exit(FTextEncoder);
   DoPhase(sdphLoadTextEncoder);
   // The old net goes first: peak memory stays one text encoder.
@@ -98481,7 +98858,7 @@ begin
       FInversionVectors.ConcatInto(ExtraTokenRows);
     end;
     SkippedConfig := FTextConfig;
-    Dec(SkippedConfig.Text.NumLayers, FClipSkip);
+    Dec(SkippedConfig.Text.NumLayers, ClipSkip);
     Result := BuildClipTextTower(Reader, SkippedConfig, SeqLen, '',
       {pTrainable=}false, ExtraTokenRows);
   finally
@@ -98498,15 +98875,15 @@ begin
   begin
     FTextEncoder := Result;
     FTextEncoderSeqLen := SeqLen;
-    FTextEncoderClipSkip := FClipSkip;
+    FTextEncoderClipSkip := ClipSkip;
   end;
 end;
 
 function TStableDiffusionPipeline.BuildUNet(GridX, GridY, TextSeqLen: integer;
-  WithControl, WithAdapter: boolean; const IPAdapterFile: string;
+  WithControl, WithAdapter: boolean; const IPAdapterFile, GLIGENFile: string;
   out DeepCacheLayout: TSDUNetDeepCacheLayout; pWeightOwner: TNNet): TNNet;
 var
-  IPAdapterReader: TNNetSafeTensorsReader;
+  IPAdapterReader, GLIGENReader: TNNetSafeTensorsReader;
 begin
   if pWeightOwner = nil then
   begin
@@ -98514,23 +98891,28 @@ begin
     exit(BuildSDUNetFromSafeTensorsWithLayout(SafeTensorsFolderWeightsFile(
       ComponentFolder('unet'), 'diffusion_pytorch_model'),
       UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
-      DeepCacheLayout, WithControl, WithAdapter, IPAdapterFile));
+      DeepCacheLayout, WithControl, WithAdapter, IPAdapterFile,
+      {pTrainable=}false, GLIGENFile));
   end;
   IPAdapterReader := nil;
+  GLIGENReader := nil;
   try
     if IPAdapterFile <> '' then
       IPAdapterReader := CreatePretrainedTensorReader(IPAdapterFile);
+    if GLIGENFile <> '' then
+      GLIGENReader := CreatePretrainedTensorReader(GLIGENFile);
     Result := BuildSDUNet(nil, UNetStepConfig(GridX, GridY, TextSeqLen),
       DeepCacheLayout, {pTrainable=}false, WithControl, WithAdapter,
-      IPAdapterReader, pWeightOwner);
+      IPAdapterReader, pWeightOwner, GLIGENReader);
   finally
+    GLIGENReader.Free;
     IPAdapterReader.Free;
   end;
 end;
 
 function TStableDiffusionPipeline.AcquireUNet(GridX, GridY,
   TextSeqLen: integer; WithControl, WithAdapter: boolean;
-  const IPAdapterFile: string;
+  const IPAdapterFile, GLIGENFile: string;
   out DeepCacheLayout: TSDUNetDeepCacheLayout): TNNet;
 var
   OwnerLayout: TSDUNetDeepCacheLayout;
@@ -98538,7 +98920,8 @@ begin
   if Assigned(FUNet) and (FUNetGridX = GridX) and (FUNetGridY = GridY) and
     (FUNetTextSeqLen = TextSeqLen) and (FUNetWithControl = WithControl) and
     (FUNetWithAdapter = WithAdapter) and
-    (FUNetIPAdapterFile = IPAdapterFile) then
+    (FUNetIPAdapterFile = IPAdapterFile) and
+    (FUNetGLIGENFile = GLIGENFile) then
   begin
     DeepCacheLayout := FUNetDeepCacheLayout;
     exit(FUNet);
@@ -98547,21 +98930,23 @@ begin
   FreeAndNil(FUNet);
   if FKeepComponents then
   begin
-    if FUNetOwnerIPAdapterFile <> IPAdapterFile then FreeAndNil(FUNetOwner);
+    if (FUNetOwnerIPAdapterFile <> IPAdapterFile) or
+      (FUNetOwnerGLIGENFile <> GLIGENFile) then FreeAndNil(FUNetOwner);
     if FUNetOwner = nil then
     begin
       // The control / adapter inputs are weightless: one owner serves all.
       FUNetOwner := BuildUNet(1, 1, 1, false, false, IPAdapterFile,
-        OwnerLayout);
+        GLIGENFile, OwnerLayout);
       FUNetOwnerIPAdapterFile := IPAdapterFile;
+      FUNetOwnerGLIGENFile := GLIGENFile;
       if FUNetInt8 then FUNetOwner.QuantizeWeightsInt8();
     end;
     Result := BuildUNet(GridX, GridY, TextSeqLen, WithControl, WithAdapter,
-      IPAdapterFile, DeepCacheLayout, FUNetOwner);
+      IPAdapterFile, GLIGENFile, DeepCacheLayout, FUNetOwner);
   end
   else
     Result := BuildUNet(GridX, GridY, TextSeqLen, WithControl, WithAdapter,
-      IPAdapterFile, DeepCacheLayout);
+      IPAdapterFile, GLIGENFile, DeepCacheLayout);
   try
     // A borrowing net links the owner's int8 tables.
     PrepareComponent(Result, FUNetInt8 and not FKeepComponents);
@@ -98579,6 +98964,7 @@ begin
     FUNetWithControl := WithControl;
     FUNetWithAdapter := WithAdapter;
     FUNetIPAdapterFile := IPAdapterFile;
+    FUNetGLIGENFile := GLIGENFile;
   end;
 end;
 
@@ -99548,7 +99934,7 @@ begin
   SetLength(ChunkEmbeds, MaxListPos + 1);
   for ListPos := 0 to MaxListPos do ChunkEmbeds[ListPos] := TNNetVolume.Create();
   try
-    EncodeTokenIdLists(TokenLists, ChunkEmbeds);
+    EncodeTokenIdLists(TokenLists, ChunkEmbeds, FClipSkip);
     for PromptPos := 0 to MaxPromptPos do
     begin
       TokenSize := ChunkEmbeds[0].Depth;
@@ -99590,7 +99976,7 @@ end;
 
 procedure TStableDiffusionPipeline.EncodeTokenIdLists(
   const TokenLists: array of TNeuralIntegerArray;
-  const Embeds: array of TNNetVolume);
+  const Embeds: array of TNNetVolume; ClipSkip: integer);
 var
   TextNet: TNNet;
   TokenIds: TNNetVolume;
@@ -99601,7 +99987,7 @@ begin
   for ListPos := 0 to MaxListPos do
     if Length(TokenLists[ListPos]) <> SeqLen then
       ImportError('TStableDiffusionPipeline: token lists differ in length.');
-  TextNet := AcquireTextEncoder(SeqLen);
+  TextNet := AcquireTextEncoder(SeqLen, ClipSkip);
   TokenIds := TNNetVolume.Create(SeqLen, 1, 1);
   try
     DoPhase(sdphEncodePrompt);
@@ -99630,7 +100016,44 @@ begin
   MaxTokenPos := High(TokenIds);
   for TokenPos := 0 to MaxTokenPos do TokenList[TokenPos] := TokenIds[TokenPos];
   ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
-  EncodeTokenIdLists([TokenList], [PromptEmbeds]);
+  EncodeTokenIdLists([TokenList], [PromptEmbeds], FClipSkip);
+end;
+
+procedure TStableDiffusionPipeline.EncodePooledPhrases(
+  const Phrases: array of string; Pooled: TNNetVolume);
+var
+  TokenLists: array of TNeuralIntegerArray;
+  States: array of TNNetVolume;
+  TokenIds: TNNetVolume;
+  PhrasePos, MaxPhrasePos, TokenPos, MaxTokenPos, EosPos, Hidden: integer;
+begin
+  MaxPhrasePos := High(Phrases);
+  SetLength(TokenLists, MaxPhrasePos + 1);
+  SetLength(States, MaxPhrasePos + 1);
+  for PhrasePos := 0 to MaxPhrasePos do
+  begin
+    TokenLists[PhrasePos] := TokenizePrompt(Phrases[PhrasePos]);
+    States[PhrasePos] := TNNetVolume.Create();
+  end;
+  TokenIds := TNNetVolume.Create();
+  try
+    EncodeTokenIdLists(TokenLists, States, {ClipSkip=}0);
+    Hidden := FTextConfig.Text.HiddenSize;
+    Pooled.ReSize(MaxPhrasePos + 1, 1, Hidden);
+    for PhrasePos := 0 to MaxPhrasePos do
+    begin
+      MaxTokenPos := High(TokenLists[PhrasePos]);
+      TokenIds.ReSize(MaxTokenPos + 1, 1, 1);
+      for TokenPos := 0 to MaxTokenPos do
+        TokenIds.FData[TokenPos] := TokenLists[PhrasePos][TokenPos];
+      EosPos := ClipTextEosPosition(TokenIds, FTextConfig.EosTokenId);
+      Move(States[PhrasePos].FData[EosPos * Hidden],
+        Pooled.FData[PhrasePos * Hidden], Hidden * csNeuralFloatSize);
+    end;
+  finally
+    TokenIds.Free;
+    for PhrasePos := 0 to MaxPhrasePos do States[PhrasePos].Free;
+  end;
 end;
 
 procedure TStableDiffusionPipeline.EncodePrompt(const Prompt: string;
@@ -99671,7 +100094,7 @@ var
   SigmaSchedule: TNNetSigmaSchedule;
   Pred, StepNoise: TNNetVolume;
   IsGuided, WithControl, WithAdapter, UseSigmaSchedule: boolean;
-  IPAdapterFile: string;
+  IPAdapterFile, GLIGENFile: string;
   DeepCacheLayout: TSDUNetDeepCacheLayout;
   GridX, GridY, StepPos, MaxStepPos, ChunkCount, CachePos: integer;
   Eta, NoiseScale: TNeuralFloat;
@@ -99716,8 +100139,9 @@ begin
   WithControl := StepConditioner.UNetWithControl();
   WithAdapter := StepConditioner.UNetWithAdapter();
   IPAdapterFile := StepConditioner.UNetIPAdapterFile();
+  GLIGENFile := StepConditioner.UNetGLIGENFile();
   Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX, WithControl,
-    WithAdapter, IPAdapterFile, DeepCacheLayout);
+    WithAdapter, IPAdapterFile, GLIGENFile, DeepCacheLayout);
   Pred := TNNetVolume.Create();
   StepNoise := nil;
   try
@@ -99737,7 +100161,7 @@ begin
     PrepareSelfAttentionGuidance(Net, GridX, GridY, FSAGScale > 0);
     StepConditioner.BeginDenoise(Self, Latents, PromptEmbeds.SizeX);
     FUNetInputs := SDUNetConditioningInputs(Net, StepConfig,
-      IPAdapterFile <> '', WithAdapter, WithControl);
+      IPAdapterFile <> '', WithAdapter, WithControl, GLIGENFile <> '');
     StepConditioner.CollectConditioners(FPassConditioners);
     DoPhase(sdphDenoise);
     // diffusers Euler / Euler a (linspace: fractional timesteps) and Karras
@@ -100132,6 +100556,11 @@ begin
 end;
 
 function TStableDiffusionConditioner.UNetIPAdapterFile(): string;
+begin
+  Result := '';
+end;
+
+function TStableDiffusionConditioner.UNetGLIGENFile(): string;
 begin
   Result := '';
 end;
@@ -100773,6 +101202,210 @@ begin
   end;
 end;
 
+constructor TStableDiffusionGLIGEN.Create(const WeightsFile: string);
+begin
+  inherited Create();
+  FWeightsFile := WeightsFile;
+  if not FileExists(FWeightsFile) then
+    ImportError('TStableDiffusionGLIGEN: ' + FWeightsFile + ' not found.');
+  FScheduledSamplingBeta := 0.3;
+  FNullPositive := TNNetVolume.Create();
+  FNullPosition := TNNetVolume.Create();
+  FPooled := TNNetVolume.Create();
+  FPositionInput := TNNetVolume.Create();
+  FPromptObjects := TNNetVolume.Create();
+  FUncondObjects := TNNetVolume.Create();
+end;
+
+destructor TStableDiffusionGLIGEN.Destroy();
+begin
+  FBoxFourierNet.Free;
+  FPositionNet.Free;
+  FUncondObjects.Free;
+  FPromptObjects.Free;
+  FPositionInput.Free;
+  FPooled.Free;
+  FNullPosition.Free;
+  FNullPositive.Free;
+  inherited Destroy();
+end;
+
+procedure TStableDiffusionGLIGEN.AddBox(const Phrase: string;
+  X0, Y0, X1, Y1: TNeuralFloat);
+var
+  BoxPos: integer;
+begin
+  BoxPos := BoxCount();
+  if BoxPos >= csGLIGENMaxObjects then exit;
+  SetLength(FPhrases, BoxPos + 1);
+  FPhrases[BoxPos] := Phrase;
+  SetLength(FBoxes, 4 * (BoxPos + 1));
+  FBoxes[4 * BoxPos] := X0;
+  FBoxes[4 * BoxPos + 1] := Y0;
+  FBoxes[4 * BoxPos + 2] := X1;
+  FBoxes[4 * BoxPos + 3] := Y1;
+end;
+
+procedure TStableDiffusionGLIGEN.ClearBoxes();
+begin
+  FPhrases := nil;
+  FBoxes := nil;
+end;
+
+function TStableDiffusionGLIGEN.BoxCount(): integer;
+begin
+  Result := Length(FPhrases);
+end;
+
+function TStableDiffusionGLIGEN.UNetGLIGENFile(): string;
+begin
+  Result := FWeightsFile;
+end;
+
+procedure TStableDiffusionGLIGEN.ProjectObjects(WithPhrases: boolean;
+  Objects: TNNetVolume);
+var
+  SlotPos, MaxSlotPos, RowSize, PositiveDim, RowStart, PhraseCount: integer;
+begin
+  PositiveDim := FPositionConfig.PositiveDim;
+  RowSize := PositiveDim + csGLIGENBoxEmbedDim;
+  if WithPhrases then PhraseCount := BoxCount() else PhraseCount := 0;
+  FPositionInput.ReSize(csGLIGENMaxObjects, 1, RowSize);
+  MaxSlotPos := csGLIGENMaxObjects - 1;
+  RowStart := 0;
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    // diffusers masks * features + (1 - masks) * null with 0/1 masks.
+    if SlotPos < PhraseCount then
+    begin
+      Move(FPooled.FData[SlotPos * PositiveDim], FPositionInput.FData[RowStart],
+        PositiveDim * csNeuralFloatSize);
+      GLIGENBoxEmbedding(FBoxFourierNet, FBoxes[4 * SlotPos .. 4 * SlotPos + 3],
+        FPositionInput, RowStart + PositiveDim);
+    end
+    else
+    begin
+      Move(FNullPositive.FData[0], FPositionInput.FData[RowStart],
+        PositiveDim * csNeuralFloatSize);
+      Move(FNullPosition.FData[0], FPositionInput.FData[RowStart + PositiveDim],
+        csGLIGENBoxEmbedDim * csNeuralFloatSize);
+    end;
+    Inc(RowStart, RowSize);
+  end;
+  FPositionNet.Compute(FPositionInput);
+  FPositionNet.GetOutput(Objects);
+end;
+
+procedure TStableDiffusionGLIGEN.BeginDenoise(
+  Pipeline: TStableDiffusionPipeline; Latents: TNNetVolume;
+  TextSeqLen: integer);
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  inherited BeginDenoise(Pipeline, Latents, TextSeqLen);
+  if BoxCount() = 0 then
+    ImportError('TStableDiffusionGLIGEN: call AddBox first.');
+  FClosedGates := nil;
+  if not Assigned(FPositionNet) or (FNetEpoch <> Pipeline.ComponentEpoch) then
+  begin
+    StartLoadPhase();
+    FreeAndNil(FPositionNet);
+    FreeAndNil(FBoxFourierNet);
+    Reader := CreatePretrainedTensorReader(FWeightsFile);
+    try
+      FPositionConfig := ReadGLIGENPositionNetConfig(Reader);
+      if FPositionConfig.OutDim <> Pipeline.UNetConfig.CrossAttentionDim then
+        ImportError('TStableDiffusionGLIGEN: position_net makes ' +
+          IntToStr(FPositionConfig.OutDim) + '-wide object tokens, the unet ' +
+          'cross_attention_dim is ' +
+          IntToStr(Pipeline.UNetConfig.CrossAttentionDim) + '.');
+      FPositionNet := BuildGLIGENPositionNet(Reader, FPositionConfig,
+        {pTrainable=}false);
+      Reader.LoadTensorFlat('position_net.null_positive_feature', FNullPositive);
+      Reader.LoadTensorFlat('position_net.null_position_feature', FNullPosition);
+    finally
+      Reader.Free;
+    end;
+    if (FNullPositive.Size <> FPositionConfig.PositiveDim) or
+      (FNullPosition.Size <> csGLIGENBoxEmbedDim) then
+      ImportError('TStableDiffusionGLIGEN: the null features hold ' +
+        IntToStr(FNullPositive.Size) + ' and ' + IntToStr(FNullPosition.Size) +
+        ' values, not ' + IntToStr(FPositionConfig.PositiveDim) + ' and ' +
+        IntToStr(csGLIGENBoxEmbedDim) + '.');
+    FBoxFourierNet := BuildGLIGENBoxFourierNet();
+    FNetEpoch := Pipeline.ComponentEpoch;
+    Pipeline.PrepareComponent(FPositionNet, {QuantizeInt8=}false);
+  end;
+  Pipeline.EncodePooledPhrases(FPhrases, FPooled);
+  if FPooled.Depth <> FPositionConfig.PositiveDim then
+    ImportError('TStableDiffusionGLIGEN: position_net takes ' +
+      IntToStr(FPositionConfig.PositiveDim) + '-wide phrase embeddings, the ' +
+      'text encoder makes ' + IntToStr(FPooled.Depth) + '.');
+  ProjectObjects({WithPhrases=}true, FPromptObjects);
+  ProjectObjects({WithPhrases=}false, FUncondObjects);
+  // The object tokens hold for every step.
+  if not Pipeline.ComponentsLoaded then
+  begin
+    FreeAndNil(FPositionNet);
+    FreeAndNil(FBoxFourierNet);
+  end;
+end;
+
+procedure TStableDiffusionGLIGEN.CloseGates(const Gates: array of TNNetLayer);
+var
+  GatePos, MaxGatePos: integer;
+begin
+  if Length(FClosedGates) > 0 then exit;
+  MaxGatePos := High(Gates);
+  SetLength(FClosedGates, MaxGatePos + 1);
+  SetLength(FClosedGateValues, MaxGatePos + 1);
+  for GatePos := 0 to MaxGatePos do
+  begin
+    FClosedGates[GatePos] := Gates[GatePos];
+    FClosedGateValues[GatePos] := Gates[GatePos].Neurons[0].Weights.FData[0];
+    Gates[GatePos].Neurons[0].Weights.Fill(0);
+    Gates[GatePos].FlushWeightCache();
+  end;
+end;
+
+procedure TStableDiffusionGLIGEN.ReopenGates();
+var
+  GatePos, MaxGatePos: integer;
+begin
+  MaxGatePos := High(FClosedGates);
+  for GatePos := 0 to MaxGatePos do
+  begin
+    FClosedGates[GatePos].Neurons[0].Weights.Fill(FClosedGateValues[GatePos]);
+    FClosedGates[GatePos].FlushWeightCache();
+  end;
+  FClosedGates := nil;
+end;
+
+procedure TStableDiffusionGLIGEN.FillUNetInputs(
+  const UNetInputs: TSDUNetConditioningInputs; Latents, Embeds: TNNetVolume;
+  Timestep: TNeuralFloat; Inputs: TStableDiffusionPassInputs);
+const
+  csWhat = 'TStableDiffusionGLIGEN: object tokens';
+begin
+  // diffusers enable_fuser(False) from step int(beta * steps) on.
+  if FPipeline.FStepPos >= Trunc(FScheduledSamplingBeta * FPipeline.FStepCount) then
+    CloseGates(UNetInputs.GLIGENGates);
+  if sdpiPrompt in Inputs then
+    SDUNetWriteInput(UNetInputs.GLIGENObjects, FPromptObjects, false, csWhat)
+  else
+    SDUNetWriteInput(UNetInputs.GLIGENObjects, FUncondObjects, false, csWhat);
+end;
+
+procedure TStableDiffusionGLIGEN.EndDenoise();
+begin
+  ReopenGates();
+  if not FPipeline.ComponentsLoaded then
+  begin
+    FreeAndNil(FPositionNet);
+    FreeAndNil(FBoxFourierNet);
+  end;
+end;
+
 procedure TStableDiffusionMultiConditioner.CollectConditioners(
   var Conditioners: TStableDiffusionConditionerArray);
 var
@@ -100795,6 +101428,8 @@ begin
       'most (' + FImageConditioner.ClassName + ' is set).');
   if (Conditioner.UNetIPAdapterFile() <> '') and (UNetIPAdapterFile() <> '') then
     ImportError('TStableDiffusionMultiConditioner: one IP-Adapter at most.');
+  if (Conditioner.UNetGLIGENFile() <> '') and (UNetGLIGENFile() <> '') then
+    ImportError('TStableDiffusionMultiConditioner: one GLIGEN at most.');
   if Conditioner is TStableDiffusionImageConditioner then
     FImageConditioner := Conditioner;
   SetLength(FMembers, Length(FMembers) + 1);
@@ -100829,6 +101464,16 @@ begin
   MaxMemberPos := High(FMembers);
   for MemberPos := 0 to MaxMemberPos do
     if Result = '' then Result := FMembers[MemberPos].UNetIPAdapterFile();
+end;
+
+function TStableDiffusionMultiConditioner.UNetGLIGENFile(): string;
+var
+  MemberPos, MaxMemberPos: integer;
+begin
+  Result := '';
+  MaxMemberPos := High(FMembers);
+  for MemberPos := 0 to MaxMemberPos do
+    if Result = '' then Result := FMembers[MemberPos].UNetGLIGENFile();
 end;
 
 function TStableDiffusionMultiConditioner.AcceptsUNetInChannels(InChannels,

@@ -61,6 +61,9 @@ type
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
     function CreateSD15Pipeline(): TStableDiffusionPipeline;
+    // The GLIGEN conditioner of a tiny_sd15_gligen_io.json oracle's boxes.
+    function CreateSD15GLIGEN(Oracle: TJSONObject;
+      Beta: double): TStableDiffusionGLIGEN;
     // A kept pipeline generates at A, B (an odd latent grid), A; each image must
     // match a fresh pipeline's and the size changes read no weights file.
     procedure CheckSD15KeptSizeChange(SizeChangeCase: TSD15SizeChangeCase;
@@ -1354,6 +1357,13 @@ type
     procedure TestStableDiffusionT2IAdapterNonSquare;
     procedure TestStableDiffusionIPAdapterParity;
     procedure TestStableDiffusionIPAdapterScaleZero;
+    // diffusers GLIGEN text-box (tiny_sd15_gligen_io.json): pooler_output and
+    // position_net objs (prompt and all-null), then one gated UNet call.
+    procedure TestStableDiffusionGLIGENPositionNetParity;
+    procedure TestStableDiffusionGLIGENUNetParity;
+    // StableDiffusionGLIGENPipeline steps + image for CFG / no CFG and two
+    // scheduled-sampling betas, per-stage and with kept components.
+    procedure TestStableDiffusionGLIGENPipelineParity;
     procedure TestSDUNetConditioningInputsLayout;
     procedure TestStableDiffusionIPAdapterControlNetParity;
     procedure TestStableDiffusionControlNetGuidanceWindowParity;
@@ -47007,6 +47017,229 @@ begin
     PromptImage.Free;
     Pipeline.Free;
     IPAdapter.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.CreateSD15GLIGEN(Oracle: TJSONObject;
+  Beta: double): TStableDiffusionGLIGEN;
+var
+  Phrases, Boxes, Box: TJSONArray;
+  PhrasePos: integer;
+begin
+  Result := TStableDiffusionGLIGEN.Create(FixturePath(
+    'tiny_sd15_gligen/diffusion_pytorch_model.safetensors'));
+  Result.ScheduledSamplingBeta := Beta;
+  Phrases := Oracle.Arrays['phrases'];
+  Boxes := Oracle.Arrays['boxes'];
+  for PhrasePos := 0 to Phrases.Count - 1 do
+  begin
+    Box := Boxes.Arrays[PhrasePos];
+    Result.AddBox(Phrases.Strings[PhrasePos], Box.Floats[0], Box.Floats[1],
+      Box.Floats[2], Box.Floats[3]);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionGLIGENPositionNetParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  GLIGEN: TStableDiffusionGLIGEN;
+  FourierNet: TNNet;
+  Oracle: TJSONObject;
+  Box: TJSONArray;
+  Phrases: array of string;
+  Pooled, Expected, Embedding: TNNetVolume;
+  PhrasePos, FreqPos, CoordPos: integer;
+  Angle, MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_gligen_io.json');
+  Oracle := TJSONObject(FSD15Oracle);
+  Pipeline := CreateSD15Pipeline();
+  GLIGEN := CreateSD15GLIGEN(Oracle, 0.3);
+  FourierNet := BuildGLIGENBoxFourierNet();
+  Pooled := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Embedding := TNNetVolume.Create(1, 1, csGLIGENBoxEmbedDim);
+  try
+    // diffusers get_fourier_embeds_from_boundingbox: index f * 8 + s * 4 + c.
+    Box := Oracle.Arrays['boxes'].Arrays[1];
+    GLIGENBoxEmbedding(FourierNet, [Box.Floats[0], Box.Floats[1],
+      Box.Floats[2], Box.Floats[3]], Embedding, 0);
+    MaxDiff := 0;
+    for FreqPos := 0 to csGLIGENFourierFreqs - 1 do
+      for CoordPos := 0 to 3 do
+      begin
+        Angle := Power(100, FreqPos / csGLIGENFourierFreqs) *
+          Box.Floats[CoordPos];
+        MaxDiff := Max(MaxDiff, Abs(Embedding.FData[FreqPos * 8 + CoordPos] -
+          Sin(Angle)));
+        MaxDiff := Max(MaxDiff, Abs(Embedding.FData[FreqPos * 8 + 4 +
+          CoordPos] - Cos(Angle)));
+      end;
+    AssertTrue('box embedding max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    SetLength(Phrases, Oracle.Arrays['phrases'].Count);
+    for PhrasePos := 0 to High(Phrases) do
+      Phrases[PhrasePos] := Oracle.Arrays['phrases'].Strings[PhrasePos];
+    Pipeline.EncodePooledPhrases(Phrases, Pooled);
+    LoadNestedOracleVolume(Oracle.Arrays['pooled'], false, Expected);
+    MaxDiff := MaxAbsVolumeDiff(Pooled, Expected);
+    AssertTrue('pooled max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    GLIGEN.BeginDenoise(Pipeline, nil, Pipeline.MaxTokenCount);
+    LoadNestedOracleVolume(Oracle.Arrays['objs_cond'], false, Expected);
+    MaxDiff := MaxAbsVolumeDiff(GLIGEN.PromptObjects, Expected);
+    AssertTrue('objs_cond max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    LoadNestedOracleVolume(Oracle.Arrays['objs_uncond'], false, Expected);
+    MaxDiff := MaxAbsVolumeDiff(GLIGEN.UncondObjects, Expected);
+    AssertTrue('objs_uncond max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    GLIGEN.EndDenoise();
+  finally
+    Embedding.Free;
+    Expected.Free;
+    Pooled.Free;
+    FourierNet.Free;
+    GLIGEN.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionGLIGENUNetParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  Reader, GLIGENReader: TNNetSafeTensorsReader;
+  Config: TSDUNetConfig;
+  Inputs: TSDUNetConditioningInputs;
+  Net: TNNet;
+  Oracle, UNetCheck: TJSONObject;
+  Embeds, Initial, Objects, Noise, Expected: TNNetVolume;
+  GatePos: integer;
+  MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_gligen_io.json');
+  Oracle := TJSONObject(FSD15Oracle);
+  Pipeline := CreateSD15Pipeline();
+  Reader := nil;
+  GLIGENReader := nil;
+  Net := nil;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Objects := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    Pipeline.EncodePrompt(Oracle.Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(Oracle.Arrays['latents'], true, Initial);
+    LoadNestedOracleVolume(Oracle.Arrays['objs_cond'], false, Objects);
+    Config := Pipeline.UNetConfig;
+    Config.LatentGrid := Initial.SizeX;
+    Config.LatentGridY := Initial.SizeY;
+    Config.TextSeqLen := Embeds.SizeX;
+    Reader := CreatePretrainedTensorReader(FixturePath(
+      'tiny_sd15/unet/diffusion_pytorch_model.safetensors'));
+    GLIGENReader := CreatePretrainedTensorReader(FixturePath(
+      'tiny_sd15_gligen/diffusion_pytorch_model.safetensors'));
+    Net := BuildSDUNet(Reader, Config, {pTrainable=}false, false, false, nil,
+      nil, GLIGENReader);
+    Inputs := SDUNetConditioningInputs(Net, Config, false, false, false,
+      {WithGLIGEN=}true);
+    AssertTrue('two gates per fuser', (Length(Inputs.GLIGENGates) > 0) and
+      (Length(Inputs.GLIGENGates) mod 2 = 0));
+    Inputs.GLIGENObjects.Output.Copy(Objects);
+    UNetCheck := Oracle.Objects['unet_check'];
+    SDUNetDenoise(Net, Config, Initial, Embeds, UNetCheck.Get('timestep', 0), Noise);
+    LoadNestedOracleVolume(UNetCheck.Arrays['output'], true, Expected);
+    MaxDiff := MaxAbsVolumeDiff(Noise, Expected);
+    AssertTrue('gated unet max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    // Closed gates (diffusers enable_fuser(False)) must move the output.
+    for GatePos := 0 to High(Inputs.GLIGENGates) do
+      Inputs.GLIGENGates[GatePos].Neurons[0].Weights.Fill(0);
+    SDUNetDenoise(Net, Config, Initial, Embeds, UNetCheck.Get('timestep', 0),
+      Objects);
+    AssertTrue('the fusers move the output', MaxAbsVolumeDiff(Noise,
+      Objects) > 1e-3);
+  finally
+    Expected.Free;
+    Noise.Free;
+    Objects.Free;
+    Initial.Free;
+    Embeds.Free;
+    Net.Free;
+    GLIGENReader.Free;
+    Reader.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionGLIGENPipelineParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  GLIGEN: TStableDiffusionGLIGEN;
+  Oracle, CaseObject: TJSONObject;
+  Cases: TJSONArray;
+  Embeds, Initial, Image, Expected: TNNetVolume;
+  CaseName: string;
+  CasePos, RunPos, StepCount, PassesPerStep: integer;
+  GuidanceScale, MaxDiff: double;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_gligen_io.json');
+  Oracle := TJSONObject(FSD15Oracle);
+  Pipeline := CreateSD15Pipeline();
+  GLIGEN := nil;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    StepCount := Oracle.Get('steps', 0);
+    Pipeline.EncodePrompt(Oracle.Get('prompt', ''), Embeds);
+    LoadNestedOracleVolume(Oracle.Arrays['latents'], true, Initial);
+    Cases := Oracle.Arrays['cases'];
+    AssertEquals('cases', 2, Cases.Count);
+    // Run 0 builds every stage per call; run 1 keeps the components, so the
+    // second case reuses the UNet whose gates the first one closed.
+    for RunPos := 0 to 1 do
+      for CasePos := 0 to Cases.Count - 1 do
+      begin
+        CaseObject := Cases.Objects[CasePos];
+        CaseName := CaseObject.Get('name', '') + ' run ' + IntToStr(RunPos);
+        FreeAndNil(GLIGEN);
+        GLIGEN := CreateSD15GLIGEN(Oracle,
+          CaseObject.Get('scheduled_sampling_beta', 0.0));
+        GuidanceScale := CaseObject.Get('guidance_scale', 0.0);
+        Pipeline.GuidanceScale := GuidanceScale;
+        Pipeline.Conditioner := GLIGEN;
+        if (RunPos = 1) and (CasePos = 0) then
+          Pipeline.LoadComponents(Oracle.Get('width', 0),
+            Oracle.Get('height', 0));
+        FSD15StepOracle := CaseObject;
+        FSD15StepMaxDiff := 0;
+        FSD15StepCount := 0;
+        Pipeline.OnStep := @SD15CheckStep;
+        Pipeline.GenerateFromEmbeds(Embeds, Oracle.Get('width', 0),
+          Oracle.Get('height', 0), StepCount, 0, Image, Initial);
+        AssertEquals(CaseName + ' steps run', StepCount, FSD15StepCount);
+        if GuidanceScale > 1 then PassesPerStep := 2 else PassesPerStep := 1;
+        AssertEquals(CaseName + ' passes', PassesPerStep * StepCount,
+          Pipeline.ImageStats.UNetPassCount);
+        AssertTrue(CaseName + ' step latents max |diff| = ' +
+          FloatToStr(FSD15StepMaxDiff), FSD15StepMaxDiff < 1e-4);
+        LoadNestedOracleVolume(CaseObject.Arrays['image'], false, Expected);
+        MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+        AssertTrue(CaseName + ' image max |diff| = ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-4);
+      end;
+  finally
+    FSD15StepOracle := nil;
+    Pipeline.Conditioner := nil;
+    Expected.Free;
+    Image.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    GLIGEN.Free;
+    FreeAndNil(FSD15Oracle);
   end;
 end;
 
