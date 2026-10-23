@@ -2532,8 +2532,10 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       `TDotProductSharedKernel.ComputeModulatedConv`) at 1024x1024: StyleGAN2
       generator forward with OpenCL, per-layer forward time of the 1024x1024
       `TNNetModulatedConv2D` layers against the parent commit (host w'' slab +
-      upload every forward). `examples/StyleGAN2Generate` has no OpenCL switch
-      yet, so the run needs `NN.EnableOpenCL` added (or a small timing harness).
+      upload every forward). Run `examples/StyleGAN2Generate --gpu
+      --time-layers --time-passes 3 <1024 checkpoint>` (rows
+      `#<idx> ModConv 1024x1024x<D>`); CPU vs `--gpu` matched byte-for-byte on
+      the pico fixture under PoCL.
 - [ ] Follow-ups of the vision attention device paths:
       - [ ] SwinV2 follow-up: `cai_sdpa_qk_l2norm_packed` is one work-item
         per (token, Q/K/V part) with a serial d_k loop; fine for Swin windows

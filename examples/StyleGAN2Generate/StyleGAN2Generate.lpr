@@ -1,6 +1,6 @@
 program StyleGAN2Generate;
 (*
-StyleGAN2Generate: synthesizes ONE image on the CPU from a fixed latent with the
+StyleGAN2Generate: synthesizes ONE image (CPU or OpenCL) from a fixed latent with the
 repo's StyleGAN2 generator importer (BuildStyleGAN2Generator,
 neuralpretrained.pas) -- a style-based generative import
 (Karras et al. 2020, "Analyzing and Improving the Image Quality of StyleGAN",
@@ -36,10 +36,18 @@ OPTIONS
                                       noise_mode='random'),
                              none   = no noise
   --seed N                   seed for --noise random (default 1)
+  --gpu                      run the generator on OpenCL (needs a build with
+                             -dOpenCL)
+  --gpu-platform N           OpenCL platform index (default 0)
+  --gpu-device N             OpenCL device index (default 0)
+  --time-layers              after the image, run --time-passes more forwards
+                             with TNNet.LayerProfiling on and print the forward
+                             time of every TNNetModulatedConv2D layer
+  --time-passes N            timed forwards for --time-layers (default 1)
 
 OUTPUT
   Writes stylegan2_sample.ppm (a P6 color image) from a fixed latent and prints
-  the config + a small ASCII intensity preview.
+  the config, the output range + mean, and a small ASCII intensity preview.
 
 Coded by Claude (AI).
 
@@ -54,6 +62,7 @@ any later version.
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Classes,
+  {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuralpretrained;
 
 const
@@ -128,6 +137,63 @@ begin
   end;
 end;
 
+// Arms NN on the selected OpenCL device; returns where the generator runs.
+function EnableComputeDevice(NN: TNNet; UseOpenCL: boolean;
+  OpenCLPlatform, OpenCLDevice: integer
+  {$IFDEF OpenCL}; var OpenCLDevices: TEasyOpenCL{$ENDIF}): string;
+{$IFDEF OpenCL}
+var
+  OpenCLProblem: string;
+{$ENDIF}
+begin
+  Result := 'CPU';
+  if not UseOpenCL then exit;
+  {$IFDEF OpenCL}
+  OpenCLDevices := TEasyOpenCL.Create();
+  if OpenCLDevices.SelectPlatformAndDevice(OpenCLPlatform, OpenCLDevice,
+    OpenCLProblem) then
+  begin
+    NN.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
+      OpenCLDevices.Devices[OpenCLDevice]);
+    Result := 'OpenCL on ' + OpenCLDevices.PlatformNames[OpenCLPlatform] +
+      ' / ' + OpenCLDevices.DeviceNames[OpenCLDevice];
+  end
+  else
+    Result := 'CPU (' + OpenCLProblem + ')';
+  {$ELSE}
+  Result := 'CPU (built without -dOpenCL)';
+  {$ENDIF}
+end;
+
+// Runs PassCount more forwards of Z under LayerProfiling and prints one row
+// per TNNetModulatedConv2D layer (named by index and output shape).
+procedure PrintModulatedConvTimes(NN: TNNet; Z: TNNetVolume;
+  PassCount: integer);
+var
+  GroupNames: array of string;
+  Layer: TNNetLayer;
+  LayerPos, MaxLayerPos, PassPos: integer;
+begin
+  MaxLayerPos := NN.GetLastLayerIdx();
+  SetLength(GroupNames, MaxLayerPos + 1);
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := NN.Layers[LayerPos];
+    if Layer is TNNetModulatedConv2D then
+      GroupNames[LayerPos] := Format('#%d ModConv %dx%dx%d', [LayerPos,
+        Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth])
+    else
+      GroupNames[LayerPos] := '';
+  end;
+  NN.LayerProfiling := true;
+  NN.ClearTime();
+  for PassPos := 1 to PassCount do NN.Compute(Z);
+  WriteLn(Format('Layer forward times over %d timed pass(es), after the ' +
+    'forward that made the image:', [PassCount]));
+  Write(TNNet.LayerGroupTimingReport(NN, GroupNames, PassCount));
+  NN.LayerProfiling := false;
+end;
+
 var
   NN: TNNet;
   Config: TStyleGAN2Config;
@@ -136,9 +202,23 @@ var
   Positional: array of string;
   NoiseMode: TStyleGAN2NoiseMode;
   Seed: cardinal;
-  i, ArgPos: integer;
+  i, ArgPos, OpenCLPlatform, OpenCLDevice, TimePassCount: integer;
+  UseOpenCL, TimeLayers: boolean;
+  ComputeText: string;
+  StartTime: TDateTime;
+  {$IFDEF OpenCL}
+  OpenCLDevices: TEasyOpenCL;
+  {$ENDIF}
 begin
   NoiseMode := snmConst;
+  UseOpenCL := false;
+  OpenCLPlatform := 0;
+  OpenCLDevice := 0;
+  TimeLayers := false;
+  TimePassCount := 1;
+  {$IFDEF OpenCL}
+  OpenCLDevices := nil;
+  {$ENDIF}
   ModeName := 'const';
   Seed := 1;
   SetLength(Positional, 0);
@@ -155,6 +235,23 @@ begin
     begin
       Inc(ArgPos);
       Seed := StrToDWord(ParamStr(ArgPos));
+    end
+    else if ParamStr(ArgPos) = '--gpu' then UseOpenCL := true
+    else if (ParamStr(ArgPos) = '--gpu-platform') and (ArgPos < ParamCount) then
+    begin
+      Inc(ArgPos);
+      OpenCLPlatform := StrToInt(ParamStr(ArgPos));
+    end
+    else if (ParamStr(ArgPos) = '--gpu-device') and (ArgPos < ParamCount) then
+    begin
+      Inc(ArgPos);
+      OpenCLDevice := StrToInt(ParamStr(ArgPos));
+    end
+    else if ParamStr(ArgPos) = '--time-layers' then TimeLayers := true
+    else if (ParamStr(ArgPos) = '--time-passes') and (ArgPos < ParamCount) then
+    begin
+      Inc(ArgPos);
+      TimePassCount := StrToInt(ParamStr(ArgPos));
     end
     else
     begin
@@ -189,23 +286,34 @@ begin
       RestartRandSeed(Seed);
     end;
     WriteLn;
+    ComputeText := EnableComputeDevice(NN, UseOpenCL, OpenCLPlatform,
+      OpenCLDevice{$IFDEF OpenCL}, OpenCLDevices{$ENDIF});
+    WriteLn('Running on ', ComputeText);
     Z := TNNetVolume.Create(Config.LatentDim, 1, 1);
     try
       // A FIXED, reproducible latent (no RNG): a smooth deterministic ramp.
       for i := 0 to Z.Size - 1 do
         Z.FData[i] := Sin(i * 0.7 + 0.3) * 0.9;
+      StartTime := Now();
       NN.Compute(Z);
-      WriteLn('Generated image: ', NN.GetLastLayer().Output.SizeX, 'x',
-        NN.GetLastLayer().Output.SizeY, 'x',
-        NN.GetLastLayer().Output.Depth);
+      WriteLn(Format('Generated image: %dx%dx%d in %.3f s', [
+        NN.GetLastLayer().Output.SizeX, NN.GetLastLayer().Output.SizeY,
+        NN.GetLastLayer().Output.Depth, (Now() - StartTime) * 86400.0]));
+      WriteLn(Format('Output range [%.6f, %.6f], mean %.6f', [
+        NN.GetLastLayer().Output.GetMin(), NN.GetLastLayer().Output.GetMax(),
+        NN.GetLastLayer().Output.GetAvg()]));
       WriteColorPPM(NN.GetLastLayer().Output, cOutFile);
       WriteLn('Wrote ', cOutFile, '.');
       WriteLn('ASCII intensity preview:');
       AsciiPreview(NN.GetLastLayer().Output);
+      if TimeLayers then PrintModulatedConvTimes(NN, Z, TimePassCount);
     finally
       Z.Free;
     end;
   finally
     NN.Free;
+    {$IFDEF OpenCL}
+    OpenCLDevices.Free;
+    {$ENDIF}
   end;
 end.

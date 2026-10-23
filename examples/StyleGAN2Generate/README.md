@@ -4,7 +4,7 @@ The demo for `BuildStyleGAN2GeneratorFromSafeTensors`
 (`neural/neuralpretrained.pas`), a style-based generative import (Karras et al.
 2020, *Analyzing and Improving the Image Quality of StyleGAN*,
 [arXiv:1912.04958](https://arxiv.org/abs/1912.04958)). It synthesizes ONE image
-on the CPU from a fixed latent.
+from a fixed latent, on the CPU or (with `--gpu`) on OpenCL.
 
 The synthesis path the importer builds and this example runs:
 
@@ -28,7 +28,26 @@ lazbuild StyleGAN2Generate.lpi --build-mode=Release
 ../../bin/x86_64-linux/bin/StyleGAN2Generate
 ../../bin/x86_64-linux/bin/StyleGAN2Generate --noise random --seed 7
 ../../bin/x86_64-linux/bin/StyleGAN2Generate model.safetensors [config.json]
+../../bin/x86_64-linux/bin/StyleGAN2Generate --gpu --time-layers model.safetensors
 ```
+
+## OpenCL and per-layer timing
+
+* `--gpu` calls `TNNet.EnableOpenCL` on the generator (the `.lpi` builds with
+  `-dOpenCL`). `--gpu-platform N` / `--gpu-device N` pick the OpenCL platform
+  and device (default 0 / 0). When no device is found the run falls back to the
+  CPU and says why on the `Running on` line.
+* `--time-layers` runs `--time-passes N` (default 1) more forwards after the one
+  that made the image, with `TNNet.LayerProfiling` on, and prints
+  `TNNet.LayerGroupTimingReport`: one row per `TNNetModulatedConv2D` layer
+  (named `#<layer index> ModConv <X>x<Y>x<Depth>`), the other layers grouped by
+  class. Under OpenCL, `LayerProfiling` drains the queue after every layer, so
+  each row includes its kernels; the residency table below it shows whether the
+  layers kept their outputs in OpenCL memory. The first forward (kernel
+  compile, weight upload) is not in the table.
+* The `Output range [min, max], mean` line lets you compare a CPU run with a
+  `--gpu` run of the same checkpoint. On the pico fixture under PoCL both print
+  the same numbers and write a byte-identical `stylegan2_sample.ppm`.
 
 ## Noise modes
 
@@ -55,5 +74,5 @@ is a fixed, reproducible deterministic ramp (no RNG). Pass a real `.safetensors`
 
 ## Output
 
-Writes `stylegan2_sample.ppm` (a P6 color image) and prints the config plus a
-small ASCII intensity preview. Pure CPU.
+Writes `stylegan2_sample.ppm` (a P6 color image) and prints the config, the
+output range and mean, the forward time, and a small ASCII intensity preview.
