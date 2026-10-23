@@ -1163,8 +1163,7 @@ begin
       // gradio_demo.py samples with DPM++ 2M SDE Karras.
       if Opt.SamplerName = 'auto' then
       begin
-        Pipeline.Sampler := smDPMSolverPP2M;
-        Pipeline.Scheduler.DPMSolverAlgorithm := dpaSDEDPMSolverPP;
+        Pipeline.SelectSampler(smDPMSolverPP2M, dpaSDEDPMSolverPP);
         if Opt.KarrasSigmas < 0 then Pipeline.KarrasSigmas := true;
       end;
       Pipeline.Conditioner := ICLight;
@@ -1192,12 +1191,9 @@ begin
     if Opt.ImageWidth >= 1 then ImageWidth := Opt.ImageWidth;
     if Opt.ImageHeight >= 1 then ImageHeight := Opt.ImageHeight;
     if Opt.SamplerName <> 'auto' then
-    begin
-      Pipeline.Sampler := SamplerOptionMethods[
-        SamplerOptionIndex(Opt.SamplerName)];
-      Pipeline.Scheduler.DPMSolverAlgorithm := SamplerOptionDPMAlgorithms[
-        SamplerOptionIndex(Opt.SamplerName)];
-    end;
+      Pipeline.SelectSampler(
+        SamplerOptionMethods[SamplerOptionIndex(Opt.SamplerName)],
+        SamplerOptionDPMAlgorithms[SamplerOptionIndex(Opt.SamplerName)]);
     if Opt.KarrasSigmas >= 0 then Pipeline.KarrasSigmas := Opt.KarrasSigmas = 1;
     StepCount := Opt.Steps;
     GuidanceScale := Opt.GuidanceScale;

@@ -12780,7 +12780,7 @@ type
     procedure LoRAsChanged();
     procedure SetUNetOffsetFile(const Value: string);
     // smLCM swaps in a TNNetLCMScheduler of the same scheduler config
-    // (diffusers LCMScheduler.from_config).
+    // (diffusers LCMScheduler.from_config); the others need some scheduler.
     procedure SetSampler(Value: TNNetSamplerMethod);
     procedure SetDeepCacheInterval(Value: integer);
     procedure SetDeepCacheBranch(Value: integer);
@@ -12937,7 +12937,14 @@ type
     property NegativePrompt: string read FNegativePrompt
       write SetNegativePrompt;
     property HasNegativePromptEmbeds: boolean read GetHasNegativePromptEmbeds;
+    // Sampler and the scheduler's DPMSolverAlgorithm (read by smDPMSolverPP2M).
+    procedure SelectSampler(Method: TNNetSamplerMethod;
+      Algorithm: TNNetDPMSolverAlgorithm = dpaDPMSolverPP);
+    // SelectSampler, KarrasSigmas and SamplerNotice from a diffusers scheduler
+    // config (pipe.scheduler = X.from_config); betas and spacing stay.
+    procedure SelectSamplerFromConfig(const ConfigJson: string);
     // The update rule; set from the scheduler _class_name, may be overridden.
+    // Setting it keeps DPMSolverAlgorithm (SelectSampler sets both).
     property Sampler: TNNetSamplerMethod read FSampler write SetSampler;
     // '' or what the config asks for that the Sampler does not do.
     property SamplerNotice: string read FSamplerNotice;
@@ -102563,9 +102570,7 @@ begin
     if Root is TJSONObject then
       FSchedulerClassName := TJSONObject(Root).Get('_class_name', '');
     FreeAndNil(Root);
-    FSampler := DiffusersSchedulerSampler(JsonText.Text, FSamplerNotice);
-    FKarrasSigmas := DiffusersSchedulerUsesKarrasSigmas(JsonText.Text);
-    if FSampler = smLCM then SetSampler(smLCM);
+    SelectSamplerFromConfig(JsonText.Text);
     FTextConfig := ReadClipConfigFromJSONFile(ComponentFolder('text_encoder') +
       'config.json');
     FMaxTokenCount := FTextConfig.TextMaxPositions;
@@ -102598,9 +102603,6 @@ begin
     Root.Free;
     JsonText.Free;
   end;
-  if FScheduler = nil then
-    FScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
-      ComponentFolder('scheduler') + 'scheduler_config.json');
   FUNetConfig := ReadSDUNetConfigFromJSONFile(ComponentFolder('unet') +
     'config.json');
   FDeepCacheBranch := FUNetConfig.LayersPerBlock;
@@ -103125,8 +103127,29 @@ begin
     FreeAndNil(FScheduler);
     FScheduler := TNNetLCMScheduler.CreateFromDiffusersConfig(
       ComponentFolder('scheduler') + 'scheduler_config.json');
-  end;
+  end
+  else if FScheduler = nil then
+    FScheduler := TNNetDiffusionScheduler.CreateFromDiffusersConfig(
+      ComponentFolder('scheduler') + 'scheduler_config.json');
   FSampler := Value;
+end;
+
+procedure TStableDiffusionPipeline.SelectSampler(Method: TNNetSamplerMethod;
+  Algorithm: TNNetDPMSolverAlgorithm);
+begin
+  SetSampler(Method);
+  FScheduler.DPMSolverAlgorithm := Algorithm;
+end;
+
+procedure TStableDiffusionPipeline.SelectSamplerFromConfig(
+  const ConfigJson: string);
+var
+  Method: TNNetSamplerMethod;
+  Algorithm: TNNetDPMSolverAlgorithm;
+begin
+  Method := DiffusersSchedulerSampler(ConfigJson, Algorithm, FSamplerNotice);
+  FKarrasSigmas := DiffusersSchedulerUsesKarrasSigmas(ConfigJson);
+  SelectSampler(Method, Algorithm);
 end;
 
 procedure TStableDiffusionPipeline.SetDeepCacheInterval(Value: integer);

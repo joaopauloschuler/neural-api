@@ -30,6 +30,7 @@ lazbuild LatentTextToImage.lpi --build-mode=Release
 
 Optional trailing flags: `--steps N` (reverse steps, default 4), `--cfg W`
 (guidance scale, default 4.0), `--dpm` (DPM-Solver++(2M) instead of DDIM),
+`--dpm-sde` (its SDE form, diffusers `sde-dpmsolver++`: fresh noise each step),
 `--unipc` (UniPC order-2 predictor-corrector), `--lcm` (Latent Consistency Model
 few-step sampler — single model pass per step, guidance baked in),
 `--vae-tiling` (diffusers `enable_vae_tiling`: decode the latent in OVERLAPPING
@@ -84,7 +85,7 @@ instead.
 - `--preview N`: every N sampler steps, `TNNetDiffusionScheduler.PredictX0` turns
   the current latent and the guided model output into the x0 estimate. The tiny
   decoder decodes it to `latent_text_to_image_preview_NNN.ppm` (NNN = step
-  number). It works with DDIM, `--dpm`, `--unipc` and `--lcm`. With `--smoke` no
+  number). It works with DDIM, `--dpm`, `--dpm-sde`, `--unipc` and `--lcm`. With `--smoke` no
   files are written and each preview is checked for NaN/Inf.
 - `--fast-vae`: the final image comes from the tiny decoder, and the example does
   not load the full VAE. Use this for drafts. It overrides `--vae-tiling`.

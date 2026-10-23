@@ -950,15 +950,18 @@ end;
 procedure TTestNeuralDiffusion.TestDiffusersSchedulerSamplerMapping;
 var
   Notice: string;
+  Algorithm: TNNetDPMSolverAlgorithm;
 
   function Mapped(const Json: string): TNNetSamplerMethod;
   begin
-    Result := DiffusersSchedulerSampler(Json, Notice);
+    Result := DiffusersSchedulerSampler(Json, Algorithm, Notice);
   end;
 
 begin
-  AssertTrue('ddim', Mapped('{"_class_name": "DDIMScheduler"}') = smDDIM);
+  AssertTrue('ddim', Mapped('{"_class_name": "DDIMScheduler", ' +
+    '"algorithm_type": "sde-dpmsolver++"}') = smDDIM);
   AssertEquals('ddim notice', '', Notice);
+  AssertTrue('ddim algorithm', Algorithm = dpaDPMSolverPP);
   AssertTrue('pndm', Mapped('{"_class_name": "PNDMScheduler", ' +
     '"skip_prk_steps": true}') = smPNDM);
   AssertEquals('pndm notice', '', Notice);
@@ -972,9 +975,13 @@ begin
   AssertTrue('dpm', Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
     '"algorithm_type": "dpmsolver++", "solver_order": 2}') = smDPMSolverPP2M);
   AssertEquals('dpm notice', '', Notice);
+  AssertTrue('dpm algorithm', Algorithm = dpaDPMSolverPP);
   AssertTrue('sde dpm', Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
     '"algorithm_type": "sde-dpmsolver++"}') = smDPMSolverPP2M);
   AssertEquals('sde dpm notice', '', Notice);
+  AssertTrue('sde dpm algorithm', Algorithm = dpaSDEDPMSolverPP);
+  AssertTrue('two-argument form', DiffusersSchedulerSampler(
+    '{"_class_name": "PNDMScheduler", "skip_prk_steps": true}', Notice) = smPNDM);
   Mapped('{"_class_name": "DPMSolverMultistepScheduler", ' +
     '"algorithm_type": "dpmsolver"}');
   AssertTrue('dpmsolver noticed', Pos('algorithm_type', Notice) > 0);

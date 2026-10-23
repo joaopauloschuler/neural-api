@@ -51,6 +51,8 @@ Optional trailing flags:
                  (paper setting e.g. 0,-0.5,15); mixes the x0 predictions
   --apg-eps      apply --apg to the raw eps predictions instead of x0
   --dpm          use DPM-Solver++(2M) instead of DDIM
+  --dpm-sde      use the SDE DPM-Solver++(2M) (diffusers sde-dpmsolver++),
+                 which adds fresh Gaussian noise at each step
   --unipc        use UniPC (order-2 bh2 predictor-corrector; better at 5-10 steps)
   --lcm          use the Latent Consistency Model few-step sampler
                  (TNNetLCMScheduler): a SINGLE model pass per step, guidance
@@ -256,6 +258,7 @@ var
   Latent, TextStates, NullStates, EpsCond, EpsUncond, EpsGuided, Image: TNNetVolume;
   PixST, PixCfgPath, VaeST, VaeCfgPath, TinyVaeDir, TinyST, TinyCfgPath: string;
   Method: TNNetSamplerMethod;
+  DPMAlgorithm: TNNetDPMSolverAlgorithm;
   NumSteps, StepCnt, T, TPrev, i: integer;
   Guidance: TNeuralFloat;
   APG: TNNetAdaptiveProjectedGuidance;
@@ -272,6 +275,7 @@ begin
   NumSteps := 4;
   Guidance := 4.0;
   Method := smDDIM;
+  DPMAlgorithm := dpaDPMSolverPP;
   SmokeMode := false;
   UseLCM := false;
   UseTiling := false;
@@ -312,7 +316,16 @@ begin
       APG := TNNetAdaptiveProjectedGuidance.CreateFromSpec(ParamStr(i));
     end
     else if Arg = '--apg-eps' then ApgOnEps := true
-    else if Arg = '--dpm' then Method := smDPMSolverPP2M
+    else if Arg = '--dpm' then
+    begin
+      Method := smDPMSolverPP2M;
+      DPMAlgorithm := dpaDPMSolverPP;
+    end
+    else if Arg = '--dpm-sde' then
+    begin
+      Method := smDPMSolverPP2M;
+      DPMAlgorithm := dpaSDEDPMSolverPP;
+    end
     else if Arg = '--unipc' then Method := smUniPC
     else if Arg = '--lcm' then UseLCM := true
     else if Arg = '--vae-tiling' then UseTiling := true
@@ -370,6 +383,7 @@ begin
   Preview.Every := PreviewEvery;
   Preview.WriteFiles := not SmokeMode;
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  Scheduler.DPMSolverAlgorithm := DPMAlgorithm;
   LCMScheduler := TNNetLCMScheduler.Create(100, dsLinear, dpEps);
   LCMDenoiser := TLCMDenoiser.Create;
   Latent := TNNetVolume.Create;
@@ -404,8 +418,9 @@ begin
       case Method of
         smUniPC:         WriteLn('Sampler: UniPC (order-2 bh2 predictor-corrector,',
           ' few-step), steps ', NumSteps, ', CFG ', Guidance:0:2);
-        smDPMSolverPP2M: WriteLn('Sampler: DPM-Solver++(2M), steps ', NumSteps,
-          ', CFG ', Guidance:0:2);
+        smDPMSolverPP2M: WriteLn('Sampler: ', BoolToStr(
+          DPMAlgorithm = dpaSDEDPMSolverPP, 'SDE ', ''), 'DPM-Solver++(2M), ',
+          'steps ', NumSteps, ', CFG ', Guidance:0:2);
         else             WriteLn('Sampler: DDIM, steps ', NumSteps,
           ', CFG ', Guidance:0:2);
       end;

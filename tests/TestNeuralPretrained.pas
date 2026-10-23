@@ -1387,6 +1387,7 @@ type
     procedure TestStableDiffusionPipelineSamplers;
     procedure TestStableDiffusionPipelineKarrasSigmas;
     procedure TestStableDiffusionPipelineSDEDPMNoise;
+    procedure TestStableDiffusionPipelineSamplerFromConfig;
     procedure TestStableDiffusionPipelineRefusesBadSize;
     procedure TestStableDiffusionPipelineNonSquare;
     procedure TestStableDiffusionPipelineOddSize;
@@ -47564,6 +47565,74 @@ begin
     Pipeline.Free;
     FirstLatents.Free;
     Latents.Free;
+    Initial.Free;
+    Embeds.Free;
+    Root.Free;
+  end;
+end;
+
+// SelectSamplerFromConfig carries the DPM-Solver++ algorithm and Karras flag:
+// SDE -> ODE -> SDE on one pipeline matches each config, the SDE runs exactly.
+procedure TTestNeuralPretrained.TestStableDiffusionPipelineSamplerFromConfig;
+const
+  csStepCount = 3;
+  csSDEConfig = '{"_class_name": "DPMSolverMultistepScheduler", ' +
+    '"algorithm_type": "sde-dpmsolver++", "use_karras_sigmas": true}';
+  csODEConfig = '{"_class_name": "DPMSolverMultistepScheduler", ' +
+    '"algorithm_type": "dpmsolver++", "use_karras_sigmas": true}';
+var
+  Root: TJSONData;
+  Pipeline: TStableDiffusionPipeline;
+  Embeds, Initial, SDELatents, ODELatents, Latents: TNNetVolume;
+  ImageSize: integer;
+
+  procedure RunFromConfig(const ConfigJson: string;
+    Algorithm: TNNetDPMSolverAlgorithm; NoiseCount: integer;
+    Dest: TNNetVolume);
+  begin
+    Pipeline.SelectSamplerFromConfig(ConfigJson);
+    AssertTrue('dpm sampler', Pipeline.Sampler = smDPMSolverPP2M);
+    AssertTrue('algorithm', Pipeline.Scheduler.DPMSolverAlgorithm = Algorithm);
+    AssertTrue('karras', Pipeline.KarrasSigmas);
+    AssertEquals('notice', '', Pipeline.SamplerNotice);
+    FSD15NoiseCount := 0;
+    Dest.ReSize(Initial);
+    Dest.Copy(Initial);
+    Pipeline.Denoise(Embeds, ImageSize, ImageSize, csStepCount, Dest);
+    AssertEquals('noise requests', NoiseCount, FSD15NoiseCount);
+  end;
+
+begin
+  Root := LoadSD15Fixture('tiny_sd15_pipeline_io.json');
+  Pipeline := CreateSDPipeline('tiny_sd15');
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  SDELatents := TNNetVolume.Create;
+  ODELatents := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  try
+    ImageSize := TJSONObject(Root).Get('image_size', 0);
+    LoadNestedOracleVolume(TJSONObject(Root).Arrays['latents'], true, Initial);
+    Pipeline.GuidanceScale := 1;
+    Pipeline.EncodePrompt(TJSONObject(Root).Get('prompt', ''), Embeds);
+    Pipeline.OnAncestralNoise := @SD15ConstantNoise;
+    FSD15NoiseValue := 0.5;
+    RunFromConfig(csSDEConfig, dpaSDEDPMSolverPP, csStepCount, SDELatents);
+    RunFromConfig(csODEConfig, dpaDPMSolverPP, 0, ODELatents);
+    AssertTrue('ode differs from sde', ODELatents.SumDiff(SDELatents) > 1e-3);
+    RunFromConfig(csSDEConfig, dpaSDEDPMSolverPP, csStepCount, Latents);
+    AssertEquals('sde again', 0, MaxAbsVolumeDiff(Latents, SDELatents), 0);
+    Pipeline.SelectSampler(smEuler);
+    AssertTrue('select resets the algorithm',
+      Pipeline.Scheduler.DPMSolverAlgorithm = dpaDPMSolverPP);
+    Pipeline.SelectSamplerFromConfig('{"_class_name": "DDIMScheduler"}');
+    AssertTrue('ddim', Pipeline.Sampler = smDDIM);
+    AssertFalse('ddim karras', Pipeline.KarrasSigmas);
+  finally
+    Pipeline.Free;
+    Latents.Free;
+    ODELatents.Free;
+    SDELatents.Free;
     Initial.Free;
     Embeds.Free;
     Root.Free;

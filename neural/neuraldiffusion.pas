@@ -751,7 +751,12 @@ type
 // usable. Notice is '' or says what differs from the named scheduler (the
 // fallback, or options such as solver_order 3 this unit does not implement).
 function DiffusersSchedulerSampler(const ConfigJson: string;
-  out Notice: string): TNNetSamplerMethod;
+  out Notice: string): TNNetSamplerMethod; overload;
+// The same, plus the DPM-Solver++ algorithm (dpaSDEDPMSolverPP for a
+// DPMSolverMultistepScheduler with algorithm_type sde-dpmsolver++).
+function DiffusersSchedulerSampler(const ConfigJson: string;
+  out Algorithm: TNNetDPMSolverAlgorithm;
+  out Notice: string): TNNetSamplerMethod; overload;
 
 // True when the config is an Euler or DPM-Solver multistep scheduler with
 // use_karras_sigmas (follow it with BuildSigmaSchedule).
@@ -3488,6 +3493,15 @@ end;
 function DiffusersSchedulerSampler(const ConfigJson: string;
   out Notice: string): TNNetSamplerMethod;
 var
+  Algorithm: TNNetDPMSolverAlgorithm;
+begin
+  Result := DiffusersSchedulerSampler(ConfigJson, Algorithm, Notice);
+end;
+
+function DiffusersSchedulerSampler(const ConfigJson: string;
+  out Algorithm: TNNetDPMSolverAlgorithm;
+  out Notice: string): TNNetSamplerMethod;
+var
   Root: TJSONData;
   Obj: TJSONObject;
   SchedulerClass: string;
@@ -3514,6 +3528,7 @@ var
 begin
   Notice := '';
   Result := smDDIM;
+  Algorithm := dpaDPMSolverPP;
   Root := GetJSON(ConfigJson);
   try
     if not (Root is TJSONObject) then
@@ -3550,9 +3565,9 @@ begin
     else if SchedulerClass = 'DPMSolverMultistepScheduler' then
     begin
       Result := smDPMSolverPP2M;
-      // DPMSolverAlgorithm of a config-built scheduler follows sde-dpmsolver++.
-      if Obj.Get('algorithm_type', 'dpmsolver++') <> 'sde-dpmsolver++' then
-        NoteIfNot('algorithm_type', 'dpmsolver++');
+      if Obj.Get('algorithm_type', 'dpmsolver++') = 'sde-dpmsolver++' then
+        Algorithm := dpaSDEDPMSolverPP
+      else NoteIfNot('algorithm_type', 'dpmsolver++');
       NoteIfNot('solver_type', 'midpoint');
       if Obj.Get('solver_order', 2) <> 2 then
         Note(SchedulerClass + ' solver_order ' +
