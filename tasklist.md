@@ -2481,6 +2481,15 @@ cannot pay for its own transfer.
 
 ## Layer follow-ups that fix real limitations
 
+- [ ] Dilated `TNNetConvolution` follow-ups (c331577c; the 6-argument
+      `Create(..., SuppressBias, Dilation)`, FStruct[6]):
+  - [ ] `TNNetConvolutionRectangular` takes no dilation argument.
+  - [ ] The unused `BackpropagateCPU` / `BackpropagateFastCPU` /
+        `BackpropagateFastCPUDev` and the Debug-only reference routines are
+        still dense-only; either honour FDilationY or raise when it is > 1.
+  - [ ] Winograd and the 2x-upsample fold decline dilation > 1 (plain path);
+        fine unless a dilated 3x3 shows up hot in a GPU-box profile.
+
 - [ ] Convolution training on OpenCL that pays for itself. Today a CNN trains
       on the CPU even under OpenCL (examples/SimpleImageClassifierGPU,
       VisualGAN, UNetSegmentation, VQGAN): `TNNetConvolution.BackpropagateOpenCL`
