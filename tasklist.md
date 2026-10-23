@@ -850,7 +850,8 @@ rather than acted on.
           memory levels with level_embed + sine pos) into ONE forward — v1 takes the
           pixel-decoder outputs as PRECOMPUTED TNNetInput feature maps (mirroring Mask
           R-CNN v1's FPN-input stance); the masked-attention decoder + heads are complete;
-      (b) instance + panoptic post-processing (v1 is SEMANTIC argmax only);
+      (b) DONE c8384fd4: instance + panoptic post-processing (DecodeMask2FormerInstance /
+          DecodeMask2FormerPanoptic, examples/UniversalSegmentation --task);
       (c) multi-head cross-attention beyond the pico 1-head fixture is wired generically
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
