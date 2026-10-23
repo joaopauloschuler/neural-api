@@ -12778,8 +12778,11 @@ type
       out ChunkIds: TNeuralIntegerArray; out ChunkWeights: TNeuralFloatDynArr);
     // Every prompt at one shared chunk count: each chunk encoded, the chunks
     // concatenated along X, then weighted (ApplyPromptWeights); cuts go to PromptNotice.
+    // A shorter prompt fills the count with empty chunks, or with RepeatChunks
+    // with its own weighted embeds again (chunk k is its chunk k mod its count).
     procedure EncodePromptList(const Prompts: array of string;
-      const Embeds: array of TNNetVolume; MinChunkCount, MaxChunkCount: integer);
+      const Embeds: array of TNNetVolume; MinChunkCount, MaxChunkCount: integer;
+      RepeatChunks: boolean = false);
     // lpw_stable_diffusion: each token row times its weight, then the whole
     // volume rescaled to its unweighted mean.
     procedure ApplyPromptWeights(Embeds: TNNetVolume;
@@ -12880,6 +12883,11 @@ type
     // EncodePrompt of each prompt (e.g. prompt and negative prompt) at the
     // chunk count of the longest, in one text encoder load.
     procedure EncodePrompts(const Prompts: array of string;
+      const Embeds: array of TNNetVolume);
+    // EncodePrompts, but a prompt with fewer chunks than the longest repeats
+    // its own chunks instead of adding empty ones (IC-Light gradio_demo
+    // encode_prompt_pair: torch.cat([c] * ceil(max / len))[:max]).
+    procedure EncodePromptsRepeatingChunks(const Prompts: array of string;
       const Embeds: array of TNNetVolume);
     // CLIPTextModel pooler_output of each phrase (Length(Phrases), 1, hidden):
     // the last block's final_layer_norm state at its eos; ClipSkip is ignored.
@@ -104049,68 +104057,93 @@ end;
 
 procedure TStableDiffusionPipeline.EncodePromptList(
   const Prompts: array of string; const Embeds: array of TNNetVolume;
-  MinChunkCount, MaxChunkCount: integer);
+  MinChunkCount, MaxChunkCount: integer; RepeatChunks: boolean);
 var
   TextIdLists, ChunkStartLists, TokenLists: array of TNeuralIntegerArray;
   TextWeightLists, ChunkWeightLists: array of TNeuralFloatDynArr;
   ChunkIds: TNeuralIntegerArray;
+  // Per prompt: the chunks it encodes and the first of them in TokenLists.
+  OwnChunkCounts, FirstListPos: TNeuralIntegerArray;
   ChunkEmbeds: array of TNNetVolume;
+  OwnEmbeds: TNNetVolume;
   ChunkCount, PromptPos, MaxPromptPos, ChunkPos, MaxChunkPos: integer;
   ListPos, MaxListPos, TokenSize, NeededChunkCount, TextCount: integer;
+  OwnChunkCount, ChunkValueCount: integer;
 begin
   MaxPromptPos := High(Prompts);
   SetLength(TextIdLists, MaxPromptPos + 1);
   SetLength(ChunkStartLists, MaxPromptPos + 1);
   SetLength(TextWeightLists, MaxPromptPos + 1);
   SetLength(ChunkWeightLists, MaxPromptPos + 1);
+  SetLength(OwnChunkCounts, MaxPromptPos + 1);
+  SetLength(FirstListPos, MaxPromptPos + 1);
   ChunkCount := Max(MinChunkCount, 1);
   for PromptPos := 0 to MaxPromptPos do
   begin
     PromptTextIds(Prompts[PromptPos], TextIdLists[PromptPos],
       TextWeightLists[PromptPos], ChunkStartLists[PromptPos]);
-    ChunkCount := Max(ChunkCount, PromptChunkCount(
-      High(ChunkStartLists[PromptPos]), MinChunkCount, MaxChunkCount));
+    OwnChunkCounts[PromptPos] := PromptChunkCount(
+      High(ChunkStartLists[PromptPos]), MinChunkCount, MaxChunkCount);
+    ChunkCount := Max(ChunkCount, OwnChunkCounts[PromptPos]);
   end;
-  SetLength(TokenLists, (MaxPromptPos + 1) * ChunkCount);
+  ListPos := 0;
+  for PromptPos := 0 to MaxPromptPos do
+  begin
+    if not RepeatChunks then OwnChunkCounts[PromptPos] := ChunkCount;
+    FirstListPos[PromptPos] := ListPos;
+    Inc(ListPos, OwnChunkCounts[PromptPos]);
+  end;
+  SetLength(TokenLists, ListPos);
   MaxChunkPos := ChunkCount - 1;
   for PromptPos := 0 to MaxPromptPos do
   begin
+    OwnChunkCount := OwnChunkCounts[PromptPos];
     NeededChunkCount := High(ChunkStartLists[PromptPos]);
-    if NeededChunkCount > ChunkCount then
+    if NeededChunkCount > OwnChunkCount then
     begin
       TextCount := Length(TextIdLists[PromptPos]);
       if FPromptNotice <> '' then FPromptNotice := FPromptNotice + ' ';
       FPromptNotice := FPromptNotice + 'Prompt "' +
         Copy(Prompts[PromptPos], 1, 40) + '..." has ' + IntToStr(TextCount) +
         ' tokens in ' + IntToStr(NeededChunkCount) + ' chunks; the last ' +
-        IntToStr(NeededChunkCount - ChunkCount) + ' chunks (' +
-        IntToStr(TextCount - ChunkStartLists[PromptPos][ChunkCount]) +
-        ' tokens) were cut (' + IntToStr(ChunkCount) + ' chunks of ' +
+        IntToStr(NeededChunkCount - OwnChunkCount) + ' chunks (' +
+        IntToStr(TextCount - ChunkStartLists[PromptPos][OwnChunkCount]) +
+        ' tokens) were cut (' + IntToStr(OwnChunkCount) + ' chunks of ' +
         IntToStr(FMaxTokenCount - 2) + ').';
     end;
     LayoutPromptChunks(TextIdLists[PromptPos], TextWeightLists[PromptPos],
-      ChunkStartLists[PromptPos], ChunkCount, ChunkIds,
+      ChunkStartLists[PromptPos], OwnChunkCount, ChunkIds,
       ChunkWeightLists[PromptPos]);
-    for ChunkPos := 0 to MaxChunkPos do
-      TokenLists[PromptPos * ChunkCount + ChunkPos] :=
+    for ChunkPos := 0 to OwnChunkCount - 1 do
+      TokenLists[FirstListPos[PromptPos] + ChunkPos] :=
         Copy(ChunkIds, ChunkPos * FMaxTokenCount, FMaxTokenCount);
   end;
   MaxListPos := High(TokenLists);
   SetLength(ChunkEmbeds, MaxListPos + 1);
   for ListPos := 0 to MaxListPos do ChunkEmbeds[ListPos] := TNNetVolume.Create();
+  OwnEmbeds := TNNetVolume.Create();
   try
     EncodeTokenIdLists(TokenLists, ChunkEmbeds, FClipSkip);
+    TokenSize := ChunkEmbeds[0].Depth;
+    ChunkValueCount := FMaxTokenCount * TokenSize;
     for PromptPos := 0 to MaxPromptPos do
     begin
-      TokenSize := ChunkEmbeds[0].Depth;
+      // The prompt's own chunks, weighted; a shorter one then tiles them.
+      OwnChunkCount := OwnChunkCounts[PromptPos];
+      OwnEmbeds.ReSize(OwnChunkCount * FMaxTokenCount, 1, TokenSize);
+      for ChunkPos := 0 to OwnChunkCount - 1 do
+        Move(ChunkEmbeds[FirstListPos[PromptPos] + ChunkPos].FData[0],
+          OwnEmbeds.FData[ChunkPos * ChunkValueCount],
+          ChunkValueCount * SizeOf(TNeuralFloat));
+      ApplyPromptWeights(OwnEmbeds, ChunkWeightLists[PromptPos]);
       Embeds[PromptPos].ReSize(ChunkCount * FMaxTokenCount, 1, TokenSize);
       for ChunkPos := 0 to MaxChunkPos do
-        Move(ChunkEmbeds[PromptPos * ChunkCount + ChunkPos].FData[0],
-          Embeds[PromptPos].FData[ChunkPos * FMaxTokenCount * TokenSize],
-          FMaxTokenCount * TokenSize * SizeOf(TNeuralFloat));
-      ApplyPromptWeights(Embeds[PromptPos], ChunkWeightLists[PromptPos]);
+        Move(OwnEmbeds.FData[(ChunkPos mod OwnChunkCount) * ChunkValueCount],
+          Embeds[PromptPos].FData[ChunkPos * ChunkValueCount],
+          ChunkValueCount * SizeOf(TNeuralFloat));
     end;
   finally
+    OwnEmbeds.Free;
     for ListPos := 0 to MaxListPos do ChunkEmbeds[ListPos].Free;
   end;
 end;
@@ -104233,6 +104266,14 @@ begin
   ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
   FPromptNotice := '';
   EncodePromptList(Prompts, Embeds, 1, FMaxPromptChunkCount);
+end;
+
+procedure TStableDiffusionPipeline.EncodePromptsRepeatingChunks(
+  const Prompts: array of string; const Embeds: array of TNNetVolume);
+begin
+  ClearPhaseStats([sdphLoadTextEncoder, sdphEncodePrompt]);
+  FPromptNotice := '';
+  EncodePromptList(Prompts, Embeds, 1, FMaxPromptChunkCount, true);
 end;
 
 procedure TStableDiffusionPipeline.MakeInitialLatents(Width, Height: integer;

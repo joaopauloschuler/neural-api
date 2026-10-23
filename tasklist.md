@@ -852,11 +852,6 @@ rather than acted on.
       - [ ] (h) `gradio_demo_bg.py` was not checked: the fbc low-res pass is
             assumed txt2img, guidance 2.0 is used for fbc (its default may be
             7.0), and its own light presets (gradients, grey) are not ported.
-      - [ ] (i) Multi-chunk prompts of different chunk counts: the reference
-            repeats the shorter prompt's chunks; this port pads with empty
-            chunks.
-      - [ ] (j) `--birefnet-config FILE`: today the BiRefNet config must be a
-            `config.json` next to the model file.
 - [ ] Karras / continuous-sigma img2img follow-ups (fed30990, e9fe925f): pico
       parity vs a diffusers oracle for img2img with Euler linspace, Euler a
       Karras (per-step ancestral noise) and 9-channel inpainting below

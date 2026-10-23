@@ -425,8 +425,10 @@ rounds the timestep. Euler and Euler a with `linspace` spacing also give the
 UNet fractional timesteps (e.g. 749.25 at 5 steps). `--karras-sigmas` turns
 Karras sigmas on for any config (Euler a too, which diffusers does not offer),
 and `--no-karras-sigmas` turns them off. Pico parity `< 1e-4` against diffusers
-float64 (`TestStableDiffusionPipelineKarrasSigmas`). Image-to-image and the
-4-channel inpainting blend still run these samplers at integer timesteps.
+float64 (`TestStableDiffusionPipelineKarrasSigmas`). Image-to-image starts
+(and 9-channel inpainting below strength 1) cut the continuous schedule at the
+strength's start step, as diffusers' `get_timesteps`; the 4-channel inpainting
+blend still runs these samplers at integer timesteps.
 
 ## Latent Consistency Models (`--sampler lcm`)
 
@@ -893,9 +895,10 @@ reference uses `stablediffusionapi/realistic-vision-v51`.
 * The subject is matted on gray 127 (the reference's `run_rmbg` composite).
   The reference mattes with `briaai/RMBG-1.4` (IS-Net), which is not ported.
   This port takes the alpha of an RGBA `--relight` file, or runs BiRefNet /
-  RMBG-2.0 with `--birefnet model.safetensors` (its `config.json` beside it;
-  see `examples/BackgroundRemoval`). An RGB file without `--birefnet` is used
-  as it is, so it should already be on gray.
+  RMBG-2.0 with `--birefnet model.safetensors` (its `config.json` beside it,
+  or `--birefnet-config FILE` when the config is elsewhere; see
+  `examples/BackgroundRemoval`). An RGB file without `--birefnet` is used as
+  it is, so it should already be on gray.
 * The subject is resized to cover the output size and centre-cropped, then its
   VAE latent mode (times `scaling_factor`) joins the latents on every UNet
   pass, the unconditional pass included, as the reference's UNet hook does.
@@ -913,10 +916,12 @@ reference uses `stablediffusionapi/realistic-vision-v51`.
   prompt (`--relight-added-prompt`) and the negative prompt "lowres, bad
   anatomy, bad hands, cropped, worst quality" unless `--negative` is given.
   The reference's default size is 512x640 (`--width 512 --height 640`).
-* The light start and the highres pass are image-to-image runs, which sample
-  at integer timesteps here: Karras sigmas apply to the steps from noise only
-  (the `use_karras_sigmas` paragraph above). The reference samples both at
-  Karras sigmas.
+* A prompt longer than 75 tokens (or split by `BREAK`) takes several chunks.
+  As in the reference's `encode_prompt_pair`, the prompt with fewer chunks
+  repeats its own chunks up to the other's count instead of being padded with
+  empty chunks (the plain text-to-image path pads, as A1111 does).
+* The light start and the highres pass are image-to-image runs on the
+  truncated Karras schedule, as diffusers' img2img cuts it.
 
 ```
 StableDiffusion --model ~/models/realistic-vision-v51 \
@@ -1132,6 +1137,8 @@ StableDiffusion [--model DIR] [options]
   --relight-background PNG the background of an fbc offset
   --birefnet FILE   BiRefNet / RMBG-2.0 model.safetensors: matte the --relight
                     image with it instead of its alpha
+  --birefnet-config FILE the BiRefNet config.json (default: the one beside the
+                    --birefnet file, else the BiRefNet defaults)
   --relight-added-prompt TEXT appended to the prompt after ", " (default
                     "best quality"; "" adds nothing)
   --highres-scale S the highres pass size factor, sides rounded to multiples of

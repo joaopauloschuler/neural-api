@@ -1466,6 +1466,9 @@ type
     // A1111 BREAK chunk layout of TokenizePromptChunks / EncodePrompts.
     procedure TestStableDiffusionPromptBreakTokens;
     procedure TestStableDiffusionLongPromptEmbeds;
+    // EncodePromptsRepeatingChunks (IC-Light encode_prompt_pair): the shorter
+    // prompt's chunks tile up to the longer one's count; EncodePrompts pads.
+    procedure TestStableDiffusionRepeatingPromptChunks;
     procedure TestStableDiffusionClipSkipParity;
     // TDiTFirstBlockCache.Interval: the run/skip pattern, the kept tail output,
     // the residual calls under an Interval, misuse refusals.
@@ -51647,6 +51650,77 @@ begin
     GotNegative.Free;
     Got.Free;
     Root.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestStableDiffusionRepeatingPromptChunks;
+const
+  cThree = 'a red cat BREAK a blue dog BREAK a green bird';
+  cTwo = 'a (small:1.3) house BREAK a tree';
+  cOne = 'a (cat:1.2) on a mat';
+var
+  Pipeline: TStableDiffusionPipeline;
+  Three, Two, One, Tiled, Other: TNNetVolume;
+
+  // Max |A chunk AChunk - B chunk BChunk| over one 77-token chunk.
+  function ChunkDiff(A: TNNetVolume; AChunk: integer; B: TNNetVolume;
+    BChunk: integer): double;
+  var
+    ChunkSize, ValuePos: integer;
+  begin
+    ChunkSize := 77 * A.Depth;
+    Result := 0;
+    for ValuePos := 0 to ChunkSize - 1 do
+      Result := Max(Result, Abs(A.FData[AChunk * ChunkSize + ValuePos] -
+        B.FData[BChunk * ChunkSize + ValuePos]));
+  end;
+
+begin
+  Pipeline := CreateSD15Pipeline();
+  Three := TNNetVolume.Create;
+  Two := TNNetVolume.Create;
+  One := TNNetVolume.Create;
+  Tiled := TNNetVolume.Create;
+  Other := TNNetVolume.Create;
+  try
+    Pipeline.LoadComponents(16, 16);
+    Pipeline.EncodePrompt(cThree, Three);
+    Pipeline.EncodePrompt(cTwo, Two);
+    Pipeline.EncodePrompt(cOne, One);
+    AssertEquals('3 chunks', 3 * 77, Three.SizeX);
+    AssertEquals('2 chunks', 2 * 77, Two.SizeX);
+    AssertEquals('1 chunk', 77, One.SizeX);
+    // 3 vs 2: torch.cat([uc] * 2)[:3] = uc0, uc1, uc0; the longer is as alone.
+    Pipeline.EncodePromptsRepeatingChunks([cThree, cTwo], [Other, Tiled]);
+    AssertEquals('tiled to 3', 3 * 77, Tiled.SizeX);
+    AssertEquals('longer unchanged', 0, MaxAbsVolumeDiff(Other, Three), 1e-6);
+    // cTwo is weighted too: tiling does not change its weighting.
+    AssertEquals('chunk 0', 0, ChunkDiff(Tiled, 0, Two, 0), 1e-6);
+    AssertEquals('chunk 1', 0, ChunkDiff(Tiled, 1, Two, 1), 1e-6);
+    AssertEquals('chunk 2 repeats chunk 0', 0, ChunkDiff(Tiled, 2, Two, 0),
+      1e-6);
+    // The weighted 1-chunk prompt first: every chunk is its weighted chunk
+    // (each prompt is weighted on its own chunks, then tiled).
+    Pipeline.EncodePromptsRepeatingChunks([cOne, cThree], [Tiled, Other]);
+    AssertEquals('tiled to 3, first prompt', 3 * 77, Tiled.SizeX);
+    AssertEquals('longer second unchanged', 0, MaxAbsVolumeDiff(Other, Three),
+      1e-6);
+    AssertEquals('weighted chunk 0', 0, ChunkDiff(Tiled, 0, One, 0), 1e-5);
+    AssertEquals('weighted chunk 1', 0, ChunkDiff(Tiled, 1, One, 0), 1e-5);
+    AssertEquals('weighted chunk 2', 0, ChunkDiff(Tiled, 2, One, 0), 1e-5);
+    AssertEquals('no cut', '', Pipeline.PromptNotice);
+    // EncodePrompts keeps the generic layout: the second chunk is empty text.
+    Pipeline.EncodePrompts([cOne, cTwo], [Tiled, Other]);
+    AssertEquals('padded to 2', 2 * 77, Tiled.SizeX);
+    AssertTrue('padded chunk is not a repeat',
+      ChunkDiff(Tiled, 1, One, 0) > 1e-4);
+  finally
+    Other.Free;
+    Tiled.Free;
+    One.Free;
+    Two.Free;
+    Three.Free;
+    Pipeline.Free;
   end;
 end;
 

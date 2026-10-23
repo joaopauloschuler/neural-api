@@ -77,7 +77,8 @@ is added to the UNet weights, the prompt describes the light, --light
 left|right|top|bottom starts from a light gradient, --relight-background PNG
 (with iclight_sd15_fbc) relights against a background, and a highres pass
 upscales by 1.5. The subject's alpha (RGBA), or --birefnet FILE (BiRefNet /
-RMBG-2.0), mattes it on gray.
+RMBG-2.0; --birefnet-config FILE when its config.json is elsewhere), mattes
+it on gray.
 --panorama WxH runs MultiDiffusion (Bar-Tal et al. 2023, diffusers
 StableDiffusionPanoramaPipeline): each step runs the UNet, with its own CFG,
 on overlapping --width x --height windows (default the checkpoint size) of a
@@ -175,9 +176,11 @@ type
     UpscaleImageFile: string;
     NoiseLevel: integer;
     // --relight subject ('' for none), --iclight offset, --relight-background,
-    // --birefnet, --light, --relight-added-prompt and the highres pass
+    // --birefnet (and --birefnet-config, '' for the config.json beside it),
+    // --light, --relight-added-prompt and the highres pass
     // (--highres-scale, --highres-strength; < 0: default).
     RelightImageFile, ICLightFile, RelightBackgroundFile, BiRefNetFile: string;
+    BiRefNetConfigFile: string;
     LightDirection: TSDLightDirection;
     RelightAddedPrompt: string;
     HighResScale, HighResStrength: double;
@@ -483,6 +486,9 @@ begin
   WriteLn('  --birefnet FILE   BiRefNet / RMBG-2.0 model.safetensors: matte ',
     'the --relight');
   WriteLn('                    image with it instead of its alpha');
+  WriteLn('  --birefnet-config FILE the BiRefNet config.json (default: the one ',
+    'beside the');
+  WriteLn('                    --birefnet file, else the BiRefNet defaults)');
   WriteLn('  --relight-added-prompt TEXT appended to the prompt after ", " ',
     '(default');
   WriteLn('                    "best quality"; "" adds nothing)');
@@ -659,9 +665,10 @@ begin
     'not "' + Name + '"');
 end;
 
-// ICLight.SetMatte of Image's BiRefNet matte (BiRefNetFile model).
-procedure MatteWithBiRefNet(const BiRefNetFile: string; Image: TNNetVolume;
-  ICLight: TStableDiffusionICLight);
+// ICLight.SetMatte of Image's BiRefNet matte (BiRefNetFile model; ConfigFile
+// '' reads the config.json beside it).
+procedure MatteWithBiRefNet(const BiRefNetFile, ConfigFile: string;
+  Image: TNNetVolume; ICLight: TStableDiffusionICLight);
 var
   NN: TNNet;
   Config: TBiRefNetConfig;
@@ -671,7 +678,8 @@ begin
   RGB := TNNetVolume.Create;
   Mask := TNNetVolume.Create;
   try
-    NN := BuildBiRefNetFromSafeTensors(BiRefNetFile, Config, {pTrainable=}false);
+    NN := BuildBiRefNetFromSafeTensors(BiRefNetFile, Config, {pTrainable=}false,
+      ConfigFile);
     RGB.CopyChannels(Image, [0, 1, 2]);
     BiRefNetRemoveBackground(NN, Config, RGB, Mask);
     ICLight.SetMatte(Mask);
@@ -718,6 +726,7 @@ begin
   Opt.ICLightFile := '';
   Opt.RelightBackgroundFile := '';
   Opt.BiRefNetFile := '';
+  Opt.BiRefNetConfigFile := '';
   Opt.LightDirection := sdlNone;
   Opt.RelightAddedPrompt := ICLightAddedPrompt;
   Opt.HighResScale := -1;
@@ -837,6 +846,7 @@ begin
     else if Arg = '--relight-background' then
       Opt.RelightBackgroundFile := NextArg()
     else if Arg = '--birefnet' then Opt.BiRefNetFile := NextArg()
+    else if Arg = '--birefnet-config' then Opt.BiRefNetConfigFile := NextArg()
     else if Arg = '--light' then
       Opt.LightDirection := ParseLightDirection(NextArg())
     else if Arg = '--relight-added-prompt' then
@@ -964,6 +974,8 @@ begin
     (Opt.HighResScale >= 0) or (Opt.HighResStrength >= 0)) then
     raise Exception.Create('--relight-background, --birefnet, --light, ' +
       '--relight-added-prompt and --highres-* need --relight');
+  if (Opt.BiRefNetConfigFile <> '') and (Opt.BiRefNetFile = '') then
+    raise Exception.Create('--birefnet-config needs --birefnet');
   if (Opt.RelightImageFile <> '') and ((Opt.InitImageFile <> '') or
     (Opt.EditImageFile <> '') or (Opt.UpscaleImageFile <> '') or
     (Opt.InvertImageFile <> '') or (Opt.EditPrompt <> '') or
@@ -1284,7 +1296,8 @@ begin
       if Opt.BiRefNetFile <> '' then
       begin
         WriteLn('Matting ', Opt.RelightImageFile, ' with ', Opt.BiRefNetFile);
-        MatteWithBiRefNet(Opt.BiRefNetFile, Image, ICLight);
+        MatteWithBiRefNet(Opt.BiRefNetFile, Opt.BiRefNetConfigFile, Image,
+          ICLight);
       end;
       if Opt.RelightBackgroundFile <> '' then
       begin
@@ -1761,11 +1774,12 @@ begin
       end
       else if Assigned(ICLight) then
       begin
-        // Both prompts in one text encoder load.
+        // Both prompts in one text encoder load; the shorter one repeats its
+        // chunks (the reference encode_prompt_pair).
         if (ImagePos = 0) and (Pipeline.CFGGuidanceScale > 1) then
         begin
-          Pipeline.EncodePrompts([RelightPrompt, Pipeline.NegativePrompt],
-            [PromptEmbeds, NegativeEmbeds]);
+          Pipeline.EncodePromptsRepeatingChunks([RelightPrompt,
+            Pipeline.NegativePrompt], [PromptEmbeds, NegativeEmbeds]);
           Pipeline.SetNegativePromptEmbeds(NegativeEmbeds);
         end
         else if ImagePos = 0 then
