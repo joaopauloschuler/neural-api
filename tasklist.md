@@ -368,11 +368,6 @@ rather than acted on.
       are done; open:
   - [ ] Real-checkpoint run on the GPU box (`--gpu`) before README calls it
         supported.
-  - [X] ResNet-50 variant (`rvm_resnet50.pth`): variant detected from the
-        `backbone.conv1` keys; the shared AddResNetTrunk/LoadResNetTrunk
-        (BuildResNet uses them too) gives the f1..f4 taps and honours
-        torchvision replace_stride_with_dilation. Pico parity 1.8e-7
-        (TestRVMResNet50Parity), generator tools/rvm_tiny_fixture.py.
   - [ ] ResNet-50 real checkpoint: `rvm_resnet50.pth` was not on the dev box;
         run `tools/rvm_tiny_fixture.py --variant resnet50 --real FILE` and
         compare a 128x96 clip, then a GPU run, before README calls it tested.
@@ -380,21 +375,6 @@ rather than acted on.
         1.7 GB RSS on CPU (dev box). Find which activations dominate (the
         full-res refiner maps?) before 720p/1080p runs; check the low-memory
         mode and whether the full-res layers can drop their outputs early.
-  - [X] `TNNetBoxFilter` OpenCL forward: separable `cai_box_filter_pass`
-        launched twice (rows into a scratch buffer sized at arm / resize time,
-        then columns) by `TNNetBoxFilterCL`; a direct clipped (2r+1)-tap sum
-        per pass (no running-sum drift, every work-item independent), so
-        2(2r+1) taps per output instead of (2r+1)^2. Parity vs CPU <= 3.6e-7
-        over 9 shapes incl. r = 0 and radii past both sides
-        (BoxFilterOpenCLParity). The GPU-box throughput is unmeasured.
-  - [X] fast_guided_filter refiner and segmentation_pass: `TRVMConfig.Refiner`
-        (auto: fast_guided_filter when `refiner.box_filter.weight` is absent,
-        since that refiner has no weights; overridable) and
-        `TRVMConfig.SegmentationPass` (project_seg logits at the low-res size,
-        no refiner); VideoMatting `--refiner`, `--segmentation`. Pico parity
-        (generator `--refiner fast_guided_filter`): FGF 1.6e-5 / 4.4e-5
-        (MobileNetV3 / ResNet-50; float32 torch is 0.7e-5 / 1.3e-5 off its own
-        float64 run, cov/(var+eps) is ill conditioned), seg 8.9e-8 / 4.1e-8.
   - [ ] Real-checkpoint check of `--segmentation` and `--refiner
         fast_guided_filter` with `rvm_mobilenetv3.pth` against the official
         model (`tools/rvm_tiny_fixture.py --real` only runs the DGF matte).
@@ -861,49 +841,14 @@ rather than acted on.
       landed; pico parity and OpenCL parity only): run GFPGANv1.3.pth and
       GFPGANv1.4.pth on real aligned 512x512 faces (CPU and `--gpu`) against the
       official `gfpgan` inference output before README calls it supported.
-- [ ] Whole-photo face restoration: RetinaFace detector + 5-point alignment +
-      paste-back (port of facexlib `FaceRestoreHelper`, what `gfpgan`'s
-      inference_gfpgan.py runs by default). FaceRestoration currently needs a
-      pre-aligned 512x512 crop (the GFPGAN importer comment says "Face detection
-      and alignment are not part of the net"), so it cannot restore a real group
-      photo.
-  - [X] (1) RetinaFace detector importer in neuralpretrained.pas:
-        `BuildRetinaFace[FromSafeTensors[Ex]]` / `InferRetinaFaceConfigFromTensors`
-        for facexlib's `detection_mobilenet0.25_Final.pth` and
-        `detection_Resnet50_Final.pth` (backbone from the `body.stage1` /
-        `body.layer2` keys, "module." stripped; the ResNet trunk reuses
-        AddResNetTrunk / LoadResNetTrunk), `RetinaFacePrepareInput` (BGR minus
-        104/117/123, bilinear resize when the image size differs),
-        `DecodeRetinaFaceDetections` (prior boxes, box + landmark decode,
-        threshold, `NeuralGreedyNMS`, MaxFaces) and `DetectRetinaFaceFaces`,
-        returning `TRetinaFaceDetectionArray` (X1/Y1/X2/Y2/Score + LandmarkX/Y[0..4]
-        in the pixels of the image passed in). Pico parity + OpenCL parity only
-        (TestRetinaFace*); no real checkpoint was on the dev box.
+- [ ] Whole-photo face restoration (port of facexlib `FaceRestoreHelper`, what
+      `gfpgan`'s inference_gfpgan.py runs by default): the RetinaFace detector,
+      5-point alignment, paste-back and the `FaceRestoration --detector`
+      whole-photo mode are done; open:
   - [ ] Run the real detection_mobilenet0.25_Final.pth / detection_Resnet50_Final.pth
         on a real photo against facexlib `detect_faces` (oracle in the ~/x venv:
         facexlib 0.3.0 is not installed there; the wheel's retinaface*.py run with
         torchvision from /tmp/tvlib and a cv2 stub).
-  - [X] (2) + (3) facexlib `FaceRestoreHelper` port (use_parse=False) in
-        neuralpretrained.pas: `FaceAlignmentMatrix` (FFHQ 512 template scaled to
-        the face size; `EstimateSimilarityTransformLMedS`, a deterministic
-        cv2.estimateAffinePartial2D LMEDS: best-median point pair -> inliers ->
-        least squares), `AlignWarpFace` (gray border 132/133/135 RGB),
-        `PasteFaceIntoImage` (inverse warp x upscale + 0.5*upscale offset,
-        square mask eroded by 2*upscale, then eroded by 2*w_edge and
-        GaussianBlur(2*w_edge+1), w_edge = int(sqrt(area))//20; work limited to
-        the face's canvas box), `FilterFacesByEyeDistance` and
-        `RestoreFacesInImage`. Generic pieces in neuralimageresize.pas:
-        `WarpImageAffine` (cv2.warpAffine bilinear, BORDER_CONSTANT, float, on
-        NeuralBilinearGatherColumn), `InvertImageAffineMatrix`,
-        `EstimateSimilarityTransform[LMedS]`, `ErodeImage`, `GaussianBlurImageCV2`
-        (cv2 tables up to 9 taps), `ResizeImageLanczos4CV2`. Tests vs cv2 4.10 /
-        numpy oracles: TestSimilarityTransform*, TestWarpImageAffineMatchesFloatOracle,
-        TestResizeImageLanczos4CV2MatchesCV2, TestErodeAndGaussianBlurCV2MatchCV2,
-        TestFacePasteMatchesFacexlibOracle, TestRestoreFacesInImagePicoSmoke.
-  - [X] Example: `FaceRestoration --model M --detector D --input photo.jpg`
-        restores every face (`--upscale`, `--bg-upsampler` through
-        TRRDBNetUpscaler, `--det-threshold`, `--min-eye-distance`, `--max-faces`,
-        `--save-faces`); the old mode is `--aligned`.
   - [ ] ParseNet face-parsing paste mask: GFPGANer builds FaceRestoreHelper with
         `use_parse=True` (facexlib `parsing_parsenet.pth`, v0.2.2 release), so
         inference_gfpgan.py blends through a parsing mask (GaussianBlur 101/11
