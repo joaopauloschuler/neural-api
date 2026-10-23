@@ -635,8 +635,9 @@ begin
   WriteLn('                       transformer weights at load, times SCALE ',
     '(default 1). Repeat it to stack');
   WriteLn('                       adapters.');
-  WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
-    'of 16 (default 256,192)');
+  WriteLn('  --vae-tile S[,T]     VAE decode and encode tile S pixels every T ',
+    'pixels, multiples of 16');
+  WriteLn('                       (default 256,192)');
   WriteLn('  --upscale FILE       upscale each image with this Real-ESRGAN / ',
     'ESRGAN RRDBNet checkpoint');
   WriteLn('                       (.pth or .safetensors; config.json next to ',

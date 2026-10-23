@@ -211,8 +211,8 @@ only with `--negative-prompt`, see
    `ResizeImageLanczos`, as for img2img below).
 2. The Qwen3-VL vision tower (`TQwen3VLVisionTower`, CPU) encodes the
    resized image composited over white; the VAE encoder
-   (`TQwenImage21VaeEncoder`, CPU, untiled) encodes the same resized image
-   with its alpha channel.
+   (`TQwenImage21VaeEncoder`, CPU, in `--vae-tile` tiles) encodes the same
+   resized image with its alpha channel.
 3. The text encoder reads the edit template (`<image1><|vision_start|>
    <|image_pad|><|vision_end|> <image2>...` then the prompt), with each
    `<|image_pad|>` expanded to the image's vision rows.
@@ -246,8 +246,8 @@ Requirements and caveats:
   the previous images or loads anything (the Qwen3-VL processor would
   resize it a second time; this program does not). Change `--width` x
   `--height` (or `/size`) then.
-- Memory: the vision tower and the VAE encoder run untiled on the CPU, so
-  their activations grow with the area. The transformer prefix grows by one
+- Memory: the vision tower runs untiled on the CPU, so its activations grow
+  with the area (the VAE encoder works in `--vae-tile` tiles). The transformer prefix grows by one
   token per 16x16 pixels of every condition image: one 1024x1024 image adds
   4096 prefix tokens (task C4 in `tasklist.md` has the estimates; the prefix
   pass runs on the CPU). None of this has been measured on the real
@@ -268,9 +268,9 @@ bin/x86_64-linux/bin/QwenImage --model Qwen-Image-2.1 --init-image photo.jpg \
   --strength 0.6 -p "a watercolor painting of a harbor" --output harbor.png
 ```
 
-1. The VAE encoder (`TQwenImage21VaeEncoder`, on the CPU, untiled) encodes
-   the init image to latents: the posterior mean, as the 2.1 pipeline
-   encodes its condition images. (The v1 img2img pipeline samples the
+1. The VAE encoder (`TQwenImage21VaeEncoder`, on the CPU, in `--vae-tile`
+   tiles) encodes the init image to latents: the posterior mean, as the 2.1
+   pipeline encodes its condition images. (The v1 img2img pipeline samples the
    posterior instead.)
 2. `--strength S` cuts the schedule: of N steps, the first
    `t_start = int(N - N * S)` are skipped. 18 steps at 0.6 run the last 11;
@@ -880,10 +880,13 @@ the default 18 Euler steps.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `--vae-tile S[,T]` | decode tiles of S pixels, one every T pixels (multiples of 16); without T, the stride is 3/4 of S | 256,192 |
+| `--vae-tile S[,T]` | decode and encode tiles of S pixels, one every T pixels (multiples of 16); without T, the stride is 3/4 of S | 256,192 |
 
 `TQwenImage21VaeDecoder` decodes the image in overlapping tiles and blends
-the overlaps. The tile size trades memory against quality and speed: a
+the overlaps (diffusers `tiled_decode`). `TQwenImage21VaeEncoder.EncodeTiled`
+does the same for every image the VAE encodes (img2img, inpainting and edit
+condition images), blending the tile latents (diffusers `tiled_encode`); an
+image no larger than one tile is encoded in one pass. The tile size trades memory against quality and speed: a
 smaller tile needs less memory but adds tiles and overlap, so the decode
 does more work. At 1024x1024, 128-pixel tiles showed visible seams between
 tiles. The default is 256,192.
@@ -1027,8 +1030,8 @@ under [VAE tiles](#vae-tiles).
 - `--upscale` has run only with the repository's random pico RRDBNet
   (`tests/fixtures/tiny_rrdbnet*`); a real `RealESRGAN_x4plus.pth` run is
   still pending.
-- The VAE encoder and the vision tower run untiled on the CPU, so their
-  memory grows with the output size. They have not been measured at
+- The vision tower runs untiled on the CPU, so its memory grows with the
+  output size. Neither it nor the tiled VAE encoder has been measured at
   1024x1024 on the real checkpoint.
 
 ## Advanced: A/B switches

@@ -9891,7 +9891,10 @@ type
     FParallel: boolean;
     FMaxThreads: integer;
     FShareHostOutputs: boolean;
+    FLastEncodeTileCount: integer;
     procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
+    // One forward of Net on ImageTile and the copy of its latent.
+    procedure EncodeTile(ImageTile, TileLatent: TNNetVolume);
   public
     // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
     constructor Create(const VaeFolder: string);
@@ -9904,6 +9907,10 @@ type
     procedure ReleaseNet();
     // Encodes the whole image in one pass (the untiled diffusers encode).
     procedure Encode(Image, Latent: TNNetVolume);
+    // diffusers tiled_encode: TileSampleSize-pixel tiles every TileSampleStride
+    // pixels (one net per tile shape), linear blend over the latent overlap.
+    procedure EncodeTiled(Image, Latent: TNNetVolume;
+      TileSampleSize: integer = 256; TileSampleStride: integer = 192);
     property Config: TQwenImage21VaeConfig read FConfig;
     property WeightOwner: TNNet read FWeightOwner;
     property Net: TNNet read FNet;
@@ -9914,6 +9921,8 @@ type
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
     property ShareHostOutputs: boolean read FShareHostOutputs
       write FShareHostOutputs;
+    // Tiles of the last Encode/EncodeTiled (1 when untiled).
+    property LastEncodeTileCount: integer read FLastEncodeTileCount;
   end;
 
 const
@@ -10303,8 +10312,8 @@ type
     procedure AddLoRA(const FileName: string; Scale: TNeuralFloat = 1.0);
     procedure ClearLoRAs();
     property LoRACount: integer read GetLoRACount;
-    // VAE tile in pixels (multiples of 16); default 256/192 (diffusers'
-    // enable_tiling) hides tile seams; ~10.7 GB of layer buffers live.
+    // VAE decode and encode tile in pixels (multiples of 16); default 256/192
+    // (diffusers' enable_tiling) hides tile seams; ~10.7 GB of layer buffers live.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
     property VaeTileStride: integer read FVaeTileStride write FVaeTileStride;
     // Every component runs the parallel layer scheduler with intra-layer
@@ -11957,6 +11966,11 @@ function TiledVaeEncode(Encoder: TNNet; Image: TNNetVolume;
   TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat;
   OutputLayer: TNNetLayer = nil): TNNetVolume;
 
+// Latent cells of a square TileSize-pixel VAE tile over a GridX x GridY latent
+// (0: one pass covers it), clamped to the shorter side; raises off ScaleFactor.
+function VaeTileCellsForGrid(TileSize, ScaleFactor, GridX, GridY: integer;
+  const Owner: string): integer;
+
 // ---------------------------------------------------------------------------
 // STABLE DIFFUSION UNet IMPORT (diffusers UNet2DConditionModel - the text-
 // conditioned latent DENOISER behind Stable Diffusion v1.x / v2.x). This is
@@ -12332,6 +12346,11 @@ procedure MarigoldEnsembleDepth(const Members: array of TNNetVolume;
 procedure MarigoldEnsembleNormals(const Members: array of TNNetVolume;
   Dest: TNNetVolume; PickClosest: boolean = true);
 
+// ImageLatent := VaeEncoder(Padded), tiled (TiledVaeEncode, overlap 0.25) when
+// the encoder input is a smaller square tile; raises unless Padded fits it.
+procedure MarigoldEncodePadded(VaeEncoder: TNNet;
+  Padded, ImageLatent: TNNetVolume);
+
 // Marigold depth (W,H,1 in [0,1]) or normals (W,H,3 unit) at Image's size; one
 // ensemble member per StartNoises latent. UNet TextSeqLen must be EncStates.SizeX.
 procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
@@ -12361,7 +12380,7 @@ type
     FVaeEncoderConfig, FVaeDecoderConfig: TVaeDecoderConfig;
     FPredictionType: string;
     FPredictNormals, FUseFullZRange, FQuantizeInt8: boolean;
-    FDefaultSteps, FDefaultProcessingResolution: integer;
+    FDefaultSteps, FDefaultProcessingResolution, FVaeTileSize: integer;
     // text_encoder/'s empty-prompt states, from the first Predict unless set.
     FEmptyPromptStates: TNNetVolume;
     FHasEmptyPromptStates: boolean;
@@ -12395,6 +12414,9 @@ type
       read FDefaultProcessingResolution;
     // int8 UNet weights (TNNet.QuantizeWeightsInt8) for later Predict calls.
     property QuantizeInt8: boolean read FQuantizeInt8 write FQuantizeInt8;
+    // > 0: the VAE encodes a padded image larger than this many pixels in
+    // square tiles of this side (TiledVaeEncode, overlap 0.25); 0: one pass.
+    property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
     property UNetConfig: TSDUNetConfig read FUNetConfig;
   end;
 
@@ -76656,6 +76678,19 @@ begin
   Result := TiledNetCompute(Decoder, Latent, Overlap, {Pad=}0);
 end;
 
+function VaeTileCellsForGrid(TileSize, ScaleFactor, GridX, GridY: integer;
+  const Owner: string): integer;
+begin
+  if (TileSize < 0) or (TileSize mod ScaleFactor <> 0) then
+    ImportError(Owner + ': VaeTileSize ' + IntToStr(TileSize) +
+      ' must be 0 or a positive multiple of ' + IntToStr(ScaleFactor) + '.');
+  Result := TileSize div ScaleFactor;
+  // One tile covering the whole grid is the plain pass (diffusers tiles only
+  // a side above the tile); else the square tile fits the shorter side.
+  if (Result >= GridX) and (Result >= GridY) then Result := 0
+  else Result := Min(Result, Min(GridX, GridY));
+end;
+
 function TiledVaeEncode(Encoder: TNNet; Image: TNNetVolume;
   TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat;
   OutputLayer: TNNetLayer): TNNetVolume;
@@ -77372,6 +77407,89 @@ begin
       IntToStr(SpatialScale) + ' with stride <= size.';
 end;
 
+type
+  TQwenImage21VaeTiles = array of TNNetVolume;
+  // PrepareNet of the decoder or encoder: (re)builds the net for one tile shape.
+  TQwenImage21VaeTileNetEvent = procedure(TileW, TileH: integer) of object;
+  // One forward of that net on SourceTile into TileResult.
+  TQwenImage21VaeTilePassEvent = procedure(SourceTile,
+    TileResult: TNNetVolume) of object;
+
+// diffusers tiled_encode / tiled_decode tile loop: a TileSize tile every
+// TileStride cells of Source (edge tiles smaller), one net per tile shape.
+procedure QwenImage21VaeComputeTiles(Source: TNNetVolume;
+  TileSize, TileStride: integer; PrepareTileNet: TQwenImage21VaeTileNetEvent;
+  RunTile: TQwenImage21VaeTilePassEvent; out ColumnCount: integer;
+  var Tiles: TQwenImage21VaeTiles);
+var
+  RowCount, TileCount, TilePos, MaxTilePos, ShapeTilePos, TileW, TileH: integer;
+  TileWidths, TileHeights: TNeuralIntegerArray;
+  SourceTile: TNNetVolume;
+begin
+  RowCount := (Source.SizeY + TileStride - 1) div TileStride;
+  ColumnCount := (Source.SizeX + TileStride - 1) div TileStride;
+  TileCount := RowCount * ColumnCount;
+  MaxTilePos := TileCount - 1;
+  SetLength(Tiles, TileCount);
+  SetLength(TileWidths, TileCount);
+  SetLength(TileHeights, TileCount);
+  for TilePos := 0 to MaxTilePos do
+  begin
+    Tiles[TilePos] := nil;
+    TileWidths[TilePos] := Min(TileSize,
+      Source.SizeX - (TilePos mod ColumnCount) * TileStride);
+    TileHeights[TilePos] := Min(TileSize,
+      Source.SizeY - (TilePos div ColumnCount) * TileStride);
+  end;
+  SourceTile := TNNetVolume.Create();
+  try
+    for TilePos := 0 to MaxTilePos do
+    begin
+      if Tiles[TilePos] <> nil then continue;
+      TileW := TileWidths[TilePos];
+      TileH := TileHeights[TilePos];
+      PrepareTileNet(TileW, TileH);
+      for ShapeTilePos := TilePos to MaxTilePos do
+      begin
+        if (Tiles[ShapeTilePos] <> nil) or (TileWidths[ShapeTilePos] <> TileW) or
+           (TileHeights[ShapeTilePos] <> TileH) then continue;
+        SourceTile.CopyCropping(Source,
+          (ShapeTilePos mod ColumnCount) * TileStride,
+          (ShapeTilePos div ColumnCount) * TileStride, TileW, TileH);
+        Tiles[ShapeTilePos] := TNNetVolume.Create();
+        RunTile(SourceTile, Tiles[ShapeTilePos]);
+      end;
+    end;
+  finally
+    SourceTile.Free;
+  end;
+end;
+
+// diffusers' row-major in-place blend_v / blend_h of Tiles, each adding its
+// first Stride cells into Dest, which the caller sized to the whole output.
+procedure QwenImage21VaeAssembleTiles(const Tiles: TQwenImage21VaeTiles;
+  ColumnCount, BlendExtent, Stride: integer; Dest: TNNetVolume);
+var
+  TilePos, MaxTilePos, RowPos, ColumnPos: integer;
+begin
+  Dest.Fill(0);
+  MaxTilePos := Length(Tiles) - 1;
+  for TilePos := 0 to MaxTilePos do
+  begin
+    RowPos := TilePos div ColumnCount;
+    ColumnPos := TilePos mod ColumnCount;
+    if RowPos > 0 then
+      QwenImage21VaeBlendTileTop(Tiles[TilePos - ColumnCount], Tiles[TilePos],
+        BlendExtent);
+    if ColumnPos > 0 then
+      QwenImage21VaeBlendTileLeft(Tiles[TilePos - 1], Tiles[TilePos],
+        BlendExtent);
+    Dest.AddArea(ColumnPos * Stride, RowPos * Stride, 0, 0,
+      Min(Stride, Tiles[TilePos].SizeX), Min(Stride, Tiles[TilePos].SizeY),
+      Tiles[TilePos]);
+  end;
+end;
+
 { TQwenImage21VaeEncoder }
 
 constructor TQwenImage21VaeEncoder.Create(const VaeFolder: string);
@@ -77454,9 +77572,54 @@ begin
       IntToStr(Image.Depth) + ' channels, expected in_channels = ' +
       IntToStr(FConfig.InChannels) + '.');
   PrepareNet(Image.SizeX, Image.SizeY);
-  FNet.Compute(Image, 0, FParallel);
+  EncodeTile(Image, Latent);
+  FLastEncodeTileCount := 1;
+end;
+
+procedure TQwenImage21VaeEncoder.EncodeTile(ImageTile, TileLatent: TNNetVolume);
+begin
+  FNet.Compute(ImageTile, 0, FParallel);
   FNet.GetLastLayer().ForceOutputOnRAM();
-  Latent.Copy(FNet.GetLastLayer().Output);
+  TileLatent.Copy(FNet.GetLastLayer().Output);
+end;
+
+procedure TQwenImage21VaeEncoder.EncodeTiled(Image, Latent: TNNetVolume;
+  TileSampleSize, TileSampleStride: integer);
+var
+  Scale, ColumnCount, TilePos: integer;
+  Tiles: TQwenImage21VaeTiles;
+  TileProblem: string;
+begin
+  Scale := FConfig.SpatialScale;
+  TileProblem := QwenImage21VaeTileProblem(TileSampleSize, TileSampleStride,
+    Scale);
+  if TileProblem <> '' then
+    ImportError(csQwenImage21VaeImporter + ': ' + TileProblem);
+  // diffusers tiles only an image wider or taller than one tile.
+  if (Image.SizeX <= TileSampleSize) and (Image.SizeY <= TileSampleSize) then
+  begin
+    Encode(Image, Latent);
+    exit;
+  end;
+  if Image.Depth <> FConfig.InChannels then
+    ImportError(csQwenImage21VaeImporter + ': the image has ' +
+      IntToStr(Image.Depth) + ' channels, expected in_channels = ' +
+      IntToStr(FConfig.InChannels) + '.');
+  CheckQwenImage21VaeImageSize(FConfig, Image.SizeX, Image.SizeY);
+  Tiles := nil;
+  try
+    QwenImage21VaeComputeTiles(Image, TileSampleSize, TileSampleStride,
+      @PrepareNet, @EncodeTile, ColumnCount, Tiles);
+    FLastEncodeTileCount := Length(Tiles);
+    // The net's quant_conv folds the latent normalization, an affine map per
+    // channel, so blending normalized means equals diffusers' moment blend.
+    Latent.ReSize(Image.SizeX div Scale, Image.SizeY div Scale, FConfig.ZDim);
+    QwenImage21VaeAssembleTiles(Tiles, ColumnCount,
+      (TileSampleSize - TileSampleStride) div Scale, TileSampleStride div Scale,
+      Latent);
+  finally
+    for TilePos := 0 to High(Tiles) do Tiles[TilePos].Free;
+  end;
 end;
 
 { TQwenImage21VaeDecoder }
@@ -77903,12 +78066,8 @@ end;
 procedure TQwenImage21VaeDecoder.DecodeTiled(Latent, Image: TNNetVolume;
   TileSampleSize, TileSampleStride: integer);
 var
-  Scale, TileLatentSize, TileLatentStride, BlendExtent: integer;
-  RowCount, ColumnCount, TileCount, TilePos, MaxTilePos, ShapeTilePos: integer;
-  RowPos, ColumnPos, TileW, TileH, CropW, CropH: integer;
-  Tiles: array of TNNetVolume;
-  TileWidths, TileHeights: TNeuralIntegerArray;
-  LatentTile: TNNetVolume;
+  Scale, ColumnCount, TilePos: integer;
+  Tiles: TQwenImage21VaeTiles;
   TileProblem: string;
   DecodeStart, AssemblyStart: TDateTime;
   ReleaseMsBefore: double;
@@ -77919,11 +78078,9 @@ begin
     Scale);
   if TileProblem <> '' then
     ImportError(csQwenImage21VaeImporter + ': ' + TileProblem);
-  TileLatentSize := TileSampleSize div Scale;
-  TileLatentStride := TileSampleStride div Scale;
-  BlendExtent := TileSampleSize - TileSampleStride;
   // diffusers tiles only a latent wider or taller than one tile.
-  if (Latent.SizeX <= TileLatentSize) and (Latent.SizeY <= TileLatentSize) then
+  if (Latent.SizeX <= TileSampleSize div Scale) and
+     (Latent.SizeY <= TileSampleSize div Scale) then
   begin
     Decode(Latent, Image);
     exit;
@@ -77937,70 +78094,20 @@ begin
   ReleaseMsBefore := FReleaseMs;
   TotalsBefore := FProfileTotals;
   if FLayerProfiling then DecodeStart := Now();
-  RowCount := (Latent.SizeY + TileLatentStride - 1) div TileLatentStride;
-  ColumnCount := (Latent.SizeX + TileLatentStride - 1) div TileLatentStride;
-  TileCount := RowCount * ColumnCount;
   FLargestNetOpenCLBytes := 0;
-  FLastDecodeTileCount := TileCount;
   FLastDecodeNetCount := 0;
-  MaxTilePos := TileCount - 1;
-  SetLength(Tiles, TileCount);
-  SetLength(TileWidths, TileCount);
-  SetLength(TileHeights, TileCount);
-  for TilePos := 0 to MaxTilePos do
-  begin
-    Tiles[TilePos] := nil;
-    RowPos := TilePos div ColumnCount;
-    ColumnPos := TilePos mod ColumnCount;
-    TileWidths[TilePos] := Min(TileLatentSize,
-      Latent.SizeX - ColumnPos * TileLatentStride);
-    TileHeights[TilePos] := Min(TileLatentSize,
-      Latent.SizeY - RowPos * TileLatentStride);
-  end;
-  LatentTile := TNNetVolume.Create();
+  Tiles := nil;
   try
-    // Edge tiles are smaller; each tile shape gets one sized net.
-    for TilePos := 0 to MaxTilePos do
-    begin
-      if Tiles[TilePos] <> nil then continue;
-      TileW := TileWidths[TilePos];
-      TileH := TileHeights[TilePos];
-      PrepareNet(TileW, TileH);
-      for ShapeTilePos := TilePos to MaxTilePos do
-      begin
-        if (Tiles[ShapeTilePos] <> nil) or (TileWidths[ShapeTilePos] <> TileW) or
-           (TileHeights[ShapeTilePos] <> TileH) then continue;
-        LatentTile.CopyCropping(Latent,
-          (ShapeTilePos mod ColumnCount) * TileLatentStride,
-          (ShapeTilePos div ColumnCount) * TileLatentStride, TileW, TileH);
-        Tiles[ShapeTilePos] := TNNetVolume.Create();
-        DecodeTile(LatentTile, Tiles[ShapeTilePos]);
-      end;
-    end;
+    QwenImage21VaeComputeTiles(Latent, TileSampleSize div Scale,
+      TileSampleStride div Scale, @PrepareNet, @DecodeTile, ColumnCount, Tiles);
+    FLastDecodeTileCount := Length(Tiles);
     if FLayerProfiling then AssemblyStart := Now();
-    // Row-major and in place, as diffusers does: a tile blends with its
-    // neighbours after they were blended themselves.
     Image.ReSize(Latent.SizeX * Scale, Latent.SizeY * Scale,
       FConfig.OutChannels);
-    Image.Fill(0);
-    for TilePos := 0 to MaxTilePos do
-    begin
-      RowPos := TilePos div ColumnCount;
-      ColumnPos := TilePos mod ColumnCount;
-      if RowPos > 0 then
-        QwenImage21VaeBlendTileTop(Tiles[TilePos - ColumnCount],
-          Tiles[TilePos], BlendExtent);
-      if ColumnPos > 0 then
-        QwenImage21VaeBlendTileLeft(Tiles[TilePos - 1], Tiles[TilePos],
-          BlendExtent);
-      CropW := Min(TileSampleStride, Tiles[TilePos].SizeX);
-      CropH := Min(TileSampleStride, Tiles[TilePos].SizeY);
-      Image.AddArea(ColumnPos * TileSampleStride, RowPos * TileSampleStride,
-        0, 0, CropW, CropH, Tiles[TilePos]);
-    end;
+    QwenImage21VaeAssembleTiles(Tiles, ColumnCount,
+      TileSampleSize - TileSampleStride, TileSampleStride, Image);
   finally
-    LatentTile.Free;
-    for TilePos := 0 to MaxTilePos do Tiles[TilePos].Free;
+    for TilePos := 0 to High(Tiles) do Tiles[TilePos].Free;
   end;
   Image.ForceMaxRange(1.0);
   if FLayerProfiling then
@@ -80898,13 +81005,27 @@ begin
   end;
 end;
 
-// ImageLatent := VaeEncoder(Padded); raises unless Padded fits its input.
 procedure MarigoldEncodePadded(VaeEncoder: TNNet;
   Padded, ImageLatent: TNNetVolume);
 var
-  EncoderInput: TNNetVolume;
+  EncoderInput, TiledLatent: TNNetVolume;
 begin
   EncoderInput := VaeEncoder.Layers[0].Output;
+  if (EncoderInput.SizeX = EncoderInput.SizeY) and
+     (EncoderInput.Depth = Padded.Depth) and
+     (EncoderInput.SizeX <= Min(Padded.SizeX, Padded.SizeY)) and
+     not Padded.SameSize(EncoderInput) then
+  begin
+    TiledLatent := TiledVaeEncode(VaeEncoder, Padded,
+      VaeEncoder.GetLastLayer().Output.SizeX, 0.25);
+    try
+      ImageLatent.ReSize(TiledLatent);
+      ImageLatent.Copy(TiledLatent);
+    finally
+      TiledLatent.Free;
+    end;
+    exit;
+  end;
   if not Padded.SameSize(EncoderInput) then
     ImportError('Marigold: padded image ' + IntToStr(Padded.SizeX) + 'x' +
       IntToStr(Padded.SizeY) + 'x' + IntToStr(Padded.Depth) +
@@ -102633,7 +102754,10 @@ begin
       'diffusion_pytorch_model');
 
     EncoderConfig := FVaeEncoderConfig;
-    EncoderConfig.LatentGrid := LatentGrid;
+    // A tile-sized encoder makes MarigoldEncodePadded encode in tiles.
+    EncoderConfig.LatentGrid := VaeTileCellsForGrid(FVaeTileSize, Alignment,
+      LatentGrid, LatentGrid, 'TMarigoldPipeline');
+    if EncoderConfig.LatentGrid = 0 then EncoderConfig.LatentGrid := LatentGrid;
     Net := BuildVaeEncoderFromSafeTensorsEx(VaeWeightsFile, EncoderConfig,
       {pTrainable=}false);
     try
@@ -103330,15 +103454,8 @@ end;
 function TStableDiffusionPipeline.VaeTileCellsFor(GridX,
   GridY: integer): integer;
 begin
-  if (FVaeTileSize < 0) or (FVaeTileSize mod VaeScaleFactor <> 0) then
-    ImportError('TStableDiffusionPipeline: VaeTileSize ' +
-      IntToStr(FVaeTileSize) + ' must be 0 or a positive multiple of ' +
-      IntToStr(VaeScaleFactor) + '.');
-  Result := FVaeTileSize div VaeScaleFactor;
-  // One tile covering the whole grid is the plain pass (diffusers tiles only
-  // a side above the tile); else the square tile fits the shorter side.
-  if (Result >= GridX) and (Result >= GridY) then Result := 0
-  else Result := Min(Result, Min(GridX, GridY));
+  Result := VaeTileCellsForGrid(FVaeTileSize, VaeScaleFactor, GridX, GridY,
+    'TStableDiffusionPipeline');
 end;
 
 function TStableDiffusionPipeline.GetVaeScaleFactor(): integer;
@@ -110352,7 +110469,8 @@ begin
       DoPhase(qppEncodeImage);
       ConvertAndResizeImagePIL(Image, VaeImage, Width, Height, 4,
         {ClipToByteRange=}true, -1, 1);
-      Encoder.Encode(VaeImage, ImageLatents);
+      Encoder.EncodeTiled(VaeImage, ImageLatents, FVaeTileSize,
+        FVaeTileStride);
       QwenImage21LatentToTokens(ImageLatents);
     finally
       ReleaseVaeEncoder(Encoder);
@@ -110536,7 +110654,8 @@ begin
           ConvertAndResizeImagePIL(Resized[ImagePos], VaeImage,
             Resized[ImagePos].SizeX, Resized[ImagePos].SizeY, 4,
             {ClipToByteRange=}true, -1, 1);
-          Encoder.Encode(VaeImage, FConditionLatents[ImagePos]);
+          Encoder.EncodeTiled(VaeImage, FConditionLatents[ImagePos],
+            FVaeTileSize, FVaeTileStride);
           QwenImage21LatentToTokens(FConditionLatents[ImagePos]);
         end;
       finally

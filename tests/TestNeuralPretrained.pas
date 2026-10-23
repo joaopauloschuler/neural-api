@@ -1171,6 +1171,7 @@ type
     procedure TestQwenImage21VaeDecoderTensorSet;
     procedure TestQwenImage21VaeDecoderParity;
     procedure TestQwenImage21VaeDecoderTiledParity;
+    procedure TestQwenImage21VaeEncoderTiledParity;
     procedure TestQwenImage21VaeDecoderPhaseProfile;
     procedure TestQwenImage21VaeDecoderOpenCL;
     // ShareHostOutputs on vs off on the CPU: same images (whole and tiled,
@@ -1392,6 +1393,7 @@ type
     procedure TestMergeSafeTensorsFiles;
     procedure TestMarigoldWidenUNetConvIn;
     procedure TestMarigoldPipelineMatchesPredict;
+    procedure TestMarigoldTiledVaeEncode;
     procedure TestStableDiffusionPipelineTokens;
     procedure TestStableDiffusionPipelineFastTokenizer;
     procedure TestStableDiffusionPipelineEmbeds;
@@ -54481,6 +54483,210 @@ begin
     DeleteFile(Folder + 'vae' + DirectorySeparator + 'config.json');
     DeleteFile(Folder + 'vae' + DirectorySeparator +
       'diffusion_pytorch_model.safetensors');
+    RemoveDir(Folder + 'scheduler');
+    RemoveDir(Folder + 'unet');
+    RemoveDir(Folder + 'vae');
+    RemoveDir(Folder);
+  end;
+end;
+
+const
+  // diffusers AutoencoderKLQwenImage21 tiled_encode, float64, on the pico VAE
+  // (enable_tiling with these tile sizes / strides), the normalised latent of
+  // FillQwenImage21FormulaImage; (H, W, size, stride) = (64, 64, 32, 16) has
+  // four tile shapes (16-pixel edge tiles), (48, 64, 48, 32) is 2 x 2 tiles.
+  csQwenImageTiledEncodeSamples: array[0..1, 0..4] of TSDLatentSample = (
+    ((X: 0; Y: 0; Channel: 0; Value: -0.122757086),
+     (X: 3; Y: 0; Channel: 5; Value: -0.070366511),
+     (X: 1; Y: 2; Channel: 9; Value: -0.353200393),
+     (X: 2; Y: 3; Channel: 15; Value: -0.308358525),
+     (X: 2; Y: 0; Channel: 1; Value: 0.267775936)),
+    ((X: 0; Y: 0; Channel: 0; Value: 0.288895370),
+     (X: 3; Y: 0; Channel: 5; Value: -0.150306854),
+     (X: 1; Y: 2; Channel: 9; Value: 0.271756389),
+     (X: 1; Y: 1; Channel: 12; Value: 0.161246717),
+     (X: 2; Y: 0; Channel: 1; Value: 0.318062709)));
+  csQwenImageTiledEncodeMeanAbs: array[0..1] of double = (0.196182962,
+    0.208286644);
+
+// EncodeTiled vs diffusers' tiled_encode (csQwenImageTiledEncodeSamples); an
+// image no larger than one tile is the plain Encode bit for bit.
+procedure TTestNeuralPretrained.TestQwenImage21VaeEncoderTiledParity;
+const
+  cHeights: array[0..1] of integer = (64, 48);
+  cTileSizes: array[0..1] of integer = (32, 48);
+  cTileStrides: array[0..1] of integer = (16, 32);
+  cTileCounts: array[0..1] of integer = (16, 4);
+var
+  Encoder: TQwenImage21VaeEncoder;
+  Image, Latent, Whole: TNNetVolume;
+  CasePos, SamplePos: integer;
+  IsRefused: boolean;
+  Sample: TSDLatentSample;
+begin
+  Encoder := nil;
+  Image := TNNetVolume.Create;
+  Latent := TNNetVolume.Create;
+  Whole := TNNetVolume.Create;
+  try
+    Encoder := TQwenImage21VaeEncoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    FillQwenImage21FormulaImage(Image, 64, 64, 4);
+    Encoder.Encode(Image, Whole);
+    Encoder.EncodeTiled(Image, Latent, 64, 48);
+    AssertEquals('one tile: tile count', 1, Encoder.LastEncodeTileCount);
+    AssertEquals('one tile = plain encode', 0, MaxAbsVolumeDiff(Whole, Latent),
+      0);
+    for CasePos := 0 to 1 do
+    begin
+      FillQwenImage21FormulaImage(Image, 64, cHeights[CasePos], 4);
+      Encoder.EncodeTiled(Image, Latent, cTileSizes[CasePos],
+        cTileStrides[CasePos]);
+      AssertEquals('case ' + IntToStr(CasePos) + ' tile count',
+        cTileCounts[CasePos], Encoder.LastEncodeTileCount);
+      AssertEquals('case ' + IntToStr(CasePos) + ' width', 4, Latent.SizeX);
+      AssertEquals('case ' + IntToStr(CasePos) + ' height',
+        cHeights[CasePos] div 16, Latent.SizeY);
+      AssertEquals('case ' + IntToStr(CasePos) + ' depth', 16, Latent.Depth);
+      AssertEquals('case ' + IntToStr(CasePos) + ' mean |latent|',
+        csQwenImageTiledEncodeMeanAbs[CasePos],
+        Latent.GetSumAbs() / Latent.Size, 1e-5);
+      for SamplePos := 0 to High(csQwenImageTiledEncodeSamples[CasePos]) do
+      begin
+        Sample := csQwenImageTiledEncodeSamples[CasePos, SamplePos];
+        AssertEquals('case ' + IntToStr(CasePos) + ' sample ' +
+          IntToStr(SamplePos), Sample.Value,
+          Latent[Sample.X, Sample.Y, Sample.Channel], 5e-5);
+      end;
+    end;
+    IsRefused := false;
+    try
+      Encoder.EncodeTiled(Image, Latent, 32, 20);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('a stride off the 16-pixel grid is refused', IsRefused);
+  finally
+    Whole.Free;
+    Latent.Free;
+    Image.Free;
+    Encoder.Free;
+  end;
+end;
+
+// Marigold tiled encode on the pico VAE (16x16 padded image, 8x8 latent):
+// MarigoldEncodePadded with a 6-cell tile encoder runs 2 x 2 tiles (starts 0
+// and 2, overlap 2) and matches a hand blend of the four tile encodes; the
+// pipeline's VaeTileSize at the padded size is the plain Predict bit for bit.
+procedure TTestNeuralPretrained.TestMarigoldTiledVaeEncode;
+const
+  cSeed = 4242;
+var
+  Folder, VaeFile: string;
+  VaeConfig: TVaeDecoderConfig;
+  TileEnc, WholeEnc: TNNet;
+  Pipeline: TMarigoldPipeline;
+  Padded, Tiled, Whole, Crop, Tile00, Tile10, Tile11, Plain, Got,
+    EncStates, Image: TNNetVolume;
+  X, Y, C: integer;
+  IsRefused: boolean;
+begin
+  Folder := IncludeTrailingPathDelimiter(GetTempDir(false) +
+    'cai_marigold_tiled_pico');
+  VaeFile := Folder + 'vae' + DirectorySeparator +
+    'diffusion_pytorch_model.safetensors';
+  TileEnc := nil; WholeEnc := nil; Pipeline := nil;
+  Padded := TNNetVolume.Create(16, 16, 3);
+  Tiled := TNNetVolume.Create; Whole := TNNetVolume.Create;
+  Crop := TNNetVolume.Create; Tile00 := TNNetVolume.Create;
+  Tile10 := TNNetVolume.Create; Tile11 := TNNetVolume.Create;
+  Plain := TNNetVolume.Create; Got := TNNetVolume.Create;
+  EncStates := TNNetVolume.Create; Image := TNNetVolume.Create(16, 12, 3);
+  try
+    WriteMarigoldPicoFolder(
+      ExtractFilePath(FixturePath('tiny_sd_unet_linproj.safetensors')), Folder,
+      'MarigoldDepthPipeline');
+    VaeConfig := ReadVaeEncoderConfigFromJSONFile(Folder + 'vae' +
+      DirectorySeparator + 'config.json');
+    VaeConfig.LatentGrid := 8;
+    WholeEnc := BuildVaeEncoderFromSafeTensorsEx(VaeFile, VaeConfig,
+      {pTrainable=}false);
+    VaeConfig.LatentGrid := 6;
+    TileEnc := BuildVaeEncoderFromSafeTensorsEx(VaeFile, VaeConfig,
+      {pTrainable=}false);
+    for Y := 0 to 15 do
+      for X := 0 to 15 do
+        for C := 0 to 2 do
+          Padded[X, Y, C] := Sin(0.9 * X + 0.4 * Y * Y + 1.3 * C);
+    MarigoldEncodePadded(WholeEnc, Padded, Whole);
+    AssertEquals('whole width', 8, Whole.SizeX);
+    MarigoldEncodePadded(TileEnc, Padded, Tiled);
+    AssertTrue('tiled = whole shape', Tiled.SameSize(Whole));
+    AssertTrue('the tiles differ from the whole encode',
+      MaxAbsVolumeDiff(Tiled, Whole) > 1e-4);
+    // Tile (tx, ty) covers pixels 4 * (tx, ty) .. + 11, latent cells 2 * (tx, ty) .. + 5.
+    Crop.CopyCropping(Padded, 0, 0, 12, 12);
+    TileEnc.Compute(Crop); TileEnc.GetOutput(Tile00);
+    Crop.CopyCropping(Padded, 4, 0, 12, 12);
+    TileEnc.Compute(Crop); TileEnc.GetOutput(Tile10);
+    Crop.CopyCropping(Padded, 4, 4, 12, 12);
+    TileEnc.Compute(Crop); TileEnc.GetOutput(Tile11);
+    for C := 0 to Tiled.Depth - 1 do
+    begin
+      // Cells 0..1 only tile (0, 0) reaches; cells 6..7 only tile (1, 1).
+      for Y := 0 to 1 do
+        for X := 0 to 1 do
+        begin
+          AssertEquals('first-tile cell', Tile00[X, Y, C], Tiled[X, Y, C], 0);
+          AssertEquals('last-tile cell', Tile11[X + 4, Y + 4, C],
+            Tiled[X + 6, Y + 6, C], 0);
+        end;
+      // Cell (2, 0): the first feathered column, ramp (0 + 1) / (2 + 1).
+      AssertEquals('seam cell', Tile00[2, 0, C] * 2 / 3 + Tile10[0, 0, C] / 3,
+        Tiled[2, 0, C], 1e-6);
+    end;
+
+    Pipeline := TMarigoldPipeline.Create(Folder);
+    EncStates.ReSize(2, 1, Pipeline.UNetConfig.CrossAttentionDim);
+    EncStates.RandomizeGaussian(0.5);
+    Pipeline.SetEmptyPromptStates(EncStates);
+    for Y := 0 to Image.SizeY - 1 do
+      for X := 0 to Image.SizeX - 1 do
+        for C := 0 to 2 do
+          Image[X, Y, C] := 0.5 + 0.5 * Sin(0.4 * X + 0.7 * Y + C);
+    Pipeline.Predict(Image, 0, 1, -1, cSeed, Plain);
+    Pipeline.VaeTileSize := 16;
+    Pipeline.Predict(Image, 0, 1, -1, cSeed, Got);
+    AssertEquals('a tile over the padded image = plain', 0,
+      MaxAbsVolumeDiff(Plain, Got), 0);
+    Pipeline.VaeTileSize := 12;
+    Pipeline.Predict(Image, 0, 1, -1, cSeed, Got);
+    AssertTrue('tiled prediction shape', Got.SameSize(Plain));
+    AssertTrue('the tiled encode reaches the prediction',
+      MaxAbsVolumeDiff(Plain, Got) > 0);
+    for X := 0 to Got.Size - 1 do
+      AssertFalse('finite tiled prediction', IsNan(Got.FData[X]) or
+        IsInfinite(Got.FData[X]));
+    Pipeline.VaeTileSize := 5;
+    IsRefused := false;
+    try
+      Pipeline.Predict(Image, 0, 1, -1, cSeed, Got);
+    except
+      on EPretrainedImportError do IsRefused := true;
+    end;
+    AssertTrue('a tile off the VAE factor is refused', IsRefused);
+  finally
+    Pipeline.Free; TileEnc.Free; WholeEnc.Free;
+    Padded.Free; Tiled.Free; Whole.Free; Crop.Free; Tile00.Free;
+    Tile10.Free; Tile11.Free; Plain.Free; Got.Free; EncStates.Free;
+    Image.Free;
+    DeleteFile(Folder + 'model_index.json');
+    DeleteFile(Folder + 'scheduler' + DirectorySeparator + 'scheduler_config.json');
+    DeleteFile(Folder + 'unet' + DirectorySeparator + 'config.json');
+    DeleteFile(Folder + 'unet' + DirectorySeparator +
+      'diffusion_pytorch_model.safetensors');
+    DeleteFile(Folder + 'vae' + DirectorySeparator + 'config.json');
+    DeleteFile(VaeFile);
     RemoveDir(Folder + 'scheduler');
     RemoveDir(Folder + 'unet');
     RemoveDir(Folder + 'vae');
