@@ -5781,6 +5781,7 @@ type
     FGeneratorMagnitude, FGeneratorPhase: TNNetVolume;
     FHarmonicSource: TNNetHarmonicSource;
     FHarmonicSTFT: TNNetForwardSTFT;
+    FGeneratorISTFT: TNNetInverseSTFT;
     // har_source of the last ComputeHarmonicSpectrum: (600F,1,1) real.
     FHarmonicWave: TNNetVolume;
     FParallel: boolean;
@@ -56972,6 +56973,8 @@ begin
   FGeneratorPhase := TNNetVolume.Create();
   FHarmonicSTFT := TNNetForwardSTFT.Create(Config.ISTFTNFFT,
     Config.ISTFTHopSize);
+  FGeneratorISTFT := TNNetInverseSTFT.Create(Config.ISTFTNFFT,
+    Config.ISTFTHopSize);
   Consumed := TStringList.Create;
   Consumed.Sorted := true;
   Consumed.Duplicates := dupIgnore;
@@ -57018,6 +57021,7 @@ begin
   FStageAInput.Free;
   FHarmonicSource.Free;
   FHarmonicSTFT.Free;
+  FGeneratorISTFT.Free;
   FHarmonicWave.Free;
   FEnglishG2P.Free;
   inherited Destroy();
@@ -57332,8 +57336,8 @@ begin
     Inc(RowBase, ConvPost.Depth);
     Inc(BinBase, BinCount);
   end;
-  ISTFTCenteredMagnitudePhase(FGeneratorMagnitude, FGeneratorPhase, Audio,
-    FConfig.ISTFTNFFT, FConfig.ISTFTHopSize);
+  FGeneratorISTFT.TransformCenteredMagnitudePhase(FGeneratorMagnitude,
+    FGeneratorPhase, Audio);
 end;
 
 procedure TNNetKokoro.RunStageCGenerator(DecoderFeatures,

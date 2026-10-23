@@ -1288,8 +1288,15 @@ rather than acted on.
           rad need its exact range reduction; the vector `Sin` was not checked
           at that range) on one thread; 41 ms total is small next to the nets.
   - 2.11 Generator follow-up:
-        - [ ] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
-          their scratch per call (once per utterance).
+        - [X] `ISTFTCenteredMagnitudePhase` and `ISTFTOverlapAddReIm` allocate
+          their scratch per call (once per utterance). DONE: `TNNetInverseSTFT`
+          (neuralaudio) builds window, twiddles and FFT plan once, scratch only
+          grows, no FullWave copy; Kokoro owns one (`FGeneratorISTFT`). The free
+          functions wrap a temporary instance. Test
+          `TestInverseSTFTReuseMatchesFreeFunctions`; Kokoro parity unchanged.
+          5 s utterance iSTFT ~52 -> ~45 ms (1-core VM, noisy).
+        - [ ] `ISTFTOverlapAdd` (magnitude + phase, +sin sign) still builds its
+          Re/Im volumes per call; no hot caller.
   Later (user 2026-10-13): MP3 in pure Pascal — decoder (minimp3 port, CC0)
   and/or encoder (shine port, LGPL); not scheduled.
   Not in scope: `hexgrad/Kokoro-82M-v1.1-zh` (different repo and vocab); int8.

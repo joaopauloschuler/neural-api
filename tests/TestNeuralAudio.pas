@@ -41,6 +41,9 @@ type
     // matches the straightforward (NumBins x NFFT) product-table reference,
     // for even and odd, power-of-two and non-power-of-two NFFT.
     procedure TestISTFTReImMatchesProductTable;
+    // One TNNetInverseSTFT reused over growing and shrinking frame counts
+    // gives the same samples as the free ISTFT functions.
+    procedure TestInverseSTFTReuseMatchesFreeFunctions;
     // Resampling 16 kHz -> 16 kHz is a bit-identical passthrough.
     procedure TestResampleIdentity;
     // Output length matches the round(N * target/source) ratio (up and down).
@@ -370,6 +373,62 @@ begin
       Im.Free;
       Got.Free;
       Want.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestInverseSTFTReuseMatchesFreeFunctions;
+var
+  InverseSTFT: TNNetInverseSTFT;
+  Re, Im, Got, Want: TNNetVolume;
+  NFFTIdx, NFFT, Hop, CallIdx, FrameCount, ElementPos: integer;
+  Prefix: string;
+begin
+  // NFFT 20 (direct inverse DFT) and 16 (radix-2); frame counts 12, 5, 9 make
+  // the scratch grow, then shrink, then grow inside its capacity.
+  for NFFTIdx := 0 to 1 do
+  begin
+    if NFFTIdx = 0 then begin NFFT := 20; Hop := 5; end
+    else begin NFFT := 16; Hop := 4; end;
+    InverseSTFT := TNNetInverseSTFT.Create(NFFT, Hop);
+    Re := TNNetVolume.Create(); Im := TNNetVolume.Create();
+    Got := TNNetVolume.Create(); Want := TNNetVolume.Create();
+    try
+      for CallIdx := 0 to 2 do
+      begin
+        case CallIdx of
+          0: FrameCount := 12;
+          1: FrameCount := 5;
+        else FrameCount := 9;
+        end;
+        Prefix := 'NFFT ' + IntToStr(NFFT) + ', ' + IntToStr(FrameCount) +
+          ' frames: ';
+        Re.ReSize(FrameCount, 1, NFFT div 2 + 1);
+        Im.ReSize(FrameCount, 1, NFFT div 2 + 1);
+        for ElementPos := 0 to Re.Size - 1 do
+        begin
+          Re.FData[ElementPos] := 1.0 + Sin(0.7 * ElementPos + CallIdx);
+          Im.FData[ElementPos] := Cos(1.3 * ElementPos - CallIdx);
+        end;
+        InverseSTFT.TransformReIm(Re, Im, Got);
+        ISTFTOverlapAddReIm(Re, Im, Want, NFFT, Hop);
+        AssertEquals(Prefix + 'ReIm length', Want.Size, Got.Size);
+        for ElementPos := 0 to Want.Size - 1 do
+          AssertEquals(Prefix + 'ReIm sample ' + IntToStr(ElementPos),
+            Want.FData[ElementPos], Got.FData[ElementPos], 0);
+        // Re as magnitude, Im as phase.
+        InverseSTFT.TransformCenteredMagnitudePhase(Re, Im, Got);
+        ISTFTCenteredMagnitudePhase(Re, Im, Want, NFFT, Hop);
+        AssertEquals(Prefix + 'centred length', Hop * (FrameCount - 1),
+          Got.Size);
+        AssertEquals(Prefix + 'centred length', Want.Size, Got.Size);
+        for ElementPos := 0 to Want.Size - 1 do
+          AssertEquals(Prefix + 'centred sample ' + IntToStr(ElementPos),
+            Want.FData[ElementPos], Got.FData[ElementPos], 0);
+      end;
+    finally
+      Re.Free; Im.Free; Got.Free; Want.Free;
+      InverseSTFT.Free;
     end;
   end;
 end;
