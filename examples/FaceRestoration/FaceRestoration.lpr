@@ -1,15 +1,17 @@
 program FaceRestoration;
 (*
-FaceRestoration: GFPGAN v1.3 / v1.4 blind face restoration (Wang et al.,
-CVPR 2021) with the importers in neuralpretrained.pas.
+FaceRestoration: blind face restoration with GFPGAN v1.3 / v1.4 (Wang et al.,
+CVPR 2021) or CodeFormer (Zhou et al., NeurIPS 2022; S-Lab License 1.0,
+non-commercial) and the importers in neuralpretrained.pas. --model picks the
+restorer from the checkpoint's tensors.
 
 Modes:
   * no arguments: smokes of the committed random pico fixtures
-    (tests/fixtures/tiny_gfpgan, tiny_retinaface_mobilenet): an aligned crop,
-    then a whole synthetic photo.
+    (tests/fixtures/tiny_gfpgan, tiny_codeformer, tiny_retinaface_mobilenet):
+    per restorer an aligned crop, then a whole synthetic photo.
   * --model FILE --detector FILE --input IMG --output IMG: whole-photo
-    restoration as GFPGAN's inference_gfpgan.py: RetinaFace finds every face,
-    each is aligned to the FFHQ 5-point template, restored and pasted back
+    restoration as inference_gfpgan.py / inference_codeformer.py: RetinaFace
+    finds every face, each is aligned to the FFHQ 5-point template, restored and pasted back
     (RestoreFacesInImage, a port of facexlib's FaceRestoreHelper without face
     parsing) on the background upscaled by --upscale (Lanczos, or an
     RRDBNet / Real-ESRGAN checkpoint with --bg-upsampler).
@@ -34,7 +36,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   neuralimageresize;
 
 const
-  // Fixture committed with the GFPGAN importer tests.
+  // Fixtures committed with the GFPGAN / CodeFormer importer tests.
   FixturesDir = '../../tests/fixtures/';
 
 type
@@ -44,6 +46,8 @@ type
     NoiseMode: TStyleGAN2NoiseMode;
     Seed, BackgroundTile, MaxFaces: integer;
     Upscale, DetectionThreshold, MinEyeDistance: TNeuralFloat;
+    // CodeFormer's w; negative = the config's fidelity_weight (default 0.5).
+    Fidelity: TNeuralFloat;
     IsAligned, KeepSize, UseOpenCL, UseInt8: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
@@ -53,9 +57,12 @@ begin
   WriteLn('Usage: FaceRestoration                       (pico fixture smokes)');
   WriteLn('       FaceRestoration --model FILE --detector FILE --input IMG --output IMG [options]');
   WriteLn('       FaceRestoration --aligned --model FILE --input IMG --output IMG [options]');
-  WriteLn('  --model FILE         GFPGAN checkpoint (GFPGANv1.4.pth / .safetensors)');
+  WriteLn('  --model FILE         GFPGAN (GFPGANv1.4.pth) or CodeFormer (codeformer.pth)');
+  WriteLn('                       checkpoint, told apart by its tensors');
   WriteLn('  --config FILE        config.json (default: next to --model, else the');
-  WriteLn('                       v1.4 settings; shapes come from the tensors)');
+  WriteLn('                       release settings; shapes come from the tensors)');
+  WriteLn('  --fidelity W         CodeFormer fidelity weight, 0 = quality .. 1 = identity');
+  WriteLn('                       (default 0.5, as inference_codeformer.py)');
   WriteLn('  --input IMG          photo (or, with --aligned, an aligned face crop)');
   WriteLn('  --output IMG         restored photo / face (PNG)');
   WriteLn('  --aligned            the input is an ALIGNED, cropped face: no detection');
@@ -71,7 +78,7 @@ begin
   WriteLn('  --min-eye-distance P skip faces whose eyes are closer than P pixels (default 5)');
   WriteLn('  --max-faces N        restore at most the N best-scoring faces (default all)');
   WriteLn('  --save-faces PREFIX  write PREFIX_cropped_NN.png and PREFIX_restored_NN.png');
-  WriteLn('  --noise MODE         random (GFPGAN''s default), const (the ',
+  WriteLn('  --noise MODE         GFPGAN only: random (its default), const (the ',
     'checkpoint''s');
   WriteLn('                       stored maps) or none (default random)');
   WriteLn('  --seed N             seed of the random noise (default: time based)');
@@ -129,6 +136,7 @@ begin
   Opt.Upscale := 2;
   Opt.DetectionThreshold := 0.97;
   Opt.MinEyeDistance := 5;
+  Opt.Fidelity := -1;
   Opt.IsAligned := false;
   Opt.KeepSize := false;
   Opt.UseOpenCL := false;
@@ -154,6 +162,7 @@ begin
     else if Arg = '--min-eye-distance' then Opt.MinEyeDistance := NextFloat()
     else if Arg = '--max-faces' then Opt.MaxFaces := StrToInt(NextArg())
     else if Arg = '--save-faces' then Opt.SaveFacesPrefix := NextArg()
+    else if Arg = '--fidelity' then Opt.Fidelity := NextFloat()
     else if Arg = '--noise' then Opt.NoiseMode := ParseNoiseMode(NextArg())
     else if Arg = '--seed' then Opt.Seed := StrToInt(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
@@ -178,6 +187,8 @@ begin
       '(detection_Resnet50_Final.pth); pass --aligned for an aligned face crop');
   if Opt.Upscale <= 0 then
     raise Exception.Create('--upscale must be positive');
+  if Opt.Fidelity > 1 then
+    raise Exception.Create('--fidelity must be in [0, 1]');
 end;
 
 type
@@ -232,15 +243,35 @@ begin
   {$ENDIF}
 end;
 
+// Builds the GFPGAN or CodeFormer net of Opt.ModelFile; FaceSize := its
+// resolution, the only thing RestoreFacesInImage needs to know about it.
 function LoadRestorer(const Opt: TFaceRestorationOptions;
-  const Device: TComputeDevice; out Config: TGFPGANConfig): TNNet;
+  const Device: TComputeDevice; out FaceSize: integer): TNNet;
 var
+  GFPGANConfig: TGFPGANConfig;
+  CodeFormerConfig: TCodeFormerConfig;
   StartTime: TDateTime;
 begin
   StartTime := Now();
-  Result := BuildGFPGANFromSafeTensors(Opt.ModelFile, Config, {pTrainable=}false,
-    Opt.ConfigFile, Opt.NoiseMode);
-  WriteLn(GFPGANConfigToString(Config));
+  if IsCodeFormerCheckpoint(Opt.ModelFile) then
+  begin
+    Result := BuildCodeFormerFromSafeTensors(Opt.ModelFile, CodeFormerConfig,
+      {pTrainable=}false, Opt.ConfigFile);
+    if Opt.Fidelity >= 0 then
+    begin
+      CodeFormerConfig.Fidelity := Opt.Fidelity;
+      CodeFormerSetFidelity(Result, Opt.Fidelity);
+    end;
+    WriteLn(CodeFormerConfigToString(CodeFormerConfig));
+    FaceSize := CodeFormerConfig.ImageSize;
+  end
+  else
+  begin
+    Result := BuildGFPGANFromSafeTensors(Opt.ModelFile, GFPGANConfig,
+      {pTrainable=}false, Opt.ConfigFile, Opt.NoiseMode);
+    WriteLn(GFPGANConfigToString(GFPGANConfig));
+    FaceSize := GFPGANConfig.OutSize;
+  end;
   WriteLn(Format('  loaded in %.1f s', [(Now() - StartTime) * 86400.0]));
   // Quantize before EnableOpenCL: the OpenCL arming reads the int8 codes.
   if Opt.UseInt8 then Result.QuantizeWeightsInt8();
@@ -259,7 +290,7 @@ procedure RestoreAlignedFile(const Opt: TFaceRestorationOptions;
   const Device: TComputeDevice);
 var
   NN: TNNet;
-  Config: TGFPGANConfig;
+  FaceSize: integer;
   Face, Restored, Resized: TNNetVolume;
   StartTime: TDateTime;
 begin
@@ -270,13 +301,12 @@ begin
   try
     if not LoadImageFromFileIntoVolume(Opt.InputFile, Face) then
       raise Exception.Create('could not load ' + Opt.InputFile);
-    NN := LoadRestorer(Opt, Device, Config);
+    NN := LoadRestorer(Opt, Device, FaceSize);
     if Opt.Seed >= 0 then RestartRandSeed(Opt.Seed);
     WriteLn(Format('Restoring a %dx%d face on %s, net resolution %dx%d',
-      [Face.SizeX, Face.SizeY, ComputeText(Opt, Device), Config.OutSize,
-      Config.OutSize]));
+      [Face.SizeX, Face.SizeY, ComputeText(Opt, Device), FaceSize, FaceSize]));
     StartTime := Now();
-    GFPGANRestoreFace(NN, Config, Face, Restored);
+    FaceRestorerRestoreFace(NN, FaceSize, Face, Restored);
     WriteLn(Format('  %.1f s', [(Now() - StartTime) * 86400.0]));
     if Opt.KeepSize and
        ((Face.SizeX <> Restored.SizeX) or (Face.SizeY <> Restored.SizeY)) then
@@ -343,7 +373,7 @@ procedure RestorePhotoFile(const Opt: TFaceRestorationOptions;
   const Device: TComputeDevice);
 var
   Restorer, Detector: TNNet;
-  RestorerConfig: TGFPGANConfig;
+  RestorerFaceSize: integer;
   DetectorConfig: TRetinaFaceConfig;
   Image, Background, Output: TNNetVolume;
   Crops, RestoredFaces: TNNetVolumeList;
@@ -368,7 +398,7 @@ begin
     WriteLn(RetinaFaceConfigToString(DetectorConfig));
     WriteLn(Format('  loaded in %.1f s', [(Now() - StartTime) * 86400.0]));
     EnableDevice(Detector, Device);
-    Restorer := LoadRestorer(Opt, Device, RestorerConfig);
+    Restorer := LoadRestorer(Opt, Device, RestorerFaceSize);
     if Opt.BackgroundFile <> '' then
       Background := UpscaleBackground(Opt, Device, Image);
     if Opt.Seed >= 0 then RestartRandSeed(Opt.Seed);
@@ -376,7 +406,7 @@ begin
       [Image.SizeX, Image.SizeY, ComputeText(Opt, Device), Opt.Upscale]));
     StartTime := Now();
     FaceCount := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
-      RestorerConfig, Image, Background, Output, Opt.Upscale,
+      RestorerFaceSize, Image, Background, Output, Opt.Upscale,
       Opt.DetectionThreshold, Opt.MinEyeDistance, Opt.MaxFaces, Crops,
       RestoredFaces);
     WriteLn(Format('  %d face(s) in %.1f s', [FaceCount,
@@ -432,9 +462,12 @@ begin
     end;
 end;
 
-// Pico smokes: a 40x30 crop through --aligned, then a 256x192 photo through
-// the whole-photo path (the random detector finds random "faces").
-procedure RunFixtureSmoke(const InPng, OutPng, PhotoPng, PhotoOutPng: string);
+// Pico smokes of one restorer: a 40x30 crop through --aligned, then a 256x192
+// photo through the whole-photo path (the random detector finds random "faces").
+procedure RunFixtureSmoke(const ModelFile, ConfigFile, OutPrefix: string);
+const
+  InPng = 'face_in.png';
+  PhotoPng = 'face_photo_in.png';
 var
   Img: TNNetVolume;
   Opt: TFaceRestorationOptions;
@@ -457,17 +490,17 @@ begin
     Img.Free;
   end;
   ParseOptions(Opt);
-  Opt.ModelFile := FixturesDir + 'tiny_gfpgan.pth';
-  Opt.ConfigFile := FixturesDir + 'tiny_gfpgan_config.json';
+  Opt.ModelFile := ModelFile;
+  Opt.ConfigFile := ConfigFile;
   Opt.InputFile := InPng;
-  Opt.OutputFile := OutPng;
+  Opt.OutputFile := OutPrefix + '_out.png';
   Opt.NoiseMode := snmConst;
   Opt.IsAligned := true;
   RunOptions(Opt);
   Opt.IsAligned := false;
   Opt.DetectorFile := FixturesDir + 'tiny_retinaface_mobilenet.pth';
   Opt.InputFile := PhotoPng;
-  Opt.OutputFile := PhotoOutPng;
+  Opt.OutputFile := OutPrefix + '_photo_out.png';
   Opt.DetectionThreshold := 0.5;
   Opt.MaxFaces := 3;
   RunOptions(Opt);
@@ -484,8 +517,12 @@ begin
     begin
       WriteLn('GFPGAN face restoration smoke (random pico weights)');
       WriteLn('===================================================');
-      RunFixtureSmoke('gfpgan_in.png', 'gfpgan_out.png', 'gfpgan_photo_in.png',
-        'gfpgan_photo_out.png');
+      RunFixtureSmoke(FixturesDir + 'tiny_gfpgan.pth',
+        FixturesDir + 'tiny_gfpgan_config.json', 'gfpgan');
+      WriteLn('CodeFormer face restoration smoke (random pico weights)');
+      WriteLn('=======================================================');
+      RunFixtureSmoke(FixturesDir + 'tiny_codeformer.pth',
+        FixturesDir + 'tiny_codeformer_config.json', 'codeformer');
       WriteLn('Done.');
     end;
   except

@@ -886,13 +886,14 @@ rather than acted on.
       as inference_codeformer.py). Pico parity vs the official arch files
       (tools/codeformer_tiny_fixture.py, tests/fixtures/tiny_codeformer*):
       TestCodeFormerParity (w = 0.7 1.5e-5, w = 0 5e-6, codes, round trip),
-      TestCodeFormerNoAdaINParity (1.1e-5). OPEN: (a) generalize
-      `RestoreFacesInImage` through a small restorer abstraction (today it takes a
-      `TGFPGANConfig`); (b) examples/FaceRestoration `--model codeformer.pth
-      --fidelity W` (default 0.5) + its README; (c) OpenCL parity of the tiny
-      fixture (TNNetTopKGate / TNNetAdaIN / fusion path untested on OpenCL);
-      (d) real `codeformer.pth` on the user's box before the README calls it
-      supported. A Fuse_sft_block at the latent level (the official table puts
+      TestCodeFormerNoAdaINParity (1.1e-5). Also LANDED: `RestoreFacesInImage`
+      takes a restorer face size (`FaceRestorerRestoreFace`; overloads for
+      `TGFPGANConfig` / `TCodeFormerConfig`), `IsCodeFormerCheckpoint`,
+      examples/FaceRestoration `--model codeformer.pth --fidelity W` (both modes,
+      `--gpu`), TestCodeFormerOpenCLParity (size verdict + ForceOpenCL, every
+      layer) and TestRestoreFacesInImageCodeFormer. OPEN: real `codeformer.pth`
+      (CPU and `--gpu`, aligned and whole-photo) on the user's box before the
+      README calls it supported. A Fuse_sft_block at the latent level (the official table puts
       '16' after the 2nd ResBlock) is rejected; codeformer.pth does not use it.
 - [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
       landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`

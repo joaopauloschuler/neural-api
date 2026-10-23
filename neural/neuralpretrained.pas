@@ -14912,6 +14912,11 @@ procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
 procedure FaceRestorerPrepareInput(Face: TNNetVolume; FaceSize: integer;
   NetInput: TNNetVolume);
 
+// Restores Face with a GFPGAN or CodeFormer net of resolution FaceSize:
+// FaceRestorerPrepareInput -> NN.Compute -> GFPGANComposeOutput.
+procedure FaceRestorerRestoreFace(NN: TNNet; FaceSize: integer;
+  Face, Restored: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // CodeFormer BLIND FACE RESTORATION IMPORT (Zhou et al., "Towards Robust Blind
 // Face Restoration with Codebook Lookup Transformer", NeurIPS 2022,
@@ -14994,6 +14999,11 @@ function CodeFormerSetFidelity(NN: TNNet; Fidelity: TNeuralFloat): integer;
 // net currently holds (ImageSize x ImageSize, RGB 0..255).
 procedure CodeFormerRestoreFace(NN: TNNet; const Config: TCodeFormerConfig;
   Face, Restored: TNNetVolume);
+
+// True when the checkpoint holds CodeFormer tensors (encoder.blocks.0,
+// position_emb, quantize, idx_pred_layer) rather than, e.g., GFPGAN ones.
+function IsCodeFormerCheckpoint(Reader: TNNetSafeTensorsReader): boolean; overload;
+function IsCodeFormerCheckpoint(const FileName: string): boolean; overload;
 
 // ---------------------------------------------------------------------------
 // BiRefNet / RMBG-2.0 BACKGROUND-REMOVAL IMPORT (Zheng et al., "Bilateral
@@ -16201,12 +16211,30 @@ function FilterFacesByEyeDistance(const Faces: TRetinaFaceDetectionArray;
 // GFPGANer.enhance (no face parsing): Output := Background (nil: Image) resized
 // to Trunc(UpscaleFactor * size) with every detected face restored and pasted;
 // returns the face count. Crops / RestoredFaces (optional) receive copies.
+// Restorer is a GFPGAN or CodeFormer net of resolution RestorerFaceSize.
+function RestoreFacesInImage(Detector: TNNet;
+  const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
+  RestorerFaceSize: integer; Image, Background, Output: TNNetVolume;
+  UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
+  MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
+  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
+  overload;
+
+// Same with the resolution of a GFPGAN / CodeFormer config.
 function RestoreFacesInImage(Detector: TNNet;
   const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
   const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
   MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
   Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
+  overload;
+function RestoreFacesInImage(Detector: TNNet;
+  const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
+  const RestorerConfig: TCodeFormerConfig; Image, Background, Output: TNNetVolume;
+  UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat = 0.97;
+  MinEyeDistance: TNeuralFloat = 5; MaxFaces: integer = 0;
+  Crops: TNNetVolumeList = nil; RestoredFaces: TNNetVolumeList = nil): integer;
+  overload;
 
 // ---------------------------------------------------------------------------
 // YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
@@ -85611,20 +85639,26 @@ begin
   Restored.Mul(127.5);
 end;
 
-procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
+procedure FaceRestorerRestoreFace(NN: TNNet; FaceSize: integer;
   Face, Restored: TNNetVolume);
 var
   NetInput: TNNetVolume;
 begin
   NetInput := TNNetVolume.Create;
   try
-    GFPGANPrepareInput(Face, Config, NetInput);
+    FaceRestorerPrepareInput(Face, FaceSize, NetInput);
     NN.Compute(NetInput);
     NN.GetOutput(Restored);
     GFPGANComposeOutput(Restored, Restored);
   finally
     NetInput.Free;
   end;
+end;
+
+procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
+  Face, Restored: TNNetVolume);
+begin
+  FaceRestorerRestoreFace(NN, Config.OutSize, Face, Restored);
 end;
 
 // ===========================================================================
@@ -110399,10 +110433,7 @@ var
   end;
 
 begin
-  if not (Reader.HasTensor('encoder.blocks.0.weight') and
-    Reader.HasTensor('position_emb') and
-    Reader.HasTensor('quantize.embedding.weight') and
-    Reader.HasTensor('idx_pred_layer.1.weight')) then
+  if not IsCodeFormerCheckpoint(Reader) then
     ImportError(csCodeFormerImporter + ': ' + Reader.FileName +
       ' has no encoder.blocks.0 / position_emb / quantize / idx_pred_layer ' +
       'tensors - not a CodeFormer checkpoint?');
@@ -110864,17 +110895,27 @@ end;
 
 procedure CodeFormerRestoreFace(NN: TNNet; const Config: TCodeFormerConfig;
   Face, Restored: TNNetVolume);
-var
-  NetInput: TNNetVolume;
 begin
-  NetInput := TNNetVolume.Create;
+  FaceRestorerRestoreFace(NN, Config.ImageSize, Face, Restored);
+end;
+
+function IsCodeFormerCheckpoint(Reader: TNNetSafeTensorsReader): boolean;
+begin
+  Result := Reader.HasTensor('encoder.blocks.0.weight') and
+    Reader.HasTensor('position_emb') and
+    Reader.HasTensor('quantize.embedding.weight') and
+    Reader.HasTensor('idx_pred_layer.1.weight');
+end;
+
+function IsCodeFormerCheckpoint(const FileName: string): boolean;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
   try
-    FaceRestorerPrepareInput(Face, Config.ImageSize, NetInput);
-    NN.Compute(NetInput);
-    NN.GetOutput(Restored);
-    GFPGANComposeOutput(Restored, Restored);
+    Result := IsCodeFormerCheckpoint(Reader);
   finally
-    NetInput.Free;
+    Reader.Free;
   end;
 end;
 
@@ -111015,7 +111056,7 @@ end;
 
 function RestoreFacesInImage(Detector: TNNet;
   const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
-  const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
+  RestorerFaceSize: integer; Image, Background, Output: TNNetVolume;
   UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
   MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
   RestoredFaces: TNNetVolumeList): integer;
@@ -111023,7 +111064,7 @@ var
   Faces: TRetinaFaceDetectionArray;
   Matrices: array of TImageAffineMatrix;
   Crop: TNNetVolume;
-  // Restored[FacePos]: GFPGAN's output for face FacePos.
+  // Restored[FacePos]: the restorer's output for face FacePos.
   Restored: TNNetVolumeList;
   FacePos, MaxFacePos, CanvasSizeX, CanvasSizeY: integer;
 
@@ -111054,11 +111095,12 @@ begin
     for FacePos := 0 to MaxFacePos do
     begin
       Matrices[FacePos] := FaceAlignmentMatrix(Faces[FacePos],
-        RestorerConfig.OutSize);
-      AlignWarpFace(Image, Matrices[FacePos], RestorerConfig.OutSize, Crop);
+        RestorerFaceSize);
+      AlignWarpFace(Image, Matrices[FacePos], RestorerFaceSize, Crop);
       if Crops <> nil then AddCopy(Crops, Crop);
       Restored.Add(TNNetVolume.Create);
-      GFPGANRestoreFace(Restorer, RestorerConfig, Crop, Restored[FacePos]);
+      FaceRestorerRestoreFace(Restorer, RestorerFaceSize, Crop,
+        Restored[FacePos]);
       if RestoredFaces <> nil then AddCopy(RestoredFaces, Restored[FacePos]);
     end;
     CanvasSizeX := Trunc(Image.SizeX * UpscaleFactor);
@@ -111074,6 +111116,30 @@ begin
     Restored.Free;
     Crop.Free;
   end;
+end;
+
+function RestoreFacesInImage(Detector: TNNet;
+  const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
+  const RestorerConfig: TGFPGANConfig; Image, Background, Output: TNNetVolume;
+  UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
+  MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
+  RestoredFaces: TNNetVolumeList): integer;
+begin
+  Result := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
+    RestorerConfig.OutSize, Image, Background, Output, UpscaleFactor,
+    ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces);
+end;
+
+function RestoreFacesInImage(Detector: TNNet;
+  const DetectorConfig: TRetinaFaceConfig; Restorer: TNNet;
+  const RestorerConfig: TCodeFormerConfig; Image, Background, Output: TNNetVolume;
+  UpscaleFactor: TNeuralFloat; ConfThreshold: TNeuralFloat;
+  MinEyeDistance: TNeuralFloat; MaxFaces: integer; Crops: TNNetVolumeList;
+  RestoredFaces: TNNetVolumeList): integer;
+begin
+  Result := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
+    RestorerConfig.ImageSize, Image, Background, Output, UpscaleFactor,
+    ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces);
 end;
 
 {$IFDEF OpenCL}

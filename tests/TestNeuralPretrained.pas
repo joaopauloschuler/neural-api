@@ -1559,6 +1559,11 @@ type
     // (CodeFormerSetFidelity) with adain, and the save/load round trip.
     procedure TestCodeFormerParity;
     procedure TestCodeFormerNoAdaINParity;
+    // The tiny fixture with EnableOpenCL against the host net, every layer.
+    procedure TestCodeFormerOpenCLParity;
+    // Pico RetinaFace + tiny CodeFormer through RestoreFacesInImage: each restored
+    // face equals CodeFormerRestoreFace on its crop; IsCodeFormerCheckpoint.
+    procedure TestRestoreFacesInImageCodeFormer;
     procedure TestBiRefNetParity;
     procedure TestBiRefNetInfersConfig;
     procedure TestBiRefNetPrepareAndCompose;
@@ -56845,6 +56850,173 @@ begin
     NetInput.Free;
     IO.Free;
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestCodeFormerOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TCodeFormerConfig;
+  NN, NNCPU: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxLayerPos: integer;
+
+  // A nearest-2x upsample folded into the next convolution has no output.
+  function IsFoldedUpsample(LayerPos: integer): boolean;
+  begin
+    Result := (LayerPos < MaxLayerPos) and
+      (NN.Layers[LayerPos + 1].PrevLayer = NN.Layers[LayerPos]) and
+      (NN.Layers[LayerPos + 1].OpenCLUpsampleFoldLaunchCount() > 0);
+  end;
+
+  // Computes both nets at fidelity w and asserts the face and every layer match.
+  procedure AssertNetsMatch(const PassName: string; Fidelity: TNeuralFloat);
+  var
+    LayerPos, FirstBadLayer, OpenCLLayerCnt, FoldedCnt: integer;
+    LayerDiff, MaxDiff, OutputDiff: double;
+  begin
+    CodeFormerSetFidelity(NN, Fidelity);
+    CodeFormerSetFidelity(NNCPU, Fidelity);
+    NNCPU.Compute(NetInput);
+    NN.ClearTime();
+    NN.Compute(NetInput);
+    NN.Compute(NetInput);
+    OutputDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output,
+      NNCPU.GetLastLayer().Output);
+    MaxDiff := 0;
+    FirstBadLayer := -1;
+    OpenCLLayerCnt := 0;
+    FoldedCnt := 0;
+    for LayerPos := 1 to MaxLayerPos do
+    begin
+      if NN.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+      if IsFoldedUpsample(LayerPos) then
+      begin
+        Inc(FoldedCnt);
+        continue;
+      end;
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      // Relative to the layer's magnitude: the fusion features reach |x| > 10.
+      LayerDiff := MaxAbsVolumeDiff(NN.Layers[LayerPos].Output,
+        NNCPU.Layers[LayerPos].Output) /
+        Max(1.0, NNCPU.Layers[LayerPos].Output.GetMaxAbs());
+      if (LayerDiff >= 1e-4) and (FirstBadLayer < 0) then
+      begin
+        FirstBadLayer := LayerPos;
+        WriteLn('  CodeFormer OpenCL ', PassName, ' first layer past 1e-4: ',
+          LayerPos, ' ', NN.Layers[LayerPos].ClassName, ' relative max|diff|=',
+          LayerDiff:0:9);
+      end;
+      if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
+    end;
+    WriteLn('  CodeFormer OpenCL ', PassName, ' face max|diff| = ', OutputDiff:0:9,
+      ' any layer (relative) = ', MaxDiff:0:9, ' layers on OpenCL: ',
+      OpenCLLayerCnt, '/', MaxLayerPos, ' folded upsamples: ', FoldedCnt);
+    AssertTrue(PassName + ': some layers ran on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue(PassName + ': face OpenCL vs CPU max |diff| = ' +
+      FloatToStr(OutputDiff) + ' must be < 1e-4', OutputDiff < 1e-4);
+    AssertEquals(PassName + ': every layer OpenCL vs CPU within 1e-4 relative',
+      -1, FirstBadLayer);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := BuildCodeFormerFromSafeTensors(FixturePath('tiny_codeformer.pth'),
+    Config, {pTrainable=}false, FixturePath('tiny_codeformer_config.json'));
+  NNCPU := BuildCodeFormerFromSafeTensors(FixturePath('tiny_codeformer.pth'),
+    Config, {pTrainable=}false, FixturePath('tiny_codeformer_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_codeformer_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    MaxLayerPos := NN.CountLayers() - 1;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertNetsMatch('w=0.7', 0.7);
+    // A fidelity change after EnableOpenCL must reach the OpenCL forward.
+    AssertNetsMatch('w=0.2', 0.2);
+    // Every layer with a kernel, including the ones too small for the size verdict.
+    NN.ForceOpenCL(true);
+    AssertNetsMatch('forced w=0.7', 0.7);
+  finally
+    NetInput.Free;
+    IO.Free;
+    NNCPU.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.TestRestoreFacesInImageCodeFormer;
+var
+  DetectorConfig: TRetinaFaceConfig;
+  RestorerConfig: TCodeFormerConfig;
+  Detector, Restorer: TNNet;
+  Image, Output, Background, Expected: TNNetVolume;
+  Crops, RestoredFaces: TNNetVolumeList;
+  FaceCount, FacePos, MaxFacePos, X, Y, Channel: integer;
+begin
+  AssertTrue('CodeFormer detected',
+    IsCodeFormerCheckpoint(FixturePath('tiny_codeformer.pth')));
+  AssertFalse('GFPGAN is not CodeFormer',
+    IsCodeFormerCheckpoint(FixturePath('tiny_gfpgan.pth')));
+  Detector := BuildRetinaFaceFromSafeTensors(
+    FixturePath('tiny_retinaface_mobilenet.pth'), 256, 192, DetectorConfig, false);
+  Restorer := BuildCodeFormerFromSafeTensors(FixturePath('tiny_codeformer.pth'),
+    RestorerConfig, {pTrainable=}false,
+    FixturePath('tiny_codeformer_config.json'));
+  Image := TNNetVolume.Create(256, 192, 3);
+  Output := TNNetVolume.Create;
+  Background := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Crops := TNNetVolumeList.Create(true);
+  RestoredFaces := TNNetVolumeList.Create(true);
+  try
+    for Y := 0 to 191 do
+      for X := 0 to 255 do
+        for Channel := 0 to 2 do
+          Image[X, Y, Channel] := 128 + 90 * Sin(X * 0.15 + Channel) *
+            Cos(Y * 0.125);
+    CodeFormerSetFidelity(Restorer, 0.7);
+    FaceCount := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
+      RestorerConfig, Image, nil, Output, 2, 0.5, 5, 3, Crops, RestoredFaces);
+    AssertTrue('some faces', FaceCount > 0);
+    AssertEquals('crops', FaceCount, Crops.Count);
+    AssertEquals('restored', FaceCount, RestoredFaces.Count);
+    AssertEquals('output width', 512, Output.SizeX);
+    AssertEquals('output height', 384, Output.SizeY);
+    ResizeImageLanczos4CV2(Image, Background, 512, 384);
+    AssertTrue('the faces change the canvas', Output.SumDiff(Background) > 0);
+    MaxFacePos := FaceCount - 1;
+    for FacePos := 0 to MaxFacePos do
+    begin
+      AssertEquals('crop size', RestorerConfig.ImageSize, Crops[FacePos].SizeX);
+      AssertEquals('restored size', RestorerConfig.ImageSize,
+        RestoredFaces[FacePos].SizeY);
+      CodeFormerRestoreFace(Restorer, RestorerConfig, Crops[FacePos], Expected);
+      AssertEquals('face ' + IntToStr(FacePos) + ' = CodeFormerRestoreFace', 0,
+        MaxAbsVolumeDiff(RestoredFaces[FacePos], Expected), 1e-4);
+    end;
+    WriteLn('  RestoreFacesInImage CodeFormer pico: ', FaceCount, ' faces');
+  finally
+    RestoredFaces.Free;
+    Crops.Free;
+    Expected.Free;
+    Background.Free;
+    Output.Free;
+    Image.Free;
+    Restorer.Free;
+    Detector.Free;
   end;
 end;
 
