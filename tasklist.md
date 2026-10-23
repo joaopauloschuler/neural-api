@@ -363,25 +363,9 @@ rather than acted on.
 
 - [ ] Robust Video Matting (Lin et al. WACV 2022, arXiv:2108.11515,
       PeterL1n/RobustVideoMatting; `rvm_mobilenetv3.pth` is GPL-3.0, so load it
-      at run time and never ship it).
-  - [x] MobileNetV3 importer landed: `InferRVMConfigFromTensors`,
-        `BuildRVM[FromSafeTensors[Ex]]` and the per-frame `TRVMMatting`
-        (`Step(Frame, Matte)`, `ResetState`, `HiddenState(1..4)`) in
-        neuralpretrained.pas. One TNNet per (frame size, downsample_ratio):
-        frame (W, H, 3) RGB [0,1] -> (W, H, 4) clamped fgr RGB + alpha; the
-        four ConvGRU states are TNNetInput #1..#4 that `Step` refills. Pico
-        parity 1.2e-7 over 3 frames (DGF) and 2 frames (ratio 1), OpenCL vs
-        CPU 1.2e-7 (208/228 layers forced on OpenCL); the real
-        `rvm_mobilenetv3.pth` matched the official model.py to 2.9e-6 on a
-        128x96 frame at ratio 0.5 over 3 frames (one-off check, not a test).
-  - [x] examples/VideoMatting landed: mattes a frame folder (PNG/JPEG,
-        natural sort) into `<frame>_rgba.png` + `<frame>_green.png` and an
-        optional `--gif`; `--ratio` defaults to the RVM README portrait
-        column (1 up to 512 px, else 480 / longest side); a frame of another
-        size rebuilds the net and resets the state; `--gpu` OpenCL; no
-        arguments = <1 s pico smoke at ratio 0.5. Real `rvm_mobilenetv3.pth`
-        on CPU, 640x480 at ratio 0.75, one core: ~1.3-1.4 s/frame after the
-        first, 1.7 GB RSS, clean subject matte.
+      at run time and never ship it). The MobileNetV3 importer
+      (`BuildRVM[FromSafeTensors[Ex]]`, `TRVMMatting`) and examples/VideoMatting
+      are done; open:
   - [ ] Real-checkpoint run on the GPU box (`--gpu`) before README calls it
         supported.
   - [ ] ResNet-50 variant (`rvm_resnet50.pth`): needs the ResNet trunk with
@@ -645,8 +629,6 @@ rather than acted on.
                 unet/vae/scheduler configs load (the pico folder mirrors the
                 layout from memory of the real configs), time it, and compare
                 the image with diffusers.
-          - [ ] The real UNet ships as fp16 weights in many mirrors; the F16
-                loader item below applies.
           - [ ] diffusers' upscale pipeline takes a batch of images and
                 num_images_per_prompt; the conditioner takes one image.
       - [ ] SDXL: two text encoders (CLIP-L + OpenCLIP-bigG) concatenated + the
@@ -692,7 +674,8 @@ rather than acted on.
               lllyasviel/sd-controlnet-canny, TencentARC/t2iadapter_sketch_sd15v2
               and runwayml/stable-diffusion-inpainting (plus the blended mode on
               SD 1.5). The conditioners' OpenCL and int8 paths only ran on the
-              pico (CPU) so far.
+              pico (CPU) so far. These runs (and the Marigold one) also re-check
+              the UNet config head-count fix on real checkpoints.
         - [ ] T2I-Adapter on a plain DownBlock2D that has a downsampler (the
               feature goes after the downsampler, in place on the last skip):
               coded from the diffusers source, no fixture has such a block.
@@ -705,8 +688,6 @@ rather than acted on.
               test (diffusers MultiAdapter adapter_weights).
         - [ ] Real-checkpoint run of a global_pool_conditions ControlNet
               (lllyasviel/control_v11e_sd15_shuffle).
-      - [ ] Re-check the head-count fix on real ControlNet / T2I-Adapter /
-            Marigold checkpoints (all read the same UNet config parser).
       - [ ] Textual inversion on a real checkpoint: SD 1.5 with a
             sd-concepts-library learned_embeds.safetensors and an A1111 .pt
             (e.g. EasyNegative); only the pico fixture is tested.
@@ -1590,8 +1571,7 @@ rather than acted on.
       frozen CLIP dual encoder + a FiLM-conditioned transposed-conv decoder emitting a
       single-channel mask for a free-text prompt; pico parity TestCLIPSegParity < 1e-4
       vs the REAL HF CLIPSegForImageSegmentation float64 oracle; examples/CLIPSegPrompt
-      writes a binary-mask PPM; v1 = single text prompt -> one mask, inference-only,
-      use_complex_transposed_convolution = false):
+      writes a binary-mask PPM; v1 = single text prompt -> one mask, inference-only):
   - [ ] Real-checkpoint parity (CIDAS/clipseg-rd64-refined) — verify against the REAL
         HF checkpoint logits (the offline env could not download it; the pico parity
         already pins the math vs the real HF classes). Needs the ~600 MB checkpoint +
@@ -1788,19 +1768,9 @@ rather than acted on.
   Phase B — speed:
   - [ ] B1 follow-ups (B1 = OpenCL transformer step pass, int4 and int8 on the
         shared tiled OpenCL kernels, 88aad8ca..52e1d2c7, `examples/QwenImage --gpu`).
-        First GPU run (user, 2026-09-30, NVIDIA L4, tip dd2c2971, before B1d):
-        256x256 --int4, 40 steps: 2.2 s/step (CPU int4 16.4 s/step), denoise
-        91.7 s; load transformer 240.3 s (CPU int4 load 148 s); load text
-        encoder 39.8 s; VAE decode 33.3 s (CPU); peak RSS 8.8 GB. 2.2 s/step is
-        ~1.6 TFLOPS of projections, far below the L4, so host layers,
-        transfers and synchronisation dominate at 256 tokens.
-        Second GPU run (user, 2026-09-30, L4): 1024x1024 --int4, 10 steps:
-        36.3 s/step (16.5x the 256x256 step for 16x the tokens: linear, so
-        attention does not dominate; ~75 TFLOP/step, ~2 TFLOPS achieved),
-        denoise 370.4 s, VAE decode 528.2 s (CPU), load transformer 245.2 s,
-        peak RSS 10.9 GB. Superseded by the run with the VAE on OpenCL in
-        examples/QwenImage/README.md (1024x1024 --int4, 10 steps: 13.05 s/step,
-        VAE decode 35.2 s, load transformer 55.3 s, peak RSS 12.7 GB).
+        Latest L4 measurements are in examples/QwenImage/README.md (1024x1024
+        --int4, 10 steps: 13.05 s/step, VAE decode 35.2 s, load transformer
+        55.3 s, peak RSS 12.7 GB).
     - [ ] B1d1 follow-up: Non-blocking row write + a queue Finish at the end of
           TNNet.Compute when the last layer ends on the host (these writes
           are the only mid-block waits).
@@ -1839,10 +1809,8 @@ rather than acted on.
           for CPU OpenCL devices only if a --serial gap remains.
     - [ ] B2f. Big tiles / untiled decode (dims 1152/1152/1152/576/288/144,
           1.06 TFLOP per 256-px tile; 1024x1024 = 29.2 TFLOP at 256/192, 26.5
-          at 512/384, 17.0 untiled). B2f1-B2f5 are done (implicit-GEMM conv,
-          per-row bias + lazy host conv buffers, OpenCL and host output sharing
-          by liveness, the upsample fold); the planned OpenCL bytes per sized
-          net after them are ~1.3 / ~1.9 / ~4.7 GB at a 256 tile / 512 /
+          at 512/384, 17.0 untiled). The planned OpenCL bytes per sized
+          net are ~1.3 / ~1.9 / ~4.7 GB at a 256 tile / 512 /
           untiled 1024. a78b169f shares one weight copy across the tile-shape
           nets, so re-measure the time outside the nets. Untiled 1024 still
           overflows on the host (`TVolume.ReSize` integer size). In the REPL
@@ -1871,8 +1839,8 @@ rather than acted on.
           in examples/QwenImage/README.md.
   Phase C — editing and reference images (plan from source reading of
   diffusers 0.41.0.dev0 `pipeline_qwenimage21.py` / `transformer_qwenimage21.py`
-  / `autoencoder_kl_qwenimage21.py` and transformers 5.17.0 `modeling_qwen3_vl.py`;
-  C2, C2b, C1a, C1b, C3a and C3b are done, C4 remains). diffusers has
+  / `autoencoder_kl_qwenimage21.py` and transformers 5.17.0 `modeling_qwen3_vl.py`).
+  diffusers has
   one pipeline for text-to-image and editing (`image=`): no strength, no mask, no
   second-image input; masks and circles are extra input images. Condition images
   are resized with our own resize, not PIL Lanczos (accepted divergence).
