@@ -16492,6 +16492,17 @@ function RestoreFacesInImage(Detector: TNNet;
 // (softmax each 16-bin side -> expected value -> ltrb distances -> xyxy box in
 // grid units -> *stride to pixels) + NMS are a CPU post-process in
 // DecodeYoloDetections (training-only loss/anchor-assignment is omitted).
+//
+// SEGMENTATION (task "segment": ultralytics yolov8-seg and FastSAM-s/-x, which
+// are yolov8s-seg / yolov8x-seg trained on SA-1B with one class): the Segment
+// head adds, per stride, a cv4 branch (Conv3 -> Conv3 -> Conv2d(nm,+bias)) whose
+// nm mask coefficients are APPENDED to each cell, so the head becomes
+// (NumCells, 1, 4*reg_max + num_classes + num_masks); and a Proto branch on the
+// stride-8 head input (Conv3 -> ConvTranspose2d(2,s2,+bias) -> Conv3 -> Conv1)
+// giving a (ImageSize/4, ImageSize/4, num_masks) prototype map, read through
+// GetYoloProtoLayer. ComputeYoloMasks / DecodeYoloSegmentation turn kept
+// detections into masks (ultralytics 8.0 process_mask, the FastSAM default);
+// FastSAMSelectByBox / FastSAMSelectByPoint are FastSAM's box / point prompts.
 // Coded by Claude (AI).
 type
   TYoloConfig = record
@@ -16506,19 +16517,22 @@ type
     BnEps: TNeuralFloat;             // BatchNorm2d eps (ultralytics 1e-3)
     Strides: array[0..2] of integer; // 8 / 16 / 32
     ModelType: string;               // 'yolov8'
+    NumMasks: integer;               // mask coefficients (0 = detection only)
+    ProtoHidden: integer;            // Proto hidden width (ultralytics npr)
+    MaskHidden: integer;             // cv4 hidden width (ultralytics c4)
   end;
 
-// Reads a YOLOv8 config (the pico-fixture / repacked schema). Required:
-// num_classes. Optional overrides: widths (5-int), depths (2-int), reg_max (16),
-// box_hidden / cls_hidden, num_channels (3), image_size (640), bn_eps (1e-3),
-// strides ([8,16,32]), model_type ('yolov8'). Defaults reproduce yolov8n.
+// Reads a YOLOv8 config. Required: num_classes (FastSAM: 1). Optional: widths,
+// depths, reg_max, box_hidden, cls_hidden, num_channels, image_size, bn_eps,
+// strides, model_type ('yolov8' / 'fastsam'), task ('detect' / 'segment'),
+// num_masks (32), proto_hidden (4*widths[0]), mask_hidden (max(widths[2]/4,
+// num_masks)). Hidden widths default to the ultralytics rules; yolov8n otherwise.
 function ReadYoloConfigFromJSONFile(const FileName: string): TYoloConfig;
 
 function YoloConfigToString(const Config: TYoloConfig): string;
 
-// Builds the YOLOv8 detector described by Config and loads every weight from
-// Reader (caller owns Reader), folding each BatchNorm into its conv. Output:
-// (sum_i Hi*Wi, 1, 4*reg_max + num_classes) raw head (see the section comment).
+// Builds the YOLOv8 detector (or segmenter) described by Config, loading every
+// weight from Reader (caller owns it). Output: the raw head (see section comment).
 function BuildYolo(Reader: TNNetSafeTensorsReader;
   const Config: TYoloConfig; pTrainable: boolean = true): TNNet;
 
@@ -16536,6 +16550,7 @@ type
     ClassId: integer;
     Score: TNeuralFloat;
     X1, Y1, X2, Y2: TNeuralFloat;
+    CellIndex: integer;              // head row the detection came from
   end;
   TYoloDetectionArray = array of TYoloDetection;
 
@@ -16549,6 +16564,35 @@ type
 function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
   ScoreThreshold: TNeuralFloat = 0.25;
   IoUThreshold: TNeuralFloat = 0.45): TYoloDetectionArray;
+
+// The (ImageSize/4, ImageSize/4, NumMasks) Proto output layer of a segmentation
+// BuildYolo net. After an OpenCL Compute, call its ForceOutputOnRAM before reading.
+function GetYoloProtoLayer(NN: TNNet): TNNetLayer;
+
+// Masks := (ImageSize, ImageSize, Length(Dets)), channel k = mask of Dets[k]:
+// sigmoid(coefs . Proto), crop to the box at Proto scale, bilinear up, > 0.5.
+procedure ComputeYoloMasks(Head, Proto: TNNetVolume; const Config: TYoloConfig;
+  const Dets: TYoloDetectionArray; Masks: TNNetVolume; Binarize: boolean = true);
+
+// FastSAM post-NMS box step: snaps sides within BorderThreshold px of the image
+// edge to it, then boxes with IoU > FullBoxIoU vs the image become the image box.
+procedure FastSAMAdjustBoxes(var Dets: TYoloDetectionArray; ImageSize: integer;
+  BorderThreshold: TNeuralFloat = 20; FullBoxIoU: TNeuralFloat = 0.9);
+
+// Decodes a computed segmentation net: DecodeYoloDetections, FastSAMAdjustBoxes
+// when IsFastSAM, then ComputeYoloMasks into Masks. Returns the detections.
+function DecodeYoloSegmentation(NN: TNNet; const Config: TYoloConfig;
+  Masks: TNNetVolume; ScoreThreshold: TNeuralFloat = 0.25;
+  IoUThreshold: TNeuralFloat = 0.45; IsFastSAM: boolean = false): TYoloDetectionArray;
+
+// FastSAM box prompt: index of the mask (channel of Masks) with the highest
+// IoU vs the pixel box [X1,X2) x [Y1,Y2) (clamped); -1 when Masks is empty.
+function FastSAMSelectByBox(Masks: TNNetVolume; X1, Y1, X2, Y2: integer): integer;
+
+// FastSAM point prompt: masks by decreasing area; a mask under a label-1 point is
+// OR'ed into Dest (W,H,1), one under a label-0 point is erased from it.
+procedure FastSAMSelectByPoint(Masks: TNNetVolume;
+  const PointX, PointY, PointLabels: array of integer; Dest: TNNetVolume);
 
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
@@ -94174,6 +94218,7 @@ var
   ArrData: TJSONData;
   Arr: TJSONArray;
   i: integer;
+  Task: string;
 begin
   // Canonical yolov8n defaults; the pico fixture overrides widths/depths etc.
   Result.Widths[0] := 16; Result.Widths[1] := 32; Result.Widths[2] := 64;
@@ -94204,13 +94249,19 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     Result.ModelType := Obj.Get('model_type', 'yolov8');
-    if (Result.ModelType <> 'yolov8') and (Result.ModelType <> 'yolo') then
+    if (Result.ModelType <> 'yolov8') and (Result.ModelType <> 'yolo') and
+       (Result.ModelType <> 'fastsam') then
       ImportError('YOLO import: config model_type is "' + Result.ModelType +
-        '" - only "yolov8" is supported.');
-    if Obj.IndexOfName('num_classes') < 0 then
+        '" - only "yolov8" and "fastsam" are supported.');
+    if Result.ModelType = 'fastsam' then Task := Obj.Get('task', 'segment')
+    else Task := Obj.Get('task', 'detect');
+    if (Task <> 'detect') and (Task <> 'segment') then
+      ImportError('YOLO import: config task is "' + Task +
+        '" - only "detect" and "segment" are supported.');
+    if (Obj.IndexOfName('num_classes') < 0) and (Result.ModelType <> 'fastsam') then
       ImportError('YOLO import: config "' + FileName +
         '" is missing the required field "num_classes".');
-    Result.NumClasses := Obj.Get('num_classes', 0);
+    Result.NumClasses := Obj.Get('num_classes', 1);
     if Result.NumClasses <= 0 then
       ImportError('YOLO import: num_classes must be a positive integer.');
     ArrData := Obj.Find('widths');
@@ -94238,8 +94289,20 @@ begin
       for i := 0 to 2 do Result.Strides[i] := Arr.Integers[i];
     end;
     Result.RegMax := Obj.Get('reg_max', Result.RegMax);
-    Result.BoxHidden := Obj.Get('box_hidden', Result.BoxHidden);
-    Result.ClsHidden := Obj.Get('cls_hidden', Result.ClsHidden);
+    // ultralytics Detect: c2 = max(16, ch0 // 4, 4*reg_max), c3 = max(ch0,
+    // min(nc, 100)); Segment: c4 = max(ch0 // 4, nm), npr = 256 * width.
+    Result.BoxHidden := Obj.Get('box_hidden',
+      Max(Max(16, Result.Widths[2] div 4), 4 * Result.RegMax));
+    Result.ClsHidden := Obj.Get('cls_hidden',
+      Max(Result.Widths[2], Min(Result.NumClasses, 100)));
+    if Task = 'segment' then Result.NumMasks := Obj.Get('num_masks', 32)
+    else Result.NumMasks := 0;
+    Result.ProtoHidden := Obj.Get('proto_hidden', 4 * Result.Widths[0]);
+    Result.MaskHidden := Obj.Get('mask_hidden',
+      Max(Result.Widths[2] div 4, Result.NumMasks));
+    if (Task = 'segment') and ((Result.NumMasks <= 0) or
+       (Result.ProtoHidden <= 0) or (Result.MaskHidden <= 0)) then
+      ImportError('YOLO import: num_masks / proto_hidden / mask_hidden must be > 0.');
     Result.NumChannels := Obj.Get('num_channels', Result.NumChannels);
     Result.ImageSize := Obj.Get('image_size', Result.ImageSize);
     if Obj.IndexOfName('bn_eps') >= 0 then
@@ -94262,7 +94325,11 @@ begin
     '], depths=[' + IntToStr(Config.Depths[0]) + ',' +
     IntToStr(Config.Depths[1]) + '], num_classes=' +
     IntToStr(Config.NumClasses) + ', reg_max=' + IntToStr(Config.RegMax) +
-    ', image_size=' + IntToStr(Config.ImageSize) + ')';
+    ', image_size=' + IntToStr(Config.ImageSize);
+  if Config.NumMasks > 0 then
+    Result := Result + ', num_masks=' + IntToStr(Config.NumMasks) +
+      ', proto_hidden=' + IntToStr(Config.ProtoHidden);
+  Result := Result + ')';
 end;
 
 // Adds an ultralytics "Conv" module (conv2d no bias -> BN -> SiLU) and returns
@@ -94336,7 +94403,13 @@ begin
   Result := NN.GetLastLayer();
 end;
 
-// Adds an SPPF block (1x1 -> 3 chained k5 s1 maxpools kept -> concat -> 1x1).
+const
+  // SiLU >= -0.2785, so SiLU + csYoloSPPFShift > 0 and the zero padding of
+  // TNNetMaxPoolPortable acts as torch's -inf padding.
+  csYoloSPPFShift = 0.5;
+
+// Adds an SPPF block (1x1 -> 3 chained k5 s1 maxpools kept -> concat -> 1x1) on
+// the shifted cv1 output; YoloUnshiftSPPF folds the shift into cv2's bias.
 function YoloAddSPPF(NN: TNNet; var Refs: TYoloConvRefArray;
   cin, cout: integer; const Prefix: string): TNNetLayer;
 var
@@ -94346,7 +94419,7 @@ begin
   cmid := cin div 2;
   cv1 := YoloAddConv(NN, cmid, 1, 1);
   YoloPushConv(Refs, cv1, cin, 1, Prefix + '.cv1');
-  cv1 := NN.GetLastLayer();   // SiLU output
+  cv1 := NN.AddLayer(TNNetAddConstant.Create(csYoloSPPFShift));
   P1 := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(5, 1, 2), cv1);
   P2 := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(5, 1, 2), P1);
   P3 := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(5, 1, 2), P2);
@@ -94358,6 +94431,29 @@ begin
   Result := NN.GetLastLayer();
 end;
 
+// Subtracts csYoloSPPFShift * sum(weights) from each bias of the loaded SPPF cv2.
+procedure YoloUnshiftSPPF(Conv: TNNetLayer);
+var
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  MaxNeuronPos := Conv.Neurons.Count - 1;
+  for NeuronPos := 0 to MaxNeuronPos do
+    Conv.Neurons[NeuronPos].BiasWeight := Conv.Neurons[NeuronPos].BiasWeight -
+      csYoloSPPFShift * Conv.Neurons[NeuronPos].Weights.GetSum();
+  Conv.FlushWeightCache();
+end;
+
+// Adds an ultralytics "Conv" (conv + folded BN + SiLU) after Prev and records it.
+function YoloAddConvAfter(NN: TNNet; var Refs: TYoloConvRefArray;
+  Prev: TNNetLayer; InCh, OutCh, K, Stride: integer; const Name: string;
+  pTrainable: boolean): TNNetLayer;
+begin
+  Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(OutCh, K, K div 2,
+    Stride, 0).SetTrainable(pTrainable), Prev);
+  YoloPushConv(Refs, Result, InCh, K, Name);
+  Result := NN.AddLayer(TNNetSiLU.Create());
+end;
+
 function BuildYolo(Reader: TNNetSafeTensorsReader;
   const Config: TYoloConfig; pTrainable: boolean): TNNet;
 var
@@ -94365,12 +94461,13 @@ var
   Refs: TYoloConvRefArray;
   i, OutDim, TotalCells, ci: integer;
   HiRefs: integer;
-  w0, w1, w2, w3, w4, d0, d1, nc, rm, cb, cc: integer;
+  w0, w1, w2, w3, w4, d0, d1, nc, rm, cb, cc, nm, npr, c4: integer;
   HeadCh: array[0..2] of integer;
   HeadIn: array[0..2] of TNNetLayer;
   StrideTok: array[0..2] of TNNetLayer;
-  P3, P4, P5, N4, H3, H4, H5, T, U, Cat, BoxC, ClsC: TNNetLayer;
-  BoxConv, ClsConv: array[0..2] of array[0..2] of TNNetLayer;
+  P3, P4, P5, N4, H3, H4, H5, T, U, Cat, BoxC, ClsC, MaskC: TNNetLayer;
+  SPPFOut, ProtoUp: TNNetLayer;
+  BoxConv, ClsConv, MaskConv: array[0..2] of array[0..2] of TNNetLayer;
   Pref: string;
 begin
   w0 := Config.Widths[0]; w1 := Config.Widths[1]; w2 := Config.Widths[2];
@@ -94378,7 +94475,9 @@ begin
   d0 := Config.Depths[0]; d1 := Config.Depths[1];
   nc := Config.NumClasses; rm := Config.RegMax;
   cb := Config.BoxHidden; cc := Config.ClsHidden;
-  OutDim := 4 * rm + nc;
+  nm := Config.NumMasks; npr := Config.ProtoHidden; c4 := Config.MaskHidden;
+  OutDim := 4 * rm + nc + nm;
+  ProtoUp := nil;
   SetLength(Refs, 0);
   NN := TNNet.Create();
   try
@@ -94396,6 +94495,7 @@ begin
     T := YoloAddConv(NN, w4, 3, 2); YoloPushConv(Refs, T, w3, 3, 'model.7');
     YoloAddC2f(NN, Refs, w4, w4, d0, True, 'model.8');
     P5 := YoloAddSPPF(NN, Refs, w4, w4, 'model.9');              // /32
+    SPPFOut := Refs[High(Refs)].Conv;
     // neck: top-down
     U := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), P5);       // 2x nearest
     Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P4]));
@@ -94414,6 +94514,18 @@ begin
     T := NN.GetLastLayer();
     Cat := NN.AddLayer(TNNetDeepConcat.Create([T, P5]));
     H5 := YoloAddC2f(NN, Refs, w3 + w4, w4, d0, False, 'model.21');  // head /32
+    // -------------------- Segment Proto (stride 4) --------------------
+    if nm > 0 then
+    begin
+      T := YoloAddConvAfter(NN, Refs, H3, w2, npr, 3, 1, 'model.22.proto.cv1',
+        pTrainable);
+      ProtoUp := NN.AddLayer(TNNetDeconvolutionLinear.Create(npr, 2, 2, 0, 0).
+        SetTrainable(pTrainable));
+      T := YoloAddConvAfter(NN, Refs, ProtoUp, npr, npr, 3, 1,
+        'model.22.proto.cv2', pTrainable);
+      YoloAddConvAfter(NN, Refs, T, npr, nm, 1, 1, 'model.22.proto.cv3',
+        pTrainable);
+    end;
     // -------------------- Detect head --------------------
     HeadIn[0] := H3; HeadIn[1] := H4; HeadIn[2] := H5;
     HeadCh[0] := w2; HeadCh[1] := w3; HeadCh[2] := w4;
@@ -94442,8 +94554,20 @@ begin
       NN.AddLayer(TNNetSiLU.Create());
       ClsConv[i][2] := NN.AddLayer(TNNetConvolutionLinear.Create(nc, 1, 0, 1, 0).SetTrainable(pTrainable));
       ClsC := NN.GetLastLayer();
-      // per-cell channel layout = [box(4*rm), cls(nc)]
-      Cat := NN.AddLayer(TNNetDeepConcat.Create([BoxC, ClsC]));
+      // per-cell channel layout = [box(4*rm), cls(nc)] (+ mask coefs(nm))
+      if nm > 0 then
+      begin
+        T := YoloAddConvAfter(NN, Refs, HeadIn[i], ci, c4, 3, 1,
+          Pref + '.cv4.' + IntToStr(i) + '.0', pTrainable);
+        YoloAddConvAfter(NN, Refs, T, c4, c4, 3, 1,
+          Pref + '.cv4.' + IntToStr(i) + '.1', pTrainable);
+        MaskConv[i][2] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(nm, 1, 0, 1, 0).SetTrainable(pTrainable));
+        MaskC := NN.GetLastLayer();
+        Cat := NN.AddLayer(TNNetDeepConcat.Create([BoxC, ClsC, MaskC]));
+      end
+      else
+        Cat := NN.AddLayer(TNNetDeepConcat.Create([BoxC, ClsC]));
       // flatten (H,W,OutDim) -> (H*W,1,OutDim), row-major (depth-fastest layout)
       StrideTok[i] := NN.AddLayer(
         TNNetReshape.Create(Cat.Output.SizeX * Cat.Output.SizeY, 1, OutDim));
@@ -94471,7 +94595,15 @@ begin
       LoadMobileNetSEConv(Reader, ClsConv[i][2],
         'model.22.cv3.' + IntToStr(i) + '.2.weight',
         'model.22.cv3.' + IntToStr(i) + '.2.bias', nc, cc);
+      if nm > 0 then
+        LoadMobileNetSEConv(Reader, MaskConv[i][2],
+          'model.22.cv4.' + IntToStr(i) + '.2.weight',
+          'model.22.cv4.' + IntToStr(i) + '.2.bias', nm, c4);
     end;
+    YoloUnshiftSPPF(SPPFOut);
+    if nm > 0 then
+      LoadConvTranspose2DFoldBN(Reader, ProtoUp, 'model.22.proto.upsample.weight',
+        'model.22.proto.upsample.bias', npr, npr, 2);
     if not pTrainable then NN.SetTrainable();
     Result := NN;
   except
@@ -94595,6 +94727,7 @@ begin
           Cand[Cnt].Y1 := (Cy - Tp) * Stride;
           Cand[Cnt].X2 := (Cx + R) * Stride;
           Cand[Cnt].Y2 := (Cy + Bp) * Stride;
+          Cand[Cnt].CellIndex := Cell;
           Inc(Cnt);
         end;
         Inc(Cell);
@@ -94621,6 +94754,223 @@ begin
   KeptIdxHi := High(KeptIdx);
   for k := 0 to KeptIdxHi do
     Result[k] := Cand[KeptIdx[k]];
+end;
+
+function GetYoloProtoLayer(NN: TNNet): TNNetLayer;
+var
+  LayerPos: integer;
+begin
+  Result := nil;
+  // BuildYolo adds Deconv -> Conv -> SiLU -> Conv -> SiLU for the Proto.
+  for LayerPos := NN.CountLayers() - 1 downto 0 do
+    if NN.Layers[LayerPos] is TNNetDeconvolutionLinear then
+    begin
+      if LayerPos + 4 < NN.CountLayers() then Result := NN.Layers[LayerPos + 4];
+      break;
+    end;
+  if Result = nil then
+    raise Exception.Create('GetYoloProtoLayer: NN is not a segmentation BuildYolo net.');
+end;
+
+procedure ComputeYoloMasks(Head, Proto: TNNetVolume; const Config: TYoloConfig;
+  const Dets: TYoloDetectionArray; Masks: TNNetVolume; Binarize: boolean);
+var
+  Coefs, LowRes: TNNetVolume;
+  NumMasks, DetCnt, MaxDetPos, DetPos, CoefOfs, ProtoW, ProtoH: integer;
+  X, Y, MaxX, MaxY, PixelBase, MaxValuePos, ValuePos: integer;
+  RatioX, RatioY: TNeuralFloat;
+  BoxX1, BoxY1, BoxX2, BoxY2: TNeuralFloatDynArr;
+begin
+  NumMasks := Config.NumMasks;
+  if NumMasks <= 0 then
+    raise Exception.Create('ComputeYoloMasks: Config has no mask coefficients.');
+  if Head.Depth <> 4 * Config.RegMax + Config.NumClasses + NumMasks then
+    raise Exception.Create('ComputeYoloMasks: Head depth does not match Config.');
+  DetCnt := Length(Dets);
+  Masks.ReSize(Config.ImageSize, Config.ImageSize, DetCnt);
+  if DetCnt = 0 then Exit;
+  MaxDetPos := DetCnt - 1;
+  ProtoW := Proto.SizeX; ProtoH := Proto.SizeY;
+  CoefOfs := 4 * Config.RegMax + Config.NumClasses;
+  RatioX := ProtoW / Config.ImageSize;
+  RatioY := ProtoH / Config.ImageSize;
+  SetLength(BoxX1, DetCnt); SetLength(BoxY1, DetCnt);
+  SetLength(BoxX2, DetCnt); SetLength(BoxY2, DetCnt);
+  Coefs := TNNetVolume.Create(NumMasks * DetCnt, 1, 1);
+  LowRes := TNNetVolume.Create(ProtoW, ProtoH, DetCnt);
+  try
+    for DetPos := 0 to MaxDetPos do
+    begin
+      Move(Head.FData[Head.GetRawPos(Dets[DetPos].CellIndex, 0, CoefOfs)],
+        Coefs.FData[DetPos * NumMasks], NumMasks * csNeuralFloatSize);
+      BoxX1[DetPos] := Dets[DetPos].X1 * RatioX;
+      BoxY1[DetPos] := Dets[DetPos].Y1 * RatioY;
+      BoxX2[DetPos] := Dets[DetPos].X2 * RatioX;
+      BoxY2[DetPos] := Dets[DetPos].Y2 * RatioY;
+    end;
+    // LowRes[x, y, k] = coefs[k] . Proto[x, y, :]
+    LowRes.DotProducts(DetCnt, ProtoW * ProtoH, NumMasks, Coefs, Proto);
+    TNNetVolume.Sigmoid(LowRes.GetRawPtr(0), LowRes.GetRawPtr(0), LowRes.Size);
+    // ultralytics crop_mask: keep x1 <= x < x2, y1 <= y < y2 at Proto scale.
+    MaxX := ProtoW - 1; MaxY := ProtoH - 1;
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+      begin
+        PixelBase := LowRes.GetRawPos(X, Y, 0);
+        for DetPos := 0 to MaxDetPos do
+          if (X < BoxX1[DetPos]) or (X >= BoxX2[DetPos]) or
+             (Y < BoxY1[DetPos]) or (Y >= BoxY2[DetPos]) then
+            LowRes.FData[PixelBase + DetPos] := 0;
+      end;
+    InterpolateVolume2D(LowRes, Masks, Config.ImageSize, Config.ImageSize,
+      {bilinear}1, {AlignCorners}0);
+    if Binarize then
+    begin
+      MaxValuePos := Masks.Size - 1;
+      for ValuePos := 0 to MaxValuePos do
+        if Masks.FData[ValuePos] > 0.5 then Masks.FData[ValuePos] := 1
+        else Masks.FData[ValuePos] := 0;
+    end;
+  finally
+    LowRes.Free;
+    Coefs.Free;
+  end;
+end;
+
+procedure FastSAMAdjustBoxes(var Dets: TYoloDetectionArray; ImageSize: integer;
+  BorderThreshold: TNeuralFloat; FullBoxIoU: TNeuralFloat);
+var
+  DetPos, MaxDetPos: integer;
+  FarEdge: TNeuralFloat;
+begin
+  MaxDetPos := High(Dets);
+  FarEdge := ImageSize - BorderThreshold;
+  for DetPos := 0 to MaxDetPos do
+  begin
+    if Dets[DetPos].X1 < BorderThreshold then Dets[DetPos].X1 := 0;
+    if Dets[DetPos].Y1 < BorderThreshold then Dets[DetPos].Y1 := 0;
+    if Dets[DetPos].X2 > FarEdge then Dets[DetPos].X2 := ImageSize;
+    if Dets[DetPos].Y2 > FarEdge then Dets[DetPos].Y2 := ImageSize;
+    if NeuralBoxIoU(0, 0, ImageSize, ImageSize, Dets[DetPos].X1,
+       Dets[DetPos].Y1, Dets[DetPos].X2, Dets[DetPos].Y2) > FullBoxIoU then
+    begin
+      Dets[DetPos].X1 := 0; Dets[DetPos].Y1 := 0;
+      Dets[DetPos].X2 := ImageSize; Dets[DetPos].Y2 := ImageSize;
+      Dets[DetPos].ClassId := 0;
+    end;
+  end;
+end;
+
+function DecodeYoloSegmentation(NN: TNNet; const Config: TYoloConfig;
+  Masks: TNNetVolume; ScoreThreshold: TNeuralFloat;
+  IoUThreshold: TNeuralFloat; IsFastSAM: boolean): TYoloDetectionArray;
+var
+  ProtoLayer: TNNetLayer;
+begin
+  ProtoLayer := GetYoloProtoLayer(NN);
+  ProtoLayer.ForceOutputOnRAM();
+  Result := DecodeYoloDetections(NN.GetLastLayer().Output, Config,
+    ScoreThreshold, IoUThreshold);
+  if IsFastSAM then FastSAMAdjustBoxes(Result, Config.ImageSize);
+  ComputeYoloMasks(NN.GetLastLayer().Output, ProtoLayer.Output, Config, Result,
+    Masks);
+end;
+
+function FastSAMSelectByBox(Masks: TNNetVolume; X1, Y1, X2, Y2: integer): integer;
+var
+  Inside, Total: TNeuralFloatDynArr;
+  MaskCnt, MaxMaskPos, MaskPos, X, Y, MaxX, MaxY, PixelBase: integer;
+  BoxArea, Union, IoU, BestIoU: TNeuralFloat;
+  IsInBox: boolean;
+begin
+  Result := -1;
+  MaskCnt := Masks.Depth;
+  if (MaskCnt = 0) or (Masks.Size = 0) then Exit;
+  X1 := Max(X1, 0); Y1 := Max(Y1, 0);
+  X2 := Min(X2, Masks.SizeX); Y2 := Min(Y2, Masks.SizeY);
+  BoxArea := (Y2 - Y1) * (X2 - X1);
+  MaxMaskPos := MaskCnt - 1;
+  SetLength(Inside, MaskCnt); SetLength(Total, MaskCnt);
+  for MaskPos := 0 to MaxMaskPos do
+  begin
+    Inside[MaskPos] := 0; Total[MaskPos] := 0;
+  end;
+  MaxX := Masks.SizeX - 1; MaxY := Masks.SizeY - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      PixelBase := Masks.GetRawPos(X, Y, 0);
+      IsInBox := (X >= X1) and (X < X2) and (Y >= Y1) and (Y < Y2);
+      for MaskPos := 0 to MaxMaskPos do
+      begin
+        Total[MaskPos] := Total[MaskPos] + Masks.FData[PixelBase + MaskPos];
+        if IsInBox then
+          Inside[MaskPos] := Inside[MaskPos] + Masks.FData[PixelBase + MaskPos];
+      end;
+    end;
+  BestIoU := -1;
+  for MaskPos := 0 to MaxMaskPos do
+  begin
+    Union := BoxArea + Total[MaskPos] - Inside[MaskPos];
+    if Union > 0 then IoU := Inside[MaskPos] / Union else IoU := 0;
+    if IoU > BestIoU then
+    begin
+      BestIoU := IoU;
+      Result := MaskPos;
+    end;
+  end;
+end;
+
+procedure FastSAMSelectByPoint(Masks: TNNetVolume;
+  const PointX, PointY, PointLabels: array of integer; Dest: TNNetVolume);
+var
+  Area: TNeuralFloatDynArr;
+  Order: TNeuralIntegerArray;
+  MaskCnt, MaxMaskPos, MaskPos, OrderPos, SortPos, MaskIdx, PointPos: integer;
+  MaxPointPos, PixelPos, MaxPixelPos, X, Y, MaxX, MaxY: integer;
+  PixelCnt: integer;
+begin
+  Dest.ReSize(Masks.SizeX, Masks.SizeY, 1);
+  Dest.Fill(0);
+  MaskCnt := Masks.Depth;
+  if (MaskCnt = 0) or (Masks.Size = 0) then Exit;
+  MaxMaskPos := MaskCnt - 1;
+  PixelCnt := Masks.SizeX * Masks.SizeY;
+  MaxPixelPos := PixelCnt - 1;
+  SetLength(Area, MaskCnt);
+  SetLength(Order, MaskCnt);
+  for MaskPos := 0 to MaxMaskPos do Area[MaskPos] := 0;
+  for PixelPos := 0 to MaxPixelPos do
+    for MaskPos := 0 to MaxMaskPos do
+      Area[MaskPos] := Area[MaskPos] + Masks.FData[PixelPos * MaskCnt + MaskPos];
+  // Stable insertion sort by descending area (python sorted(reverse=True)).
+  for OrderPos := 0 to MaxMaskPos do
+  begin
+    SortPos := OrderPos;
+    while (SortPos > 0) and (Area[Order[SortPos - 1]] < Area[OrderPos]) do
+    begin
+      Order[SortPos] := Order[SortPos - 1];
+      Dec(SortPos);
+    end;
+    Order[SortPos] := OrderPos;
+  end;
+  MaxPointPos := Min(High(PointX), Min(High(PointY), High(PointLabels)));
+  MaxX := Masks.SizeX - 1; MaxY := Masks.SizeY - 1;
+  for OrderPos := 0 to MaxMaskPos do
+  begin
+    MaskIdx := Order[OrderPos];
+    for PointPos := 0 to MaxPointPos do
+    begin
+      X := PointX[PointPos]; Y := PointY[PointPos];
+      if (X < 0) or (Y < 0) or (X > MaxX) or (Y > MaxY) or
+         (Masks[X, Y, MaskIdx] <= 0.5) or
+         ((PointLabels[PointPos] <> 0) and (PointLabels[PointPos] <> 1)) then
+        Continue;
+      for PixelPos := 0 to MaxPixelPos do
+        if Masks.FData[PixelPos * MaskCnt + MaskIdx] > 0.5 then
+          Dest.FData[PixelPos] := PointLabels[PointPos];
+    end;
+  end;
 end;
 
 function BuildDPTFromSafeTensorsEx(const FileName: string;

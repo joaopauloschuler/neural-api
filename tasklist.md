@@ -270,16 +270,31 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [ ] FastSAM real-time segment-anything importer (`BuildFastSAMFromSafeTensors[Ex]`,
-      ultralytics FastSAM-s / FastSAM-x). Architecturally distinct from the landed
-      ViT-encoder SAM path: FastSAM reframes "segment everything" as a YOLOv8
-      instance-segmentation backbone (CSP/C2f conv stages + a prototype-mask head)
-      followed by a CLIP-text or point/box prompt-selection step over the emitted
-      masks — no heavy image encoder, so it runs interactively on CPU. v1 scope:
-      the YOLOv8-seg backbone + proto-mask head producing the full mask set on a
-      fixed input, reusing the landed conv/SPPF building blocks; the CLIP-prompt
-      mask ranking as a follow-up. Pico-fixture parity < 1e-4 on the proto-mask
-      logits vs a float64 reference.
+- [ ] FastSAM real-time segment-anything importer (ultralytics FastSAM-s /
+      FastSAM-x = yolov8s-seg / yolov8x-seg, one class), built on the YOLOv8
+      importer as `"task": "segment"` / `model_type` `fastsam`.
+      - [X] Segment head in `BuildYolo`: per-stride `cv4` mask coefficients
+            appended to each head cell + the `Proto` branch (stride-4 map,
+            `GetYoloProtoLayer`); ultralytics key names; head widths derived
+            from the ultralytics rules so FastSAM-s / -x configs only need
+            widths/depths (`TestYoloSegConfigDefaults`).
+      - [X] `ComputeYoloMasks` / `DecodeYoloSegmentation` (ultralytics 8.0
+            `process_mask`, FastSAM's border-snap / full-box step
+            `FastSAMAdjustBoxes`), `FastSAMSelectByBox` / `FastSAMSelectByPoint`.
+      - [X] Pico fixture `tools/yolo_tiny_fixture.py --seg`: `TestYoloSegParity`
+            (head 8e-7, proto 4e-6, soft masks 1.4e-6, binary masks identical),
+            `TestFastSAMPromptSelection`, `TestYoloSegOpenCLParity`.
+      - [X] SPPF fix: torch pads its maxpool with -inf, `TNNetMaxPoolPortable`
+            with 0; `BuildYolo` now shifts the SPPF input by +0.5 and folds the
+            shift into cv2's bias (the detect fixture moved by 2e-3).
+      - [X] examples/FastSAM (segment everything, `--box`, `--point`, `--gpu`).
+      - [ ] Real-checkpoint run: FastSAM-s.pt / FastSAM-x.pt converted to
+            safetensors on the user's box (config rows in
+            examples/FastSAM/README.md); check masks against ultralytics.
+      - [ ] Retina-mask path (`retina_masks=True`, FastSAM's CLI default:
+            upsample to the image, then crop) and the `max_det` 300 cap.
+      - [ ] CLIP text prompt (`text_prompt`: crop each mask's box, CLIP
+            image/text similarity, argmax).
 
 - [ ] Marigold diffusion depth / surface normals follow-ups (`TMarigoldPipeline`
       in neuralpretrained.pas + `examples/MarigoldDepth`, dc2979d4; checkpoints

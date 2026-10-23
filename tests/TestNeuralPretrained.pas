@@ -1271,6 +1271,10 @@ type
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloObjectDetectionParity;
     procedure TestYoloDetectionDecode;
+    procedure TestYoloSegConfigDefaults;
+    procedure TestYoloSegParity;
+    procedure TestFastSAMPromptSelection;
+    procedure TestYoloSegOpenCLParity;
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
     procedure TestOwlViTDetectionDecode;
@@ -56129,6 +56133,241 @@ begin
   RunRetinaFaceOpenCLParity('tiny_retinaface_mobilenet', 'odd');
   RunRetinaFaceOpenCLParity('tiny_retinaface_resnet50', 'odd');
 end;
+
+// A FastSAM-x config with only widths/depths derives the ultralytics head widths.
+procedure TTestNeuralPretrained.TestYoloSegConfigDefaults;
+var
+  Config: TYoloConfig;
+  Lines: TStringList;
+  CfgPath: string;
+begin
+  CfgPath := GetTempDir + 'cai_fastsam_x_config.json';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := '{"model_type": "fastsam", "widths": [80, 160, 320, 640, 640],' +
+      ' "depths": [3, 6], "image_size": 1024}';
+    Lines.SaveToFile(CfgPath);
+    Config := ReadYoloConfigFromJSONFile(CfgPath);
+  finally
+    Lines.Free;
+    DeleteFile(CfgPath);
+  end;
+  AssertEquals('num_classes', 1, Config.NumClasses);
+  AssertEquals('num_masks', 32, Config.NumMasks);
+  AssertEquals('proto_hidden = 256 * 1.25', 320, Config.ProtoHidden);
+  AssertEquals('mask_hidden = max(320/4, 32)', 80, Config.MaskHidden);
+  AssertEquals('box_hidden = max(16, 80, 64)', 80, Config.BoxHidden);
+  AssertEquals('cls_hidden = max(320, 1)', 320, Config.ClsHidden);
+  Config := ReadYoloConfigFromJSONFile(FixturePath('tiny_yolo_seg_config.json'));
+  AssertEquals('pico num_masks', 4, Config.NumMasks);
+  AssertEquals('pico mask_hidden', 4, Config.MaskHidden);
+  Config := ReadYoloConfigFromJSONFile(FixturePath('tiny_yolo_config.json'));
+  AssertEquals('detect config has no masks', 0, Config.NumMasks);
+end;
+
+// Pico YOLOv8-seg / FastSAM (tools/yolo_tiny_fixture.py --seg) vs the float64
+// oracle: raw head (box, class, mask coefs) and Proto < 1e-4, NMS + FastSAM box
+// step, soft masks < 1e-4, binary masks equal away from the 0.5 threshold.
+procedure TTestNeuralPretrained.TestYoloSegParity;
+var
+  NN: TNNet;
+  Config: TYoloConfig;
+  IO: TNNetSafeTensorsReader;
+  Img, RefHead, RefProto, RefBoxes, RefScores, RefCells, RefSoft: TNNetVolume;
+  Head, Proto, Masks, SoftMasks, Thresholds: TNNetVolume;
+  Dets: TYoloDetectionArray;
+  HeadDiff, ProtoDiff, BoxDiff, SoftDiff: double;
+  DetPos, ValuePos, Mismatches, Ambiguous: integer;
+  RefBit: boolean;
+begin
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_yolo_seg_io.safetensors'));
+  Img := TNNetVolume.Create; RefHead := TNNetVolume.Create;
+  RefProto := TNNetVolume.Create; RefBoxes := TNNetVolume.Create;
+  RefScores := TNNetVolume.Create; RefCells := TNNetVolume.Create;
+  RefSoft := TNNetVolume.Create; Masks := TNNetVolume.Create;
+  SoftMasks := TNNetVolume.Create; Thresholds := TNNetVolume.Create;
+  NN := nil;
+  try
+    NN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo_seg.safetensors'),
+      Config, {pTrainable=}false, FixturePath('tiny_yolo_seg_config.json'));
+    LoadDDColorTorchImage(IO, 'input', Img);
+    LoadDDColorTorchImage(IO, 'proto', RefProto);
+    LoadDDColorTorchImage(IO, 'soft_masks', RefSoft);
+    IO.LoadTensorFlat('head', RefHead);
+    IO.LoadTensorFlat('det_boxes', RefBoxes);
+    IO.LoadTensorFlat('det_scores', RefScores);
+    IO.LoadTensorFlat('det_cells', RefCells);
+    NN.Compute(Img);
+    Head := NN.GetLastLayer().Output;
+    Proto := GetYoloProtoLayer(NN).Output;
+    AssertEquals('head depth', 4 * Config.RegMax + Config.NumClasses +
+      Config.NumMasks, Head.Depth);
+    AssertEquals('head size', RefHead.Size, Head.Size);
+    HeadDiff := 0;
+    for ValuePos := 0 to Head.Size - 1 do
+      HeadDiff := Max(HeadDiff, Abs(Head.FData[ValuePos] - RefHead.FData[ValuePos]));
+    ProtoDiff := MaxAbsVolumeDiff(Proto, RefProto);
+    IO.LoadTensorFlat('conf', Thresholds);
+    IO.LoadTensorFlat('iou', SoftMasks);
+    Dets := DecodeYoloSegmentation(NN, Config, Masks, Thresholds.FData[0],
+      SoftMasks.FData[0], {IsFastSAM=}true);
+    AssertEquals('detection count', RefScores.Size, Length(Dets));
+    BoxDiff := 0;
+    for DetPos := 0 to High(Dets) do
+    begin
+      AssertEquals('cell of det ' + IntToStr(DetPos),
+        Round(RefCells.FData[DetPos]), Dets[DetPos].CellIndex);
+      BoxDiff := Max(BoxDiff, Abs(Dets[DetPos].X1 - RefBoxes.FData[DetPos * 4]));
+      BoxDiff := Max(BoxDiff, Abs(Dets[DetPos].Y1 - RefBoxes.FData[DetPos * 4 + 1]));
+      BoxDiff := Max(BoxDiff, Abs(Dets[DetPos].X2 - RefBoxes.FData[DetPos * 4 + 2]));
+      BoxDiff := Max(BoxDiff, Abs(Dets[DetPos].Y2 - RefBoxes.FData[DetPos * 4 + 3]));
+      AssertTrue('score of det ' + IntToStr(DetPos),
+        Abs(Dets[DetPos].Score - RefScores.FData[DetPos]) < 1e-5);
+    end;
+    ComputeYoloMasks(Head, Proto, Config, Dets, SoftMasks, {Binarize=}false);
+    SoftDiff := MaxAbsVolumeDiff(SoftMasks, RefSoft);
+    Mismatches := 0; Ambiguous := 0;
+    for ValuePos := 0 to Masks.Size - 1 do
+    begin
+      RefBit := RefSoft.FData[ValuePos] > 0.5;
+      if Abs(RefSoft.FData[ValuePos] - 0.5) < 1e-4 then Inc(Ambiguous)
+      else if RefBit <> (Masks.FData[ValuePos] > 0.5) then Inc(Mismatches);
+    end;
+    WriteLn('  YOLO-seg head max|diff| = ', HeadDiff:0:9, ', proto ', ProtoDiff:0:9,
+      ', boxes ', BoxDiff:0:9, ', soft masks ', SoftDiff:0:9, ', mask pixel ',
+      'mismatches ', Mismatches, ' (', Ambiguous, ' within 1e-4 of 0.5 skipped)');
+    AssertTrue('head max |diff| ' + FloatToStr(HeadDiff), HeadDiff < 1e-4);
+    AssertTrue('proto max |diff| ' + FloatToStr(ProtoDiff), ProtoDiff < 1e-4);
+    AssertTrue('box max |diff| ' + FloatToStr(BoxDiff), BoxDiff < 1e-3);
+    AssertTrue('soft mask max |diff| ' + FloatToStr(SoftDiff), SoftDiff < 1e-4);
+    AssertEquals('binary mask mismatches', 0, Mismatches);
+  finally
+    NN.Free; Thresholds.Free; SoftMasks.Free; Masks.Free; RefSoft.Free; RefCells.Free;
+    RefScores.Free; RefBoxes.Free; RefProto.Free; RefHead.Free; Img.Free;
+    IO.Free;
+  end;
+end;
+
+// FastSAM prompt.py box / point selection and the post-NMS box step on
+// hand-made masks.
+procedure TTestNeuralPretrained.TestFastSAMPromptSelection;
+var
+  Masks, Dest: TNNetVolume;
+  Dets: TYoloDetectionArray;
+  X, Y: integer;
+begin
+  // mask 0: left half (x < 4); mask 1: 2x2 square at (5..6, 5..6);
+  // mask 2: everything.
+  Masks := TNNetVolume.Create(8, 8, 3);
+  Dest := TNNetVolume.Create;
+  try
+    for Y := 0 to 7 do
+      for X := 0 to 7 do
+      begin
+        if X < 4 then Masks[X, Y, 0] := 1;
+        if (X in [5, 6]) and (Y in [5, 6]) then Masks[X, Y, 1] := 1;
+        Masks[X, Y, 2] := 1;
+      end;
+    AssertEquals('box on the square', 1, FastSAMSelectByBox(Masks, 5, 5, 7, 7));
+    AssertEquals('box on the left half', 0, FastSAMSelectByBox(Masks, 0, 0, 4, 8));
+    AssertEquals('clamped full box', 2, FastSAMSelectByBox(Masks, -3, -3, 20, 20));
+    // positive point in the square: the full mask (largest) then the square.
+    FastSAMSelectByPoint(Masks, [5], [5], [1], Dest);
+    AssertEquals('positive point selects all 64', 64, Round(Dest.GetSum()));
+    // positive (1,1), negative (6,6): the full mask holds both, so it is set
+    // then erased; the left half is set; the square is erased (not in it).
+    FastSAMSelectByPoint(Masks, [1, 6], [1, 6], [1, 0], Dest);
+    AssertEquals('left half survives', 32, Round(Dest.GetSum()));
+    AssertEquals('positive pixel', 1, Round(Dest[1, 1, 0]));
+    AssertEquals('erased pixel', 0, Round(Dest[6, 6, 0]));
+    // FastSAMAdjustBoxes: snap to the border, then the near-full box is replaced.
+    SetLength(Dets, 2);
+    Dets[0].X1 := 10; Dets[0].Y1 := 30; Dets[0].X2 := 50; Dets[0].Y2 := 985;
+    Dets[0].ClassId := 0;
+    // after the snap (0, 0, 1000, 930): IoU 0.93 vs the image -> full box.
+    Dets[1].X1 := 3; Dets[1].Y1 := 2; Dets[1].X2 := 990; Dets[1].Y2 := 930;
+    Dets[1].ClassId := 2;
+    FastSAMAdjustBoxes(Dets, 1000);
+    AssertEquals('snapped x1', 0, Dets[0].X1, 1e-6);
+    AssertEquals('kept y1', 30, Dets[0].Y1, 1e-6);
+    AssertEquals('kept x2', 50, Dets[0].X2, 1e-6);
+    AssertEquals('snapped y2', 1000, Dets[0].Y2, 1e-6);
+    AssertEquals('full box y2', 1000, Dets[1].Y2, 1e-6);
+    AssertEquals('full box class', 0, Dets[1].ClassId);
+  finally
+    Dest.Free;
+    Masks.Free;
+  end;
+end;
+
+// The pico YOLOv8-seg head and Proto map: OpenCL vs CPU < 1e-4.
+procedure TTestNeuralPretrained.TestYoloSegOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TYoloConfig;
+  OnOpenCL, OnHost: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Img, ProtoCL: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, OpenCLLayerCnt: integer;
+  HeadDiff, ProtoDiff: double;
+  Forced: boolean;
+  ProtoLayer: TNNetLayer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_yolo_seg_io.safetensors'));
+  Img := TNNetVolume.Create;
+  ProtoCL := TNNetVolume.Create;
+  OnHost := nil;
+  OnOpenCL := nil;
+  try
+    LoadDDColorTorchImage(IO, 'input', Img);
+    OnHost := BuildYoloFromSafeTensors(FixturePath('tiny_yolo_seg.safetensors'),
+      Config, false, FixturePath('tiny_yolo_seg_config.json'));
+    OnOpenCL := BuildYoloFromSafeTensors(FixturePath('tiny_yolo_seg.safetensors'),
+      Config, false, FixturePath('tiny_yolo_seg_config.json'));
+    OnOpenCL.EnableOpenCL(PlatformId, DeviceId);
+    OnHost.Compute(Img);
+    ProtoLayer := GetYoloProtoLayer(OnOpenCL);
+    HeadDiff := 0; ProtoDiff := 0;
+    for Forced := false to true do
+    begin
+      OnOpenCL.ForceOpenCL(Forced);
+      OnOpenCL.Compute(Img);
+      ProtoLayer.ForceOutputOnRAM();
+      ProtoCL.Copy(ProtoLayer.Output);
+      HeadDiff := Max(HeadDiff, MaxAbsVolumeDiff(OnOpenCL.GetLastLayer().Output,
+        OnHost.GetLastLayer().Output));
+      ProtoDiff := Max(ProtoDiff, MaxAbsVolumeDiff(ProtoCL,
+        GetYoloProtoLayer(OnHost).Output));
+    end;
+    OpenCLLayerCnt := 0;
+    for LayerPos := 0 to OnOpenCL.CountLayers() - 1 do
+      if OnOpenCL.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+    WriteLn('  YOLO-seg OpenCL head max|diff| = ', HeadDiff:0:9, ', proto ',
+      ProtoDiff:0:9, ', layers on OpenCL: ', OpenCLLayerCnt, ' of ',
+      OnOpenCL.CountLayers());
+    AssertTrue('some layers run on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue('head OpenCL vs CPU ' + FloatToStr(HeadDiff), HeadDiff < 1e-4);
+    AssertTrue('proto OpenCL vs CPU ' + FloatToStr(ProtoDiff), ProtoDiff < 1e-4);
+  finally
+    OnOpenCL.Free;
+    OnHost.Free;
+    ProtoCL.Free;
+    Img.Free;
+    IO.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // DDColorPrepareInput keeps only L (gray RGB in [0,1]); DDColorComposeOutput keeps
 // the source L and takes the chroma from the a*b* volume.
