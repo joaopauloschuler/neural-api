@@ -758,6 +758,48 @@ ad hoc diffusers run and are hardcoded in the tests. The pico folder has
 random weights, so its round trip does not reconstruct the image; a real
 checkpoint has not been run with inversion yet.
 
+### Null-text inversion (`--null-text`)
+
+Null-text inversion (Mokady et al. 2022, arXiv:2211.09794) makes the round trip
+work under CFG. The image is DDIM-inverted at guidance 1 as above; then, for
+each sampling step from x_T, Adam fits the unconditional embeds (starting from
+the negative prompt's, `""` by default) so that the guided DDIM step lands on
+the inverted latent of the next timestep. Each step keeps its own embeds, and
+sampling back with them at `--guidance` (default 7.5 in this mode) retraces
+the inversion. This follows `null_optimization` of google/prompt-to-prompt
+`null_text_w_ptp.ipynb`: MSE loss, a fresh Adam per step at learning rate
+`1e-2 * (1 - i / 100)`, at most `--null-text-inner N` steps (default 10),
+stopping early when the loss is below `1e-5 + i * 2e-5`.
+
+```
+StableDiffusion --model ~/models/stable-diffusion-v1-5 --steps 50 \
+  --invert-image photo.png --prompt "a photo of a cat on a sofa" --null-text
+```
+
+With `--edit-prompt` both prompts sample with the per-step embeds, which is
+the reference's real-image Prompt-to-Prompt edit. `--null-text` inverts over
+`--steps`, so it does not combine with `--invert-steps` or
+`--invert-guidance`.
+
+The optimization backpropagates through the UNet to its text input, so it
+builds a trainable FP32 UNet on the CPU for the inversion (int8 and OpenCL do
+not apply to it). A trainable layer also holds weight deltas and inertia, so
+this UNet takes about three times its FP32 weight bytes plus per-layer error
+buffers (estimated from the buffers, not measured: roughly 10 GB for SD 1.5),
+and each inner step is one forward and one backward pass. With 50 steps and
+10 inner steps that is up to 500 backward passes.
+
+`TStableDiffusionPipeline.NullTextInversion` returns the inverted latents and
+one embeds volume per step; `Denoise`, `DenoiseEdit`, `GenerateFromEmbeds` and
+`GenerateEditFromEmbeds` take that list (DDIM only). The gradient reaches the
+text input through `TNNet.EnableInputGradient(InputLayer)`
+(`TestSDUNetTextStatesGradient` checks it against central differences on the
+pico UNet). `TestStableDiffusionNullTextInversionParity` runs 4 steps, 3 inner
+steps, guidance 7.5 on the pico folder against an ad hoc float64 torch run of
+the reference loop (numbers hardcoded): the per-step embeds within 1e-4, the
+early stop, and the latents sampled back with them within 1e-4. A real
+checkpoint has not been run with null-text inversion yet.
+
 ## Prompt-to-Prompt (`--edit-prompt`)
 
 Prompt-to-Prompt (Hertz et al. 2022, arXiv:2208.01626) edits an image by
@@ -804,8 +846,8 @@ layout.
 With `--invert-image PNG` both prompts start from the image's DDIM-inverted
 latents (inverted with `--prompt`), which edits a real image. Plain DDIM
 inversion only returns close to the image at guidance 1, so that mode defaults
-to guidance 1; at higher guidance the edit drifts, which null-text inversion
-(not ported yet) corrects.
+to guidance 1; at higher guidance the edit drifts, which `--null-text`
+corrects (see [Null-text inversion](#null-text-inversion---null-text)).
 
 The sampler is always DDIM. `--edit-prompt` does not combine with
 `--init-image`, `--edit-image`, `--upscale-image`, `--gligen`,
@@ -988,6 +1030,10 @@ StableDiffusion [--model DIR] [options]
                     default 1.0
   --invert-steps N  inversion steps (default: --steps)
   --invert-guidance G CFG weight of the inversion (default 1.0)
+  --null-text       with --invert-image: null-text inversion, per-step
+                    unconditional embeds fitted so DDIM at --guidance (default
+                    7.5) retraces the inversion; also for --edit-prompt
+  --null-text-inner N Adam steps per sampling step (default 10)
   --edit-prompt TEXT Prompt-to-Prompt: also sample this prompt from the same
                     latent (DDIM), its attention steered by --prompt's; writes
                     --output and its _edit twin; with --invert-image both start

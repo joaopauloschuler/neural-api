@@ -12665,6 +12665,9 @@ type
     FSelfAttentionMask: TNNetVolume;
     // During DenoiseEdit: the edit and whether the target prompt's passes run.
     FAttentionEdit: TSDPromptToPromptEdit;
+    // The unconditional embeds of the running step: FNegativePromptEmbeds, or
+    // the step's entry of a NullTextInversion list.
+    FStepNegativeEmbeds: TNNetVolume;
     FIsAttentionEditTarget: boolean;
     // AddLoRA's files and scales, merged by AcquireUNet / AcquireTextEncoder.
     FLoRAFiles: TStringArray;
@@ -12802,7 +12805,7 @@ type
     procedure RunSteps(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Latents: TNNetVolume; IsInversion: boolean;
       Edit: TSDPromptToPromptEdit = nil; EditEmbeds: TNNetVolume = nil;
-      EditLatents: TNNetVolume = nil);
+      EditLatents: TNNetVolume = nil; UncondEmbeds: TNNetVolumeList = nil);
   public
     // Reads model_index.json and the scheduler/, text_encoder/, tokenizer/,
     // unet/ and vae/ configs; no weights are loaded here.
@@ -12869,9 +12872,10 @@ type
     // runs the UNet passes of each step (CFG when GuidanceScale > 1).
     // A Conditioner strength < 1 runs only the last steps (LCM: all StepCount
     // over a shorter origin grid). Euler a, LCM and SDE DPM++ 2M draw their step
-    // noise from OnAncestralNoise or the global RNG.
+    // noise from OnAncestralNoise or the global RNG. UncondEmbeds: per DDIM step.
     procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
-      StepCount: integer; Latents: TNNetVolume);
+      StepCount: integer; Latents: TNNetVolume;
+      UncondEmbeds: TNNetVolumeList = nil);
     // DDIM inversion (diffusers DDIMInverseScheduler, eta 0) in place: clean
     // Latents walked to x_T over StepCount steps, CFG at GuidanceScale (1: none).
     procedure InvertLatents(PromptEmbeds: TNNetVolume; Width, Height,
@@ -12892,13 +12896,14 @@ type
     // TargetEmbeds on TargetLatents step by step, Edit steering the target (DDIM).
     procedure DenoiseEdit(SourceEmbeds, TargetEmbeds: TNNetVolume; Width,
       Height, StepCount: integer; Edit: TSDPromptToPromptEdit;
-      SourceLatents, TargetLatents: TNNetVolume);
+      SourceLatents, TargetLatents: TNNetVolume;
+      UncondEmbeds: TNNetVolumeList = nil);
     // DenoiseEdit from InitialLatents (nil: drawn from Seed) for both prompts,
     // then DecodeLatents of each.
     procedure GenerateEditFromEmbeds(SourceEmbeds, TargetEmbeds: TNNetVolume;
       Width, Height, StepCount: integer; Seed: cardinal;
       Edit: TSDPromptToPromptEdit; SourceImage, TargetImage: TNNetVolume;
-      InitialLatents: TNNetVolume = nil);
+      InitialLatents: TNNetVolume = nil; UncondEmbeds: TNNetVolumeList = nil);
     // Prompt split at ' ' as tokenized (weights and inversion tokens resolved),
     // its ids with bos and eos, and each text token's decoded length ('#' stripped).
     procedure PromptWordTokens(const Prompt: string; out Words: TStringArray;
@@ -12918,7 +12923,7 @@ type
     // Denoise + DecodeLatents; InitialLatents (noise) = nil draws it from Seed.
     procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; Seed: cardinal; Image: TNNetVolume;
-      InitialLatents: TNNetVolume = nil);
+      InitialLatents: TNNetVolume = nil; UncondEmbeds: TNNetVolumeList = nil);
     // Encodes Prompt (and the negative prompt, in the same text encoder load).
     procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
       Seed: cardinal; Image: TNNetVolume);
@@ -102525,6 +102530,7 @@ begin
   FDeepCacheInterval := 1;
   FSelfAttentionMask := TNNetVolume.Create();
   FNegativePromptEmbeds := TNNetVolume.Create();
+  FStepNegativeEmbeds := FNegativePromptEmbeds;
   FInversionVectors := TNNetVolumeList.Create();
   FGuidanceScale := 7.5;
   FPromptWeighting := true;
@@ -104146,9 +104152,11 @@ begin
 end;
 
 procedure TStableDiffusionPipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
-  Height, StepCount: integer; Latents: TNNetVolume);
+  Height, StepCount: integer; Latents: TNNetVolume;
+  UncondEmbeds: TNNetVolumeList);
 begin
-  RunSteps(PromptEmbeds, Width, Height, StepCount, Latents, false);
+  RunSteps(PromptEmbeds, Width, Height, StepCount, Latents, false, nil, nil,
+    nil, UncondEmbeds);
 end;
 
 procedure TStableDiffusionPipeline.InvertLatents(PromptEmbeds: TNNetVolume;
@@ -104358,7 +104366,8 @@ end;
 
 procedure TStableDiffusionPipeline.DenoiseEdit(SourceEmbeds,
   TargetEmbeds: TNNetVolume; Width, Height, StepCount: integer;
-  Edit: TSDPromptToPromptEdit; SourceLatents, TargetLatents: TNNetVolume);
+  Edit: TSDPromptToPromptEdit; SourceLatents, TargetLatents: TNNetVolume;
+  UncondEmbeds: TNNetVolumeList);
 var
   StepConditioner: TStableDiffusionConditioner;
 begin
@@ -104388,13 +104397,13 @@ begin
     ImportError('TStableDiffusionPipeline.DenoiseEdit: the source and target ' +
       'latents differ in size.');
   RunSteps(SourceEmbeds, Width, Height, StepCount, SourceLatents, false, Edit,
-    TargetEmbeds, TargetLatents);
+    TargetEmbeds, TargetLatents, UncondEmbeds);
 end;
 
 procedure TStableDiffusionPipeline.GenerateEditFromEmbeds(SourceEmbeds,
   TargetEmbeds: TNNetVolume; Width, Height, StepCount: integer; Seed: cardinal;
   Edit: TSDPromptToPromptEdit; SourceImage, TargetImage: TNNetVolume;
-  InitialLatents: TNNetVolume);
+  InitialLatents: TNNetVolume; UncondEmbeds: TNNetVolumeList);
 var
   SourceLatents, TargetLatents: TNNetVolume;
 begin
@@ -104410,7 +104419,7 @@ begin
     TargetLatents.ReSize(SourceLatents);
     TargetLatents.Copy(SourceLatents);
     DenoiseEdit(SourceEmbeds, TargetEmbeds, Width, Height, StepCount, Edit,
-      SourceLatents, TargetLatents);
+      SourceLatents, TargetLatents, UncondEmbeds);
     DecodeLatents(SourceLatents, Width, Height, SourceImage);
     DecodeLatents(TargetLatents, Width, Height, TargetImage);
     DoPhase(sdphDone);
@@ -104423,7 +104432,7 @@ end;
 procedure TStableDiffusionPipeline.RunSteps(PromptEmbeds: TNNetVolume;
   Width, Height, StepCount: integer; Latents: TNNetVolume;
   IsInversion: boolean; Edit: TSDPromptToPromptEdit; EditEmbeds,
-  EditLatents: TNNetVolume);
+  EditLatents: TNNetVolume; UncondEmbeds: TNNetVolumeList);
 var
   StepConfig: TSDUNetConfig;
   Net: TNNet;
@@ -104541,6 +104550,20 @@ begin
     else if IsInversion then MaxStepPos := High(Schedule)
     else MaxStepPos := Length(Schedule) - 2;
     FStepCount := MaxStepPos + 1;
+    if Assigned(UncondEmbeds) then
+    begin
+      if IsInversion or (FSampler <> smDDIM) then
+        ImportError('TStableDiffusionPipeline.Denoise: per-step unconditional ' +
+          'embeds (NullTextInversion) are fitted to DDIM sampling steps.');
+      if UncondEmbeds.Count <> FStepCount then
+        ImportError('TStableDiffusionPipeline.Denoise: ' +
+          IntToStr(UncondEmbeds.Count) + ' unconditional embeds for ' +
+          IntToStr(FStepCount) + ' steps.');
+      for StepPos := 0 to MaxStepPos do
+        if not UncondEmbeds[StepPos].SameSize(PromptEmbeds) then
+          ImportError('TStableDiffusionPipeline.Denoise: unconditional ' +
+            'embeds ' + IntToStr(StepPos) + ' differ in size from the prompt''s.');
+    end;
     if Assigned(Edit) then
     begin
       Edit.Attach(Net, FUNetConfig, FStepCount);
@@ -104554,6 +104577,8 @@ begin
       if UseSigmaSchedule then Timestep := SigmaSchedule.ModelTimesteps[StepPos]
       else Timestep := Schedule[StepPos] - 1;
       if Assigned(Edit) then Edit.BeginStep(StepPos);
+      if Assigned(UncondEmbeds) then
+        FStepNegativeEmbeds := UncondEmbeds[StepPos];
       StepConditioner.PredictGuidedNoise(Net, StepConfig, Latents,
         PromptEmbeds, Timestep, Pred);
       if Assigned(Edit) then
@@ -104587,6 +104612,7 @@ begin
       if Assigned(FOnStep) then FOnStep(StepPos, MaxStepPos + 1, Timestep, Latents);
     end;
   finally
+    FStepNegativeEmbeds := FNegativePromptEmbeds;
     EndPhase();
     // ReleaseBuffers also resets the counts the stats read first.
     for CachePos := 0 to High(FDeepCaches) do
@@ -104657,7 +104683,8 @@ end;
 
 procedure TStableDiffusionPipeline.GenerateFromEmbeds(
   PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
-  Seed: cardinal; Image: TNNetVolume; InitialLatents: TNNetVolume);
+  Seed: cardinal; Image: TNNetVolume; InitialLatents: TNNetVolume;
+  UncondEmbeds: TNNetVolumeList);
 var
   Latents: TNNetVolume;
 begin
@@ -104669,7 +104696,7 @@ begin
       Latents.Copy(InitialLatents);
     end
     else MakeInitialLatents(Width, Height, Seed, Latents);
-    Denoise(PromptEmbeds, Width, Height, StepCount, Latents);
+    Denoise(PromptEmbeds, Width, Height, StepCount, Latents, UncondEmbeds);
     DecodeLatents(Latents, Width, Height, Image);
     DoPhase(sdphDone);
   finally
@@ -104759,7 +104786,7 @@ var
 
 begin
   if sdpiPrompt in Inputs then Embeds := PromptEmbeds
-  else Embeds := FPipeline.FNegativePromptEmbeds;
+  else Embeds := FPipeline.FStepNegativeEmbeds;
   FPipeline.FillUNetInputs(Latents, Embeds, Timestep, Inputs);
   FPipeline.FPassDeepCache := FPipeline.DeepCacheFor(Inputs);
   IsPerturbedPass := sdpiPerturbed in Inputs;

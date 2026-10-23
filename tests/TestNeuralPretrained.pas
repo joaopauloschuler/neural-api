@@ -1507,8 +1507,8 @@ type
     // guidance 1 and 3, vs diffusers DDIMInverseScheduler float64 (ad hoc run);
     // then DDIM from the guidance-1 latents.
     procedure TestStableDiffusionDDIMInversionParity;
-    // NullTextInversion on the tiny_sd15_img2img_io.json image and prompt, 4
-    // steps, 3 inner, guidance 7.5, early stop 1e-5 and 0.47, vs an ad hoc torch run.
+    // NullTextInversion (tiny_sd15 img2img image, 4 steps, 3 inner, CFG 7.5, early
+    // stop 1e-5 / 0.47) vs ad hoc torch; Denoise and DenoiseEdit with its embeds.
     procedure TestStableDiffusionNullTextInversionParity;
     // TNNet.EnableInputGradient on the tiny_sd15 UNet's text states input:
     // Backpropagate's error there vs central differences of 0.5 |pred - target|^2.
@@ -52247,21 +52247,35 @@ const
       0.924765115, -1.019038618),
      (-0.492065300, -1.695396552, 0.984952890, -0.735112794, -0.644434944,
       0.953778273, -1.048126207)));
+  // The reference's CFG DDIM steps from x_T with those embeds (early stop 1e-5).
+  csNullTextReconstructed: array[0..3] of TSDLatentSample = (
+    (X: 0; Y: 5; Channel: 0; Value: -0.342778230),
+    (X: 5; Y: 2; Channel: 1; Value: 0.952893487),
+    (X: 7; Y: 1; Channel: 2; Value: 0.258339058),
+    (X: 3; Y: 4; Channel: 3; Value: 2.525898268));
+  csNullTextReconstructedMeanAbs = 1.208627942;
 
 procedure TTestNeuralPretrained.TestStableDiffusionNullTextInversionParity;
 var
   Pipeline: TStableDiffusionPipeline;
-  SourceImage, Embeds, Latents: TNNetVolume;
+  Edit: TSDPromptToPromptEdit;
+  SourceImage, Embeds, Latents, Reconstructed, SourceLatents,
+    TargetLatents: TNNetVolume;
   UncondEmbeds: TNNetVolumeList;
   ImageWidth, ImageHeight, CasePos, StepPos, ProbePos: integer;
   CaseName: string;
+  IsRefused: boolean;
 begin
   FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
   Pipeline := CreateSD15Pipeline();
   SourceImage := TNNetVolume.Create;
   Embeds := TNNetVolume.Create;
   Latents := TNNetVolume.Create;
+  Reconstructed := TNNetVolume.Create;
+  SourceLatents := TNNetVolume.Create;
+  TargetLatents := TNNetVolume.Create;
   UncondEmbeds := TNNetVolumeList.Create();
+  Edit := nil;
   try
     ImageWidth := TJSONObject(FSD15Oracle).Get('width', 0);
     ImageHeight := TJSONObject(FSD15Oracle).Get('height', 0);
@@ -52291,9 +52305,50 @@ begin
             UncondEmbeds[StepPos][csNullTextProbeTokens[ProbePos], 0,
             csNullTextProbeDims[ProbePos]], 1e-4);
       end;
+      if CasePos = 0 then
+      begin
+        Reconstructed.Copy(Latents);
+        Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 4, Reconstructed,
+          UncondEmbeds);
+        AssertEquals('reconstructed mean abs', csNullTextReconstructedMeanAbs,
+          Reconstructed.GetSumAbs() / Reconstructed.Size, 1e-4);
+        for ProbePos := 0 to 3 do
+          AssertEquals('reconstructed latent ' + IntToStr(ProbePos),
+            csNullTextReconstructed[ProbePos].Value,
+            Reconstructed[csNullTextReconstructed[ProbePos].X,
+            csNullTextReconstructed[ProbePos].Y,
+            csNullTextReconstructed[ProbePos].Channel], 1e-4);
+        // An edit that replaces nothing: both tracks are the reconstruction.
+        Edit := Pipeline.CreatePromptToPromptEdit(
+          TJSONObject(FSD15Oracle).Get('prompt', ''),
+          TJSONObject(FSD15Oracle).Get('prompt', ''), sdpemRefine, [], []);
+        Edit.CrossReplaceFraction := 0;
+        Edit.SelfReplaceFraction := 0;
+        SourceLatents.Copy(Latents);
+        TargetLatents.Copy(Latents);
+        Pipeline.DenoiseEdit(Embeds, Embeds, ImageWidth, ImageHeight, 4, Edit,
+          SourceLatents, TargetLatents, UncondEmbeds);
+        AssertEquals('edit source = reconstruction', 0,
+          MaxAbsVolumeDiff(SourceLatents, Reconstructed), 0);
+        AssertEquals('edit target = reconstruction', 0,
+          MaxAbsVolumeDiff(TargetLatents, Reconstructed), 0);
+        UncondEmbeds.Delete(3);
+        IsRefused := false;
+        try
+          Pipeline.Denoise(Embeds, ImageWidth, ImageHeight, 4, Reconstructed,
+            UncondEmbeds);
+        except
+          on EPretrainedImportError do IsRefused := true;
+        end;
+        AssertTrue('3 embeds for 4 steps refused', IsRefused);
+      end;
     end;
   finally
+    Edit.Free;
     UncondEmbeds.Free;
+    TargetLatents.Free;
+    SourceLatents.Free;
+    Reconstructed.Free;
     Latents.Free;
     Embeds.Free;
     SourceImage.Free;

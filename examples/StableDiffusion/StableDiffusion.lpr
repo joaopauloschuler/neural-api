@@ -66,7 +66,9 @@ the mid-block self-attention concentrates.
 --invert-image PNG [--invert-steps N] [--invert-guidance G] runs DDIM inversion
 (diffusers DDIMInverseScheduler): the image's VAE latents are walked to noise
 with the prompt, then sampled back with DDIM and the prompt; guidance defaults
-to 1, where the round trip reconstructs the image best.
+to 1, where the round trip reconstructs the image best. --null-text adds
+null-text inversion (Mokady et al. 2022): per step, the unconditional embeds are
+fitted so sampling back at the CFG guidance (default 7.5) retraces the inversion.
 --relight PNG --iclight FILE relights a cut-out subject with IC-Light (Zhang
 et al. 2025, lllyasviel/IC-Light gradio_demo.py): the iclight_sd15_fc offset
 is added to the UNet weights, the prompt describes the light, --light
@@ -145,6 +147,9 @@ type
     InvertImageFile: string;
     InvertSteps: integer;
     InvertGuidanceScale: double;
+    // --null-text and its --null-text-inner Adam steps per sampling step.
+    NullText: boolean;
+    NullTextInnerSteps: integer;
     // --edit-prompt ('' for none), --edit-mode, --cross-replace,
     // --self-replace and the --reweight words and scales.
     EditPrompt, EditMode: string;
@@ -405,6 +410,12 @@ begin
     'default 1.0');
   WriteLn('  --invert-steps N  inversion steps (default: --steps)');
   WriteLn('  --invert-guidance G CFG weight of the inversion (default 1.0)');
+  WriteLn('  --null-text       with --invert-image: null-text inversion, per-step ',
+    'unconditional');
+  WriteLn('                    embeds fitted so DDIM at --guidance (default ',
+    '7.5) retraces the');
+  WriteLn('                    inversion; also for --edit-prompt');
+  WriteLn('  --null-text-inner N Adam steps per sampling step (default 10)');
   WriteLn('  --edit-prompt TEXT Prompt-to-Prompt: also sample this prompt from ',
     'the same latent');
   WriteLn('                    (DDIM), its attention steered by --prompt''s; ',
@@ -640,6 +651,8 @@ begin
   Opt.InvertImageFile := '';
   Opt.InvertSteps := -1;
   Opt.InvertGuidanceScale := -1;
+  Opt.NullText := false;
+  Opt.NullTextInnerSteps := -1;
   Opt.EditPrompt := '';
   Opt.EditMode := '';
   Opt.CrossReplaceFraction := -1;
@@ -753,6 +766,9 @@ begin
     else if Arg = '--invert-steps' then Opt.InvertSteps := StrToInt(NextArg())
     else if Arg = '--invert-guidance' then
       Opt.InvertGuidanceScale := StrToFloat(NextArg())
+    else if Arg = '--null-text' then Opt.NullText := true
+    else if Arg = '--null-text-inner' then
+      Opt.NullTextInnerSteps := StrToInt(NextArg())
     else if Arg = '--edit-prompt' then Opt.EditPrompt := NextArg()
     else if Arg = '--edit-mode' then Opt.EditMode := LowerCase(NextArg())
     else if Arg = '--cross-replace' then
@@ -877,6 +893,19 @@ begin
     raise Exception.Create('--invert-image samples with ddim');
   if (Opt.InvertImageFile <> '') and (Opt.RepeatCount > 1) then
     raise Exception.Create('--invert-image makes one image; drop --repeat');
+  if (Opt.NullText or (Opt.NullTextInnerSteps <> -1)) and
+    (Opt.InvertImageFile = '') then
+    raise Exception.Create('--null-text and --null-text-inner need ' +
+      '--invert-image');
+  if (Opt.NullTextInnerSteps <> -1) and not Opt.NullText then
+    raise Exception.Create('--null-text-inner needs --null-text');
+  if Opt.NullText and (Opt.NullTextInnerSteps < 0) and
+    (Opt.NullTextInnerSteps <> -1) then
+    raise Exception.Create('--null-text-inner must be >= 0');
+  if Opt.NullText and ((Opt.InvertSteps <> -1) or
+    (Opt.InvertGuidanceScale >= 0)) then
+    raise Exception.Create('--null-text inverts at guidance 1 over --steps; ' +
+      'drop --invert-steps and --invert-guidance');
   if (Opt.EditPrompt = '') and ((Opt.EditMode <> '') or
     (Opt.CrossReplaceFraction >= 0) or (Opt.SelfReplaceFraction >= 0) or
     (Length(Opt.ReweightWords) > 0)) then
@@ -980,6 +1009,7 @@ var
   StepCount, Img2ImgStepCount, InvertStepCount: integer;
   InvertGuidanceScale: double;
   InvertImage, InvertedLatents: TNNetVolume;
+  NullTextEmbeds: TNNetVolumeList;
   Edit: TSDPromptToPromptEdit;
   EditMode: TSDPromptEditMode;
   EditEmbeds, EditedImage, EditInitialLatents: TNNetVolume;
@@ -992,9 +1022,30 @@ var
   Seed: cardinal;
   StartTime, SaveStart: TDateTime;
   PngSaveMs: double;
+  NullTextInnerSteps: integer;
   {$IFDEF OpenCL}
   OpenCLText: string;
   {$ENDIF}
+
+  // InvertedLatents of InvertImage: null-text inversion (filling NullTextEmbeds)
+  // with --null-text, else DDIM inversion.
+  procedure InvertForSampling();
+  begin
+    if Opt.NullText then
+    begin
+      WriteLn('Null-text inversion:');
+      Pipeline.NullTextInversion(InvertImage, PromptEmbeds, ImageWidth,
+        ImageHeight, StepCount, Pipeline.GuidanceScale, InvertedLatents,
+        NullTextEmbeds, NullTextInnerSteps);
+    end
+    else
+    begin
+      WriteLn('Inverting:');
+      Pipeline.InvertImage(InvertImage, PromptEmbeds, ImageWidth, ImageHeight,
+        InvertStepCount, InvertGuidanceScale, InvertedLatents);
+    end;
+  end;
+
 begin
   Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
   Reporter := TStableDiffusionReporter.Create;
@@ -1011,6 +1062,7 @@ begin
   PromptEmbeds := TNNetVolume.Create;
   InvertImage := TNNetVolume.Create;
   InvertedLatents := TNNetVolume.Create;
+  NullTextEmbeds := nil;
   Edit := nil;
   EditEmbeds := TNNetVolume.Create;
   EditedImage := TNNetVolume.Create;
@@ -1169,7 +1221,7 @@ begin
       if StepCount < 1 then StepCount := 25;
       if GuidanceScale < 0 then GuidanceScale := 2.0;
     end
-    else if Opt.InvertImageFile <> '' then
+    else if (Opt.InvertImageFile <> '') and not Opt.NullText then
     begin
       // Guidance 1 keeps the inversion and the sampling on the same path.
       if StepCount < 1 then StepCount := 25;
@@ -1184,6 +1236,9 @@ begin
     if InvertStepCount < 1 then InvertStepCount := StepCount;
     InvertGuidanceScale := Opt.InvertGuidanceScale;
     if InvertGuidanceScale < 0 then InvertGuidanceScale := 1.0;
+    NullTextInnerSteps := Opt.NullTextInnerSteps;
+    if NullTextInnerSteps < 0 then NullTextInnerSteps := 10;
+    if Opt.NullText then NullTextEmbeds := TNNetVolumeList.Create();
     Pipeline.GuidanceScale := GuidanceScale;
     Pipeline.NegativePrompt := Opt.NegativePrompt;
     RelightPrompt := Opt.Prompt;
@@ -1292,9 +1347,14 @@ begin
         WriteLn('Depth: estimated by depth_estimator/ (depth-to-image)');
     end;
     if Opt.InvertImageFile <> '' then
-      WriteLn(Format('Invert image: %s (%dx%d), %d DDIM inversion steps, ' +
-        'guidance %.2f', [Opt.InvertImageFile, InvertImage.SizeX,
-        InvertImage.SizeY, InvertStepCount, InvertGuidanceScale]));
+      if Opt.NullText then
+        WriteLn(Format('Invert image: %s (%dx%d), null-text inversion over ' +
+          '%d steps, %d inner steps', [Opt.InvertImageFile, InvertImage.SizeX,
+          InvertImage.SizeY, StepCount, NullTextInnerSteps]))
+      else
+        WriteLn(Format('Invert image: %s (%dx%d), %d DDIM inversion steps, ' +
+          'guidance %.2f', [Opt.InvertImageFile, InvertImage.SizeX,
+          InvertImage.SizeY, InvertStepCount, InvertGuidanceScale]));
     if Opt.EditPrompt <> '' then
     begin
       if Opt.EditMode = 'swap' then EditMode := sdpemSwap
@@ -1441,15 +1501,13 @@ begin
         EditInitialLatents := nil;
         if Opt.InvertImageFile <> '' then
         begin
-          WriteLn('Inverting:');
-          Pipeline.InvertImage(InvertImage, PromptEmbeds, ImageWidth,
-            ImageHeight, InvertStepCount, InvertGuidanceScale, InvertedLatents);
+          InvertForSampling();
           EditInitialLatents := InvertedLatents;
         end;
         WriteLn('Sampling the prompt and the edit:');
         Pipeline.GenerateEditFromEmbeds(PromptEmbeds, EditEmbeds, ImageWidth,
           ImageHeight, StepCount, Seed, Edit, Image, EditedImage,
-          EditInitialLatents);
+          EditInitialLatents, NullTextEmbeds);
         EditImageFile := ChangeFileExt(ImageFile, '') + '_edit' +
           ExtractFileExt(ImageFile);
         EditedImage.Mul(255.0);
@@ -1460,14 +1518,12 @@ begin
       else if Opt.InvertImageFile <> '' then
       begin
         Pipeline.EncodePrompt(Opt.Prompt, PromptEmbeds);
-        WriteLn('Inverting:');
-        Pipeline.InvertImage(InvertImage, PromptEmbeds, ImageWidth,
-          ImageHeight, InvertStepCount, InvertGuidanceScale, InvertedLatents);
+        InvertForSampling();
         WriteLn(Format('Inverted latents: mean abs %.4f',
           [InvertedLatents.GetSumAbs() / InvertedLatents.Size]));
         WriteLn('Sampling from the inverted latents:');
         Pipeline.GenerateFromEmbeds(PromptEmbeds, ImageWidth, ImageHeight,
-          StepCount, Seed, Image, InvertedLatents);
+          StepCount, Seed, Image, InvertedLatents, NullTextEmbeds);
       end
       else if Assigned(ICLight) then
       begin
@@ -1512,6 +1568,7 @@ begin
     EditedImage.Free;
     EditEmbeds.Free;
     Edit.Free;
+    NullTextEmbeds.Free;
     InvertedLatents.Free;
     InvertImage.Free;
     PromptEmbeds.Free;

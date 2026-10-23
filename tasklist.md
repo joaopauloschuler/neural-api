@@ -793,7 +793,7 @@ rather than acted on.
             2022, arXiv:2208.01626). Edits a generated or real image by changing
             words in its prompt while the layout stays fixed: today img2img /
             InstructPix2Pix are the only edit routes, and both redraw the layout.
-        - [ ] Null-text inversion (Mokady et al. 2022) for
+        - [X] Null-text inversion (Mokady et al. 2022) for
               TStableDiffusionPipeline: per-step optimized unconditional
               embeds on top of `InvertImage`, so a real image reconstructs
               under CFG (guidance 7.5) and Prompt-to-Prompt edits of it
@@ -813,7 +813,7 @@ rather than acted on.
                 with the early stop `loss < 1e-5 + i * 2e-5`. Returns one uncond
                 embed per step. Parity vs an ad hoc torch run of that loop on the
                 pico folder (numbers hardcoded, no new tool).
-          - [ ] (c) `RunSteps` / `DenoiseEdit` take a per-step uncond embed list;
+          - [X] (c) `RunSteps` / `DenoiseEdit` take a per-step uncond embed list;
                 `--null-text` in examples/StableDiffusion with `--invert-image`.
         - [ ] Prompt-to-Prompt on a real checkpoint (SD 1.5) on the user's
               GPU box: swap, refine and reweight from a seed and from an
