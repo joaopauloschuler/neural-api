@@ -805,7 +805,7 @@ rather than acted on.
                 already leaves the error on the text `TNNetInput` (the attn2 K/V
                 projections read it); if not, add it. Test: numerical gradient
                 on the pico UNet (tests/fixtures/tiny_sd15) at a few embed entries.
-          - [ ] (b) `NullTextInversion(Image, PromptEmbeds, Steps, Guidance,
+          - [X] (b) `NullTextInversion(Image, PromptEmbeds, Steps, Guidance,
                 InnerSteps = 10, LearningRate = 1e-2)` on TStableDiffusionPipeline:
                 the reference loop of Mokady et al. (google/prompt-to-prompt
                 null_text_w_ptp.ipynb): per step, Adam on the uncond embeds to

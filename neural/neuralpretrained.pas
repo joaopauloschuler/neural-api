@@ -12719,7 +12719,7 @@ type
     function BuildUNet(GridX, GridY, TextSeqLen: integer; WithControl,
       WithAdapter: boolean; const IPAdapterFile, GLIGENFile: string;
       out DeepCacheLayout: TSDUNetDeepCacheLayout;
-      pWeightOwner: TNNet = nil): TNNet;
+      pWeightOwner: TNNet = nil; pTrainable: boolean = false): TNNet;
     function BuildVaeDecoderNet(GridX, GridY: integer;
       pWeightOwner: TNNet = nil): TNNet;
     function BuildVaeEncoderNet(GridX, GridY: integer;
@@ -12790,6 +12790,13 @@ type
       Value: boolean);
     // The step cache of the passes that see Inputs; nil when DeepCache is off.
     function DeepCacheFor(Inputs: TStableDiffusionPassInputs): TDiTFirstBlockCache;
+    // Encodes NegativePrompt as the unconditional embeds unless they are set or
+    // already hold PromptEmbeds' token count; raises when set ones differ.
+    procedure EnsureNegativePromptEmbeds(PromptEmbeds: TNNetVolume);
+    // Latents of Image (W, H, 3|4, 0..255) resized to Width x Height and
+    // VAE-encoded as img2img does (SampleNoise nil: the latent mean).
+    procedure EncodeImageLatents(Image: TNNetVolume; Width, Height: integer;
+      Latents, SampleNoise: TNNetVolume);
     // Denoise, or (IsInversion) InvertLatents at the pipeline's GuidanceScale;
     // Edit set: also DenoiseEdit's target track on EditEmbeds and EditLatents.
     procedure RunSteps(PromptEmbeds: TNNetVolume; Width, Height,
@@ -12874,6 +12881,13 @@ type
     procedure InvertImage(Image, PromptEmbeds: TNNetVolume; Width, Height,
       StepCount: integer; GuidanceScale: TNeuralFloat; Latents: TNNetVolume;
       SampleNoise: TNNetVolume = nil);
+    // Null-text inversion (Mokady et al. 2022): Latents := InvertImage at guidance 1;
+    // UncondEmbeds := per DDIM step, Adam-fitted uncond embeds retracing it under CFG.
+    procedure NullTextInversion(Image, PromptEmbeds: TNNetVolume; Width,
+      Height, StepCount: integer; GuidanceScale: TNeuralFloat;
+      Latents: TNNetVolume; UncondEmbeds: TNNetVolumeList;
+      InnerSteps: integer = 10; LearningRate: TNeuralFloat = 1e-2;
+      EarlyStopEpsilon: TNeuralFloat = 1e-5);
     // Prompt-to-Prompt: Denoise of SourceEmbeds on SourceLatents and of
     // TargetEmbeds on TargetLatents step by step, Edit steering the target (DDIM).
     procedure DenoiseEdit(SourceEmbeds, TargetEmbeds: TNNetVolume; Width,
@@ -102826,7 +102840,8 @@ end;
 
 function TStableDiffusionPipeline.BuildUNet(GridX, GridY, TextSeqLen: integer;
   WithControl, WithAdapter: boolean; const IPAdapterFile, GLIGENFile: string;
-  out DeepCacheLayout: TSDUNetDeepCacheLayout; pWeightOwner: TNNet): TNNet;
+  out DeepCacheLayout: TSDUNetDeepCacheLayout; pWeightOwner: TNNet;
+  pTrainable: boolean): TNNet;
 var
   IPAdapterReader, GLIGENReader: TNNetSafeTensorsReader;
 begin
@@ -102837,7 +102852,7 @@ begin
       ComponentFolder('unet'), 'diffusion_pytorch_model'),
       UNetStepConfig(GridX, GridY, TextSeqLen), FLoRAFiles, FLoRAScales,
       DeepCacheLayout, WithControl, WithAdapter, IPAdapterFile,
-      {pTrainable=}false, GLIGENFile, FUNetOffsetFile));
+      pTrainable, GLIGENFile, FUNetOffsetFile));
   end;
   IPAdapterReader := nil;
   GLIGENReader := nil;
@@ -104151,9 +104166,28 @@ begin
   end;
 end;
 
-procedure TStableDiffusionPipeline.InvertImage(Image,
-  PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
-  GuidanceScale: TNeuralFloat; Latents: TNNetVolume; SampleNoise: TNNetVolume);
+procedure TStableDiffusionPipeline.EnsureNegativePromptEmbeds(
+  PromptEmbeds: TNNetVolume);
+var
+  ChunkCount: integer;
+begin
+  if not FHasNegativePromptEmbeds or (FNegativeEmbedsFromPrompt and
+    (FNegativePromptEmbeds.SizeX <> PromptEmbeds.SizeX)) then
+  begin
+    ChunkCount := Max(1, PromptEmbeds.SizeX div FMaxTokenCount);
+    EncodePromptList([FNegativePrompt], [FNegativePromptEmbeds], ChunkCount,
+      ChunkCount);
+    FHasNegativePromptEmbeds := true;
+    FNegativeEmbedsFromPrompt := true;
+  end;
+  if FNegativePromptEmbeds.SizeX <> PromptEmbeds.SizeX then
+    ImportError('TStableDiffusionPipeline.Denoise: the negative embeds hold ' +
+      IntToStr(FNegativePromptEmbeds.SizeX) + ' tokens, the prompt ' +
+      IntToStr(PromptEmbeds.SizeX) + ' (encode both with EncodePrompts).');
+end;
+
+procedure TStableDiffusionPipeline.EncodeImageLatents(Image: TNNetVolume;
+  Width, Height: integer; Latents, SampleNoise: TNNetVolume);
 var
   VaeImage: TNNetVolume;
 begin
@@ -104165,7 +104199,161 @@ begin
   finally
     VaeImage.Free;
   end;
+end;
+
+procedure TStableDiffusionPipeline.InvertImage(Image,
+  PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+  GuidanceScale: TNeuralFloat; Latents: TNNetVolume; SampleNoise: TNNetVolume);
+begin
+  EncodeImageLatents(Image, Width, Height, Latents, SampleNoise);
   InvertLatents(PromptEmbeds, Width, Height, StepCount, GuidanceScale, Latents);
+end;
+
+procedure TStableDiffusionPipeline.NullTextInversion(Image,
+  PromptEmbeds: TNNetVolume; Width, Height, StepCount: integer;
+  GuidanceScale: TNeuralFloat; Latents: TNNetVolume;
+  UncondEmbeds: TNNetVolumeList; InnerSteps: integer;
+  LearningRate: TNeuralFloat; EarlyStopEpsilon: TNeuralFloat);
+const
+  // torch.optim.Adam defaults, as the reference.
+  csAdamBeta1 = 0.9;
+  csAdamBeta2 = 0.999;
+  csAdamEpsilon = 1e-8;
+var
+  Net: TNNet;
+  Config: TSDUNetConfig;
+  DeepCacheLayout: TSDUNetDeepCacheLayout;
+  TextInput: TNNetLayer;
+  Trajectory: TNNetVolumeList;
+  Schedule: TNeuralIntegerArray;
+  Current, Uncond, CondPred, UncondPred, GuidedPred, Residual, ErrorTarget,
+    Gradient, FirstMoment, SecondMoment: TNNetVolume;
+  GridX, GridY, StepPos, MaxStepPos, InnerPos, MaxInnerPos, Tt, TtPrev: integer;
+  XtCoef, PredCoef, Loss, InvElementCount, StepLearningRate, Beta1Power,
+    Beta2Power: TNeuralFloat;
+
+  procedure Predict(StepLatents, Embeds: TNNetVolume; Timestep: integer;
+    Pred: TNNetVolume);
+  begin
+    SDUNetDenoise(Net, Config, StepLatents, Embeds, Timestep, Pred);
+    Inc(FImageStats.UNetPassCount);
+  end;
+
+begin
+  LatentGridFor(Width, Height, GridX, GridY);
+  if Assigned(FConditioner) then
+    ImportError('TStableDiffusionPipeline.NullTextInversion: a ' +
+      FConditioner.ClassName + ' is set; null-text inversion runs the plain ' +
+      'UNet.');
+  if (StepCount < 1) or (InnerSteps < 0) then
+    ImportError('TStableDiffusionPipeline.NullTextInversion: ' +
+      IntToStr(StepCount) + ' steps of ' + IntToStr(InnerSteps) +
+      ' inner steps.');
+  EnsureNegativePromptEmbeds(PromptEmbeds);
+  EncodeImageLatents(Image, Width, Height, Latents, nil);
+  ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
+  FImageStats.UNetPassCount := 0;
+  FImageStats.UNetCachedPassCount := 0;
+  FImageStats.ControlNetShallowRunCount := 0;
+  DoPhase(sdphLoadUNet);
+  // Backpropagate needs the FP32 error buffers an inference-only UNet frees.
+  Net := BuildUNet(GridX, GridY, PromptEmbeds.SizeX, false, false, '', '',
+    DeepCacheLayout, nil, {pTrainable=}true);
+  Config := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
+  Trajectory := TNNetVolumeList.Create();
+  Current := TNNetVolume.Create();
+  Uncond := TNNetVolume.Create(FNegativePromptEmbeds);
+  CondPred := TNNetVolume.Create();
+  UncondPred := TNNetVolume.Create();
+  GuidedPred := TNNetVolume.Create();
+  Residual := TNNetVolume.Create();
+  ErrorTarget := TNNetVolume.Create();
+  Gradient := TNNetVolume.Create();
+  FirstMoment := TNNetVolume.Create(Uncond.SizeX, Uncond.SizeY, Uncond.Depth);
+  SecondMoment := TNNetVolume.Create(Uncond.SizeX, Uncond.SizeY, Uncond.Depth);
+  try
+    DoPhase(sdphDenoise);
+    Net.SetBatchUpdate(true);
+    TextInput := SDUNetTextStatesInput(Net);
+    Net.EnableInputGradient(TextInput);
+    // The reference's ddim_loop: the prompt alone, every latent kept.
+    Trajectory.Add(TNNetVolume.Create(Latents));
+    Schedule := FScheduler.BuildInversionSchedule(StepCount,
+      FScheduler.ConfigSpacing);
+    MaxStepPos := High(Schedule);
+    for StepPos := 0 to MaxStepPos do
+    begin
+      Predict(Latents, PromptEmbeds, Schedule[StepPos] - 1, CondPred);
+      FScheduler.InverseDDIMStep(Latents, CondPred, Schedule[StepPos],
+        StepCount);
+      Trajectory.Add(TNNetVolume.Create(Latents));
+    end;
+    Current.Copy(Latents);
+    UncondEmbeds.Clear();
+    InvElementCount := 1 / Latents.Size;
+    MaxInnerPos := InnerSteps - 1;
+    Schedule := FScheduler.BuildSamplerSchedule(StepCount,
+      FScheduler.ConfigSpacing, smDDIM);
+    MaxStepPos := Length(Schedule) - 2;
+    for StepPos := 0 to MaxStepPos do
+    begin
+      Tt := Schedule[StepPos];
+      TtPrev := Schedule[StepPos + 1];
+      FScheduler.DDIMStepCoefficients(Tt, TtPrev, XtCoef, PredCoef);
+      Predict(Current, PromptEmbeds, Tt - 1, CondPred);
+      FirstMoment.Fill(0);
+      SecondMoment.Fill(0);
+      Beta1Power := 1;
+      Beta2Power := 1;
+      StepLearningRate := LearningRate * (1 - StepPos / 100);
+      for InnerPos := 0 to MaxInnerPos do
+      begin
+        Predict(Current, Uncond, Tt - 1, UncondPred);
+        TNNetDiffusionScheduler.ApplyCFG(CondPred, UncondPred, GuidedPred,
+          GuidanceScale);
+        // MSE of the DDIM step from Current against the inverted latent of TtPrev.
+        Residual.Copy(Current);
+        Residual.Mul(XtCoef);
+        Residual.MulAdd(PredCoef, GuidedPred);
+        Residual.Sub(Trajectory[MaxStepPos - StepPos]);
+        Loss := Residual.GetSumSqr() * InvElementCount;
+        // Backpropagate takes output - target as d loss / d output.
+        ErrorTarget.Copy(UncondPred);
+        ErrorTarget.MulAdd(-2 * InvElementCount * PredCoef *
+          (1 - GuidanceScale), Residual);
+        Net.Backpropagate(ErrorTarget);
+        Gradient.Copy(TextInput.OutputError);
+        Beta1Power := Beta1Power * csAdamBeta1;
+        Beta2Power := Beta2Power * csAdamBeta2;
+        TNNetVolume.AdamDelta(Gradient.DataPtr, FirstMoment.DataPtr,
+          SecondMoment.DataPtr, csAdamBeta1, 1 - csAdamBeta1, csAdamBeta2,
+          1 - csAdamBeta2, 1 / (1 - Beta2Power), csAdamEpsilon,
+          StepLearningRate / (1 - Beta1Power), Gradient.Size);
+        Uncond.Sub(Gradient);
+        if Loss < EarlyStopEpsilon + StepPos * 2e-5 then break;
+      end;
+      Net.ClearDeltas();
+      UncondEmbeds.Add(TNNetVolume.Create(Uncond));
+      Predict(Current, Uncond, Tt - 1, UncondPred);
+      TNNetDiffusionScheduler.ApplyCFG(CondPred, UncondPred, GuidedPred,
+        GuidanceScale);
+      FScheduler.Step(Current, GuidedPred, Tt, TtPrev, smDDIM);
+    end;
+  finally
+    EndPhase();
+    SecondMoment.Free;
+    FirstMoment.Free;
+    Gradient.Free;
+    ErrorTarget.Free;
+    Residual.Free;
+    GuidedPred.Free;
+    UncondPred.Free;
+    CondPred.Free;
+    Uncond.Free;
+    Current.Free;
+    Trajectory.Free;
+    Net.Free;
+  end;
 end;
 
 procedure TStableDiffusionPipeline.DenoiseEdit(SourceEmbeds,
@@ -104246,7 +104434,7 @@ var
   IsGuided, WithControl, WithAdapter, UseSigmaSchedule: boolean;
   IPAdapterFile, GLIGENFile: string;
   DeepCacheLayout: TSDUNetDeepCacheLayout;
-  GridX, GridY, StepPos, MaxStepPos, ChunkCount, CachePos: integer;
+  GridX, GridY, StepPos, MaxStepPos, CachePos: integer;
   Eta, NoiseScale: TNeuralFloat;
   Timestep: double;
 begin
@@ -104272,19 +104460,7 @@ begin
       IntToStr(Latents.Depth) + ' do not match a ' + IntToStr(Width) +
       'x' + IntToStr(Height) + ' image.');
   IsGuided := StepConditioner.IsGuided(CFGGuidanceScale);
-  if IsGuided and (not FHasNegativePromptEmbeds or (FNegativeEmbedsFromPrompt
-    and (FNegativePromptEmbeds.SizeX <> PromptEmbeds.SizeX))) then
-  begin
-    ChunkCount := Max(1, PromptEmbeds.SizeX div FMaxTokenCount);
-    EncodePromptList([FNegativePrompt], [FNegativePromptEmbeds], ChunkCount,
-      ChunkCount);
-    FHasNegativePromptEmbeds := true;
-    FNegativeEmbedsFromPrompt := true;
-  end;
-  if IsGuided and (FNegativePromptEmbeds.SizeX <> PromptEmbeds.SizeX) then
-    ImportError('TStableDiffusionPipeline.Denoise: the negative embeds hold ' +
-      IntToStr(FNegativePromptEmbeds.SizeX) + ' tokens, the prompt ' +
-      IntToStr(PromptEmbeds.SizeX) + ' (encode both with EncodePrompts).');
+  if IsGuided then EnsureNegativePromptEmbeds(PromptEmbeds);
   StepConfig := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
   ClearPhaseStats([sdphLoadUNet, sdphDenoise]);
   FImageStats.UNetPassCount := 0;

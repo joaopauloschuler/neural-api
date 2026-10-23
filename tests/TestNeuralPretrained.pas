@@ -1507,6 +1507,9 @@ type
     // guidance 1 and 3, vs diffusers DDIMInverseScheduler float64 (ad hoc run);
     // then DDIM from the guidance-1 latents.
     procedure TestStableDiffusionDDIMInversionParity;
+    // NullTextInversion on the tiny_sd15_img2img_io.json image and prompt, 4
+    // steps, 3 inner, guidance 7.5, early stop 1e-5 and 0.47, vs an ad hoc torch run.
+    procedure TestStableDiffusionNullTextInversionParity;
     // TNNet.EnableInputGradient on the tiny_sd15 UNet's text states input:
     // Backpropagate's error there vs central differences of 0.5 |pred - target|^2.
     procedure TestSDUNetTextStatesGradient;
@@ -52211,6 +52214,89 @@ begin
     Embeds.Free;
     SourceImage.Free;
     Img2Img.Free;
+    Pipeline.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
+const
+  // google/prompt-to-prompt null_optimization (float64 torch, Adam lr 1e-2):
+  // embed entries (token, dim) of the uncond embeds after each step, early
+  // stop 1e-5 (no step stops) and 0.47 (step 0 stops after 2 inner steps).
+  csNullTextProbeTokens: array[0..6] of integer = (0, 0, 1, 3, 5, 10, 76);
+  csNullTextProbeDims: array[0..6] of integer = (0, 5, 7, 31, 12, 20, 3);
+  csNullTextEarlyStop: array[0..1] of TNeuralFloat = (1e-5, 0.47);
+  csNullTextPassCounts: array[0..1] of integer = (24, 23);
+  csNullTextMeanAbs: array[0..1, 0..3] of double = (
+    (0.751961902, 0.747983963, 0.743927116, 0.744010698),
+    (0.754022127, 0.749445015, 0.743903167, 0.742357541));
+  csNullTextEmbeds: array[0..1, 0..3, 0..6] of double = (
+    ((-0.516651308, -1.729263225, 1.063149707, -0.657020561, -0.547323617,
+      0.875776916, -0.969971335),
+     (-0.487026666, -1.752410378, 1.033509233, -0.686708448, -0.576950432,
+      0.905427931, -0.999613713),
+     (-0.457689459, -1.722995976, 1.004195520, -0.716127496, -0.606297195,
+      0.934713523, -1.028979001),
+     (-0.486735449, -1.693922887, 0.975123628, -0.745120406, -0.634670764,
+      0.963692652, -1.058062396)),
+    ((-0.522025742, -1.739191358, 1.072992822, -0.647005812, -0.557061749,
+      0.865799260, -0.960021238),
+     (-0.492392647, -1.753881476, 1.043351101, -0.676693813, -0.586702453,
+      0.895454629, -0.989669883),
+     (-0.463044507, -1.724466541, 1.014027596, -0.706115314, -0.616048602,
+      0.924765115, -1.019038618),
+     (-0.492065300, -1.695396552, 0.984952890, -0.735112794, -0.644434944,
+      0.953778273, -1.048126207)));
+
+procedure TTestNeuralPretrained.TestStableDiffusionNullTextInversionParity;
+var
+  Pipeline: TStableDiffusionPipeline;
+  SourceImage, Embeds, Latents: TNNetVolume;
+  UncondEmbeds: TNNetVolumeList;
+  ImageWidth, ImageHeight, CasePos, StepPos, ProbePos: integer;
+  CaseName: string;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Pipeline := CreateSD15Pipeline();
+  SourceImage := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  UncondEmbeds := TNNetVolumeList.Create();
+  try
+    ImageWidth := TJSONObject(FSD15Oracle).Get('width', 0);
+    ImageHeight := TJSONObject(FSD15Oracle).Get('height', 0);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    Pipeline.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    for CasePos := 0 to 1 do
+    begin
+      CaseName := 'early stop ' + FloatToStr(csNullTextEarlyStop[CasePos]);
+      Pipeline.NullTextInversion(SourceImage, Embeds, ImageWidth, ImageHeight,
+        4, 7.5, Latents, UncondEmbeds, 3, 1e-2, csNullTextEarlyStop[CasePos]);
+      AssertEquals(CaseName + ' passes', csNullTextPassCounts[CasePos],
+        Pipeline.ImageStats.UNetPassCount);
+      // The guidance-1 DDIM inversion of TestStableDiffusionDDIMInversionParity.
+      AssertEquals(CaseName + ' inverted mean abs', csInversionMeanAbs[0],
+        Latents.GetSumAbs() / Latents.Size, 2e-5);
+      AssertEquals(CaseName + ' embeds per step', 4, UncondEmbeds.Count);
+      for StepPos := 0 to 3 do
+      begin
+        AssertEquals(CaseName + ' step ' + IntToStr(StepPos) + ' mean abs',
+          csNullTextMeanAbs[CasePos, StepPos],
+          UncondEmbeds[StepPos].GetSumAbs() / UncondEmbeds[StepPos].Size, 2e-5);
+        for ProbePos := 0 to 6 do
+          AssertEquals(CaseName + ' step ' + IntToStr(StepPos) + ' entry ' +
+            IntToStr(ProbePos), csNullTextEmbeds[CasePos, StepPos, ProbePos],
+            UncondEmbeds[StepPos][csNullTextProbeTokens[ProbePos], 0,
+            csNullTextProbeDims[ProbePos]], 1e-4);
+      end;
+    end;
+  finally
+    UncondEmbeds.Free;
+    Latents.Free;
+    Embeds.Free;
+    SourceImage.Free;
     Pipeline.Free;
     FreeAndNil(FSD15Oracle);
   end;

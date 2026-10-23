@@ -280,6 +280,10 @@ type
     // diffusers DDIMInverseScheduler.step (eta 0) in place: Xt moves up from
     // Tt - T div NumSteps (FinalAlphaBar below 1) to Tt; RawPred is the model at Tt.
     procedure InverseDDIMStep(Xt, RawPred: TNNetVolume; Tt, NumSteps: integer);
+    // The deterministic smDDIM Step from Tt to TtPrev (0: clean) as
+    // XtCoef * x_t + PredCoef * RawPred.
+    procedure DDIMStepCoefficients(Tt, TtPrev: integer;
+      out XtCoef, PredCoef: TNeuralFloat);
     // diffusers SD img2img/inpaint get_timesteps: the first schedule entry that
     // runs at Strength, N - min(int(N * Strength), N); raises when no step runs.
     class function Img2ImgStartStep(NumSteps: integer;
@@ -2008,6 +2012,18 @@ begin
     FSqrtAlphaBar[Tt], FSqrtOneMinusAlphaBar[Tt], XtCoef, PredCoef);
   Xt.Mul(XtCoef);
   Xt.MulAdd(PredCoef, RawPred);
+end;
+
+procedure TNNetDiffusionScheduler.DDIMStepCoefficients(Tt, TtPrev: integer;
+  out XtCoef, PredCoef: TNeuralFloat);
+var
+  AbPrev: TNeuralFloat;
+begin
+  if TtPrev = 0 then AbPrev := FFinalAlphaBar
+  else AbPrev := FAlphaBar[TtPrev];
+  DDIMMoveCoefficients(FSqrtAlphaBar[Tt], FSqrtOneMinusAlphaBar[Tt],
+    FInvSqrtAlphaBar[Tt], Sqrt(AbPrev), Sqrt(Max(0.0, 1.0 - AbPrev)), XtCoef,
+    PredCoef);
 end;
 
 class function TNNetDiffusionScheduler.Img2ImgStartStep(NumSteps: integer;
