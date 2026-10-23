@@ -137,6 +137,16 @@ type
     procedure TestActivationReportsRepeatStable;
     procedure TestLensReportsIgnoreNilProbes;
     procedure TestEnableInputGradient;
+    // TNNet.SetErrorOnlyBackprop on an inference-only clone of a pico net
+    // (conv, group norm, strided ReLU conv, pointwise conv, attention, token
+    // layer norm, dense): the input gradient equals the trainable net's, the
+    // weights stay byte-identical, no delta buffer exists, False restores
+    // inference, and a weight layer without an error-only backward is refused.
+    procedure TestErrorOnlyBackpropMatchesTrainable;
+    // Error-only through int8 weights: the input gradient matches an FP32 net
+    // holding the dequantized weights and stays close to the FP32 original;
+    // an int4 pointwise conv stays close to its FP32 original.
+    procedure TestErrorOnlyBackpropQuantized;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
     procedure TestGradientNoiseScaleReportSmoke;
@@ -5219,6 +5229,231 @@ begin
   finally
     X.Free;
     NN.Free;
+  end;
+end;
+
+function BuildErrorOnlyPicoNet(): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(6, 4, 3));
+  Result.AddLayer(TNNetConvolutionLinear.Create(8, 3, 1, 1));
+  Result.AddLayer(TNNetGroupNorm.Create(2));
+  Result.AddLayer(TNNetConvolutionReLU.Create(6, 3, 1, 2));
+  Result.AddLayer(TNNetReshape.Create(6, 1, 6));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(12));
+  Result.AddLayer(TNNetScaledDotProductAttention.Create(4, false));
+  Result.AddLayer(TNNetTokenLayerNorm.Create());
+  Result.AddLayer(TNNetFullConnectReLU.Create(7));
+  Result.AddLayer(TNNetFullConnectLinear.Create(3));
+  Result.InitWeights();
+  Result.SetLearningRate(0.01, 0);
+  Result.SetBatchUpdate(true);
+end;
+
+function ErrorOnlyMaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+var
+  Pos: integer;
+begin
+  Result := 0;
+  for Pos := 0 to A.Size - 1 do
+    Result := Max(Result, Abs(A.FData[Pos] - B.FData[Pos]));
+end;
+
+// || A - B || / || B ||
+function ErrorOnlyRelativeDiff(A, B: TNNetVolume): TNeuralFloat;
+var
+  Pos: integer;
+  DiffSqr: TNeuralFloat;
+begin
+  DiffSqr := 0;
+  for Pos := 0 to A.Size - 1 do
+    DiffSqr := DiffSqr + Sqr(A.FData[Pos] - B.FData[Pos]);
+  Result := Sqrt(DiffSqr / B.GetSumSqr());
+end;
+
+function NetHasNeuronDeltas(NN: TNNet): boolean;
+var
+  LayerCnt, NeuronCnt: integer;
+begin
+  Result := false;
+  for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    for NeuronCnt := 0 to NN.Layers[LayerCnt].Neurons.Count - 1 do
+      if (NN.Layers[LayerCnt].Neurons[NeuronCnt].Delta <> nil) or
+        (NN.Layers[LayerCnt].Neurons[NeuronCnt].BackInertia <> nil) then
+        exit(true);
+end;
+
+procedure TTestNeuralLayersExtra.TestErrorOnlyBackpropMatchesTrainable;
+var
+  Trainable, ErrorOnly, Refused: TNNet;
+  X, Target: TNNetVolume;
+  WeightsBefore: string;
+  Pass, LayerCnt: integer;
+  IsRefused: boolean;
+begin
+  RandSeed := 20261023;
+  Trainable := BuildErrorOnlyPicoNet();
+  ErrorOnly := Trainable.Clone();
+  X := TNNetVolume.Create(6, 4, 3);
+  Target := TNNetVolume.Create(3, 1, 1);
+  Refused := nil;
+  try
+    ErrorOnly.SetTrainable(false);
+    AssertFalse('inference-only clone has no deltas', NetHasNeuronDeltas(ErrorOnly));
+    ErrorOnly.SetErrorOnlyBackprop(true);
+    AssertTrue('net reports error-only', ErrorOnly.ErrorOnlyBackprop);
+    for LayerCnt := 0 to ErrorOnly.GetLastLayerIdx() do
+      AssertTrue('layer ' + IntToStr(LayerCnt) + ' error-only',
+        ErrorOnly.Layers[LayerCnt].ErrorOnlyBackprop);
+    Trainable.EnableInputGradient();
+    ErrorOnly.EnableInputGradient();
+    WeightsBefore := ErrorOnly.SaveDataToString();
+    for Pass := 0 to 1 do
+    begin
+      X.RandomizeGaussian(1.0);
+      Target.RandomizeGaussian(1.0);
+      Trainable.Compute(X);
+      Trainable.Backpropagate(Target);
+      ErrorOnly.Compute(X);
+      ErrorOnly.Backpropagate(Target);
+      AssertEquals('pass ' + IntToStr(Pass) + ' same output', 0,
+        ErrorOnlyMaxAbsDiff(ErrorOnly.GetLastLayer().Output,
+        Trainable.GetLastLayer().Output), 1e-6);
+      AssertTrue('pass ' + IntToStr(Pass) + ' nonzero input gradient',
+        Trainable.Layers[0].OutputError.GetSumAbs() > 1e-4);
+      AssertEquals('pass ' + IntToStr(Pass) + ' input gradient', 0,
+        ErrorOnlyMaxAbsDiff(ErrorOnly.Layers[0].OutputError,
+        Trainable.Layers[0].OutputError), 1e-6);
+    end;
+    AssertTrue('weights byte-identical',
+      WeightsBefore = ErrorOnly.SaveDataToString());
+    AssertFalse('no delta buffers after backprop', NetHasNeuronDeltas(ErrorOnly));
+    ErrorOnly.ClearDeltas();
+    ErrorOnly.UpdateWeights();
+    AssertTrue('UpdateWeights leaves the weights alone',
+      WeightsBefore = ErrorOnly.SaveDataToString());
+    ErrorOnly.SetErrorOnlyBackprop(false);
+    AssertFalse('net leaves error-only', ErrorOnly.ErrorOnlyBackprop);
+    AssertFalse('conv back to inference-only', ErrorOnly.Layers[1].IsTrainable);
+    AssertFalse('conv leaves error-only', ErrorOnly.Layers[1].ErrorOnlyBackprop);
+    AssertEquals('conv error buffer collapsed', 1,
+      ErrorOnly.Layers[1].OutputError.Size);
+    AssertFalse('still no deltas', NetHasNeuronDeltas(ErrorOnly));
+    ErrorOnly.Compute(X);
+    AssertEquals('inference output unchanged', 0,
+      ErrorOnlyMaxAbsDiff(ErrorOnly.GetLastLayer().Output,
+      Trainable.GetLastLayer().Output), 1e-6);
+    // TNNetBitLinear's backward differs from the plain weight-row sum.
+    Refused := TNNet.Create();
+    Refused.AddLayer(TNNetInput.Create(8));
+    Refused.AddLayer(TNNetBitLinear.Create(3));
+    Refused.SetTrainable(false);
+    IsRefused := false;
+    try
+      Refused.SetErrorOnlyBackprop(true);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('BitLinear refused', IsRefused);
+    AssertFalse('refusal changes no layer', Refused.Layers[0].ErrorOnlyBackprop);
+    AssertFalse('refusal leaves the net', Refused.ErrorOnlyBackprop);
+  finally
+    Refused.Free;
+    Target.Free;
+    X.Free;
+    ErrorOnly.Free;
+    Trainable.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestErrorOnlyBackpropQuantized;
+var
+  Reference, Quantized, Dequantized: TNNet;
+  X, Target: TNNetVolume;
+  LayerCnt: integer;
+begin
+  RandSeed := 20261024;
+  Reference := BuildErrorOnlyPicoNet();
+  Quantized := Reference.Clone();
+  Dequantized := Reference.Clone();
+  X := TNNetVolume.Create(6, 4, 3);
+  Target := TNNetVolume.Create(3, 1, 1);
+  try
+    Quantized.SetTrainable(false);
+    Quantized.QuantizeWeightsInt8();
+    AssertTrue('conv is int8', Quantized.Layers[1].HasInferenceOnlyWeights());
+    AssertTrue('dense is int8', Quantized.Layers[9].HasInferenceOnlyWeights());
+    // The FP32 twin of the int8 weights.
+    for LayerCnt := 0 to Dequantized.GetLastLayerIdx() do
+      if Dequantized.Layers[LayerCnt] is TNNetLayerConcatedWeights then
+      begin
+        TNNetLayerConcatedWeights(Dequantized.Layers[LayerCnt]).QuantizeWeightsInt8();
+        TNNetLayerConcatedWeights(Dequantized.Layers[LayerCnt]).DequantizeWeightsInt8();
+      end;
+    // Clone does not carry SetBatchUpdate: without it every backward step
+    // would move the twin's weights before its previous-layer error.
+    Dequantized.SetBatchUpdate(true);
+    Quantized.SetErrorOnlyBackprop(true);
+    AssertTrue('int8 conv error-only', Quantized.Layers[1].ErrorOnlyBackprop);
+    Reference.EnableInputGradient();
+    Quantized.EnableInputGradient();
+    Dequantized.EnableInputGradient();
+    X.RandomizeGaussian(1.0);
+    Target.RandomizeGaussian(1.0);
+    Reference.Compute(X);
+    Reference.Backpropagate(Target);
+    Dequantized.Compute(X);
+    Dequantized.Backpropagate(Target);
+    Quantized.Compute(X);
+    Quantized.Backpropagate(Target);
+    AssertFalse('int8 net has no deltas', NetHasNeuronDeltas(Quantized));
+    AssertEquals('int8 = dequantized FP32 input gradient', 0,
+      ErrorOnlyMaxAbsDiff(Quantized.Layers[0].OutputError,
+      Dequantized.Layers[0].OutputError), 1e-5);
+    // Rows of 6 to 27 weights through attention: about 5% here (measured).
+    AssertEquals('int8 close to the FP32 input gradient', 0,
+      ErrorOnlyRelativeDiff(Quantized.Layers[0].OutputError,
+      Reference.Layers[0].OutputError), 0.1);
+  finally
+    Target.Free;
+    X.Free;
+    Dequantized.Free;
+    Quantized.Free;
+    Reference.Free;
+  end;
+  // Int4 weights x int8 input: a pointwise conv with 32 input channels.
+  Reference := TNNet.Create();
+  X := TNNetVolume.Create(4, 3, 32);
+  Target := TNNetVolume.Create(3, 1, 1);
+  Quantized := nil;
+  try
+    Reference.AddLayer(TNNetInput.Create(4, 3, 32));
+    Reference.AddLayer(TNNetPointwiseConvLinear.Create(8));
+    Reference.AddLayer(TNNetFullConnectLinear.Create(3));
+    Reference.InitWeights();
+    Reference.SetLearningRate(0.01, 0);
+    Reference.SetBatchUpdate(true);
+    Quantized := Reference.Clone();
+    Quantized.SetTrainable(false);
+    TNNetLayerConcatedWeights(Quantized.Layers[1]).QuantizeWeightsInt4();
+    AssertTrue('conv is int4', Quantized.Layers[1].HasInferenceOnlyWeights());
+    Quantized.SetErrorOnlyBackprop(true);
+    Reference.EnableInputGradient();
+    Quantized.EnableInputGradient();
+    X.RandomizeGaussian(1.0);
+    Target.RandomizeGaussian(1.0);
+    Reference.Compute(X);
+    Reference.Backpropagate(Target);
+    Quantized.Compute(X);
+    Quantized.Backpropagate(Target);
+    AssertEquals('int4 close to the FP32 input gradient', 0,
+      ErrorOnlyRelativeDiff(Quantized.Layers[0].OutputError,
+      Reference.Layers[0].OutputError), 0.25);
+  finally
+    Quantized.Free;
+    Target.Free;
+    X.Free;
+    Reference.Free;
   end;
 end;
 

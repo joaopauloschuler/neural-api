@@ -823,16 +823,22 @@ rather than acted on.
               `--invert-image --null-text` (with and without `--edit-prompt`)
               there: reconstruction quality at guidance 7.5.
         - [ ] Null-text inversion follow-ups (b5f693ec..59dcdab1):
-          - [ ] Error-only backprop mode on `TNNet` (propagate input errors,
-                skip weight deltas, no delta/inertia buffers), so
-                `NullTextInversion` can run on the kept inference UNet and on
-                int8 weights instead of a separate trainable FP32 UNet (about 3x
-                the FP32 weight bytes for deltas + inertia; SD 1.5 estimated
-                ~10 GB, not measured).
-          - [ ] The trainable UNet never runs on OpenCL: 50 steps x 10 inner
-                steps is up to 500 CPU forward+backward passes.
-          - [ ] One CLI run builds the UNet twice (trainable for the inversion,
-                inference for sampling back), reading the weights twice.
+          - [x] Error-only backprop mode on `TNNet` (`SetErrorOnlyBackprop`):
+                `NullTextInversion` runs on the sampling UNet, int8 included,
+                with no delta/inertia buffers. The memory saving against the
+                old trainable FP32 UNet (SD 1.5 estimated ~10 GB) is not
+                measured on a real checkpoint.
+          - [ ] OpenCL: with OpenCL on, `NullTextInversion` still builds a
+                trainable FP32 UNet on the CPU; 50 steps x 10 inner steps is
+                up to 500 CPU forward+backward passes. Error-only on the
+                OpenCL UNet was not tried: check that the device forward
+                leaves every backward cache (GroupNorm's normalized input,
+                attention probabilities, ...) on the host, or add a device
+                backward.
+          - [x] One CLI run builds the UNet once: `--null-text` keeps the
+                components loaded (CPU only; `--gpu` still builds two UNets,
+                the trainable CPU one for the fit and the OpenCL one for
+                sampling).
 - [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
       Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`):
       `TStableDiffusionICLight` (`Relight`) and examples/StableDiffusion

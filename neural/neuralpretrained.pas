@@ -12912,6 +12912,9 @@ type
       SampleNoise: TNNetVolume = nil);
     // Null-text inversion (Mokady et al. 2022): Latents := InvertImage at guidance 1;
     // UncondEmbeds := per DDIM step, Adam-fitted uncond embeds retracing it under CFG.
+    // Backpropagates through the sampling UNet (AcquireUNet, so a kept one is
+    // reused) in TNNet.SetErrorOnlyBackprop; with OpenCL on, through a
+    // separate trainable FP32 UNet on the CPU.
     procedure NullTextInversion(Image, PromptEmbeds: TNNetVolume; Width,
       Height, StepCount: integer; GuidanceScale: TNeuralFloat;
       Latents: TNNetVolume; UncondEmbeds: TNNetVolumeList;
@@ -104334,6 +104337,7 @@ var
   GridX, GridY, StepPos, MaxStepPos, InnerPos, MaxInnerPos, Tt, TtPrev: integer;
   XtCoef, PredCoef, Loss, InvElementCount, StepLearningRate, Beta1Power,
     Beta2Power: TNeuralFloat;
+  UsesInferenceUNet: boolean;
 
   procedure Predict(StepLatents, Embeds: TNNetVolume; Timestep: integer;
     Pred: TNNetVolume);
@@ -104361,10 +104365,28 @@ begin
   FImageStats.UNetPassCount := 0;
   FImageStats.UNetCachedPassCount := 0;
   FImageStats.ControlNetShallowRunCount := 0;
-  DoPhase(sdphLoadUNet);
-  // Backpropagate needs the FP32 error buffers an inference-only UNet frees.
-  Net := BuildUNet(GridX, GridY, PromptEmbeds.SizeX, false, false, '', '',
-    DeepCacheLayout, nil, {pTrainable=}true);
+  // The sampling UNet (kept, int8 or borrowing alike) in error-only backprop:
+  // the text gradient flows, no weight delta or inertia buffer exists. The
+  // OpenCL forward does not leave every backward cache on the host, so an
+  // OpenCL pipeline builds a trainable FP32 UNet on the CPU instead.
+  UsesInferenceUNet := {$IFDEF OpenCL}not FUseOpenCL{$ELSE}true{$ENDIF};
+  if UsesInferenceUNet then
+  begin
+    Net := AcquireUNet(GridX, GridY, PromptEmbeds.SizeX, false, false, '', '',
+      DeepCacheLayout);
+    try
+      Net.SetErrorOnlyBackprop(true);
+    except
+      ReleaseComponent(Net);
+      raise;
+    end;
+  end
+  else
+  begin
+    DoPhase(sdphLoadUNet);
+    Net := BuildUNet(GridX, GridY, PromptEmbeds.SizeX, false, false, '', '',
+      DeepCacheLayout, nil, {pTrainable=}true);
+  end;
   Config := UNetStepConfig(GridX, GridY, PromptEmbeds.SizeX);
   Trajectory := TNNetVolumeList.Create();
   Current := TNNetVolume.Create();
@@ -104379,7 +104401,7 @@ begin
   SecondMoment := TNNetVolume.Create(Uncond.SizeX, Uncond.SizeY, Uncond.Depth);
   try
     DoPhase(sdphDenoise);
-    Net.SetBatchUpdate(true);
+    if not UsesInferenceUNet then Net.SetBatchUpdate(true);
     TextInput := SDUNetTextStatesInput(Net);
     Net.EnableInputGradient(TextInput);
     // The reference's ddim_loop: the prompt alone, every latent kept.
@@ -104438,7 +104460,7 @@ begin
         Uncond.Sub(Gradient);
         if Loss < EarlyStopEpsilon + StepPos * 2e-5 then break;
       end;
-      Net.ClearDeltas();
+      if not UsesInferenceUNet then Net.ClearDeltas();
       UncondEmbeds.Add(TNNetVolume.Create(Uncond));
       Predict(Current, Uncond, Tt - 1, UncondPred);
       TNNetDiffusionScheduler.ApplyCFG(CondPred, UncondPred, GuidedPred,
@@ -104458,7 +104480,12 @@ begin
     Uncond.Free;
     Current.Free;
     Trajectory.Free;
-    Net.Free;
+    if UsesInferenceUNet then
+    begin
+      Net.SetErrorOnlyBackprop(false);
+      ReleaseComponent(Net);
+    end
+    else Net.Free;
   end;
 end;
 

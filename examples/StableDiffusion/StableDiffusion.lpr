@@ -69,6 +69,8 @@ with the prompt, then sampled back with DDIM and the prompt; guidance defaults
 to 1, where the round trip reconstructs the image best. --null-text adds
 null-text inversion (Mokady et al. 2022): per step, the unconditional embeds are
 fitted so sampling back at the CFG guidance (default 7.5) retraces the inversion.
+The fit backpropagates through the sampling UNet (int8 with --int8) without
+weight gradients; on --gpu it builds a trainable FP32 UNet on the CPU.
 --relight PNG --iclight FILE relights a cut-out subject with IC-Light (Zhang
 et al. 2025, lllyasviel/IC-Light gradio_demo.py): the iclight_sd15_fc offset
 is added to the UNet weights, the prompt describes the light, --light
@@ -1699,7 +1701,10 @@ begin
       else if Assigned(GLIGEN) then Pipeline.Conditioner := GLIGEN
       else Pipeline.Conditioner := ControlNet;
     end;
-    if Opt.RepeatCount > 1 then
+    // --null-text fits the embeds on the sampling UNet (error-only backprop)
+    // and samples back with it: kept, its weights are read once. On OpenCL the
+    // fit builds its own trainable CPU UNet, so nothing would be shared.
+    if (Opt.RepeatCount > 1) or (Opt.NullText and not Opt.UseOpenCL) then
     begin
       WriteLn('Loading the text encoder, the UNet and the VAE decoder to ',
         'keep them in memory.');

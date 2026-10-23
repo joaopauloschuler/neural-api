@@ -781,12 +781,17 @@ the reference's real-image Prompt-to-Prompt edit. `--null-text` inverts over
 `--steps`, so it does not combine with `--invert-steps` or
 `--invert-guidance`.
 
-The optimization backpropagates through the UNet to its text input, so it
-builds a trainable FP32 UNet on the CPU for the inversion (int8 and OpenCL do
-not apply to it). A trainable layer also holds weight deltas and inertia, so
-this UNet takes about three times its FP32 weight bytes plus per-layer error
-buffers (estimated from the buffers, not measured: roughly 10 GB for SD 1.5),
-and each inner step is one forward and one backward pass. With 50 steps and
+The optimization backpropagates through the UNet to its text input. It runs on
+the sampling UNet (int8 with `--int8`) in error-only backprop
+(`TNNet.SetErrorOnlyBackprop`): the input errors flow through every layer and
+no weight gradient, delta or inertia buffer is made. The UNet then holds its
+error buffers and backward caches on top of the weights; the saving against
+the trainable FP32 UNet used before (about three times its FP32 weight bytes,
+roughly 10 GB estimated for SD 1.5) has not been measured on a real
+checkpoint. `--null-text` keeps the text encoder, UNet and VAE decoder loaded,
+so the inversion and the sampling back share one UNet and read its weights
+once. With `--gpu` the inversion still builds a trainable FP32 UNet on the
+CPU. Each inner step is one forward and one backward pass: with 50 steps and
 10 inner steps that is up to 500 backward passes.
 
 `TStableDiffusionPipeline.NullTextInversion` returns the inverted latents and

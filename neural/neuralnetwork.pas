@@ -592,6 +592,18 @@ type
       // the inference weight footprint minimal. Set by SetTrainable's
       // pLowMemory argument. Default False. (Coded by Claude (AI).)
       FLowMemory: boolean;
+      // Error-only backprop (SetErrorOnlyBackprop): FIsTrainable is True so the
+      // error buffers and backward caches exist, but the neurons keep no
+      // training volumes and Backpropagate writes no weight deltas, only the
+      // previous layer's error. The weights are read, never written.
+      FErrorOnly: boolean;
+      // True only inside SetErrorOnlyBackprop's SetTrainable(True) call.
+      FErrorOnlyPending: boolean;
+      // The FIsTrainable that SetErrorOnlyBackprop(False) restores.
+      FErrorOnlyWasTrainable: boolean;
+      // Dequantized weight rows of a quantized layer's error-only backward,
+      // shared by every layer of the net (TNNet owns it); nil otherwise.
+      FErrorOnlyRows: TNNetVolume;
       // Set by SetOutputErrorSize / SetOutputErrorSizeNoDeriv: the class sizes
       // its error buffers to FOutput, so SetTrainable(True) can regrow them.
       FOutputErrorTracksOutput: boolean;
@@ -1069,6 +1081,19 @@ type
       // False: inference-only, training volumes freed (chain before AddLayer to
       // never allocate them). True: restores them; Adam must be re-initialized.
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; virtual;
+      // True: Backpropagate passes the input error through this layer and
+      // leaves the weights and their (absent) deltas alone, as torch's
+      // requires_grad=False on every parameter. Works on inference-only,
+      // quantized and borrowed weights: no training volume is allocated, the
+      // low-memory setting is kept. False: back to the state before.
+      // RowScratch is the dequantize scratch a quantized layer grows to its
+      // need; prefer TNNet.SetErrorOnlyBackprop, which owns it.
+      function SetErrorOnlyBackprop(Value: boolean; RowScratch: TNNetVolume): TNNetLayer;
+      // True when Backpropagate has an error-only path for this class: the
+      // weightless layers here, a few weight-bearing classes in overrides.
+      function SupportsErrorOnlyBackprop(): boolean; virtual;
+      // Grows RowScratch to what this layer's error-only backward reads.
+      procedure SizeErrorOnlyScratch(RowScratch: TNNetVolume); virtual;
       // True when the weights cannot be trained here: quantized (int8/int4) or
       // borrowed from another layer (LinkWeightsFrom). Coded by Claude (AI).
       function HasInferenceOnlyWeights(): boolean; virtual;
@@ -1124,6 +1149,8 @@ type
       // True by default; SetTrainable(False) clears it and marks the layer
       // forward-only.
       property IsTrainable: boolean read FIsTrainable;
+      // See SetErrorOnlyBackprop.
+      property ErrorOnlyBackprop: boolean read FErrorOnly;
       property NN:TNNet read FNN write FNN;
       property Output: TNNetVolume read FOutput;
       property OutputRaw: TNNetGroupedVolume read FOutputRaw;
@@ -1210,8 +1237,9 @@ type
       // (TNNetVolume.DotProductInt8 / DotProductsTiledInt8) stream the codes
       // directly against the FP32 input and apply the per-row scale once to
       // each raw code sum, so the weight stream costs 1 byte/element.
-      // Biases stay FP32. Backpropagation raises - quantized layers are
-      // inference-only.
+      // Biases stay FP32. Training backpropagation raises - quantized layers
+      // are inference-only; SetErrorOnlyBackprop's backward dequantizes rows
+      // into a shared scratch to pass the input error.
       FQuantInt8: boolean;
       FQuantTable: TNNetVolumeQuant8;
       FQuantVectorSize: integer;
@@ -1280,6 +1308,11 @@ type
       // The fused OpenCL bias, one float per neuron: FBiasOutput only on a FullConnect.
       // GroupedConvolutionLinear/LocalConnect/LocalProduct hold it per position: override first.
       function OpenCLBiasOperand(): TNNetVolume; virtual;
+      // Error-only backward: neuron NeuronIdx's FP32 weight row, or, on a
+      // quantized layer, that row dequantized into FErrorOnlyRows' row Slot.
+      function ErrorOnlyWeightRow(NeuronIdx, Slot: integer): TNeuralFloatArrPtr;
+      // Weight rows the error-only backward holds at once (dequantize slots).
+      function ErrorOnlyRowSlots(): integer; virtual;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -1419,6 +1452,7 @@ type
       // arrays (no copy; this layer's bytes are the owner's).
       function WeightCachesSharedWithOwner(): boolean;
       function HasInferenceOnlyWeights(): boolean; override;
+      procedure SizeErrorOnlyScratch(RowScratch: TNNetVolume); override;
   end;
 
   {$IFDEF FPC}
@@ -10196,6 +10230,7 @@ type
         pCenterOutput: boolean = true); reintroduce; overload;
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
+      function SupportsErrorOnlyBackprop(): boolean; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -10445,6 +10480,7 @@ type
         pEpsilon: TNeuralFloat = 0); reintroduce; overload;
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
+      function SupportsErrorOnlyBackprop(): boolean; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -15410,6 +15446,10 @@ type
       procedure PrepareChunkedForward(); override;
       procedure Backpropagate(); override;
       procedure BackpropagateCPU(); virtual;
+      // SetErrorOnlyBackprop's backward: the previous layer's error from the
+      // FP32 or quantized weights, no weight deltas.
+      procedure BackpropagateErrorOnlyCPU();
+      function SupportsErrorOnlyBackprop(): boolean; override;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
@@ -17416,6 +17456,10 @@ type
       procedure BackpropagateFastTiledCPU();
       procedure BackpropagateFastCPUDev(); // Backprop CPU development version (do not use it)
       procedure BackpropagatePointwiseOpenCL();
+      // SetErrorOnlyBackprop's backward: the previous layer's error from the
+      // FP32 or quantized weights, no im2col input, no weight deltas.
+      procedure BackpropagateErrorOnlyCPU();
+      function ErrorOnlyRowSlots(): integer; override;
       {$IFDEF Debug}
       procedure AddBiasToRawResult(); {$IFDEF Release} inline; {$ENDIF}
       //procedure ComputeNeuronFromResult(NeuronIdx: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -17465,6 +17509,7 @@ type
       function ChunkOverNeurons(): boolean;
       procedure Backpropagate(); override;
       function SupportsLowMemory(): boolean; override;
+      function SupportsErrorOnlyBackprop(): boolean; override;
       // Opt-in Winograd F(2x2,3x3) fast forward path. Only takes effect for
       // 3x3, stride-1 convolutions (any padding); otherwise the exact direct
       // path is used unchanged. Default OFF. Forward inference only - backward
@@ -20728,6 +20773,10 @@ type
       // updated by SetTrainable with whatever value it fans out to the layers.
       // Coded by Claude (AI).
       FIsTrainable: boolean;
+      // SetErrorOnlyBackprop's state, and the dequantized weight rows its
+      // quantized layers share (nil until a quantized layer needs it).
+      FErrorOnlyBackprop: boolean;
+      FErrorOnlyRowScratch: TNNetVolume;
       // When True, int8-eligible inference-only layers ATTACHED to this net
       // (AddLayer -> SetPrevLayer -> SetNumWeightsForAllNeurons) arm their
       // int8 container directly instead of allocating FP32 weight rows, so
@@ -22636,6 +22685,16 @@ type
       // TNNetLayer.SetTrainable on every layer, then RefreshPrevLayerErrorCaches.
       // After a False->True flip run InitAdam again and re-run EnableOpenCL.
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNet; // Coded by Claude (AI).
+      // True: Backpropagate computes input errors (EnableInputGradient) through
+      // every layer and writes no weight deltas, the torch analogue of
+      // requires_grad=False on every parameter. Inference-only, int8/int4 and
+      // borrowed weights keep their storage: no delta or inertia buffer is
+      // allocated, only the error buffers and backward caches a trainable
+      // forward keeps. Raises (changing nothing) when a weight-bearing layer
+      // has no error-only backward. False: every layer goes back to its state
+      // before. A SetTrainable call on the net or a layer also leaves it.
+      // OpenCL-armed layers follow the SetTrainable(True) rules.
+      function SetErrorOnlyBackprop(Value: boolean = true): TNNet;
       // Lets every layer re-read its FPrevLayer's error-buffer size; call it
       // after changing any layer's trainability outside TNNet.SetTrainable.
       procedure RefreshPrevLayerErrorCaches(); // Coded by Claude (AI).
@@ -24971,6 +25030,7 @@ type
         write SetLayerProfiling;
       // False once SetTrainable(False) has marked the net inference-only.
       property IsTrainable: boolean read FIsTrainable;
+      property ErrorOnlyBackprop: boolean read FErrorOnlyBackprop;
   end;
 
   { TNNetSWAWrapper }
@@ -25617,6 +25677,11 @@ type
   {$ENDIF}
 
 implementation
+
+const
+  // Weight rows a convolution's error-only backward scatters per sweep of the
+  // previous error (TNNetConvolution.BackpropagateErrorOnlyCPU).
+  csErrorOnlyConvRowSlots = 16;
 
 // nil-tolerant byte counts for NonWeightBytes.
 function VolumeBytes(V: TNNetVolume): int64;
@@ -88047,26 +88112,29 @@ begin
     // (gamma scratch += OE .* x_hat) and a plain Add (beta scratch += OE; x*1+y
     // = x+y exactly, so the scale-1 accumulate needs no multiply), then fold the
     // -LR scale into each FDelta in one vectorized MulAdd to preserve the exact
-    // scalar semantics.
-    FGammaGradScratch.Fill(0);
-    FBetaGradScratch.Fill(0);
-    for TokenCnt := 0 to TokenMax do
+    // scalar semantics. Error-only (SetErrorOnlyBackprop) skips them.
+    if not FErrorOnly then
     begin
-      BaseIdx := TokenCnt * Depth;
-      OEPtr := FOutputError.GetRawPtr(BaseIdx);
-      TNNetVolume.MulAdd(GammaGradPtr, OEPtr, FNormalized.GetRawPtr(BaseIdx),
-        Depth);
-      TNNetVolume.Add(BetaGradPtr, OEPtr, Depth);
-    end;
-    TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), GammaGradPtr,
-      -FLearningRate, Depth);
-    TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), BetaGradPtr,
-      -FLearningRate, Depth);
-    if (not FBatchUpdate) then
-    begin
-      FNeurons[0].UpdateWeights(FInertia);
-      FNeurons[1].UpdateWeights(FInertia);
-      AfterWeightUpdate();
+      FGammaGradScratch.Fill(0);
+      FBetaGradScratch.Fill(0);
+      for TokenCnt := 0 to TokenMax do
+      begin
+        BaseIdx := TokenCnt * Depth;
+        OEPtr := FOutputError.GetRawPtr(BaseIdx);
+        TNNetVolume.MulAdd(GammaGradPtr, OEPtr, FNormalized.GetRawPtr(BaseIdx),
+          Depth);
+        TNNetVolume.Add(BetaGradPtr, OEPtr, Depth);
+      end;
+      TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), GammaGradPtr,
+        -FLearningRate, Depth);
+      TNNetVolume.MulAdd(FNeurons[1].FDelta.GetRawPtr(), BetaGradPtr,
+        -FLearningRate, Depth);
+      if (not FBatchUpdate) then
+      begin
+        FNeurons[0].UpdateWeights(FInertia);
+        FNeurons[1].UpdateWeights(FInertia);
+        AfterWeightUpdate();
+      end;
     end;
   end
   else GammaPtr := nil;
@@ -88109,6 +88177,11 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetTokenLayerNorm.SupportsErrorOnlyBackprop(): boolean;
+begin
+  Result := true;
 end;
 
 procedure TNNetTokenLayerNorm.InitDefault();
@@ -89546,29 +89619,33 @@ begin
   // Gradients with respect to gamma and beta (accumulated into deltas).
   // d(gamma) = sum of ( OutputError * normalized )
   // d(beta)  = sum of ( OutputError )
-  FOutputErrorDeriv.Copy(FOutputError);
-  FOutputErrorDeriv.Mul(FNormalized);
-  if FPerChannelAffine then
+  // Error-only (SetErrorOnlyBackprop) skips them.
+  if not FErrorOnly then
   begin
-    // Per-channel affine: reduce the gamma/beta gradients over all spatial
-    // positions, leaving one value per channel.
-    FAuxChannel.Fill(0);
-    FAuxChannel.AddSumChannel(FOutputErrorDeriv);
-    FNeurons[0].FDelta.MulAdd(-FLearningRate, FAuxChannel);
-    FAuxChannel.Fill(0);
-    FAuxChannel.AddSumChannel(FOutputError);
-    FNeurons[1].FDelta.MulAdd(-FLearningRate, FAuxChannel);
-  end
-  else
-  begin
-    FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputErrorDeriv);
-    FNeurons[1].FDelta.MulAdd(-FLearningRate, FOutputError);
-  end;
-  if (not FBatchUpdate) then
-  begin
-    FNeurons[0].UpdateWeights(FInertia);
-    FNeurons[1].UpdateWeights(FInertia);
-    AfterWeightUpdate();
+    FOutputErrorDeriv.Copy(FOutputError);
+    FOutputErrorDeriv.Mul(FNormalized);
+    if FPerChannelAffine then
+    begin
+      // Per-channel affine: reduce the gamma/beta gradients over all spatial
+      // positions, leaving one value per channel.
+      FAuxChannel.Fill(0);
+      FAuxChannel.AddSumChannel(FOutputErrorDeriv);
+      FNeurons[0].FDelta.MulAdd(-FLearningRate, FAuxChannel);
+      FAuxChannel.Fill(0);
+      FAuxChannel.AddSumChannel(FOutputError);
+      FNeurons[1].FDelta.MulAdd(-FLearningRate, FAuxChannel);
+    end
+    else
+    begin
+      FNeurons[0].FDelta.MulAdd(-FLearningRate, FOutputErrorDeriv);
+      FNeurons[1].FDelta.MulAdd(-FLearningRate, FOutputError);
+    end;
+    if (not FBatchUpdate) then
+    begin
+      FNeurons[0].UpdateWeights(FInertia);
+      FNeurons[1].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
   end;
   if Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size) then
@@ -89623,6 +89700,11 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetGroupNorm.SupportsErrorOnlyBackprop(): boolean;
+begin
+  Result := true;
 end;
 
 procedure TNNetGroupNorm.InitDefault();
@@ -90442,6 +90524,36 @@ end;
 function TNNetLayerConcatedWeights.HasInferenceOnlyWeights(): boolean;
 begin
   Result := inherited HasInferenceOnlyWeights() or FQuantInt8 or FQuantInt4;
+end;
+
+function TNNetLayerConcatedWeights.ErrorOnlyRowSlots(): integer;
+begin
+  Result := 1;
+end;
+
+procedure TNNetLayerConcatedWeights.SizeErrorOnlyScratch(RowScratch: TNNetVolume);
+var
+  RowElements: integer;
+begin
+  if not (FQuantInt8 or FQuantInt4) then exit;
+  RowElements := Min(ErrorOnlyRowSlots(), FNeurons.Count) * FQuantVectorSize;
+  if RowScratch.Size < RowElements then RowScratch.ReSize(RowElements, 1, 1);
+end;
+
+function TNNetLayerConcatedWeights.ErrorOnlyWeightRow(NeuronIdx,
+  Slot: integer): TNeuralFloatArrPtr;
+begin
+  if FQuantInt4 then
+  begin
+    Result := TNeuralFloatArrPtr(@FErrorOnlyRows.FData[Slot * FQuantVectorSize]);
+    FQuantTableInt4.DequantizeRowTo(NeuronIdx, 0, Result);
+  end
+  else if FQuantInt8 then
+  begin
+    Result := TNeuralFloatArrPtr(@FErrorOnlyRows.FData[Slot * FQuantVectorSize]);
+    FQuantTable.DequantizeRowTo(NeuronIdx, 0, Result);
+  end
+  else Result := FArrNeurons[NeuronIdx].Weights.DataPtr;
 end;
 
 function TNNetLayerConcatedWeights.WeightCachesSharedWithOwner(): boolean;
@@ -121347,11 +121459,11 @@ var
   StartTime, LocalNow: double;
   MaxError: TNeuralFloat;
 begin
-  if FQuantInt8 or FQuantInt4 then
+  if (FQuantInt8 or FQuantInt4) and not FErrorOnly then
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
       IntToStr(FLayerIdx) + ' has quantized weights (inference-only). ' +
       'Rebuild/reload without quantization to train.');
-  if ActiveLowMemory() then
+  if ActiveLowMemory() and not FErrorOnly then
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
       IntToStr(FLayerIdx) + ' is in low-memory inference mode (the weight ' +
       'caches backprop needs were released). Call TNNet.SetTrainable(True) ' +
@@ -121390,7 +121502,9 @@ begin
       end;
       {$ELSE}
       *)
-      BackpropagateFastTiledCPU(); // This is our default backprop
+      if FErrorOnly
+        then BackpropagateErrorOnlyCPU()
+        else BackpropagateFastTiledCPU(); // This is our default backprop
       //{$ENDIF}
       //BackpropagateCPU();
 
@@ -121895,6 +122009,120 @@ begin
     for OutputD := 0 to MaxD do FArrNeurons[OutputD].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
+end;
+
+function TNNetConvolution.SupportsErrorOnlyBackprop(): boolean;
+begin
+  // The classes whose backward is BackpropagateFastTiledCPU unchanged.
+  Result := (ClassType = TNNetConvolution) or
+    (ClassType = TNNetConvolutionLinear) or
+    (ClassType = TNNetConvolutionReLU) or
+    (ClassType = TNNetConvolutionSwish) or
+    (ClassType = TNNetConvolutionHardSwish) or
+    (ClassType = TNNetConvolutionRectangular) or
+    (ClassType = TNNetPointwiseConv) or
+    (ClassType = TNNetPointwiseConvLinear) or
+    (ClassType = TNNetPointwiseConvReLU);
+end;
+
+function TNNetConvolution.ErrorOnlyRowSlots(): integer;
+begin
+  Result := csErrorOnlyConvRowSlots;
+end;
+
+// The input-error half of BackpropagateFastTiledCPU, neuron-tile outer: a tile
+// of weight rows (dequantized once per backward on a quantized layer) is
+// scattered at every output position while the previous error's window stays
+// in cache.
+procedure TNNetConvolution.BackpropagateErrorOnlyCPU();
+var
+  OutputX, OutputY, MaxX, MaxY, PrevX, PrevY, MaxPrevX, MaxPrevY: integer;
+  TileStart, TileEnd, NeuronCount, NeuronIdx, SlotPos, DerivPos: integer;
+  LocalCntY, TapRunCnt, MaxTapRunPos, TapRunSize, TapRunSrcStep: integer;
+  PrevDepth, PrevTapRowBytes, WeightRowBytes: integer;
+  LocalPrevError: TNNetVolume;
+  Deriv, DerivCoef: TNeuralFloat;
+  DerivPtr, PosPrevPtr, RowPrevPtr, RowWeightPtr: TNeuralFloatArrPtr;
+  Rows: array[0..csErrorOnlyConvRowSlots - 1] of TNeuralFloatArrPtr;
+begin
+  // The derivative only feeds the previous error here.
+  if not FCalculatePrevLayerError then exit;
+  ComputeErrorDeriv();
+  if FPadding > 0 then
+  begin
+    FPrevLayerErrorPadded.Fill(0);
+    LocalPrevError := FPrevLayerErrorPadded;
+  end
+  else LocalPrevError := FPrevLayer.OutputError;
+  NeuronCount := FNeurons.Count;
+  PrevDepth := FPrevLayer.Output.Depth;
+  MaxX := FOutputErrorDeriv.SizeX - 1;
+  MaxY := FOutputErrorDeriv.SizeY - 1;
+  MaxPrevX := 1 + LocalPrevError.SizeX - FFeatureExtentX;
+  MaxPrevY := 1 + LocalPrevError.SizeY - FFeatureExtentY;
+  // One kernel row down is FDilationY rows of the previous error.
+  PrevTapRowBytes := LocalPrevError.IncYSizeBytes() * FDilationY;
+  WeightRowBytes := FFeatureSizeX * PrevDepth * csNeuralFloatSize;
+  // Each kernel row scatters as runs of adjacent elements, as the im2col
+  // gathers them: the whole row at dilation 1, one tap otherwise.
+  if FDilationX = 1 then
+  begin
+    TapRunSize := FFeatureSizeX * PrevDepth;
+    MaxTapRunPos := 0;
+  end
+  else
+  begin
+    TapRunSize := PrevDepth;
+    MaxTapRunPos := FFeatureSizeXMinus1;
+  end;
+  TapRunSrcStep := FDilationX * PrevDepth;
+  if FPointwise
+    then DerivCoef := 1
+    else DerivCoef := FInvLearnSmoothener;
+  DerivPtr := FOutputErrorDeriv.DataPtr;
+  TileStart := 0;
+  while TileStart < NeuronCount do
+  begin
+    TileEnd := Min(TileStart + csErrorOnlyConvRowSlots, NeuronCount) - 1;
+    for NeuronIdx := TileStart to TileEnd do
+      Rows[NeuronIdx - TileStart] :=
+        ErrorOnlyWeightRow(NeuronIdx, NeuronIdx - TileStart);
+    for OutputY := 0 to MaxY do
+    begin
+      PrevY := OutputY * FStride;
+      if PrevY >= MaxPrevY then continue;
+      for OutputX := 0 to MaxX do
+      begin
+        PrevX := OutputX * FStride;
+        if PrevX >= MaxPrevX then continue;
+        PosPrevPtr := LocalPrevError.GetRawPtr(PrevX, PrevY);
+        DerivPos := FOutputErrorDeriv.GetRawPos(OutputX, OutputY, TileStart);
+        for SlotPos := 0 to TileEnd - TileStart do
+        begin
+          Deriv := DerivPtr^[DerivPos + SlotPos];
+          if Deriv = 0 then continue;
+          Deriv := Deriv * DerivCoef;
+          RowPrevPtr := PosPrevPtr;
+          RowWeightPtr := Rows[SlotPos];
+          for LocalCntY := 0 to FFeatureSizeYMinus1 do
+          begin
+            for TapRunCnt := 0 to MaxTapRunPos do
+              TNNetVolume.MulAdd(
+                TNeuralFloatArrPtr(@RowPrevPtr^[TapRunCnt * TapRunSrcStep]),
+                TNeuralFloatArrPtr(@RowWeightPtr^[TapRunCnt * TapRunSize]),
+                Deriv, TapRunSize);
+            RowPrevPtr := TNeuralFloatArrPtr(pointer(RowPrevPtr) + PrevTapRowBytes);
+            RowWeightPtr := TNeuralFloatArrPtr(pointer(RowWeightPtr) + WeightRowBytes);
+          end;
+        end;
+      end;
+    end;
+    TileStart := TileEnd + 1;
+  end;
+  if FPadding > 0 then
+    FPrevLayer.OutputError.AddArea(0, 0, FPadding, FPaddingY,
+      FPrevLayer.OutputError.SizeX, FPrevLayer.OutputError.SizeY,
+      FPrevLayerErrorPadded);
 end;
 
 procedure TNNetConvolution.BackpropagateFastCPUDev();
@@ -123154,7 +123382,7 @@ procedure TNNetFullConnect.Backpropagate();
 var
   StartTime: double;
 begin
-  if FQuantInt8 then
+  if FQuantInt8 and not FErrorOnly then
     raise Exception.Create('TNNetFullConnect.Backpropagate: layer ' +
       IntToStr(FLayerIdx) + ' has int8-quantized weights (inference-only). ' +
       'Rebuild/reload without quantization to train.');
@@ -123168,7 +123396,8 @@ begin
   begin
     // ComputeErrorDeriv() is not required as it's done by BackpropagateCPU
     StartTime := Now();
-    if FLearningRate <> 0.0 then
+    if FErrorOnly then BackpropagateErrorOnlyCPU()
+    else if FLearningRate <> 0.0 then
     begin
       {$IFDEF OpenCL}
       if Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL then
@@ -123184,7 +123413,7 @@ begin
       {$ENDIF}
     end; // of FLearningRate <> 0.0
     {$IFDEF CheckRange} ForceRangeWeights(1000); {$ENDIF}
-    ComputePreviousLayerError();
+    if not FErrorOnly then ComputePreviousLayerError();
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end else
   begin
@@ -123261,6 +123490,38 @@ begin
       end;
   end;
   if not FBatchUpdate then AfterWeightUpdate();
+end;
+
+function TNNetFullConnect.SupportsErrorOnlyBackprop(): boolean;
+begin
+  // The classes whose previous-layer error is the plain sum of weight rows.
+  Result := (ClassType = TNNetFullConnect) or
+    (ClassType = TNNetFullConnectLinear) or
+    (ClassType = TNNetFullConnectReLU) or
+    (ClassType = TNNetFullConnectSigmoid) or
+    (ClassType = TNNetLayerFullConnect) or
+    (ClassType = TNNetDense);
+end;
+
+procedure TNNetFullConnect.BackpropagateErrorOnlyCPU();
+var
+  MaxNeuronPos, NeuronIdx, PrevSize: integer;
+  Deriv: TNeuralFloat;
+  PrevErrorPtr: TNeuralFloatArrPtr;
+begin
+  ComputeErrorDeriv();
+  if not Assigned(FPrevLayer) or
+    (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
+  PrevErrorPtr := FPrevLayer.FOutputError.DataPtr;
+  PrevSize := FPrevLayer.FOutputError.Size;
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronIdx := 0 to MaxNeuronPos do
+  begin
+    Deriv := FOutputErrorDeriv.FData[NeuronIdx];
+    if Deriv <> 0 then
+      TNNetVolume.MulAdd(PrevErrorPtr, ErrorOnlyWeightRow(NeuronIdx, 0), Deriv,
+        PrevSize);
+  end;
 end;
 
 destructor TNNetFullConnect.Destroy();
@@ -124615,6 +124876,7 @@ begin
   // The list tracks helper objects it does not own; FLayers freed them above.
   if Assigned(FOpenCLOwned) then FOpenCLOwned.Free;
   {$ENDIF}
+  FErrorOnlyRowScratch.Free;
   inherited Destroy();
 end;
 
@@ -147963,11 +148225,37 @@ var
 begin
   Result := Self;
   FIsTrainable := pTrainable;
+  // Every layer leaves error-only below.
+  FErrorOnlyBackprop := false;
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
     FLayers[LayerCnt].SetTrainable(pTrainable, pLowMemory);
   end;
+  RefreshPrevLayerErrorCaches();
+end;
+
+function TNNet.SetErrorOnlyBackprop(Value: boolean): TNNet;
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  Result := Self;
+  LastLayerIdx := GetLastLayerIdx();
+  if Value then
+  begin
+    for LayerCnt := 0 to LastLayerIdx do
+      if not FLayers[LayerCnt].SupportsErrorOnlyBackprop() then
+        raise Exception.Create('TNNet.SetErrorOnlyBackprop: layer ' +
+          IntToStr(LayerCnt) + ' (' + FLayers[LayerCnt].ClassName +
+          ') has weights and no error-only backward.');
+    if FErrorOnlyRowScratch = nil then
+      FErrorOnlyRowScratch := TNNetVolume.Create(1, 1, 1);
+  end;
+  for LayerCnt := 0 to LastLayerIdx do
+    FLayers[LayerCnt].SetErrorOnlyBackprop(Value, FErrorOnlyRowScratch);
+  FErrorOnlyBackprop := Value;
+  if (not Value) and Assigned(FErrorOnlyRowScratch) then
+    FErrorOnlyRowScratch.ReSize(1, 1, 1);
   RefreshPrevLayerErrorCaches();
 end;
 
@@ -150398,7 +150686,7 @@ end;
 
 procedure TNNetLayer.ComputeL2Decay();
 begin
-  if ( (FNeurons.Count > 0) and (FL2Decay > 0) ) then
+  if ( (FNeurons.Count > 0) and (FL2Decay > 0) and (not FErrorOnly) ) then
   begin
     MulWeights( 1 - ( FL2Decay * FLearningRate) );
   end;
@@ -150764,11 +151052,14 @@ var
   AlreadyFreed: boolean;
   BecomesTrainable: boolean;
   WasLowMemory: boolean;
+  WasErrorOnly: boolean;
 begin
   Result := Self;
   // Quantized or borrowed weights have no FP32 rows of their own to train, so
-  // such a layer stays inference-only; IsTrainable reports it.
-  if pTrainable and (not FIsTrainable) and HasInferenceOnlyWeights() then exit;
+  // such a layer stays inference-only (or error-only); IsTrainable reports it.
+  // Error-only reads those weights and trains nothing.
+  if pTrainable and (not FErrorOnlyPending) and
+    ((not FIsTrainable) or FErrorOnly) and HasInferenceOnlyWeights() then exit;
   MaxLayer := FNeurons.Count - 1;
   // A repeated inference-only call finds every neuron already freed. Neurons are
   // only appended to (or popped from) the end, so the last one decides for all.
@@ -150776,11 +151067,15 @@ begin
     ( (MaxLayer < 0) or (FNeurons[MaxLayer].FDelta = nil) );
   BecomesTrainable := pTrainable and not FIsTrainable;
   WasLowMemory := FLowMemory;
+  WasErrorOnly := FErrorOnly;
+  FErrorOnly := pTrainable and FErrorOnlyPending;
+  if not FErrorOnly then FErrorOnlyRows := nil;
   FIsTrainable := pTrainable;
   // Low-memory mode drops the backprop-side weight caches, so it only makes
   // sense for an inference-only layer. Coercing here makes the contradictory
-  // SetTrainable(True, True) combination impossible.
-  FLowMemory := pLowMemory and not pTrainable;
+  // SetTrainable(True, True) combination impossible. Error-only reads the
+  // neuron rows, never those caches, so it keeps the inference setting.
+  FLowMemory := pLowMemory and ((not pTrainable) or FErrorOnly);
   // An inference-only flip after the layer is attached frees the error buffers
   // now rather than at a re-wire that may never come.
   if not pTrainable then
@@ -150789,10 +151084,12 @@ begin
     FOutputErrorDeriv.ReSize(1, 1, 1);
   end;
   if AlreadyFreed then exit;
-  for Cnt := 0 to MaxLayer do
-  begin
-    FNeurons[Cnt].SetTrainable(pTrainable, pLowMemory);
-  end;
+  // Error-only leaves the neurons as they are; borrowed ones are the owner's.
+  if not (FErrorOnly or (WasErrorOnly and HasInferenceOnlyWeights())) then
+    for Cnt := 0 to MaxLayer do
+    begin
+      FNeurons[Cnt].SetTrainable(pTrainable, pLowMemory);
+    end;
   if BecomesTrainable then
   begin
     // SetPrevLayer sized the error buffers while the layer was inference-only,
@@ -150811,8 +151108,41 @@ begin
     end;
     // Low-memory inference released the concatenated weight caches the
     // trainable forward and backward read.
-    if WasLowMemory and (MaxLayer >= 0) then AfterWeightUpdate();
+    if WasLowMemory and (not FErrorOnly) and (MaxLayer >= 0) then
+      AfterWeightUpdate();
   end;
+end;
+
+function TNNetLayer.SetErrorOnlyBackprop(Value: boolean;
+  RowScratch: TNNetVolume): TNNetLayer;
+begin
+  Result := Self;
+  if Value = FErrorOnly then exit;
+  if Value then
+  begin
+    if not SupportsErrorOnlyBackprop() then
+      raise Exception.Create(ClassName + '.SetErrorOnlyBackprop: layer ' +
+        IntToStr(FLayerIdx) + ' has weights and no error-only backward.');
+    FErrorOnlyWasTrainable := FIsTrainable;
+    FErrorOnlyPending := true;
+    try
+      SetTrainable(true, FLowMemory);
+    finally
+      FErrorOnlyPending := false;
+    end;
+    FErrorOnlyRows := RowScratch;
+    if Assigned(RowScratch) then SizeErrorOnlyScratch(RowScratch);
+  end
+  else SetTrainable(FErrorOnlyWasTrainable, FLowMemory);
+end;
+
+function TNNetLayer.SupportsErrorOnlyBackprop(): boolean;
+begin
+  Result := FNeurons.Count = 0;
+end;
+
+procedure TNNetLayer.SizeErrorOnlyScratch(RowScratch: TNNetVolume);
+begin
 end;
 
 function TNNetLayer.HasInferenceOnlyWeights(): boolean;
@@ -151175,7 +151505,8 @@ var
   Cnt: integer;
 begin
   // Inference-only (SetTrainable(false)): the training volumes are freed.
-  if not FIsTrainable then exit;
+  // Error-only: none were made, and borrowed neurons are the owner's.
+  if (not FIsTrainable) or FErrorOnly then exit;
   if (FNeurons.Count > 0) then
   begin
     MaxNeuronPos := FNeurons.Count-1;
@@ -152462,6 +152793,7 @@ procedure TNNetLayer.UpdateWeights();
 var
   Cnt, MaxNeurons: integer;
 begin
+  if FErrorOnly then exit;
   MaxNeurons := FNeurons.Count - 1;
   if MaxNeurons >= 0 then
   begin

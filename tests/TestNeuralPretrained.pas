@@ -1532,8 +1532,15 @@ type
     // NullTextInversion (tiny_sd15 img2img image, 4 steps, 3 inner, CFG 7.5, early
     // stop 1e-5 / 0.47) vs ad hoc torch; Denoise and DenoiseEdit with its embeds.
     procedure TestStableDiffusionNullTextInversionParity;
+    // NullTextInversion runs on the sampling UNet in error-only backprop: with
+    // kept components no weights file is read for the inversion or the
+    // sampling back, the embeds equal a fresh pipeline's, the kept UNet samples
+    // as before afterwards, and an int8 UNet inverts close to the FP32 one.
+    procedure TestStableDiffusionNullTextInversionKeptUNet;
     // TNNet.EnableInputGradient on the tiny_sd15 UNet's text states input:
-    // Backpropagate's error there vs central differences of 0.5 |pred - target|^2.
+    // Backpropagate's error there vs central differences of 0.5 |pred - target|^2,
+    // on the trainable build and in SetErrorOnlyBackprop on the inference-only
+    // build, FP32 and int8.
     procedure TestSDUNetTextStatesGradient;
     // get_word_inds, get_replacement_mapper_ and get_mapper of
     // google/prompt-to-prompt on hand-made token lengths and ids.
@@ -53064,18 +53071,119 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestStableDiffusionNullTextInversionKeptUNet;
+var
+  Fresh, Kept: TStableDiffusionPipeline;
+  SourceImage, Embeds, FreshLatents, KeptLatents, Reconstructed: TNNetVolume;
+  FreshEmbeds, KeptEmbeds: TNNetVolumeList;
+  ImageWidth, ImageHeight, StepPos, LoadCount, RunPos: integer;
+  EmbedsDiff, MaxEmbedsDiff: double;
+  Delta: TNNetVolume;
+begin
+  FSD15Oracle := LoadSD15Fixture('tiny_sd15_img2img_io.json');
+  Fresh := CreateSD15Pipeline();
+  Delta := TNNetVolume.Create;
+  Kept := CreateSD15Pipeline();
+  SourceImage := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  FreshLatents := TNNetVolume.Create;
+  KeptLatents := TNNetVolume.Create;
+  Reconstructed := TNNetVolume.Create;
+  FreshEmbeds := TNNetVolumeList.Create();
+  KeptEmbeds := TNNetVolumeList.Create();
+  try
+    ImageWidth := TJSONObject(FSD15Oracle).Get('width', 0);
+    ImageHeight := TJSONObject(FSD15Oracle).Get('height', 0);
+    LoadNestedOracleVolume(TJSONObject(FSD15Oracle).Arrays['init_image'],
+      false, SourceImage);
+    SourceImage.Mul(255);
+    Fresh.EncodePrompt(TJSONObject(FSD15Oracle).Get('prompt', ''), Embeds);
+    Fresh.NullTextInversion(SourceImage, Embeds, ImageWidth, ImageHeight, 4,
+      7.5, FreshLatents, FreshEmbeds, 3, 1e-2, csNullTextEarlyStop[0]);
+    Kept.LoadComponents(ImageWidth, ImageHeight);
+    FillChar(FSD15PhaseCounts, SizeOf(FSD15PhaseCounts), 0);
+    Kept.OnPhase := @SD15CountPhase;
+    LoadCount := Kept.WeightFileLoadCount;
+    // The second run finds the UNet back in inference mode.
+    for RunPos := 0 to 1 do
+    begin
+      Kept.NullTextInversion(SourceImage, Embeds, ImageWidth, ImageHeight, 4,
+        7.5, KeptLatents, KeptEmbeds, 3, 1e-2, csNullTextEarlyStop[0]);
+      AssertEquals('run ' + IntToStr(RunPos) + ' passes',
+        csNullTextPassCounts[0], Kept.ImageStats.UNetPassCount);
+      AssertEquals('run ' + IntToStr(RunPos) + ' inverted latents', 0,
+        MaxAbsVolumeDiff(KeptLatents, FreshLatents), 1e-6);
+      for StepPos := 0 to 3 do
+        AssertEquals('run ' + IntToStr(RunPos) + ' step ' + IntToStr(StepPos) +
+          ' embeds', 0, MaxAbsVolumeDiff(KeptEmbeds[StepPos],
+          FreshEmbeds[StepPos]), 1e-6);
+      Reconstructed.Copy(KeptLatents);
+      Kept.Denoise(Embeds, ImageWidth, ImageHeight, 4, Reconstructed,
+        KeptEmbeds);
+      AssertEquals('run ' + IntToStr(RunPos) + ' reconstructed mean abs',
+        csNullTextReconstructedMeanAbs,
+        Reconstructed.GetSumAbs() / Reconstructed.Size, 1e-4);
+    end;
+    AssertEquals('kept UNet never rebuilt', 0, FSD15PhaseCounts[sdphLoadUNet]);
+    // One read: the VAE encoder, which LoadComponents does not load.
+    AssertEquals('kept UNet: no UNet weights file read', LoadCount + 1,
+      Kept.WeightFileLoadCount);
+    // Int8, both fresh (quantized in place) and kept (int8 owner, borrower).
+    Fresh.UNetInt8 := true;
+    Kept.UNetInt8 := true;
+    Fresh.NullTextInversion(SourceImage, Embeds, ImageWidth, ImageHeight, 4,
+      7.5, KeptLatents, KeptEmbeds, 3, 1e-2, csNullTextEarlyStop[0]);
+    MaxEmbedsDiff := 0;
+    for StepPos := 0 to 3 do
+    begin
+      Delta.Copy(KeptEmbeds[StepPos]);
+      Delta.Sub(FreshEmbeds[StepPos]);
+      EmbedsDiff := Delta.GetSumAbs() / Delta.Size;
+      MaxEmbedsDiff := Max(MaxEmbedsDiff, EmbedsDiff);
+    end;
+    // Adam moves each element about LearningRate per inner step whatever the
+    // gradient size, so near-zero gradients of either sign set the max; the
+    // mean is the measure (0.0099 measured). The int8 backward itself is
+    // checked by TestSDUNetTextStatesGradient.
+    AssertTrue('int8 embeds moved', MaxEmbedsDiff > 0);
+    AssertTrue('int8 embeds mean |diff| = ' + FloatToStr(MaxEmbedsDiff),
+      MaxEmbedsDiff < 0.03);
+    // FreshEmbeds now takes the kept int8 run, KeptEmbeds holds the fresh one.
+    Kept.NullTextInversion(SourceImage, Embeds, ImageWidth, ImageHeight, 4,
+      7.5, KeptLatents, FreshEmbeds, 3, 1e-2, csNullTextEarlyStop[0]);
+    for StepPos := 0 to 3 do
+      AssertEquals('kept int8 step ' + IntToStr(StepPos) + ' = fresh int8', 0,
+        MaxAbsVolumeDiff(KeptEmbeds[StepPos], FreshEmbeds[StepPos]), 1e-5);
+  finally
+    Delta.Free;
+    KeptEmbeds.Free;
+    FreshEmbeds.Free;
+    Reconstructed.Free;
+    KeptLatents.Free;
+    FreshLatents.Free;
+    Embeds.Free;
+    SourceImage.Free;
+    Kept.Free;
+    Fresh.Free;
+    FreeAndNil(FSD15Oracle);
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestSDUNetTextStatesGradient;
 const
   cTimestep = 500;
   cStep = 1e-2;
   cProbePositions: array[0..5] of integer = (0, 7, 33, 64, 101, 159);
+  cModeNames: array[0..2] of string = ('trainable', 'error-only',
+    'error-only int8');
 var
   NN: TNNet;
   Config: TSDUNetConfig;
   TextInput: TNNetLayer;
   Latents, Embeds, Target, Pred, Gradient: TNNetVolume;
-  ProbePos, EmbedPos: integer;
+  ProbePos, EmbedPos, ModePos: integer;
   SavedValue, LossPlus, LossMinus, Numerical, Tolerance: TNeuralFloat;
+  WeightsBefore: string;
 
   function Loss(): TNeuralFloat;
   begin
@@ -53085,54 +53193,71 @@ var
   end;
 
 begin
-  RandSeed := 20221117;
   Config := ReadSDUNetConfigFromJSONFile(FixturePath('tiny_sd15/unet/config.json'));
   Config.LatentGrid := 8;
   Config.LatentGridY := 6;
   Config.TextSeqLen := 5;
-  NN := BuildSDUNetFromSafeTensorsEx(
-    FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors'), Config,
-    {pTrainable=}true);
   Latents := TNNetVolume.Create(8, 6, Config.InChannels);
   Embeds := TNNetVolume.Create(Config.TextSeqLen, 1, Config.CrossAttentionDim);
   Target := TNNetVolume.Create(8, 6, Config.OutChannels);
   Pred := TNNetVolume.Create();
   Gradient := TNNetVolume.Create();
+  NN := nil;
   try
-    NN.SetBatchUpdate(true);
-    Latents.RandomizeGaussian(1.0);
-    Embeds.RandomizeGaussian(1.0);
-    Target.RandomizeGaussian(1.0);
-    TextInput := SDUNetTextStatesInput(NN);
-    SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
-    NN.EnableInputGradient(TextInput);
-    SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
-    NN.Backpropagate(Target);
-    AssertEquals('error on the text input', Embeds.Size,
-      TextInput.OutputError.Size);
-    Gradient.Copy(TextInput.OutputError);
-    AssertTrue('nonzero text gradient', Gradient.GetSumAbs() > 0);
-    for ProbePos := 0 to High(cProbePositions) do
+    // Trainable as NullTextInversion's OpenCL fallback builds it; the
+    // inference-only build (FP32, then int8) in error-only backprop as the
+    // sampling UNet it runs otherwise.
+    for ModePos := 0 to 2 do
     begin
-      EmbedPos := cProbePositions[ProbePos];
-      SavedValue := Embeds.FData[EmbedPos];
-      Embeds.FData[EmbedPos] := SavedValue + cStep;
-      LossPlus := Loss();
-      Embeds.FData[EmbedPos] := SavedValue - cStep;
-      LossMinus := Loss();
-      Embeds.FData[EmbedPos] := SavedValue;
-      Numerical := (LossPlus - LossMinus) / (2 * cStep);
-      Tolerance := 2e-3 + 0.03 * Abs(Numerical);
-      AssertEquals('d loss / d embed ' + IntToStr(EmbedPos), Numerical,
-        Gradient.FData[EmbedPos], Tolerance);
+      RandSeed := 20221117;
+      NN := BuildSDUNetFromSafeTensorsEx(
+        FixturePath('tiny_sd15/unet/diffusion_pytorch_model.safetensors'),
+        Config, {pTrainable=}ModePos = 0);
+      if ModePos = 2 then NN.QuantizeWeightsInt8();
+      if ModePos = 0
+        then NN.SetBatchUpdate(true)
+        else NN.SetErrorOnlyBackprop(true);
+      WeightsBefore := '';
+      if ModePos = 1 then WeightsBefore := NN.SaveDataToString();
+      Latents.RandomizeGaussian(1.0);
+      Embeds.RandomizeGaussian(1.0);
+      Target.RandomizeGaussian(1.0);
+      TextInput := SDUNetTextStatesInput(NN);
+      SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
+      NN.EnableInputGradient(TextInput);
+      SDUNetDenoise(NN, Config, Latents, Embeds, cTimestep, Pred);
+      NN.Backpropagate(Target);
+      AssertEquals(cModeNames[ModePos] + ': error on the text input',
+        Embeds.Size, TextInput.OutputError.Size);
+      Gradient.Copy(TextInput.OutputError);
+      AssertTrue(cModeNames[ModePos] + ': nonzero text gradient',
+        Gradient.GetSumAbs() > 0);
+      if ModePos = 1 then
+        AssertTrue('error-only: weights byte-identical',
+          WeightsBefore = NN.SaveDataToString());
+      for ProbePos := 0 to High(cProbePositions) do
+      begin
+        EmbedPos := cProbePositions[ProbePos];
+        SavedValue := Embeds.FData[EmbedPos];
+        Embeds.FData[EmbedPos] := SavedValue + cStep;
+        LossPlus := Loss();
+        Embeds.FData[EmbedPos] := SavedValue - cStep;
+        LossMinus := Loss();
+        Embeds.FData[EmbedPos] := SavedValue;
+        Numerical := (LossPlus - LossMinus) / (2 * cStep);
+        Tolerance := 2e-3 + 0.03 * Abs(Numerical);
+        AssertEquals(cModeNames[ModePos] + ': d loss / d embed ' +
+          IntToStr(EmbedPos), Numerical, Gradient.FData[EmbedPos], Tolerance);
+      end;
+      FreeAndNil(NN);
     end;
   finally
+    NN.Free;
     Gradient.Free;
     Pred.Free;
     Target.Free;
     Embeds.Free;
     Latents.Free;
-    NN.Free;
   end;
 end;
 
