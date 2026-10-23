@@ -1284,7 +1284,7 @@ rather than acted on.
   - 2.9 Forward complex STFT follow-ups:
         - [X] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.
-          DONE (commit "perf(audio): TNNetForwardSTFT FFT path"): `UseFFT` runs
+          DONE fbe4661e: `UseFFT` runs
           `TFFTPlan` on two frames per complex FFT; Create picks it for a power
           of two >= 128 (no AVX: 32) or any NFFT >= 768 (no AVX: 192), else the
           direct DFT (Kokoro's 20 stays direct: 0.46 ms direct vs 3.7 ms FFT).
@@ -2614,8 +2614,9 @@ cannot pay for its own transfer.
 
 - [X] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
       (the even/odd split trick) to halve the row cost. DONE 106ffb8d:
-      `RealToHalfSpectrum` and `HalfSpectrumToReal` pair channels c, c+1 (forward and backward of rfft2 and irfft2; odd C runs a
-      single-channel tail; `PairChannelRows` = false restores one FFT per channel).
+      `RealToHalfSpectrum` and `HalfSpectrumToReal` pair channels c, c+1 (forward
+      and backward of rfft2 and irfft2; odd C runs a single-channel tail;
+      `PairChannelRows` = false restores one FFT per channel).
       OpenCL untouched: its kernels are per-element direct DFTs, no row FFT to pair.
       AVX2 Release, 100-rep min of 5, noisy 1-core VM: rfft2 64x64x16 1.29 -> 1.09 ms,
       48x48x16 7.01 -> 4.30 ms, 33x32x15 2.49 -> 1.12 ms; irfft2 64x64x16
