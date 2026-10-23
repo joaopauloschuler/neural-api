@@ -2190,7 +2190,7 @@ rather than acted on.
       (all limbs, canvas x0.6, then dots) were written from memory; only the
       cv2 drawing primitives come from a real OpenCV wheel.
 
-- [ ] Multi-object VIDEO tracking: exact assignment + ByteTrack (Zhang et al.
+- [X] Multi-object VIDEO tracking: exact assignment + ByteTrack (Zhang et al.
       ECCV 2022, arXiv:2110.06864) over the landed YOLOv8 detector, plus
       examples/ObjectTracking (.lpr + .lpi + README.md). Today the library
       detects per image only (`BuildYolo`, `DecodeYoloDetections`,
@@ -2223,13 +2223,19 @@ rather than acted on.
             `TestByteTrackKalmanPredictUpdate`, `TestByteTrackerSyntheticSequence`,
             `TestByteTrackerLostBufferAndReset`; no run against the Python
             reference.
-      - [ ] examples/ObjectTracking: a folder of frames (move the
+      - [X] examples/ObjectTracking: a folder of frames (move the
             `ListFrames` routine of examples/VideoMatting into a shared unit
             so both examples use one copy) -> YOLO per frame -> tracker ->
             boxes drawn with one color per id and the id as text, PPM/PNG
             frames and `--gif` through neuralgif.pas, `--gpu`, `--int8`,
             `--classes` filter. Mark the README "planned (coded)" until the
             user runs a real yolov8n on a real clip.
+            Done: `ListImageFilesInFolder` in neuraldatasets.pas (VideoMatting
+            uses it too; now also lists .ppm), covered by
+            `TestListImageFilesInFolder`. Boxes drawn with `DrawLineCV2`, the
+            id with a 3x5 digit font local to the example (no text renderer
+            existed). No-argument run = pico fixture smoke on 4 synthetic
+            frames (ids stable across frames, PNGs + GIF written).
 
 ## OpenCL forward coverage — layers still on the host
 

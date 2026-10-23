@@ -74,6 +74,9 @@ type
     // A binary P6 written like the examples write it (larger than the FPC
     // reader buffer, with a comment), a P5 and a saved .ppm reload exactly.
     procedure TestLoadBinaryPPMAndPGM;
+    // ListImageFilesInFolder keeps PNG / JPEG / PPM files of any case, no
+    // directories, and sorts digit runs by value, leading zeros ignored.
+    procedure TestListImageFilesInFolder;
     // BuildOutpaintCanvas with asymmetric sides 2,1,0,3 and overlap 1: the
     // image at (2,1), clamp-to-edge border, mask band only on extended sides.
     procedure TestOutpaintCanvasPlacementEdgeFillAndMask;
@@ -1893,6 +1896,41 @@ begin
   finally
     Filtered.Free;
     Mask.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestListImageFilesInFolder;
+const
+  cFileNames: array[0..5] of string = ('f10.png', 'f2.PNG', 'f1.jpeg',
+    'f007.png', 'f3.ppm', 'notes.txt');
+  cExpected: array[0..4] of string = ('f1.jpeg', 'f2.PNG', 'f3.ppm',
+    'f007.png', 'f10.png');
+var
+  Dir: string;
+  FileNames: TStringList;
+  FilePos: integer;
+  Stream: TFileStream;
+begin
+  Dir := IncludeTrailingPathDelimiter(GetTempDir + 'cai_list_image_files');
+  ForceDirectories(Dir + 'sub.png');
+  FileNames := TStringList.Create;
+  try
+    for FilePos := 0 to High(cFileNames) do
+    begin
+      Stream := TFileStream.Create(Dir + cFileNames[FilePos], fmCreate);
+      Stream.Free;
+    end;
+    ListImageFilesInFolder(Dir, FileNames);
+    AssertEquals('count', Length(cExpected), FileNames.Count);
+    for FilePos := 0 to High(cExpected) do
+      AssertEquals('name ' + IntToStr(FilePos), cExpected[FilePos],
+        FileNames[FilePos]);
+  finally
+    FileNames.Free;
+    for FilePos := 0 to High(cFileNames) do
+      DeleteFile(Dir + cFileNames[FilePos]);
+    RemoveDir(Dir + 'sub.png');
+    RemoveDir(Dir);
   end;
 end;
 

@@ -8,8 +8,8 @@ Two modes:
   * no arguments: a smoke of the committed random pico fixture
     tests/fixtures/tiny_rvm_mobilenetv3.pth: synthesize a few small frames
     (one of them of another size), matte them, write the outputs.
-  * --model FILE --input DIR --output DIR: matte every PNG / JPEG frame of a
-    folder (sorted by name, numbers compared by value) with the real
+  * --model FILE --input DIR --output DIR: matte every PNG / JPEG / PPM frame
+    of a folder (sorted by name, numbers compared by value) with the real
     rvm_mobilenetv3.pth or rvm_resnet50.pth.
 
 RVM is recurrent: four ConvGRU states carry what the net saw in the previous
@@ -59,8 +59,8 @@ begin
   WriteLn('       VideoMatting --model FILE --input DIR --output DIR [options]');
   WriteLn('  --model FILE         rvm_mobilenetv3.pth or rvm_resnet50.pth ',
     '(or a .safetensors of it)');
-  WriteLn('  --input DIR          folder of consecutive frames (PNG / JPEG), ',
-    'sorted by name');
+  WriteLn('  --input DIR          folder of consecutive frames ',
+    '(PNG / JPEG / PPM), sorted by name');
   WriteLn('  --output DIR         writes <frame>_rgba.png and <frame>_green.png');
   WriteLn('  --ratio R            downsample ratio in (0, 1] (default: 1 up to ',
     '512 px, else 480 / longest side)');
@@ -153,71 +153,6 @@ begin
     Result := 480 / LongestSide;
 end;
 
-// Compares file names with digit runs compared by value ("f2" < "f10").
-function NaturalCompare(List: TStringList; Index1, Index2: integer): integer;
-var
-  NameA, NameB: string;
-  PosA, PosB, StartA, StartB, LenA, LenB: integer;
-  RunA, RunB: string;
-begin
-  NameA := LowerCase(List[Index1]);
-  NameB := LowerCase(List[Index2]);
-  PosA := 1;
-  PosB := 1;
-  while (PosA <= Length(NameA)) and (PosB <= Length(NameB)) do
-  begin
-    if (NameA[PosA] in ['0'..'9']) and (NameB[PosB] in ['0'..'9']) then
-    begin
-      StartA := PosA;
-      StartB := PosB;
-      while (PosA <= Length(NameA)) and (NameA[PosA] in ['0'..'9']) do Inc(PosA);
-      while (PosB <= Length(NameB)) and (NameB[PosB] in ['0'..'9']) do Inc(PosB);
-      // Leading zeros do not count: compare the significant digits.
-      while (StartA < PosA - 1) and (NameA[StartA] = '0') do Inc(StartA);
-      while (StartB < PosB - 1) and (NameB[StartB] = '0') do Inc(StartB);
-      LenA := PosA - StartA;
-      LenB := PosB - StartB;
-      if LenA <> LenB then exit(LenA - LenB);
-      RunA := Copy(NameA, StartA, LenA);
-      RunB := Copy(NameB, StartB, LenB);
-      Result := CompareStr(RunA, RunB);
-      if Result <> 0 then exit;
-    end
-    else
-    begin
-      if NameA[PosA] <> NameB[PosB] then
-        exit(Ord(NameA[PosA]) - Ord(NameB[PosB]));
-      Inc(PosA);
-      Inc(PosB);
-    end;
-  end;
-  Result := (Length(NameA) - PosA) - (Length(NameB) - PosB);
-end;
-
-// Fills Frames with the PNG / JPEG file names of Dir, in frame order.
-procedure ListFrames(const Dir: string; Frames: TStringList);
-var
-  Search: TSearchRec;
-  Extension: string;
-begin
-  Frames.Clear;
-  if FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, Search) = 0 then
-  try
-    repeat
-      if (Search.Attr and faDirectory) = 0 then
-      begin
-        Extension := LowerCase(ExtractFileExt(Search.Name));
-        if (Extension = '.png') or (Extension = '.jpg') or
-           (Extension = '.jpeg') then
-          Frames.Add(Search.Name);
-      end;
-    until FindNext(Search) <> 0;
-  finally
-    FindClose(Search);
-  end;
-  Frames.CustomSort(@NaturalCompare);
-end;
-
 // Matte (W, H, 4) in [0,1] -> RGBA 0..255 and the green-screen RGB 0..255.
 procedure ComposeOutputs(Matte, RGBA, Green: TNNetVolume);
 var
@@ -305,9 +240,9 @@ begin
   OpenCLDevices := nil;
   {$ENDIF}
   try
-    ListFrames(Opt.InputDir, Frames);
+    ListImageFilesInFolder(Opt.InputDir, Frames);
     if Frames.Count = 0 then
-      raise Exception.Create('no PNG / JPEG frames in ' + Opt.InputDir);
+      raise Exception.Create('no PNG / JPEG / PPM frames in ' + Opt.InputDir);
     ForceDirectories(Opt.OutputDir);
     ComputeText := 'CPU';
     if Opt.UseOpenCL then

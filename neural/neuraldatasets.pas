@@ -33,7 +33,7 @@ uses
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
   FPReadGif, FPReadPNM, FPReadPSD, FPReadTGA, FPReadTiff,
   FPWriteBMP, FPWritePCX, FPWriteJPEG, FPWritePNG,
-  FPWritePNM, FPWriteTGA, FPWriteTiff
+  FPWritePNM, FPWriteTGA, FPWriteTiff, Classes
   {$ENDIF}
   ;
 
@@ -185,6 +185,10 @@ type
     out TrainingFileNames, ValidationFileNames, TestFileNames: TFileNameList;
     FolderName, pImageSubFolder: string;
     TrainingProp, ValidationProp, TestProp: single);
+
+  // Fills FileNames with the names (no path) of the PNG / JPEG / PPM files of
+  // Dir, sorted as frames: case-insensitive, digit runs by value ("f2" < "f10").
+  procedure ListImageFilesInFolder(const Dir: string; FileNames: TStringList);
 
   {$IFDEF FPC}
   // M.LoadFromFile, except netpbm (.ppm/.pgm/.pbm/.pnm) goes through a reader
@@ -953,7 +957,7 @@ implementation
 
 uses
   math, neuralthread,
-  {$IFDEF FPC}Classes,SysUtils,fileutil,fpjson,jsonparser{$ELSE}
+  {$IFDEF FPC}SysUtils,fileutil,fpjson,jsonparser{$ELSE}
   SysUtils,
   IOUtils,
   Types
@@ -3297,6 +3301,67 @@ begin
   LocalPicture.Free;
   {$ENDIF}
   AuxVolume.Free;
+end;
+
+// TStringList sort order of ListImageFilesInFolder.
+function CompareFileNamesNatural(List: TStringList; Index1, Index2: integer): integer;
+var
+  NameA, NameB: string;
+  PosA, PosB, StartA, StartB, LenA, LenB: integer;
+begin
+  NameA := LowerCase(List[Index1]);
+  NameB := LowerCase(List[Index2]);
+  PosA := 1;
+  PosB := 1;
+  while (PosA <= Length(NameA)) and (PosB <= Length(NameB)) do
+  begin
+    if (NameA[PosA] in ['0'..'9']) and (NameB[PosB] in ['0'..'9']) then
+    begin
+      StartA := PosA;
+      StartB := PosB;
+      while (PosA <= Length(NameA)) and (NameA[PosA] in ['0'..'9']) do Inc(PosA);
+      while (PosB <= Length(NameB)) and (NameB[PosB] in ['0'..'9']) do Inc(PosB);
+      // Leading zeros do not count: compare the significant digits.
+      while (StartA < PosA - 1) and (NameA[StartA] = '0') do Inc(StartA);
+      while (StartB < PosB - 1) and (NameB[StartB] = '0') do Inc(StartB);
+      LenA := PosA - StartA;
+      LenB := PosB - StartB;
+      if LenA <> LenB then exit(LenA - LenB);
+      Result := CompareStr(Copy(NameA, StartA, LenA), Copy(NameB, StartB, LenB));
+      if Result <> 0 then exit;
+    end
+    else
+    begin
+      if NameA[PosA] <> NameB[PosB] then
+        exit(Ord(NameA[PosA]) - Ord(NameB[PosB]));
+      Inc(PosA);
+      Inc(PosB);
+    end;
+  end;
+  Result := (Length(NameA) - PosA) - (Length(NameB) - PosB);
+end;
+
+procedure ListImageFilesInFolder(const Dir: string; FileNames: TStringList);
+var
+  Search: TSearchRec;
+  Extension: string;
+begin
+  FileNames.Clear;
+  if FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, Search) = 0 then
+  try
+    repeat
+      if (Search.Attr and faDirectory) = 0 then
+      begin
+        Extension := LowerCase(ExtractFileExt(Search.Name));
+        if (Extension = '.png') or (Extension = '.jpg') or
+           (Extension = '.jpeg') or (Extension = '.ppm') then
+          FileNames.Add(Search.Name);
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+  FileNames.CustomSort(@CompareFileNamesNatural);
 end;
 
 procedure CreateFileNameListsFromImagesFromFolder(out TrainingFileNames,

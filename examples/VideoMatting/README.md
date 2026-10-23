@@ -28,7 +28,7 @@ check). On a 640x480 4-frame clip on one CPU core, the example took about
 
 ## How it works
 
-1. The program lists the PNG / JPEG files of `--input`, sorted by name with
+1. The program lists the PNG / JPEG / PPM files of `--input`, sorted by name with
    numbers compared by value (`f2.png` before `f10.png`).
 2. It builds the net for the first frame's size and `--ratio`. With a ratio
    below 1, the net downsamples the frame, runs the backbone (MobileNetV3, or
@@ -70,7 +70,7 @@ ffmpeg -framerate 30 -i matted/%05d_green.png matted.mp4
 | option | meaning | default |
 | --- | --- | --- |
 | `--model FILE` | `rvm_mobilenetv3.pth` or `rvm_resnet50.pth` (or a `.safetensors` copy) | smoke run |
-| `--input DIR` | folder of consecutive frames of one clip, PNG / JPEG | required with `--model` |
+| `--input DIR` | folder of consecutive frames of one clip, PNG / JPEG / PPM | required with `--model` |
 | `--output DIR` | output folder for `<frame>_rgba.png` and `<frame>_green.png` (created if missing) | required with `--model` |
 | `--ratio R` | downsample ratio in (0, 1] for the backbone | see below |
 | `--gif FILE` | also write the green-screen frames as an animated GIF | |

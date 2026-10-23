@@ -128,3 +128,7 @@ examples/VideoMatting/rvm_smoke_frames/
 examples/VideoMatting/rvm_smoke_out/
 examples/VideoMatting/rvm_smoke_out_fgf/
 examples/VideoMatting/rvm_smoke_out_seg/
+examples/ObjectTracking/ObjectTracking
+examples/ObjectTracking/*.gif
+examples/ObjectTracking/tracking_smoke_frames/
+examples/ObjectTracking/tracking_smoke_out/
