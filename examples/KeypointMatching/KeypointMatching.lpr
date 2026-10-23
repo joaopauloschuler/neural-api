@@ -229,8 +229,7 @@ end;
 // from red (score 0) to green (score 1), as transformers' visualization does.
 procedure SaveMatchImage(const FileName: string;
   const Images: array of TNNetVolume;
-  const Keypoints: array of TSuperPointKeypoints; Matcher: TLightGlueMatcher;
-  NetWidth, NetHeight: integer);
+  const Keypoints: array of TSuperPointKeypoints; Matcher: TLightGlueMatcher);
 var
   Canvas: TNNetVolume;
   Side, PixelX, PixelY, MaxPixelX, MaxPixelY, Channel: integer;
@@ -259,12 +258,11 @@ begin
     begin
       Partner := Matcher.Matches0[PointPos];
       if Partner < 0 then continue;
-      // Net-input pixels back to each original image, truncated as transformers.
-      X0 := Trunc(Keypoints[0].X[PointPos] * Images[0].SizeX / NetWidth);
-      Y0 := Trunc(Keypoints[0].Y[PointPos] * Images[0].SizeY / NetHeight);
-      X1 := Trunc(Keypoints[1].X[Partner] * Images[1].SizeX / NetWidth) +
-        Images[0].SizeX;
-      Y1 := Trunc(Keypoints[1].Y[Partner] * Images[1].SizeY / NetHeight);
+      // post_process_keypoint_matching: net-input pixels to each original image.
+      X0 := Keypoints[0].ImageX(PointPos, Images[0].SizeX);
+      Y0 := Keypoints[0].ImageY(PointPos, Images[0].SizeY);
+      X1 := Keypoints[1].ImageX(Partner, Images[1].SizeX) + Images[0].SizeX;
+      Y1 := Keypoints[1].ImageY(Partner, Images[1].SizeY);
       Score := Min(Max(Matcher.MatchScores0[PointPos], 0), 1);
       DrawLine(Canvas, X0, Y0, X1, Y1, Thickness, 255 * (1 - Score),
         255 * Score, 0);
@@ -349,8 +347,7 @@ begin
        ScoreSum / Max(MatchCount, 1), Matcher.StopLayer + 1,
        Config.NumHiddenLayers, Matcher.KeptCount0, Matcher.KeptCount1,
        Matcher.Count0, Matcher.Count1]));
-    SaveMatchImage(Opt.OutputFile, Images, Keypoints, Matcher, Opt.Width,
-      Opt.Height);
+    SaveMatchImage(Opt.OutputFile, Images, Keypoints, Matcher);
     WriteLn('  wrote ', Opt.OutputFile);
   finally
     for Side := 0 to 1 do

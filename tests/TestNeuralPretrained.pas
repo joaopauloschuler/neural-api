@@ -1526,6 +1526,9 @@ type
     procedure TestSuperPointParity;
     procedure TestSuperPointPreprocess;
     procedure TestSuperPointRejectsUnalignedInput;
+    // post_process_keypoint_detection to a wider and a taller image than
+    // the 64x48 input, including a float32 truncation case.
+    procedure TestSuperPointKeypointsToImageSize;
     procedure TestLightGlueConfigFromJSONFile;
     // descriptor_dim 16 over 8-channel SuperPoint descriptors (input_projection).
     procedure TestLightGlueParity;
@@ -54400,6 +54403,54 @@ begin
   end;
   NN.Free;
   AssertTrue('error names the multiple: ' + Msg, Pos('multiple of 8', Msg) > 0);
+end;
+
+procedure TTestNeuralPretrained.TestSuperPointKeypointsToImageSize;
+const
+  PeakX: array[0..2] of integer = (5, 24, 63);
+  PeakY: array[0..2] of integer = (7, 28, 47);
+  // transformers 5.17 int32((xy / [64, 48]) * [W, H]) for 100x75 and 30x108.
+  WideX: array[0..2] of integer = (7, 37, 98);
+  WideY: array[0..2] of integer = (10, 43, 73);
+  TallX: array[0..2] of integer = (2, 11, 29);
+  TallY: array[0..2] of integer = (15, 62, 105);
+var
+  Config: TSuperPointConfig;
+  ScoreMap, DescriptorMap: TNNetVolume;
+  Keypoints: TSuperPointKeypoints;
+  PointPos: integer;
+begin
+  Config := Default(TSuperPointConfig);
+  SetLength(Config.EncoderHiddenSizes, 4);
+  Config.KeypointThreshold := 0.005;
+  Config.MaxKeypoints := -1;
+  Config.NmsRadius := 4;
+  Config.BorderRemovalDistance := 4;
+  ScoreMap := TNNetVolume.Create(64, 48, 1);
+  DescriptorMap := TNNetVolume.Create(8, 6, 4);
+  Keypoints := TSuperPointKeypoints.Create();
+  try
+    DescriptorMap.Fill(1);
+    for PointPos := 0 to 2 do
+      ScoreMap[PeakX[PointPos], PeakY[PointPos], 0] := 1;
+    Keypoints.Extract(ScoreMap, DescriptorMap, Config);
+    AssertEquals('count', 3, Keypoints.Count);
+    AssertEquals('input width', 64, Keypoints.InputWidth);
+    AssertEquals('input height', 48, Keypoints.InputHeight);
+    for PointPos := 0 to 2 do
+    begin
+      AssertEquals('x', PeakX[PointPos], Keypoints.X[PointPos]);
+      AssertEquals('y', PeakY[PointPos], Keypoints.Y[PointPos]);
+      AssertEquals('wide x', WideX[PointPos], Keypoints.ImageX(PointPos, 100));
+      AssertEquals('wide y', WideY[PointPos], Keypoints.ImageY(PointPos, 75));
+      AssertEquals('tall x', TallX[PointPos], Keypoints.ImageX(PointPos, 30));
+      AssertEquals('tall y', TallY[PointPos], Keypoints.ImageY(PointPos, 108));
+    end;
+  finally
+    Keypoints.Free;
+    DescriptorMap.Free;
+    ScoreMap.Free;
+  end;
 end;
 
 // ReadLightGlueConfigFromJSONFile on the committed pico config.

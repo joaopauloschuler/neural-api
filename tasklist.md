@@ -2138,8 +2138,10 @@ rather than acted on.
             magic-leap-community/superpoint (check its preprocessor_config
             do_grayscale and the tensor names); the torchvision-backend
             processor (uint8 grayscale before an antialiased resize) is not
-            matched, only the PIL backend; `TSuperPointKeypoints` has no
-            post_process_keypoint_detection rescale to the original image size.
+            matched, only the PIL backend. (Done: the
+            post_process_keypoint_detection rescale to the original image size,
+            `TSuperPointKeypoints.ImageX` / `ImageY`, used by
+            examples/KeypointMatching.)
 
 - [ ] CoTracker3 point tracking importer + examples/PointTracking (Karaev et al.
       2024, *CoTracker3: Simpler and Better Point Tracking by Pseudo-Labelling

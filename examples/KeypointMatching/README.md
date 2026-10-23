@@ -56,7 +56,9 @@ lazbuild -B KeypointMatching.lpi
    whose matchability is at most `1 - width_confidence`. The confidence
    threshold is `0.8 + 0.1 exp(-4 layer / layers)`. Pruned keypoints get no
    match. The output line reports the stop layer and the kept keypoints.
-4. The keypoints are mapped back to each original image size and drawn.
+4. `TSuperPointKeypoints.ImageX` / `ImageY` map the matched keypoints back to
+   each original image size, as transformers'
+   `post_process_keypoint_matching` does, and the example draws them.
 
 `TLightGlueMatcher` does its math on the host with `TNNetPlainOps` (threaded
 per-token linears) and `TNNetVolume.DotProductsPacked` (attention and

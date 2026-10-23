@@ -15748,7 +15748,7 @@ type
   // Descriptors (Count, 1, DescriptorDim), each row L2-normalized.
   TSuperPointKeypoints = class(TObject)
   private
-    FCount: integer;
+    FCount, FInputWidth, FInputHeight: integer;
     FX, FY: TNeuralIntegerArray;
     FScores: TNeuralFloatDynArr;
     FDescriptors: TNNetVolume;
@@ -15764,6 +15764,8 @@ type
     function GetX(Index: integer): integer;
     function GetY(Index: integer): integer;
     function GetScore(Index: integer): TNeuralFloat;
+    class function RescaleCoordinate(Coordinate, InputSize,
+      ImageSize: integer): integer; static;
   public
     constructor Create();
     destructor Destroy(); override;
@@ -15777,8 +15779,15 @@ type
     property Count: integer read FCount;
     property X[Index: integer]: integer read GetX;
     property Y[Index: integer]: integer read GetY;
+    // post_process_keypoint_detection: X of keypoint Index in the original
+    // ImageWidth-wide image, Trunc((X / InputWidth) * ImageWidth) in float32.
+    function ImageX(Index, ImageWidth: integer): integer;
+    function ImageY(Index, ImageHeight: integer): integer;
     property Scores[Index: integer]: TNeuralFloat read GetScore;
     property Descriptors: TNNetVolume read FDescriptors;
+    // Score-map size of the last Extract (the net input), the frame of X / Y.
+    property InputWidth: integer read FInputWidth;
+    property InputHeight: integer read FInputHeight;
   end;
 
 // ---------------------------------------------------------------------------
@@ -96771,6 +96780,28 @@ begin
   Result := FScores[Index];
 end;
 
+class function TSuperPointKeypoints.RescaleCoordinate(Coordinate, InputSize,
+  ImageSize: integer): integer;
+var
+  Relative, Scaled: TNeuralFloat;
+begin
+  // Each float32 store rounds as torch does, so Trunc sees torch's product
+  // (28 / 48 * 108 is 62.99999 there, not 63).
+  Relative := Coordinate / InputSize;
+  Scaled := Relative * ImageSize;
+  Result := Trunc(Scaled);
+end;
+
+function TSuperPointKeypoints.ImageX(Index, ImageWidth: integer): integer;
+begin
+  Result := RescaleCoordinate(FX[Index], FInputWidth, ImageWidth);
+end;
+
+function TSuperPointKeypoints.ImageY(Index, ImageHeight: integer): integer;
+begin
+  Result := RescaleCoordinate(FY[Index], FInputHeight, ImageHeight);
+end;
+
 procedure TSuperPointKeypoints.MaxPool(Source, Dest: TNNetVolume;
   Radius: integer);
 var
@@ -96861,6 +96892,8 @@ begin
   Cell := SuperPointCellSize(Config);
   SizeX := ScoreMap.SizeX;
   SizeY := ScoreMap.SizeY;
+  FInputWidth := SizeX;
+  FInputHeight := SizeY;
   SimpleNMS(ScoreMap, Config.NmsRadius);
   if Length(FCandidateX) < ScoreMap.Size then
   begin
