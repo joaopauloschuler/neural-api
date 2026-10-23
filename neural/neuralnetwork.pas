@@ -4427,8 +4427,9 @@ type
   // 2D-DFT operator applied to dL/dy:
   //   dL/dx[s,h] = sum_{a,b} cos(2*pi*(a*s/L + b*h/D)) * dL/dy[a,b]
   // The default O(n^2) direct path works for arbitrary SeqLen and d. An
-  // opt-in FFT fast path (UseFFT, default FALSE; TFFTPlan, so any SeqLen and
-  // d) is checked against the direct path to < 1e-5. UseFFT round-trips via
+  // opt-in FFT fast path (UseFFT, default FALSE; a real hidden-axis FFT and
+  // TFFTPlan on its half spectrum, so any SeqLen and d) is checked against the
+  // direct path to < 1e-5. UseFFT round-trips via
   // FStruct[0].
   // Coded by Claude (AI).
   TNNetFourierMix = class(TNNetIdentity)
@@ -4442,14 +4443,17 @@ type
     FCosA, FSinA: array of Double;      // one sequence-axis row (length L)
     FCrT, FCiT: array of Double;        // hidden-axis partial sums, [b*L + s]
     FFFTCacheL, FFFTCacheD: integer;
-    FPlanL, FPlanD: TFFTPlan;            // sequence-axis and hidden-axis plans
+    FPlanL: TFFTPlan;                    // sequence-axis complex plan
+    FRealPlanD: TRealFFTPlan;            // hidden-axis real plan
 
     {$IFDEF FPC}
-    FFFTRe, FFFTIm: array of array of Double; // [s][h] after hidden-axis FFT
-    FFFTColRe, FFFTColIm: array of Double;    // one sequence-axis column
+    FFFTRe, FFFTIm: array of array of Double; // [b][s], b <= D div 2, after hidden-axis FFT
+    FFFTRow: array of Double;                 // one hidden-axis row (D)
+    FFFTBinRe, FFFTBinIm: array of Double;    // its bins 0..D div 2
     {$ELSE}
-    FFFTRe, FFFTIm: TNeuralDoubleDynArr2D;      // [s][h] after hidden-axis FFT
-    FFFTColRe, FFFTColIm: TNeuralDoubleDynArr;  // one sequence-axis column
+    FFFTRe, FFFTIm: TNeuralDoubleDynArr2D;    // [b][s], b <= D div 2, after hidden-axis FFT
+    FFFTRow: TNeuralDoubleDynArr;             // one hidden-axis row (D)
+    FFFTBinRe, FFFTBinIm: TNeuralDoubleDynArr; // its bins 0..D div 2
     {$ENDIF}
 
     procedure EnsureDirectBuffers(L, D: integer);
@@ -35629,71 +35633,77 @@ begin
   end;
 end;
 
-// FFT fast path: a separable 2D FFT. We FFT along the hidden axis (length D),
-// then along the sequence axis (length L), and keep the real part. The result
-// equals Re(DFT_seq(DFT_hidden(x))) exactly, for any L and D.
+// FFT fast path: a separable 2D FFT. A real FFT along the hidden axis (length
+// D) gives bins 0..D div 2 per row; the sequence-axis FFT (length L) runs on
+// those bins only, and the real part is kept. The remaining bins follow from the
+// real input's 2-D Hermitian symmetry Y[a,b] = conj Y[(L-a) mod L, D-b], so
+// Re Y[a,b] = Re Y[(L-a) mod L, D-b]. Exact for any L and D.
 procedure TNNetFourierMix.EnsureFFTBuffers(L, D: integer);
+var
+  HalfD: integer;
 begin
   if (L = FFFTCacheL) and (D = FFFTCacheD) then exit;
+  HalfD := D div 2 + 1;
   FFTPlanInit(FPlanL, L);
-  FFTPlanInit(FPlanD, D);
-  SetLength(FFFTRe, L, D);
-  SetLength(FFFTIm, L, D);
-  SetLength(FFFTColRe, L);
-  SetLength(FFFTColIm, L);
+  RealFFTPlanInit(FRealPlanD, D);
+  SetLength(FFFTRe, HalfD, L);
+  SetLength(FFFTIm, HalfD, L);
+  SetLength(FFFTRow, D);
+  SetLength(FFFTBinRe, HalfD);
+  SetLength(FFFTBinIm, HalfD);
   FFFTCacheL := L;
   FFFTCacheD := D;
 end;
 
 procedure TNNetFourierMix.ApplyRealDFTFFT(Src, Dst: TNNetVolume);
 var
-  L, D, LM1, DM1, s, h, sD, pos: integer;
-  {$IFDEF FPC}
-  reRows, imRows: array of array of Double; // [s][h] after hidden-axis FFT
-  colRe, colIm: array of Double;
-  rowRe, rowIm: array of Double;
-  {$ELSE}
-  reRows, imRows: TNeuralDoubleDynArr2D; // [s][h] after hidden-axis FFT
-  colRe, colIm: TNeuralDoubleDynArr;
-  rowRe, rowIm: TNeuralDoubleDynArr;
-  {$ENDIF}
+  L, D, HalfD, MaxSeqPos, MaxHiddenPos, MaxHalfBinPos, s, h, b, a, MirrorA, pos: integer;
 begin
   L := Src.SizeX;
   D := Src.Depth;
-  LM1 := L - 1;
-  DM1 := D - 1;
+  HalfD := D div 2 + 1;
+  MaxSeqPos := L - 1;
+  MaxHiddenPos := D - 1;
+  MaxHalfBinPos := HalfD - 1;
   // Persistent, lazily-sized layer fields (rule #17) -- not a per-call SetLength.
   EnsureFFTBuffers(L, D);
-  reRows := FFFTRe;
-  imRows := FFFTIm;
-  // FFT each row across the hidden (depth) axis.
-  for s := 0 to LM1 do
+  // Real FFT of each row across the hidden (depth) axis, stored bin-major.
+  pos := 0;   // #12: carries s*D + h
+  for s := 0 to MaxSeqPos do
   begin
-    sD := s * D;   // #9: s*D invariant across the h loop
-    rowRe := reRows[s];
-    rowIm := imRows[s];
-    // rowRe widens Single to Double per element, so it stays scalar; the
-    // imaginary row is a constant zero run and is one bulk fill (#13).
-    FillChar(rowIm[0], D * SizeOf(Double), 0);
-    for h := 0 to DM1 do
-      rowRe[h] := Src.FData[sD + h];
-    FFTPlanExecute(FPlanD, rowRe, rowIm, false);
-  end;
-  // FFT each column across the sequence axis, keep real part.
-  colRe := FFFTColRe;
-  colIm := FFFTColIm;
-  for h := 0 to DM1 do
-  begin
-    for s := 0 to LM1 do
+    // Single to Double widening, so it stays scalar.
+    for h := 0 to MaxHiddenPos do
     begin
-      colRe[s] := reRows[s][h];
-      colIm[s] := imRows[s][h];
+      FFFTRow[h] := Src.FData[pos];
+      Inc(pos);
     end;
-    FFTPlanExecute(FPlanL, colRe, colIm, false);
-    pos := h;   // #12: carry s*D+h as a running offset instead of a multiply
-    for s := 0 to LM1 do
+    RealFFTForward(FRealPlanD, FFFTRow, FFFTBinRe, FFFTBinIm);
+    for b := 0 to MaxHalfBinPos do
     begin
-      Dst.FData[pos] := colRe[s];
+      FFFTRe[b][s] := FFFTBinRe[b];
+      FFFTIm[b][s] := FFFTBinIm[b];
+    end;
+  end;
+  // FFT each kept bin column across the sequence axis, keep the real part.
+  for b := 0 to MaxHalfBinPos do
+  begin
+    FFTPlanExecute(FPlanL, FFFTRe[b], FFFTIm[b], false);
+    pos := b;   // #12: carry a*D+b as a running offset instead of a multiply
+    for a := 0 to MaxSeqPos do
+    begin
+      Dst.FData[pos] := FFFTRe[b][a];
+      Inc(pos, D);
+    end;
+  end;
+  // Bins above D div 2 mirror both axes: Re Y[a,b] = Re Y[(L-a) mod L, D-b].
+  if HalfD <= MaxHiddenPos then
+  begin
+    pos := 0;   // #12: carries a*D
+    for a := 0 to MaxSeqPos do
+    begin
+      if a = 0 then MirrorA := 0 else MirrorA := L - a;
+      for b := HalfD to MaxHiddenPos do
+        Dst.FData[pos + b] := FFFTRe[D - b][MirrorA];
       Inc(pos, D);
     end;
   end;
