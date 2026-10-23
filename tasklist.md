@@ -367,7 +367,7 @@ rather than acted on.
       gives a hard foreground mask and RVM targets video; ViTMatte turns an
       RGB image plus a trimap (0 = background, 128 = unknown, 255 = foreground)
       into a fine alpha matte (hair, fur, glass edges). Plan:
-  - [ ] `BuildViTMatteFromSafeTensors[Ex]` + `TViTMatteConfig` (reads the
+  - [X] `BuildViTMatteFromSafeTensors[Ex]` + `TViTMatteConfig` (reads the
         `backbone_config` sub-block). The VitDet backbone takes a 4-channel
         input (RGB + trimap). REUSE the SAM ViTDet blocks behind
         `BuildSAMVisionTower` (windowed + global decomposed-rel-pos attention)
@@ -378,12 +378,21 @@ rather than acted on.
         size. The detail-capture head (ConvStream 3x3 stride-2 conv+BN+ReLU
         stages, bilinear x2 fusion blocks, conv + sigmoid matting head) is
         built from existing layers only.
-  - [ ] `ViTMattePreprocess` (rescale 1/255, normalize mean/std 0.5, append
+  - [X] `ViTMattePreprocess` (rescale 1/255, normalize mean/std 0.5, append
         trimap/255, pad to a multiple of 32 as `VitMatteImageProcessor` does)
         and a crop back to the input size afterwards.
-  - [ ] Pico fixture (`tools/make_pico_vitmatte_fixture.py`, ~/x venv) and a
+  - [X] Pico fixture (`tools/make_pico_vitmatte_fixture.py`, ~/x venv) and a
         `TestViTMatteParity` logit test against transformers, plus OpenCL
         parity on the same fixture.
+        Done: the SAM blocks are shared as `AddViTDetBlock`/`LoadViTDetBlock`
+        (rel-pos tables resized at load time), the net is built for one padded
+        size (`BuildViTMatteFromSafeTensors(..., ImageWidth, ImageHeight)`),
+        `ViTMatteEstimateAlpha` = preprocess + compute + crop. Pico 45x30 image
+        (padded 64x32): alpha max|diff| 1.8e-7, preprocess 5.9e-8, OpenCL
+        66/66 layers forced.
+  - [ ] TNNetSAMVisionAttention's class comment says Backpropagate passes
+        dL/dInput through the chain; it passes a zero gradient. Fix the comment
+        or implement the backward.
   - [ ] examples/ImageMatting (`--image`, `--trimap FILE`, or `--auto-trimap`:
         build the trimap from a BiRefNet mask by eroding and dilating it with
         the existing `TNNetBoxFilter` layer + a threshold, band width `--unknown-band N`).

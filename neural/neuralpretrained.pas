@@ -11521,6 +11521,68 @@ procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   Cache: TSAMWeightCache = nil);
 
 // ---------------------------------------------------------------------------
+// ViTMatte TRIMAP-BASED IMAGE MATTING IMPORT (transformers VitMatteForImageMatting,
+// hustvl/vitmatte-small-composition-1k). A VitDet backbone (SAM's ViTDet blocks
+// plus residual bottleneck conv blocks) reads RGB + trimap; a ConvStream /
+// fusion detail-capture decoder returns a full-size alpha matte in 0..1.
+type
+  TViTMatteConfig = record
+    HiddenSize: integer;         // 384 (vitmatte-small)
+    NumLayers: integer;          // backbone blocks built: the last out_features stage
+    NumHeads: integer;           // 6
+    MlpHidden: integer;          // int(hidden_size * mlp_ratio)
+    PatchSize: integer;          // 16 = 2^(fusion block count)
+    NumChannels: integer;        // 4 (RGB + trimap)
+    ImageSize: integer;          // 512: the global blocks' rel-pos grid * patch
+    PretrainImageSize: integer;  // 224: the absolute position grid * patch
+    WindowSize: integer;         // 14
+    WindowBlockIndices: TNeuralIntegerArray;   // the other blocks are global
+    ResidualBlockIndices: TNeuralIntegerArray; // blocks followed by a conv block
+    UseAbsolutePositionEmbeddings: boolean;
+    UseRelativePositionEmbeddings: boolean;
+    LayerNormEps: TNeuralFloat;  // 1e-6
+    BatchNormEps: TNeuralFloat;  // 1e-5 (ConvStream and fusion blocks)
+    ConvStreamHiddenSizes: TNeuralIntegerArray; // [48, 96, 192]
+    FusionHiddenSizes: TNeuralIntegerArray;     // [256, 128, 64, 32]
+    InputWidth: integer;         // network input (padded image) width
+    InputHeight: integer;        // network input (padded image) height
+  end;
+
+// Reads a HF "vitmatte" config.json (backbone_config = VitDetConfig); missing
+// keys take the transformers defaults. InputWidth/Height := image_size.
+function ReadViTMatteConfigFromJSONFile(const FileName: string): TViTMatteConfig;
+
+function ViTMatteConfigToString(const Config: TViTMatteConfig): string;
+
+// Builds ViTMatte for a Config.InputWidth x InputHeight x 4 input and loads every
+// weight from Reader (caller owns Reader). The output is (W, H, 1) alpha.
+function BuildViTMatte(Reader: TNNetSafeTensorsReader;
+  const Config: TViTMatteConfig; pTrainable: boolean = true): TNNet;
+
+function BuildViTMatteFromSafeTensorsEx(const FileName: string;
+  const Config: TViTMatteConfig; pTrainable: boolean = true): TNNet;
+
+// Config from ConfigFileName ('' = config.json beside FileName). ImageWidth and
+// ImageHeight > 0 size the net for that image (padded as ViTMattePaddedSize).
+function BuildViTMatteFromSafeTensors(const FileName: string;
+  out Config: TViTMatteConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''; ImageWidth: integer = 0;
+  ImageHeight: integer = 0): TNNet;
+
+// Width x Height rounded up to multiples of SizeDivisor (VitMatteImageProcessor).
+procedure ViTMattePaddedSize(Width, Height: integer;
+  out PaddedWidth, PaddedHeight: integer; SizeDivisor: integer = 32);
+
+// Image (W, H, 3) RGB 0..255 + Trimap (W, H, 1) 0..255 -> NetInput (padded W, H,
+// 4): RGB/127.5-1, trimap/255, zeros on the right/bottom padding.
+procedure ViTMattePreprocess(Image, Trimap, NetInput: TNNetVolume;
+  SizeDivisor: integer = 32);
+
+// ViTMattePreprocess -> NN.Compute -> Alpha (W, H, 1) in 0..1, the padding
+// cropped. NN must be built for the padded size of Image.
+procedure ViTMatteEstimateAlpha(NN: TNNet; Image, Trimap, Alpha: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
 // feature backbone and the prerequisite for LPIPS + neural style transfer).
 // The architecture is a STRAIGHT stack with NO residuals or norm bookkeeping:
@@ -87877,6 +87939,483 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSAMConfigFromJSONFile(ConfigPath);
   Result := BuildSAMFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+// ===========================================================================
+// ViTMatte TRIMAP-BASED IMAGE MATTING IMPORT (VitMatteForImageMatting).
+// ===========================================================================
+
+const
+  csViTMatteImporter = 'ViTMatte import';
+  csViTMatteHeadChannels = 16; // VitMatteHead mid_channels
+  csViTDetResidualNormEps = 1e-6; // VitDetLayerNorm default eps
+
+type
+  // The layers of a VitDetResBottleneckBlock that receive checkpoint weights.
+  TViTDetResidualLayers = record
+    Conv1, Norm1, Conv2, Norm2, Conv3, Norm3: TNNetLayer;
+  end;
+
+function ReadViTMatteConfigFromJSONFile(const FileName: string): TViTMatteConfig;
+var
+  JsonText: TStringList;
+  Root, BackboneData, OutData: TJSONData;
+  Obj, Backbone: TJSONObject;
+  OutIndices: TNeuralIntegerArray;
+  StageName: string;
+
+  // VitDetConfig image sizes may be an int or an [H, W] list.
+  function ReadSquareSize(const FieldName: string; Default: integer): integer;
+  var
+    Item: TJSONData;
+  begin
+    Item := Backbone.Find(FieldName);
+    if Item is TJSONNumber then Result := Item.AsInteger
+    else if (Item is TJSONArray) and (TJSONArray(Item).Count = 2) and
+      (TJSONArray(Item).Integers[0] = TJSONArray(Item).Integers[1]) then
+      Result := TJSONArray(Item).Integers[0]
+    else if Item = nil then Result := Default
+    else
+    begin
+      Result := Default;
+      ImportError(csViTMatteImporter + ': backbone_config.' + FieldName +
+        ' must be one integer or a square [H, W] pair.');
+    end;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError(csViTMatteImporter + ': config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(csViTMatteImporter + ': config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError(csViTMatteImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    BackboneData := Obj.Find('backbone_config');
+    if BackboneData is TJSONObject then Backbone := TJSONObject(BackboneData)
+    else
+      // Without backbone_config, VitMatteConfig builds a default VitDetConfig
+      // with out_features ["stage4"].
+      Backbone := TJSONObject.Create(['out_indices', TJSONArray.Create([4])]);
+    try
+      if LowerCase(Backbone.Get('model_type', 'vitdet')) <> 'vitdet' then
+        ImportError(csViTMatteImporter + ': only a "vitdet" backbone is supported.');
+      if LowerCase(Backbone.Get('hidden_act', 'gelu')) <> 'gelu' then
+        ImportError(csViTMatteImporter + ': only hidden_act "gelu" is supported.');
+      Result.HiddenSize := Backbone.Get('hidden_size', 768);
+      Result.NumLayers := Backbone.Get('num_hidden_layers', 12);
+      Result.NumHeads := Backbone.Get('num_attention_heads', 12);
+      Result.MlpHidden := Trunc(Result.HiddenSize *
+        Backbone.Get('mlp_ratio', TJSONFloat(4)));
+      Result.PatchSize := ReadSquareSize('patch_size', 16);
+      Result.NumChannels := Backbone.Get('num_channels', 3);
+      Result.ImageSize := ReadSquareSize('image_size', 224);
+      Result.PretrainImageSize := ReadSquareSize('pretrain_image_size', 224);
+      Result.WindowSize := Backbone.Get('window_size', 0);
+      Result.WindowBlockIndices := ReadJSONIntArray(Backbone,
+        'window_block_indices', []);
+      Result.ResidualBlockIndices := ReadJSONIntArray(Backbone,
+        'residual_block_indices', []);
+      Result.UseAbsolutePositionEmbeddings := Backbone.Get(
+        'use_absolute_position_embeddings', true);
+      Result.UseRelativePositionEmbeddings := Backbone.Get(
+        'use_relative_position_embeddings', false);
+      Result.LayerNormEps := Backbone.Get('layer_norm_eps', TJSONFloat(1e-6));
+      if not Backbone.Get('qkv_bias', true) then
+        ImportError(csViTMatteImporter + ': qkv_bias false is not supported.');
+      // The decoder reads the last out_features stage: stageN = after N blocks.
+      OutIndices := ReadJSONIntArray(Backbone, 'out_indices', []);
+      OutData := Backbone.Find('out_features');
+      if Length(OutIndices) > 0 then
+        Result.NumLayers := OutIndices[High(OutIndices)]
+      else if (OutData is TJSONArray) and (TJSONArray(OutData).Count > 0) then
+      begin
+        StageName := TJSONArray(OutData).Strings[TJSONArray(OutData).Count - 1];
+        if Copy(StageName, 1, 5) <> 'stage' then
+          ImportError(csViTMatteImporter + ': out_features "' + StageName +
+            '" is not a backbone stage.');
+        Result.NumLayers := StrToInt(Copy(StageName, 6, Length(StageName)));
+      end;
+    finally
+      if not (BackboneData is TJSONObject) then Backbone.Free;
+    end;
+    Result.BatchNormEps := Obj.Get('batch_norm_eps', TJSONFloat(1e-5));
+    Result.ConvStreamHiddenSizes := ReadJSONIntArray(Obj,
+      'convstream_hidden_sizes', [48, 96, 192]);
+    Result.FusionHiddenSizes := ReadJSONIntArray(Obj, 'fusion_hidden_sizes',
+      [256, 128, 64, 32]);
+    Result.InputWidth := Result.ImageSize;
+    Result.InputHeight := Result.ImageSize;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ViTMatteConfigToString(const Config: TViTMatteConfig): string;
+
+  function ListToString(const List: TNeuralIntegerArray): string;
+  var
+    ItemPos, MaxItemPos: integer;
+  begin
+    Result := '[';
+    MaxItemPos := High(List);
+    for ItemPos := 0 to MaxItemPos do
+    begin
+      if ItemPos > 0 then Result := Result + ',';
+      Result := Result + IntToStr(List[ItemPos]);
+    end;
+    Result := Result + ']';
+  end;
+
+begin
+  Result := 'ViTMatte: hidden=' + IntToStr(Config.HiddenSize) +
+    ' layers=' + IntToStr(Config.NumLayers) +
+    ' heads=' + IntToStr(Config.NumHeads) +
+    ' mlp=' + IntToStr(Config.MlpHidden) +
+    ' patch=' + IntToStr(Config.PatchSize) +
+    ' channels=' + IntToStr(Config.NumChannels) +
+    ' image=' + IntToStr(Config.ImageSize) +
+    ' pretrain=' + IntToStr(Config.PretrainImageSize) +
+    ' window=' + IntToStr(Config.WindowSize) +
+    ' window_blocks=' + ListToString(Config.WindowBlockIndices) +
+    ' residual_blocks=' + ListToString(Config.ResidualBlockIndices) +
+    ' convstream=' + ListToString(Config.ConvStreamHiddenSizes) +
+    ' fusion=' + ListToString(Config.FusionHiddenSizes) +
+    ' input=' + IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight);
+end;
+
+// Appends a VitDetResBottleneckBlock: 1x1, 3x3 and 1x1 bias-free convs (half
+// width inside) with channel LayerNorms, GELU after the first two, plus the input.
+function AddViTDetResidualBlock(NN: TNNet; Hidden: integer;
+  pTrainable: boolean): TViTDetResidualLayers;
+var
+  Shortcut: TNNetLayer;
+  BottleneckChannels: integer;
+begin
+  Shortcut := NN.GetLastLayer();
+  BottleneckChannels := Hidden div 2;
+  Result.Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
+    BottleneckChannels, 1, 0, 1, 1).SetTrainable(pTrainable) );
+  Result.Norm1 := NN.AddLayer( TNNetTokenLayerNorm.Create(
+    csViTDetResidualNormEps).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetGELUErf.Create() );
+  Result.Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
+    BottleneckChannels, 3, 1, 1, 1).SetTrainable(pTrainable) );
+  Result.Norm2 := NN.AddLayer( TNNetTokenLayerNorm.Create(
+    csViTDetResidualNormEps).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetGELUErf.Create() );
+  Result.Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(
+    Hidden, 1, 0, 1, 1).SetTrainable(pTrainable) );
+  Result.Norm3 := NN.AddLayer( TNNetTokenLayerNorm.Create(
+    csViTDetResidualNormEps).SetTrainable(pTrainable) );
+  NN.AddLayer( TNNetSum.Create([Result.Norm3, Shortcut]) );
+end;
+
+procedure LoadViTDetResidualBlock(Reader: TNNetSafeTensorsReader;
+  const Block: TViTDetResidualLayers; const Prefix: string; Hidden: integer);
+var
+  BottleneckChannels: integer;
+begin
+  BottleneckChannels := Hidden div 2;
+  LoadTorchConvFoldBN(Reader, Block.Conv1, Prefix + 'conv1', '',
+    BottleneckChannels, Hidden, 1, nil);
+  LoadLayerNormWeights(Reader, Block.Norm1, Prefix + 'norm1.weight',
+    Prefix + 'norm1.bias', BottleneckChannels);
+  LoadTorchConvFoldBN(Reader, Block.Conv2, Prefix + 'conv2', '',
+    BottleneckChannels, BottleneckChannels, 3, nil);
+  LoadLayerNormWeights(Reader, Block.Norm2, Prefix + 'norm2.weight',
+    Prefix + 'norm2.bias', BottleneckChannels);
+  LoadTorchConvFoldBN(Reader, Block.Conv3, Prefix + 'conv3', '',
+    Hidden, BottleneckChannels, 1, nil);
+  LoadLayerNormWeights(Reader, Block.Norm3, Prefix + 'norm3.weight',
+    Prefix + 'norm3.bias', Hidden);
+end;
+
+// Loads VitDet position_embeddings (a cls row, unused, then a square native
+// grid) into the TNNetCellBias PosEmb, bicubically resized to its own grid.
+procedure LoadViTDetPositionTable(Reader: TNNetSafeTensorsReader;
+  PosEmb: TNNetLayer; const Name: string; Hidden: integer);
+var
+  Table, NativeGridTable, ResizedGridTable, Weights: TNNetVolume;
+  GridRows, NativeGrid: integer;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError('ViTDet import: missing tensor "' + Name + '".');
+  Table := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, Table);
+    GridRows := Table.Size div Hidden - 1;
+    NativeGrid := Round(Sqrt(GridRows));
+    if (Table.Size <> (GridRows + 1) * Hidden) or
+       (NativeGrid * NativeGrid <> GridRows) then
+      ImportError('ViTDet import: "' + Name + '" must hold a cls row plus a ' +
+        'square grid of ' + IntToStr(Hidden) + '-wide rows, got ' +
+        Reader.ShapeAsString(Name));
+    Weights := PosEmb.FArrNeurons[0].Weights;
+    if (PosEmb.Output.SizeX = NativeGrid) and (PosEmb.Output.SizeY = NativeGrid) then
+      Move(Table.FData[Hidden], Weights.FData[0], GridRows * Hidden *
+        csNeuralFloatSize)
+    else
+    begin
+      NativeGridTable := TNNetVolume.Create(NativeGrid, NativeGrid, Hidden);
+      ResizedGridTable := TNNetVolume.Create;
+      try
+        Move(Table.FData[Hidden], NativeGridTable.FData[0],
+          NativeGridTable.Size * csNeuralFloatSize);
+        InterpolateVolume2D(NativeGridTable, ResizedGridTable,
+          PosEmb.Output.SizeX, PosEmb.Output.SizeY, {bicubic}2,
+          {AlignCorners=}0);
+        Weights.Copy(ResizedGridTable);
+      finally
+        ResizedGridTable.Free;
+        NativeGridTable.Free;
+      end;
+    end;
+    PosEmb.FlushWeightCache();
+  finally
+    Table.Free;
+  end;
+end;
+
+function BuildViTMatte(Reader: TNNetSafeTensorsReader;
+  const Config: TViTMatteConfig; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  InputLayer, PatchConv, PosEmb, Features, Upsampled, HeadConv: TNNetLayer;
+  DetailMaps: array of TNNetLayer;
+  DetailChannels: TNeuralIntegerArray;
+  Block: TViTDetBlockLayers;
+  Residual: TViTDetResidualLayers;
+  BlockPos, MaxBlockPos, StageCount, StagePos, MaxStagePos, FusionCount,
+    FusionPos, MaxFusionPos, WindowSize, FeatureChannels: integer;
+  BlockPrefix, StagePrefix: string;
+
+  function IsListed(const List: TNeuralIntegerArray; Value: integer): boolean;
+  var
+    ItemPos, MaxItemPos: integer;
+  begin
+    Result := false;
+    MaxItemPos := High(List);
+    for ItemPos := 0 to MaxItemPos do
+      if List[ItemPos] = Value then Result := true;
+  end;
+
+begin
+  StageCount := Length(Config.ConvStreamHiddenSizes);
+  FusionCount := Length(Config.FusionHiddenSizes);
+  if (Config.HiddenSize < 2) or (Config.NumHeads < 1) or
+     (Config.HiddenSize mod Config.NumHeads <> 0) then
+    ImportError(csViTMatteImporter + ': hidden_size must be divisible by ' +
+      'num_attention_heads.');
+  if FusionCount <> StageCount + 1 then
+    ImportError(csViTMatteImporter + ': fusion_hidden_sizes needs one entry ' +
+      'more than convstream_hidden_sizes.');
+  if Config.PatchSize <> 1 shl FusionCount then
+    ImportError(csViTMatteImporter + ': patch_size ' +
+      IntToStr(Config.PatchSize) + ' must be 2^' + IntToStr(FusionCount) +
+      ' so the fusion blocks reach the input size.');
+  if (Config.InputWidth < Config.PatchSize) or
+     (Config.InputHeight < Config.PatchSize) or
+     (Config.InputWidth mod Config.PatchSize <> 0) or
+     (Config.InputHeight mod Config.PatchSize <> 0) then
+    ImportError(csViTMatteImporter + ': input ' + IntToStr(Config.InputWidth) +
+      'x' + IntToStr(Config.InputHeight) + ' must be multiples of ' +
+      IntToStr(Config.PatchSize) + '.');
+  if (Config.NumLayers < 1) or (Config.PretrainImageSize < Config.PatchSize) then
+    ImportError(csViTMatteImporter + ': the backbone needs at least one block ' +
+      'and a pretrain_image_size of at least one patch.');
+  NN := TNNet.Create();
+  try
+    // ---------------- VitDet backbone ----------------
+    InputLayer := NN.AddLayer( TNNetInput.Create(Config.InputWidth,
+      Config.InputHeight, Config.NumChannels) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(Config.HiddenSize,
+      Config.PatchSize, 0, Config.PatchSize, 0) );
+    LoadTorchConvFoldBN(Reader, PatchConv, 'backbone.embeddings.projection', '',
+      Config.HiddenSize, Config.NumChannels, Config.PatchSize, nil);
+    if Config.UseAbsolutePositionEmbeddings then
+    begin
+      PosEmb := NN.AddLayer( TNNetCellBias.Create() );
+      LoadViTDetPositionTable(Reader, PosEmb,
+        'backbone.embeddings.position_embeddings', Config.HiddenSize);
+    end;
+    MaxBlockPos := Config.NumLayers - 1;
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      BlockPrefix := 'backbone.encoder.layer.' + IntToStr(BlockPos) + '.';
+      if IsListed(Config.WindowBlockIndices, BlockPos) then
+        WindowSize := Config.WindowSize
+      else
+        WindowSize := 0;
+      Block := AddViTDetBlock(NN, Config.HiddenSize, Config.NumHeads,
+        WindowSize, Config.MlpHidden, Config.LayerNormEps, pTrainable);
+      // The global blocks' rel-pos tables are sized for image_size; with
+      // use_relative_position_embeddings false they are absent and load as 0.
+      LoadViTDetBlock(Reader, Block, BlockPrefix, 'norm1', 'norm2', 'attention',
+        'mlp.fc1', 'mlp.fc2', Config.HiddenSize, Config.MlpHidden);
+      if IsListed(Config.ResidualBlockIndices, BlockPos) then
+      begin
+        Residual := AddViTDetResidualBlock(NN, Config.HiddenSize, pTrainable);
+        LoadViTDetResidualBlock(Reader, Residual, BlockPrefix + 'residual.',
+          Config.HiddenSize);
+      end;
+    end;
+    Features := NN.GetLastLayer();
+    FeatureChannels := Config.HiddenSize;
+
+    // ---------------- ConvStream: stride-2 conv + BN + ReLU stages ----------
+    SetLength(DetailMaps, StageCount + 1);
+    SetLength(DetailChannels, StageCount + 1);
+    DetailMaps[0] := InputLayer;
+    DetailChannels[0] := Config.NumChannels;
+    MaxStagePos := StageCount - 1;
+    for StagePos := 0 to MaxStagePos do
+    begin
+      StagePrefix := 'decoder.convstream.convs.' + IntToStr(StagePos) + '.';
+      DetailChannels[StagePos + 1] := Config.ConvStreamHiddenSizes[StagePos];
+      DetailMaps[StagePos + 1] := NN.AddLayerAfter( TNNetConvolutionReLU.Create(
+        DetailChannels[StagePos + 1], 3, 1, 2, 0), DetailMaps[StagePos] );
+      LoadTorchConvFoldBN(Reader, DetailMaps[StagePos + 1], StagePrefix + 'conv',
+        StagePrefix + 'batch_norm', DetailChannels[StagePos + 1],
+        DetailChannels[StagePos], 3, nil, Config.BatchNormEps);
+    end;
+
+    // ---------------- Fusion: bilinear x2, concat, conv + BN + ReLU ---------
+    MaxFusionPos := FusionCount - 1;
+    for FusionPos := 0 to MaxFusionPos do
+    begin
+      StagePrefix := 'decoder.fusion_blocks.' + IntToStr(FusionPos) + '.conv.';
+      Upsampled := NN.AddLayerAfter( TNNetBilinearUpsample.Create(2), Features );
+      NN.AddLayer( TNNetDeepConcat.Create([DetailMaps[StageCount - FusionPos],
+        Upsampled]) );
+      Features := NN.AddLayer( TNNetConvolutionReLU.Create(
+        Config.FusionHiddenSizes[FusionPos], 3, 1, 1, 0) );
+      LoadTorchConvFoldBN(Reader, Features, StagePrefix + 'conv',
+        StagePrefix + 'batch_norm', Config.FusionHiddenSizes[FusionPos],
+        DetailChannels[StageCount - FusionPos] + FeatureChannels, 3, nil,
+        Config.BatchNormEps);
+      FeatureChannels := Config.FusionHiddenSizes[FusionPos];
+    end;
+
+    // ---------------- Matting head: conv + BN + ReLU, 1x1 conv, sigmoid ----
+    HeadConv := NN.AddLayer( TNNetConvolutionReLU.Create(
+      csViTMatteHeadChannels, 3, 1, 1, 0) );
+    LoadTorchConvFoldBN(Reader, HeadConv, 'decoder.matting_head.matting_convs.0',
+      'decoder.matting_head.matting_convs.1', csViTMatteHeadChannels,
+      FeatureChannels, 3, nil);
+    HeadConv := NN.AddLayer( TNNetConvolutionLinear.Create(1, 1, 0, 1, 0) );
+    LoadTorchConvFoldBN(Reader, HeadConv, 'decoder.matting_head.matting_convs.3',
+      '', 1, csViTMatteHeadChannels, 1, nil);
+    NN.AddLayer( TNNetSigmoid.Create() );
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildViTMatteFromSafeTensorsEx(const FileName: string;
+  const Config: TViTMatteConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildViTMatte(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildViTMatteFromSafeTensors(const FileName: string;
+  out Config: TViTMatteConfig; pTrainable: boolean;
+  const ConfigFileName: string; ImageWidth, ImageHeight: integer): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadViTMatteConfigFromJSONFile(ConfigPath);
+  if (ImageWidth > 0) and (ImageHeight > 0) then
+    ViTMattePaddedSize(ImageWidth, ImageHeight, Config.InputWidth,
+      Config.InputHeight);
+  Result := BuildViTMatteFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure ViTMattePaddedSize(Width, Height: integer;
+  out PaddedWidth, PaddedHeight: integer; SizeDivisor: integer);
+begin
+  PaddedWidth := ((Width + SizeDivisor - 1) div SizeDivisor) * SizeDivisor;
+  PaddedHeight := ((Height + SizeDivisor - 1) div SizeDivisor) * SizeDivisor;
+end;
+
+procedure ViTMattePreprocess(Image, Trimap, NetInput: TNNetVolume;
+  SizeDivisor: integer);
+var
+  PaddedWidth, PaddedHeight, MaxXPos, MaxYPos, XPos, YPos, ImagePos,
+    TrimapPos, InputPos: integer;
+begin
+  if (Image.Depth <> 3) or (Trimap.Depth <> 1) or
+     (Trimap.SizeX <> Image.SizeX) or (Trimap.SizeY <> Image.SizeY) then
+    ImportError(csViTMatteImporter + ': ViTMattePreprocess needs an RGB image ' +
+      'and a one-channel trimap of the same size.');
+  ViTMattePaddedSize(Image.SizeX, Image.SizeY, PaddedWidth, PaddedHeight,
+    SizeDivisor);
+  NetInput.ReSize(PaddedWidth, PaddedHeight, 4);
+  NetInput.Fill(0);
+  MaxXPos := Image.SizeX - 1;
+  MaxYPos := Image.SizeY - 1;
+  ImagePos := 0;
+  TrimapPos := 0;
+  for YPos := 0 to MaxYPos do
+  begin
+    InputPos := NetInput.GetRawPos(0, YPos, 0);
+    for XPos := 0 to MaxXPos do
+    begin
+      // rescale 1/255 then normalize with mean = std = 0.5.
+      NetInput.FData[InputPos] := Image.FData[ImagePos] * (2 / 255) - 1;
+      NetInput.FData[InputPos + 1] := Image.FData[ImagePos + 1] * (2 / 255) - 1;
+      NetInput.FData[InputPos + 2] := Image.FData[ImagePos + 2] * (2 / 255) - 1;
+      NetInput.FData[InputPos + 3] := Trimap.FData[TrimapPos] * (1 / 255);
+      Inc(ImagePos, 3);
+      Inc(TrimapPos);
+      Inc(InputPos, 4);
+    end;
+  end;
+end;
+
+procedure ViTMatteEstimateAlpha(NN: TNNet; Image, Trimap, Alpha: TNNetVolume);
+var
+  NetInput: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  try
+    ViTMattePreprocess(Image, Trimap, NetInput);
+    if (NN.Layers[0].Output.SizeX <> NetInput.SizeX) or
+       (NN.Layers[0].Output.SizeY <> NetInput.SizeY) then
+      ImportError(csViTMatteImporter + ': the net input is ' +
+        IntToStr(NN.Layers[0].Output.SizeX) + 'x' +
+        IntToStr(NN.Layers[0].Output.SizeY) + ' but the padded image is ' +
+        IntToStr(NetInput.SizeX) + 'x' + IntToStr(NetInput.SizeY) + '.');
+    NN.Compute(NetInput);
+    NN.GetLastLayer().ForceOutputOnRAM();
+    Alpha.CopyCropping(NN.GetLastLayer().Output, 0, 0, Image.SizeX,
+      Image.SizeY);
+  finally
+    NetInput.Free;
+  end;
 end;
 
 // ===========================================================================

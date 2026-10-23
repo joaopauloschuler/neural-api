@@ -221,6 +221,9 @@ type
     // IoFile ({"cases": [{"input", "out_grid_w", "out_grid_h", "output"}]}).
     function DPTDepthParityMaxDiff(const WeightsFile, ConfigFile,
       IoFile: string): double;
+    // tiny_vitmatte_io.json: image (W, H, 3), trimap (W, H, 1), the processor's
+    // pixel_values (padded W, H, 4) and the float64 alphas (padded W, H, 1).
+    procedure LoadViTMatteIO(Image, Trimap, PixelValues, Alphas: TNNetVolume);
     // Loads a {"shape": [T, C, ...], "data": [...]} oracle tensor of Root as a
     // (T,1,C*...) token-major volume.
     procedure LoadOracleTokenTensor(Root: TJSONData; const Key: string;
@@ -1571,6 +1574,11 @@ type
     procedure TestCodeFormerNoAdaINParity;
     // The tiny fixture with EnableOpenCL against the host net, every layer.
     procedure TestCodeFormerOpenCLParity;
+    // tiny_vitmatte: config, ViTMattePreprocess vs VitMatteImageProcessor, the
+    // padded alpha and ViTMatteEstimateAlpha's crop vs transformers, round trip.
+    procedure TestViTMatteParity;
+    // The tiny fixture with EnableOpenCL against the host net, every layer.
+    procedure TestViTMatteOpenCLParity;
     // Pico RetinaFace + tiny CodeFormer through RestoreFacesInImage: each restored
     // face equals CodeFormerRestoreFace on its crop; IsCodeFormerCheckpoint.
     procedure TestRestoreFacesInImageCodeFormer;
@@ -57191,6 +57199,222 @@ begin
     IO.Free;
     NNCPU.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralPretrained.LoadViTMatteIO(Image, Trimap, PixelValues,
+  Alphas: TNNetVolume);
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+
+  procedure LoadNumbers(const Key: string; Dest: TNNetVolume; SizeX, SizeY,
+    Depth: integer);
+  var
+    Values: TJSONArray;
+    ValuePos, MaxValuePos: integer;
+  begin
+    Values := TJSONArray(RefObj.Find(Key));
+    AssertTrue(Key + ' present', Values <> nil);
+    Dest.ReSize(SizeX, SizeY, Depth);
+    AssertEquals(Key + ' count', Dest.Size, Values.Count);
+    MaxValuePos := Values.Count - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Dest.FData[ValuePos] := Values.Items[ValuePos].AsFloat;
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_vitmatte_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    LoadNumbers('image', Image, RefObj.Get('width', 0), RefObj.Get('height', 0), 3);
+    LoadNumbers('trimap', Trimap, Image.SizeX, Image.SizeY, 1);
+    LoadNumbers('pixel_values', PixelValues, RefObj.Get('padded_width', 0),
+      RefObj.Get('padded_height', 0), 4);
+    LoadNumbers('alphas', Alphas, PixelValues.SizeX, PixelValues.SizeY, 1);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestViTMatteParity;
+var
+  Config: TViTMatteConfig;
+  NN, Reloaded: TNNet;
+  Image, Trimap, PixelValues, Alphas, NetInput, Alpha, ExpectedAlpha: TNNetVolume;
+  PreprocessDiff, AlphaDiff, CropDiff: double;
+begin
+  Image := TNNetVolume.Create;
+  Trimap := TNNetVolume.Create;
+  PixelValues := TNNetVolume.Create;
+  Alphas := TNNetVolume.Create;
+  NetInput := TNNetVolume.Create;
+  Alpha := TNNetVolume.Create;
+  ExpectedAlpha := TNNetVolume.Create;
+  NN := nil;
+  Reloaded := nil;
+  try
+    LoadViTMatteIO(Image, Trimap, PixelValues, Alphas);
+    AssertEquals('image width', 45, Image.SizeX);
+    AssertEquals('image height', 30, Image.SizeY);
+    NN := BuildViTMatteFromSafeTensors(
+      FixturePath('tiny_vitmatte' + DirectorySeparator + 'model.safetensors'),
+      Config, {pTrainable=}false, '', Image.SizeX, Image.SizeY);
+    AssertEquals('hidden', 16, Config.HiddenSize);
+    AssertEquals('layers (out stage4)', 4, Config.NumLayers);
+    AssertEquals('mlp hidden', 32, Config.MlpHidden);
+    AssertEquals('patch', 8, Config.PatchSize);
+    AssertEquals('channels', 4, Config.NumChannels);
+    AssertEquals('image_size', 32, Config.ImageSize);
+    AssertEquals('pretrain_image_size', 40, Config.PretrainImageSize);
+    AssertEquals('window blocks', 2, Length(Config.WindowBlockIndices));
+    AssertEquals('residual block 2', 2, Config.ResidualBlockIndices[1]);
+    AssertTrue('rel-pos on', Config.UseRelativePositionEmbeddings);
+    AssertEquals('fusion blocks', 3, Length(Config.FusionHiddenSizes));
+    AssertEquals('padded width', 64, Config.InputWidth);
+    AssertEquals('padded height', 32, Config.InputHeight);
+    ViTMattePreprocess(Image, Trimap, NetInput);
+    AssertEquals('preprocessed width', PixelValues.SizeX, NetInput.SizeX);
+    AssertEquals('preprocessed height', PixelValues.SizeY, NetInput.SizeY);
+    AssertEquals('preprocessed depth', 4, NetInput.Depth);
+    PreprocessDiff := MaxAbsVolumeDiff(NetInput, PixelValues);
+    NN.Compute(NetInput);
+    AlphaDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output, Alphas);
+    ViTMatteEstimateAlpha(NN, Image, Trimap, Alpha);
+    ExpectedAlpha.CopyCropping(Alphas, 0, 0, Image.SizeX, Image.SizeY);
+    AssertEquals('alpha width', Image.SizeX, Alpha.SizeX);
+    AssertEquals('alpha height', Image.SizeY, Alpha.SizeY);
+    CropDiff := MaxAbsVolumeDiff(Alpha, ExpectedAlpha);
+    WriteLn('  ViTMatte max|diff| preprocess ', PreprocessDiff:0:9, ' alpha ',
+      AlphaDiff:0:9, ' cropped ', CropDiff:0:9);
+    Reloaded := TNNet.Create();
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.SetTrainable();
+    Reloaded.Compute(NetInput);
+    AssertEquals('save/load round trip reproduces the alpha', 0,
+      MaxAbsVolumeDiff(Reloaded.GetLastLayer().Output, NN.GetLastLayer().Output),
+      1e-5);
+    AssertTrue('preprocess max |diff| = ' + FloatToStr(PreprocessDiff) +
+      ' must be < 1e-6', PreprocessDiff < 1e-6);
+    AssertTrue('alpha max |diff| = ' + FloatToStr(AlphaDiff) +
+      ' must be < 1e-4', AlphaDiff < 1e-4);
+    AssertTrue('cropped alpha max |diff| = ' + FloatToStr(CropDiff) +
+      ' must be < 1e-4', CropDiff < 1e-4);
+  finally
+    Reloaded.Free;
+    NN.Free;
+    ExpectedAlpha.Free;
+    Alpha.Free;
+    NetInput.Free;
+    Alphas.Free;
+    PixelValues.Free;
+    Trimap.Free;
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestViTMatteOpenCLParity;
+{$IFDEF OpenCL}
+var
+  Config: TViTMatteConfig;
+  NN, NNCPU: TNNet;
+  Image, Trimap, PixelValues, Alphas, NetInput: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxLayerPos: integer;
+
+  // Computes both nets and asserts the alpha and every layer match.
+  procedure AssertNetsMatch(const PassName: string);
+  var
+    LayerPos, FirstBadLayer, OpenCLLayerCnt: integer;
+    LayerDiff, MaxDiff, OutputDiff, OracleDiff: double;
+  begin
+    NNCPU.Compute(NetInput);
+    NN.ClearTime();
+    NN.Compute(NetInput);
+    NN.Compute(NetInput);
+    NN.GetLastLayer().ForceOutputOnRAM();
+    OutputDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output,
+      NNCPU.GetLastLayer().Output);
+    OracleDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output, Alphas);
+    MaxDiff := 0;
+    FirstBadLayer := -1;
+    OpenCLLayerCnt := 0;
+    for LayerPos := 1 to MaxLayerPos do
+    begin
+      if NN.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OpenCLLayerCnt);
+      NN.Layers[LayerPos].ForceOutputOnRAM();
+      LayerDiff := MaxAbsVolumeDiff(NN.Layers[LayerPos].Output,
+        NNCPU.Layers[LayerPos].Output) /
+        Max(1.0, NNCPU.Layers[LayerPos].Output.GetMaxAbs());
+      if (LayerDiff >= 1e-4) and (FirstBadLayer < 0) then
+      begin
+        FirstBadLayer := LayerPos;
+        WriteLn('  ViTMatte OpenCL ', PassName, ' first layer past 1e-4: ',
+          LayerPos, ' ', NN.Layers[LayerPos].ClassName, ' relative max|diff|=',
+          LayerDiff:0:9);
+      end;
+      if LayerDiff > MaxDiff then MaxDiff := LayerDiff;
+    end;
+    WriteLn('  ViTMatte OpenCL ', PassName, ' alpha max|diff| = ',
+      OutputDiff:0:9, ' vs transformers = ', OracleDiff:0:9,
+      ' any layer (relative) = ', MaxDiff:0:9, ' layers on OpenCL: ',
+      OpenCLLayerCnt, '/', MaxLayerPos);
+    AssertTrue(PassName + ': some layers ran on OpenCL', OpenCLLayerCnt > 0);
+    AssertTrue(PassName + ': alpha OpenCL vs CPU max |diff| = ' +
+      FloatToStr(OutputDiff) + ' must be < 1e-4', OutputDiff < 1e-4);
+    AssertTrue(PassName + ': alpha OpenCL vs transformers max |diff| = ' +
+      FloatToStr(OracleDiff) + ' must be < 1e-4', OracleDiff < 1e-4);
+    AssertEquals(PassName + ': every layer OpenCL vs CPU within 1e-4 relative',
+      -1, FirstBadLayer);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Image := TNNetVolume.Create;
+  Trimap := TNNetVolume.Create;
+  PixelValues := TNNetVolume.Create;
+  Alphas := TNNetVolume.Create;
+  NetInput := TNNetVolume.Create;
+  NN := nil;
+  NNCPU := nil;
+  try
+    LoadViTMatteIO(Image, Trimap, PixelValues, Alphas);
+    NN := BuildViTMatteFromSafeTensors(
+      FixturePath('tiny_vitmatte' + DirectorySeparator + 'model.safetensors'),
+      Config, {pTrainable=}false, '', Image.SizeX, Image.SizeY);
+    NNCPU := BuildViTMatteFromSafeTensorsEx(
+      FixturePath('tiny_vitmatte' + DirectorySeparator + 'model.safetensors'),
+      Config, {pTrainable=}false);
+    ViTMattePreprocess(Image, Trimap, NetInput);
+    MaxLayerPos := NN.CountLayers() - 1;
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertNetsMatch('size verdict');
+    // Every layer with a kernel, including the ones too small for the size verdict.
+    NN.ForceOpenCL(true);
+    AssertNetsMatch('forced');
+  finally
+    NNCPU.Free;
+    NN.Free;
+    NetInput.Free;
+    Alphas.Free;
+    PixelValues.Free;
+    Trimap.Free;
+    Image.Free;
   end;
 end;
 {$ELSE}
