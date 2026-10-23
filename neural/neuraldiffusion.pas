@@ -602,7 +602,8 @@ type
   // Update rule of TNNetFlowMatchEulerScheduler.Step:
   //   fsEuler         : x_next = x + (sigma_next - sigma)*v.
   //   fsDPMSolverPP2M : diffusers DPMSolverMultistepScheduler(use_flow_sigmas,
-  //     flow_prediction, dpmsolver++, solver_order=2, final_sigmas_type="zero").
+  //     flow_prediction, solver_order=2, final_sigmas_type="zero"), algorithm
+  //     dpmsolver++ or sde-dpmsolver++ (DPMSolverAlgorithm).
   //   fsUniPC         : diffusers UniPCMultistepScheduler(use_flow_sigmas,
   //     flow_prediction, predict_x0, solver_order=2, lower_order_final,
   //     final_sigmas_type="zero"), the Wan scheduler: the order-2 UniP
@@ -653,12 +654,14 @@ type
     FUniPCSolverType: TNNetUniPCSolverType;
     FUniPCCorrector: boolean;
     FScheduleFamily: TNNetFlowScheduleFamily;
+    FDPMSolverAlgorithm: TNNetDPMSolverAlgorithm;
     // CreateFromDiffusersConfigText of a UniPC / DPM-Solver multistep config.
     procedure ReadMultistepFlowConfig(Obj: TJSONObject; const Source,
       SchedulerClass: string);
     procedure SetSampler(Value: TNNetFlowSampler);
     // DPM-Solver++(2M) step; second order when step StepIndex-1 left history.
-    procedure StepDPMSolverPP2M(Sample, Velocity: TNNetVolume;
+    // Noise (the SDE z) is read only by dpaSDEDPMSolverPP.
+    procedure StepDPMSolverPP2M(Sample, Velocity, Noise: TNNetVolume;
       StepIndex: integer);
     // UniPC step: corrector + order-2 predictor when step StepIndex-1 left
     // history, first order otherwise and on the last step.
@@ -701,8 +704,11 @@ type
     // FLUX and Qwen-Image pipelines pass.
     procedure SetTimesteps(NumSteps: integer; Mu: double = 0.0);
     // One Sampler step in place from Sigma[StepIndex] to Sigma[StepIndex+1];
-    // Velocity is the model output at Timestep[StepIndex].
-    procedure Step(Sample, Velocity: TNNetVolume; StepIndex: integer);
+    // Velocity is the model output at Timestep[StepIndex]. Noise is the
+    // standard-normal z of the dpaSDEDPMSolverPP step (Sample-sized; nil draws
+    // it from RandG); the deterministic samplers ignore it.
+    procedure Step(Sample, Velocity: TNNetVolume; StepIndex: integer;
+      Noise: TNNetVolume = nil);
     // Forgets the multistep history, so the next Step is first order.
     procedure ResetMultistep;
     // diffusers img2img get_timesteps: the first step that runs at Strength,
@@ -731,6 +737,10 @@ type
     property UniPCSolverType: TNNetUniPCSolverType read FUniPCSolverType
       write FUniPCSolverType;
     property UniPCCorrector: boolean read FUniPCCorrector write FUniPCCorrector;
+    // fsDPMSolverPP2M algorithm: dpaDPMSolverPP (the ODE step, default) or
+    // dpaSDEDPMSolverPP (diffusers sde-dpmsolver++: the stochastic step).
+    property DPMSolverAlgorithm: TNNetDPMSolverAlgorithm
+      read FDPMSolverAlgorithm write FDPMSolverAlgorithm;
     // ffFlowMatchEuler unless a UniPC / DPM-Solver config set it.
     property ScheduleFamily: TNNetFlowScheduleFamily read FScheduleFamily
       write FScheduleFamily;
@@ -2908,6 +2918,7 @@ begin
   FUniPCSolverType := ustBh2;
   FUniPCCorrector := true;
   FScheduleFamily := ffFlowMatchEuler;
+  FDPMSolverAlgorithm := dpaDPMSolverPP;
 end;
 
 destructor TNNetFlowMatchEulerScheduler.Destroy;
@@ -3054,9 +3065,11 @@ begin
   else
   begin
     AlgorithmName := Obj.Get('algorithm_type', 'dpmsolver++');
-    if (AlgorithmName <> 'dpmsolver++') and (AlgorithmName <> 'deis') then
+    if AlgorithmName = 'sde-dpmsolver++' then
+      FDPMSolverAlgorithm := dpaSDEDPMSolverPP
+    else if (AlgorithmName <> 'dpmsolver++') and (AlgorithmName <> 'deis') then
       Refuse('"algorithm_type" = "' + AlgorithmName +
-        '" is not implemented (only "dpmsolver++").');
+        '" is not implemented (only "dpmsolver++" and "sde-dpmsolver++").');
     SolverTypeName := Obj.Get('solver_type', 'midpoint');
     if (SolverTypeName <> 'midpoint') and (SolverTypeName <> 'logrho') and
       (SolverTypeName <> 'bh1') and (SolverTypeName <> 'bh2') then
@@ -3195,13 +3208,13 @@ begin
 end;
 
 procedure TNNetFlowMatchEulerScheduler.Step(Sample, Velocity: TNNetVolume;
-  StepIndex: integer);
+  StepIndex: integer; Noise: TNNetVolume);
 begin
   if (StepIndex < 0) or (StepIndex >= GetNumSteps) then
     raise Exception.Create('Flow-matching step index ' + IntToStr(StepIndex) +
       ' outside 0..' + IntToStr(GetNumSteps - 1) + '.');
   case FSampler of
-    fsDPMSolverPP2M: StepDPMSolverPP2M(Sample, Velocity, StepIndex);
+    fsDPMSolverPP2M: StepDPMSolverPP2M(Sample, Velocity, Noise, StepIndex);
     fsUniPC: StepUniPC(Sample, Velocity, StepIndex);
   else
     Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
@@ -3220,37 +3233,59 @@ begin
 end;
 
 procedure TNNetFlowMatchEulerScheduler.StepDPMSolverPP2M(Sample,
-  Velocity: TNNetVolume; StepIndex: integer);
+  Velocity, Noise: TNNetVolume; StepIndex: integer);
 var
   SigmaS, SigmaT, SigmaPrev, AlphaS, AlphaT, AlphaPrev: double;
-  LambdaS, HistoryWeight: double;
+  LambdaS, HistoryWeight, ExpMinusH: double;
   SampleScale, DataScale, CurrentX0Scale, PrevX0Scale, StepSigma: TNeuralFloat;
-  CurrentX0: TNeuralFloat;
+  CurrentX0, NoiseScale: TNeuralFloat;
   ElementPos, MaxElementPos: integer;
-  HasHistory: boolean;
+  HasHistory, IsSDE: boolean;
 begin
   // alpha = 1 - sigma, lambda = ln(alpha/sigma), x0 = x - sigma*v, and
   // x_next = (sigma_t/sigma_s)*x - alpha_t*(exp(-h) - 1)*D (Lu et al. 2022).
+  // sde-dpmsolver++ (diffusers dpm_solver_first_order_update /
+  // multistep_dpm_solver_second_order_update, the same alpha/sigma):
+  // x_next = (sigma_t/sigma_s)*exp(-h)*x + alpha_t*(1 - exp(-2h))*D
+  //   + sigma_t*sqrt(1 - exp(-2h))*z, D the same midpoint combination.
   if Velocity.Size <> Sample.Size then
     raise Exception.Create('Flow-matching DPM-Solver++ step: ' +
       IntToStr(Velocity.Size) + ' velocity values for ' +
+      IntToStr(Sample.Size) + ' sample values.');
+  IsSDE := FDPMSolverAlgorithm = dpaSDEDPMSolverPP;
+  if IsSDE and Assigned(Noise) and (Noise.Size <> Sample.Size) then
+    raise Exception.Create('Flow-matching SDE-DPM-Solver++ step: ' +
+      IntToStr(Noise.Size) + ' noise values for ' +
       IntToStr(Sample.Size) + ' sample values.');
   SigmaS := FSigmas[StepIndex];
   SigmaT := FSigmas[StepIndex + 1];
   StepSigma := SigmaS;
   if SigmaT <= 0 then
   begin
-    // Final step to sigma 0 (lambda = +inf): first order, x_next = x0.
+    // Final step to sigma 0 (lambda = +inf): first order, x_next = x0 (the
+    // SDE noise term carries sigma_t = 0 too).
     Sample.MulAdd(-StepSigma, Velocity);
     FPrevStepIndex := -1;
     Exit;
   end;
   AlphaS := 1 - SigmaS;
   AlphaT := 1 - SigmaT;
-  // -alpha_t*(exp(-h) - 1) with exp(-h) = sigma_t*alpha_s/(alpha_t*sigma_s),
-  // finite at sigma_s = 1 (lambda_s = -inf).
-  SampleScale := SigmaT / SigmaS;
-  DataScale := AlphaT - SigmaT * AlphaS / SigmaS;
+  // exp(-h) = sigma_t*alpha_s/(alpha_t*sigma_s), finite (0) at sigma_s = 1
+  // (lambda_s = -inf); alpha_t > 0 as sigma_t < sigma_s <= 1.
+  ExpMinusH := SigmaT * AlphaS / (AlphaT * SigmaS);
+  if IsSDE then
+  begin
+    SampleScale := SigmaT / SigmaS * ExpMinusH;
+    DataScale := AlphaT * (1 - ExpMinusH * ExpMinusH);
+    NoiseScale := SigmaT * Sqrt(Max(0.0, 1 - ExpMinusH * ExpMinusH));
+  end
+  else
+  begin
+    // -alpha_t*(exp(-h) - 1) written without the division by alpha_t.
+    SampleScale := SigmaT / SigmaS;
+    DataScale := AlphaT - SigmaT * AlphaS / SigmaS;
+    NoiseScale := 0;
+  end;
   if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Sample)
   else if FPrevX0.Size <> Sample.Size then
   begin
@@ -3295,6 +3330,14 @@ begin
         DataScale * CurrentX0;
       FPrevX0.FData[ElementPos] := CurrentX0;
     end;
+  end;
+  if IsSDE then
+  begin
+    if Assigned(Noise) then Sample.MulAdd(NoiseScale, Noise)
+    else
+      for ElementPos := 0 to MaxElementPos do
+        Sample.FData[ElementPos] := Sample.FData[ElementPos] +
+          NoiseScale * RandG(0, 1);
   end;
   FPrevStepIndex := StepIndex;
 end;

@@ -122,6 +122,15 @@ type
     procedure TestFlowMatchImg2ImgStartStepVsOracle;
     procedure TestFlowMatchScaleNoiseVsOracle;
     procedure TestFlowDPMSolverFirstOrderMatchesEuler;
+    // sde-dpmsolver++ on flow sigmas: the config, one step vs a hand-computed
+    // reference, and the forward marginal kept on single-point data.
+    procedure TestFlowSDEDPMSolverFromConfig;
+    procedure TestFlowSDEDPMSolverOneStepHandComputed;
+    procedure TestFlowSDEDPMSolverKeepsForwardMarginal;
+    // SD img2img on continuous sigmas: Img2ImgStartStep vs diffusers
+    // get_timesteps by hand, and BuildImg2ImgSigmaSchedule as the full
+    // schedule cut at t_start (Euler linspace, Euler a / DPM++ 2M Karras).
+    procedure TestImg2ImgSigmaScheduleTruncation;
     procedure TestFlowDPMSolverTrajectoryVsDiffusers;
     procedure TestFlowUniPCTrajectoryVsDiffusers;
     procedure TestTrailingSpacingMatchesDiffusers;
@@ -2146,7 +2155,7 @@ const
     cUniPCHead + cFlowFields + ', "lower_order_final": false}',
     cUniPCHead + cFlowFields + ', "predict_x0": false}',
     cDPMHead + cFlowFields + ', "solver_type": "heun"}',
-    cDPMHead + cFlowFields + ', "algorithm_type": "sde-dpmsolver++"}',
+    cDPMHead + cFlowFields + ', "algorithm_type": "dpmsolver"}',
     cDPMHead + cFlowFields + ', "use_dynamic_shifting": true, ' +
       '"time_shift_type": "linear"}',
     cDPMHead + cFlowFields + ', "use_lu_lambdas": true}');
@@ -2337,6 +2346,247 @@ begin
     EulerSample.Free;
     DPMSample.Free;
     Velocity.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowSDEDPMSolverFromConfig;
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+begin
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+    '{"_class_name": "DPMSolverMultistepScheduler", "use_flow_sigmas": true, ' +
+    '"prediction_type": "flow_prediction", "flow_shift": 3.0, ' +
+    '"algorithm_type": "sde-dpmsolver++"}');
+  try
+    AssertTrue('fsDPMSolverPP2M', Sched.Sampler = fsDPMSolverPP2M);
+    AssertTrue('sde-dpmsolver++',
+      Sched.DPMSolverAlgorithm = dpaSDEDPMSolverPP);
+    AssertTrue('ffDPMSolver', Sched.ScheduleFamily = ffDPMSolver);
+    // The algorithm does not change the schedule.
+    Sched.SetTimesteps(5);
+    CheckFlowSchedule(Sched, [0.9996664524078369, 0.9227216839790344,
+      0.8178097009658813, 0.666296124458313, 0.42826521396636963],
+      [999, 922, 817, 666, 428]);
+  finally
+    Sched.Free;
+  end;
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfigText(
+    '{"_class_name": "DPMSolverMultistepScheduler", "use_flow_sigmas": true, ' +
+    '"prediction_type": "flow_prediction"}');
+  try
+    AssertTrue('dpmsolver++ default', Sched.DPMSolverAlgorithm = dpaDPMSolverPP);
+  finally
+    Sched.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowSDEDPMSolverOneStepHandComputed;
+const
+  // sigma 0.8 -> 0.5 (alpha 0.2 -> 0.5): exp(-h) = 0.5*0.2/(0.5*0.8) = 0.25,
+  // x_next = 0.625*0.25*x + 0.5*(1 - 0.0625)*x0 + 0.5*sqrt(0.9375)*z,
+  // x0 = x - 0.8*v (float64 by hand).
+  cSample: array[0..2] of TNeuralFloat = (1.0, -0.5, 0.25);
+  cVelocity: array[0..2] of TNeuralFloat = (0.5, 1.5, -2.0);
+  cNoise: array[0..2] of TNeuralFloat = (2.0, -1.0, 0.0);
+  cStep1: array[0..2] of double = (1.4057458365518543, -1.3591229182759272,
+    0.90625);
+  cX0: array[0..2] of double = (0.6, -1.7, 1.85);
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+  Sample, Velocity, Noise: TNNetVolume;
+  ElementPos: integer;
+begin
+  Sched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, false);
+  Sample := TNNetVolume.Create(3, 1, 1);
+  Velocity := TNNetVolume.Create(3, 1, 1);
+  Noise := TNNetVolume.Create(3, 1, 1);
+  try
+    Sched.Sampler := fsDPMSolverPP2M;
+    Sched.DPMSolverAlgorithm := dpaSDEDPMSolverPP;
+    Sched.SetSigmas([0.8, 0.5]);
+    AssertEquals('sigma 0', 0.8, Sched.Sigma[0], 1e-12);
+    AssertEquals('sigma 1', 0.5, Sched.Sigma[1], 1e-12);
+    for ElementPos := 0 to 2 do
+    begin
+      Sample.FData[ElementPos] := cSample[ElementPos];
+      Velocity.FData[ElementPos] := cVelocity[ElementPos];
+      Noise.FData[ElementPos] := cNoise[ElementPos];
+    end;
+    Sched.Step(Sample, Velocity, 0, Noise);
+    for ElementPos := 0 to 2 do
+      AssertEquals('SDE step @ ' + IntToStr(ElementPos), cStep1[ElementPos],
+        Sample.FData[ElementPos], 2e-6);
+    // The last step lands on sigma 0: x0 = x - 0.5*v, the noise unused.
+    for ElementPos := 0 to 2 do
+    begin
+      Sample.FData[ElementPos] := cSample[ElementPos];
+      Noise.FData[ElementPos] := 100;
+    end;
+    Sched.Step(Sample, Velocity, 1, Noise);
+    for ElementPos := 0 to 2 do
+      AssertEquals('final step = x0 @ ' + IntToStr(ElementPos),
+        cSample[ElementPos] - 0.5 * cVelocity[ElementPos],
+        Sample.FData[ElementPos], 1e-6);
+    // The ODE algorithm ignores the noise: 0.625*x + 0.5*(1 - 0.25)*x0.
+    Sched.DPMSolverAlgorithm := dpaDPMSolverPP;
+    Sched.ResetMultistep;
+    for ElementPos := 0 to 2 do
+      Sample.FData[ElementPos] := cSample[ElementPos];
+    Sched.Step(Sample, Velocity, 0, Noise);
+    for ElementPos := 0 to 2 do
+      AssertEquals('ODE step @ ' + IntToStr(ElementPos),
+        0.625 * cSample[ElementPos] + 0.375 * cX0[ElementPos],
+        Sample.FData[ElementPos], 2e-6);
+  finally
+    Sched.Free;
+    Sample.Free;
+    Velocity.Free;
+    Noise.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowSDEDPMSolverKeepsForwardMarginal;
+const
+  cElements = 5;
+  cSteps = 6;
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+  Sample, Velocity, Noise: TNNetVolume;
+  CleanData, Eps: array[0..cElements - 1] of double;
+  StepPos, ElementPos: integer;
+  SigmaS, SigmaT, ExpMinusH: double;
+begin
+  // Data that is one point x0* per element: with v = eps - x0* exact, every
+  // x0 prediction is x0*, so the first- and second-order steps both give
+  // x_next = alpha_t*x0* + sigma_t*(exp(-h)*eps + sqrt(1 - exp(-2h))*z),
+  // the forward marginal at sigma_t with the new eps.
+  Sched := TNNetFlowMatchEulerScheduler.Create(1000, 3.0, false);
+  Sample := TNNetVolume.Create(cElements, 1, 1);
+  Velocity := TNNetVolume.Create(cElements, 1, 1);
+  Noise := TNNetVolume.Create(cElements, 1, 1);
+  try
+    Sched.Sampler := fsDPMSolverPP2M;
+    Sched.DPMSolverAlgorithm := dpaSDEDPMSolverPP;
+    Sched.SetTimesteps(cSteps);
+    for ElementPos := 0 to cElements - 1 do
+    begin
+      CleanData[ElementPos] := (ElementPos - 2) * 0.3;
+      Eps[ElementPos] := 0.7 - ElementPos * 0.35;
+      Sample.FData[ElementPos] := (1 - Sched.Sigma[0]) * CleanData[ElementPos] +
+        Sched.Sigma[0] * Eps[ElementPos];
+    end;
+    for StepPos := 0 to cSteps - 1 do
+    begin
+      SigmaS := Sched.Sigma[StepPos];
+      SigmaT := Sched.Sigma[StepPos + 1];
+      for ElementPos := 0 to cElements - 1 do
+      begin
+        Velocity.FData[ElementPos] := Eps[ElementPos] - CleanData[ElementPos];
+        Noise.FData[ElementPos] := Sin(1.3 * ElementPos + 0.7 * StepPos);
+      end;
+      Sched.Step(Sample, Velocity, StepPos, Noise);
+      if SigmaT > 0 then
+        ExpMinusH := SigmaT * (1 - SigmaS) / ((1 - SigmaT) * SigmaS)
+      else ExpMinusH := 0;
+      for ElementPos := 0 to cElements - 1 do
+      begin
+        Eps[ElementPos] := ExpMinusH * Eps[ElementPos] +
+          Sqrt(1 - ExpMinusH * ExpMinusH) * Noise.FData[ElementPos];
+        AssertEquals('marginal, step ' + IntToStr(StepPos) + ' @ ' +
+          IntToStr(ElementPos), (1 - SigmaT) * CleanData[ElementPos] +
+          SigmaT * Eps[ElementPos], Sample.FData[ElementPos], 1e-5);
+      end;
+    end;
+    // The run ends on x0*.
+    for ElementPos := 0 to cElements - 1 do
+      AssertEquals('clean @ ' + IntToStr(ElementPos), CleanData[ElementPos],
+        Sample.FData[ElementPos], 1e-5);
+  finally
+    Sched.Free;
+    Sample.Free;
+    Velocity.Free;
+    Noise.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestImg2ImgSigmaScheduleTruncation;
+type
+  TStartCase = record
+    NumSteps: integer;
+    Strength: double;
+    StartStep: integer;
+  end;
+const
+  // t_start = N - min(int(N*strength), N) in float64: 100*0.29 is
+  // 28.999999999999996 (t_start 72), 100*0.57 is 56.99999999999999 (44),
+  // 10*0.7 is 7.000000000000001 (3).
+  cStartCases: array[0..8] of TStartCase = (
+    (NumSteps: 10; Strength: 0.7; StartStep: 3),
+    (NumSteps: 100; Strength: 0.29; StartStep: 72),
+    (NumSteps: 100; Strength: 0.57; StartStep: 44),
+    (NumSteps: 10; Strength: 0.3; StartStep: 7),
+    (NumSteps: 8; Strength: 0.3; StartStep: 6),
+    (NumSteps: 10; Strength: 0.75; StartStep: 3),
+    (NumSteps: 20; Strength: 0.35; StartStep: 13),
+    (NumSteps: 7; Strength: 1.0; StartStep: 0),
+    (NumSteps: 3; Strength: 0.34; StartStep: 2));
+var
+  Sched: TNNetDiffusionScheduler;
+  CasePos: integer;
+
+  procedure CheckCut(const Name: string; NumSteps: integer;
+    Spacing: TNNetTimestepSpacing; Method: TNNetSamplerMethod;
+    KarrasSigmas: boolean; Strength: double; StartStep: integer);
+  var
+    Full, Cut: TNNetSigmaSchedule;
+    EntryPos: integer;
+  begin
+    Full := Sched.BuildSigmaSchedule(NumSteps, Spacing, Method, KarrasSigmas);
+    Cut := Sched.BuildImg2ImgSigmaSchedule(NumSteps, Spacing, Method,
+      KarrasSigmas, Strength);
+    AssertEquals(Name + ' steps', NumSteps - StartStep,
+      Length(Cut.ModelTimesteps));
+    AssertEquals(Name + ' sigmas', NumSteps - StartStep + 1,
+      Length(Cut.Sigmas));
+    for EntryPos := 0 to High(Cut.ModelTimesteps) do
+      AssertEquals(Name + ' timestep ' + IntToStr(EntryPos),
+        Full.ModelTimesteps[StartStep + EntryPos], Cut.ModelTimesteps[EntryPos],
+        0);
+    for EntryPos := 0 to High(Cut.Sigmas) do
+      AssertEquals(Name + ' sigma ' + IntToStr(EntryPos),
+        Full.Sigmas[StartStep + EntryPos], Cut.Sigmas[EntryPos], 0);
+    AssertEquals(Name + ' final sigma', 0, Cut.Sigmas[High(Cut.Sigmas)], 0);
+  end;
+
+var
+  Cut: TNNetSigmaSchedule;
+  EntryPos: integer;
+begin
+  for CasePos := 0 to High(cStartCases) do
+    with cStartCases[CasePos] do
+      AssertEquals('t_start N=' + IntToStr(NumSteps) + ' strength ' +
+        FloatToStr(Strength), StartStep,
+        TNNetDiffusionScheduler.Img2ImgStartStep(NumSteps, Strength));
+  Sched := TNNetDiffusionScheduler.Create(1000, dsScaledLinear, dpEps, 0.00085,
+    0.012);
+  try
+    // Euler linspace, 10 steps: timesteps linspace(0, 999, 10) reversed =
+    // 999, 888, ..., 0; strength 0.75 starts at index 3 (666), add_noise at
+    // its sigma (Cut.Sigmas[0], checked by CheckCut).
+    CheckCut('Euler linspace', 10, tsUniform, smEuler, false, 0.75, 3);
+    Cut := Sched.BuildImg2ImgSigmaSchedule(10, tsUniform, smEuler, false, 0.75);
+    for EntryPos := 0 to 6 do
+      AssertEquals('Euler linspace timestep ' + IntToStr(EntryPos),
+        666 - 111 * EntryPos, Cut.ModelTimesteps[EntryPos], 1e-3);
+    // Karras ramps: Euler a over the leading timesteps' sigma range, DPM++ 2M
+    // over the whole table (also the 9-channel inpainting start).
+    CheckCut('Euler a Karras', 8, tsLeading, smEulerAncestral, true, 0.3, 6);
+    CheckCut('DPM++ 2M Karras', 10, tsLeading, smDPMSolverPP2M, true, 0.7, 3);
+    CheckCut('DPM++ 2M Karras 100', 100, tsLeading, smDPMSolverPP2M, true,
+      0.29, 72);
+    CheckCut('Euler Karras full strength', 7, tsLeading, smEuler, true, 1.0, 0);
+  finally
+    Sched.Free;
   end;
 end;
 

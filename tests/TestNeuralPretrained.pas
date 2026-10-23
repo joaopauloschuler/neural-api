@@ -47701,8 +47701,8 @@ begin
     for SamplerPos := 0 to Samplers.Count - 1 do
     begin
       Entry := Samplers.Objects[SamplerPos];
-      Pipeline.Sampler := DiffusersSchedulerSampler(
-        Entry.Objects['config'].AsJSON, Notice);
+      Pipeline.SelectSamplerFromConfig(Entry.Objects['config'].AsJSON);
+      Notice := Pipeline.SamplerNotice;
       AssertTrue(Entry.Get('class_name', '') + ' mapped',
         Pipeline.Sampler = cExpected[SamplerPos]);
       AssertEquals(Entry.Get('class_name', '') + ' notice', '', Notice);
@@ -49492,8 +49492,9 @@ begin
     for CasePos := 0 to Cases.Count - 1 do
     begin
       Entry := Cases.Objects[CasePos];
-      Pipeline.Sampler := DiffusersSchedulerSampler(
-        Entry.Objects['scheduler_config'].AsJSON, Notice);
+      Pipeline.SelectSamplerFromConfig(
+        Entry.Objects['scheduler_config'].AsJSON);
+      Notice := Pipeline.SamplerNotice;
       AssertEquals(Entry.Get('name', '') + ' notice', '', Notice);
       Img2Img.Strength := Entry.Get('strength', 0.0);
       CheckSD15ConditionedParity(Pipeline, Entry);
@@ -50140,8 +50141,9 @@ begin
     for CasePos := 0 to Cases.Count - 1 do
     begin
       Entry := Cases.Objects[CasePos];
-      Pipeline.Sampler := DiffusersSchedulerSampler(
-        Entry.Objects['scheduler_config'].AsJSON, Notice);
+      Pipeline.SelectSamplerFromConfig(
+        Entry.Objects['scheduler_config'].AsJSON);
+      Notice := Pipeline.SamplerNotice;
       AssertTrue(Entry.Get('name', '') + ' mapped', Pipeline.Sampler = smLCM);
       AssertEquals(Entry.Get('name', '') + ' notice', '', Notice);
       AssertTrue(Entry.Get('name', '') + ' LCM scheduler',

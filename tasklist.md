@@ -858,12 +858,14 @@ rather than acted on.
       - [ ] (j) `--birefnet-config FILE`: today the BiRefNet config must be a
             `config.json` next to the model file.
 - [ ] Karras / continuous-sigma img2img follow-ups (fed30990, e9fe925f): pico
-      parity vs diffusers for img2img with Euler linspace, Euler a Karras
-      (per-step ancestral noise) and 9-channel inpainting below strength 1 with
-      Karras (only DPM++ 2M, SDE and Euler Karras are pinned); move the three
-      tests that still assign `Pipeline.Sampler := DiffusersSchedulerSampler(...)`
-      to `SelectSamplerFromConfig`; `TNNetFlowMatchEulerScheduler`'s DPM path
-      still refuses `sde-dpmsolver++`.
+      parity vs a diffusers oracle for img2img with Euler linspace, Euler a
+      Karras (per-step ancestral noise) and 9-channel inpainting below
+      strength 1 with Karras (only DPM++ 2M, SDE and Euler Karras are pinned
+      against diffusers; `TestImg2ImgSigmaScheduleTruncation` pins the t_start
+      cut by hand). Needs a new oracle generator; no Python was added for
+      it (ask the user how to produce it). The flow-match `sde-dpmsolver++` step is pinned only
+      by hand-computed and invariant tests, with no diffusers trajectory, and the
+      Qwen-Image pipeline draws its SDE noise from RandG (no step-noise hook).
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close; and `gligen-1-4-inpainting-text-box` with
