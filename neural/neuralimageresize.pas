@@ -48,6 +48,10 @@ procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat); ov
 // reflect padding (no edge repeat). Dest may be Source.
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
   KernelSize: integer); overload;
+// scipy.ndimage.gaussian_filter(sigma=Sigma, radius=TapRadius) on x and y of each
+// channel, mode "reflect" (the edge pixel repeats). Dest may be Source.
+procedure GaussianFilterImageScipy(Source, Dest: TNNetVolume;
+  Sigma: TNeuralFloat; TapRadius: integer);
 
 // cv2.Canny(Source, Low, High, apertureSize=3, L2gradient) of a 0..255 image
 // (no blur; strongest channel per pixel): Dest (W,H,DestDepth) holds 0 or 255.
@@ -137,9 +141,11 @@ function EstimateSimilarityTransformLMedS(const SourceX, SourceY, DestX,
 
 // cv2.warpAffine(Source, Matrix, (DestSizeX, DestSizeY)) bilinear in float with
 // BORDER_CONSTANT: an outside neighbour reads BorderValue (missing channels 0).
+// BlendsBorder false is scipy affine_transform(order=1, mode="constant"): a
+// sample outside [0, Size - 1] reads BorderValue unblended.
 procedure WarpImageAffine(Source, Dest: TNNetVolume;
   const Matrix: TImageAffineMatrix; DestSizeX, DestSizeY: integer;
-  const BorderValue: array of TNeuralFloat);
+  const BorderValue: array of TNeuralFloat; BlendsBorder: boolean = true);
 
 type
   // Resize + crop of a HF image processor: shortest-edge (KeepsAspect) or
@@ -656,10 +662,15 @@ begin
 end;
 
 
+type
+  // Past the edge: repeat the edge pixel, mirror without it (d c b | a b c d,
+  // torchvision/cv2 reflect-101) or mirror with it (b a | a b c d, scipy "reflect").
+  TBlurEdgeMode = (bemClamp, bemReflect101, bemSymmetric);
+
 // Separable blur of Source by Taps (odd count, tap TapPos weighs the pixel
-// TapPos - Length(Taps) div 2 away) on both axes; past the edge it clamps or reflects.
+// TapPos - Length(Taps) div 2 away) on both axes; EdgeMode reads past the edge.
 procedure BlurImageSeparableTaps(Source, Dest: TNNetVolume;
-  const Taps: array of double; IsReflect: boolean);
+  const Taps: array of double; EdgeMode: TBlurEdgeMode);
 var
   // NeighboursX/Y[Pos * TapCount + TapPos]: the pixel tap TapPos of Pos reads.
   NeighboursX, NeighboursY: array of integer;
@@ -678,7 +689,13 @@ var
       for NeighbourTapPos := 0 to MaxTapPos do
       begin
         Offset := Pos + NeighbourTapPos - TapRadius;
-        if not IsReflect then Offset := Min(Max(Offset, 0), MaxPos)
+        if EdgeMode = bemClamp then Offset := Min(Max(Offset, 0), MaxPos)
+        else if EdgeMode = bemSymmetric then
+        begin
+          if Offset < 0 then Offset := -Offset - 1;
+          Offset := Offset mod (Period + 2);
+          if Offset > MaxPos then Offset := Period + 1 - Offset;
+        end
         else if Period = 0 then Offset := 0
         else
         begin
@@ -739,9 +756,9 @@ begin
 end;
 
 // Separable blur of Source by the normalized Gaussian of Sigma over taps
-// -TapRadius..TapRadius; past the edge it clamps or reflects.
+// -TapRadius..TapRadius; EdgeMode reads past the edge.
 procedure BlurImageSeparable(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
-  TapRadius: integer; IsReflect: boolean);
+  TapRadius: integer; EdgeMode: TBlurEdgeMode);
 var
   Taps: array of double;
   TapPos, MaxTapPos: integer;
@@ -758,7 +775,7 @@ begin
   end;
   for TapPos := 0 to MaxTapPos do
     Taps[TapPos] := Taps[TapPos] / TapSum;
-  BlurImageSeparableTaps(Source, Dest, Taps, IsReflect);
+  BlurImageSeparableTaps(Source, Dest, Taps, EdgeMode);
 end;
 
 procedure GaussianBlurImageCV2(Source, Dest: TNNetVolume; KernelSize: integer);
@@ -785,14 +802,14 @@ begin
   if KernelSize > 9 then
   begin
     BlurImageSeparable(Source, Dest, 0.3 * ((KernelSize - 1) * 0.5 - 1) + 0.8,
-      KernelSize div 2, true);
+      KernelSize div 2, bemReflect101);
     exit;
   end;
   MaxTapPos := KernelSize - 1;
   SetLength(Taps, KernelSize);
   for TapPos := 0 to MaxTapPos do
     Taps[TapPos] := csSmallTaps[KernelSize div 2, TapPos] / 256;
-  BlurImageSeparableTaps(Source, Dest, Taps, true);
+  BlurImageSeparableTaps(Source, Dest, Taps, bemReflect101);
 end;
 
 procedure ErodeImage(Source, Dest: TNNetVolume; KernelSizeX,
@@ -1136,7 +1153,7 @@ end;
 
 procedure WarpImageAffine(Source, Dest: TNNetVolume;
   const Matrix: TImageAffineMatrix; DestSizeX, DestSizeY: integer;
-  const BorderValue: array of TNeuralFloat);
+  const BorderValue: array of TNeuralFloat; BlendsBorder: boolean);
 var
   Inverse: TImageAffineMatrix;
   // Border[Channel]: what an outside neighbour reads.
@@ -1174,6 +1191,17 @@ begin
          (TopY < SizeY - 1) then
         NeuralBilinearGatherColumn(Source, OutPtr, SourceX, SourceY, SizeX,
           SizeY, Depth, {BorderPad=}false)
+      else if not BlendsBorder then
+      begin
+        if (SourceX < 0) or (SourceX > SizeX - 1) or (SourceY < 0) or
+           (SourceY > SizeY - 1) then
+        begin
+          for Channel := 0 to MaxChannel do OutPtr^[Channel] := Border[Channel];
+        end
+        else
+          NeuralBilinearGatherColumn(Source, OutPtr, SourceX, SourceY, SizeX,
+            SizeY, Depth, {BorderPad=}false);
+      end
       else if (LeftX < -1) or (LeftX > SizeX - 1) or (TopY < -1) or
          (TopY > SizeY - 1) then
       begin
@@ -1210,7 +1238,7 @@ begin
     exit;
   end;
   // 3 sigma holds all but 0.3% of the Gaussian's mass.
-  BlurImageSeparable(Source, Dest, Radius, Ceil(3 * Radius), false);
+  BlurImageSeparable(Source, Dest, Radius, Ceil(3 * Radius), bemClamp);
 end;
 
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Sigma: TNeuralFloat;
@@ -1219,7 +1247,16 @@ begin
   if (KernelSize < 1) or not Odd(KernelSize) or (Sigma <= 0) then
     raise EArgumentException.Create('GaussianBlurImage: KernelSize must be ' +
       'odd and >= 1 and Sigma > 0.');
-  BlurImageSeparable(Source, Dest, Sigma, KernelSize div 2, true);
+  BlurImageSeparable(Source, Dest, Sigma, KernelSize div 2, bemReflect101);
+end;
+
+procedure GaussianFilterImageScipy(Source, Dest: TNNetVolume;
+  Sigma: TNeuralFloat; TapRadius: integer);
+begin
+  if (TapRadius < 0) or (Sigma <= 0) then
+    raise EArgumentException.Create('GaussianFilterImageScipy: TapRadius ' +
+      'must be >= 0 and Sigma > 0.');
+  BlurImageSeparable(Source, Dest, Sigma, TapRadius, bemSymmetric);
 end;
 
 procedure CannyEdges(Source, Dest: TNNetVolume; LowThreshold,

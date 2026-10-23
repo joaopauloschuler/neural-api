@@ -1266,6 +1266,7 @@ type
     procedure TestViTPosePoseEstimationParity;
     procedure TestViTPoseKeypointDecode;
     procedure TestViTPoseKeypointDecodeTieBreak;
+    procedure TestViTPoseTopDownParity;
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
@@ -41643,6 +41644,103 @@ begin
   finally
     RefRoot.Free;
     Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Top-down ViTPose against transformers VitPoseImageProcessor +
+// post_process_pose_estimation (tools/make_vitpose_topdown_oracle.py): a tall and
+// a wide box, the wide one partly outside the photo. Checks center/scale, crop
+// checksums, then photo-pixel keypoints (1e-3 px) and scores (1e-4).
+procedure TTestNeuralPretrained.TestViTPoseTopDownParity;
+var
+  NN: TNNet;
+  Config: TViTPoseConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  ImageArr, BoxesArr, BoxArr, KeypointsArr, ScoresArr: TJSONArray;
+  BoxObj: TJSONObject;
+  Image, Crop: TNNetVolume;
+  Box: TViTPoseBoxTransform;
+  Joints: TPoseJointArray;
+  ImageW, ImageH, ValuePos, MaxValuePos, BoxPos, Joint: integer;
+  PixelSum, PixelAbsSum, MaxCoordDiff, MaxScoreDiff: double;
+begin
+  NN := BuildViTPoseFromSafeTensors(FixturePath('tiny_vitpose.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_vitpose_config.json'));
+  RefJson := TStringList.Create;
+  Image := TNNetVolume.Create;
+  Crop := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxCoordDiff := 0;
+  MaxScoreDiff := 0;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_vitpose_topdown.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    ImageW := TJSONObject(RefRoot).Get('image_w', 0);
+    ImageH := TJSONObject(RefRoot).Get('image_h', 0);
+    ImageArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    Image.ReSize(ImageW, ImageH, 3);
+    // image is flat (y, x, c), the TNNetVolume layout.
+    MaxValuePos := Image.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Image.FData[ValuePos] := ImageArr.Items[ValuePos].AsInteger;
+    BoxesArr := TJSONArray(TJSONObject(RefRoot).Find('boxes'));
+    AssertEquals('box count', 2, BoxesArr.Count);
+    for BoxPos := 0 to BoxesArr.Count - 1 do
+    begin
+      BoxObj := TJSONObject(BoxesArr.Items[BoxPos]);
+      BoxArr := TJSONArray(BoxObj.Find('box'));
+      Box := ViTPoseBoxToCenterScale(BoxArr.Items[0].AsFloat,
+        BoxArr.Items[1].AsFloat, BoxArr.Items[2].AsFloat,
+        BoxArr.Items[3].AsFloat, Config.ImageW, Config.ImageH);
+      AssertEquals('center x', TJSONArray(BoxObj.Find('center')).Items[0].AsFloat,
+        Box.CenterX, 1e-5);
+      AssertEquals('center y', TJSONArray(BoxObj.Find('center')).Items[1].AsFloat,
+        Box.CenterY, 1e-5);
+      AssertEquals('scale x', TJSONArray(BoxObj.Find('scale')).Items[0].AsFloat,
+        Box.ScaleX, 1e-7);
+      AssertEquals('scale y', TJSONArray(BoxObj.Find('scale')).Items[1].AsFloat,
+        Box.ScaleY, 1e-7);
+      ViTPoseCropPerson(Image, Crop, Box, Config.ImageW, Config.ImageH,
+        csViTPoseImageMean, csViTPoseImageStd);
+      AssertEquals('crop width', Config.ImageW, Crop.SizeX);
+      AssertEquals('crop height', Config.ImageH, Crop.SizeY);
+      PixelSum := 0;
+      PixelAbsSum := 0;
+      MaxValuePos := Crop.Size - 1;
+      for ValuePos := 0 to MaxValuePos do
+      begin
+        PixelSum := PixelSum + Crop.FData[ValuePos];
+        PixelAbsSum := PixelAbsSum + Abs(Crop.FData[ValuePos]);
+      end;
+      AssertEquals('crop sum', BoxObj.Get('pixel_sum', 0.0), PixelSum, 1e-3);
+      AssertEquals('crop abs sum', BoxObj.Get('pixel_abs_sum', 0.0),
+        PixelAbsSum, 1e-3);
+      NN.Compute(Crop);
+      Joints := DecodeViTPoseKeypointsInImage(NN.GetLastLayer().Output, Box);
+      KeypointsArr := TJSONArray(BoxObj.Find('keypoints'));
+      ScoresArr := TJSONArray(BoxObj.Find('scores'));
+      AssertEquals('joint count', KeypointsArr.Count, Length(Joints));
+      for Joint := 0 to KeypointsArr.Count - 1 do
+      begin
+        MaxCoordDiff := Max(MaxCoordDiff, Abs(Joints[Joint].X -
+          TJSONArray(KeypointsArr.Items[Joint]).Items[0].AsFloat));
+        MaxCoordDiff := Max(MaxCoordDiff, Abs(Joints[Joint].Y -
+          TJSONArray(KeypointsArr.Items[Joint]).Items[1].AsFloat));
+        MaxScoreDiff := Max(MaxScoreDiff, Abs(Joints[Joint].Score -
+          ScoresArr.Items[Joint].AsFloat));
+      end;
+    end;
+    AssertTrue('keypoints: max |diff| = ' + FloatToStr(MaxCoordDiff) +
+      ' px must be < 1e-3', MaxCoordDiff < 1e-3);
+    AssertTrue('scores: max |diff| = ' + FloatToStr(MaxScoreDiff) +
+      ' must be < 1e-4', MaxScoreDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Crop.Free;
+    Image.Free;
     RefJson.Free;
     NN.Free;
   end;

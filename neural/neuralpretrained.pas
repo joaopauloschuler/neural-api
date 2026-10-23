@@ -15978,6 +15978,45 @@ type
 // plain CPU helper, exactly the recipe the task asks for.
 function DecodeViTPoseKeypoints(Heatmaps: TNNetVolume): TViTPoseKeypointArray;
 
+type
+  // A person box as transformers box_to_center_and_scale returns it: the centre
+  // in photo pixels and the padded crop size / 200 (float32, as transformers).
+  TViTPoseBoxTransform = record
+    CenterX, CenterY, ScaleX, ScaleY: single;
+  end;
+
+  // One joint in photo pixels and its heatmap peak value.
+  TPoseJoint = record
+    X, Y, Score: TNeuralFloat;
+  end;
+  TPoseJointArray = array of TPoseJoint;
+
+const
+  // VitPoseImageProcessor image_mean / image_std (IMAGENET_DEFAULT_*).
+  csViTPoseImageMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  csViTPoseImageStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+
+// transformers box_to_center_and_scale: the COCO (x, y, w, h) box grown to the
+// InputW:InputH aspect, then padded by 1.25.
+function ViTPoseBoxToCenterScale(BoxX, BoxY, BoxW, BoxH: TNeuralFloat;
+  InputW, InputH: integer): TViTPoseBoxTransform;
+
+// VitPoseImageProcessor: Crop (InputW, InputH, 3) := Image (RGB 0..255) warped
+// through Box (scipy order 1, 0 outside, rounded to bytes), / 255, (x - Mean) / Std.
+procedure ViTPoseCropPerson(Image, Crop: TNNetVolume;
+  const Box: TViTPoseBoxTransform; InputW, InputH: integer;
+  const Mean, Std: array of TNeuralFloat);
+
+// post_process_pose_estimation of one box: heatmap argmax, DARK refinement
+// (scipy Gaussian, sigma 0.8, KernelSize taps), transform_preds to photo pixels.
+function DecodeViTPoseKeypointsInImage(Heatmaps: TNNetVolume;
+  const Box: TViTPoseBoxTransform; KernelSize: integer = 11): TPoseJointArray;
+
+// Top-down ViTPose of the COCO (x, y, w, h) person box of Image (RGB 0..255):
+// ViTPoseCropPerson, PoseNN.Compute, DecodeViTPoseKeypointsInImage.
+function EstimateViTPoseInBox(PoseNN: TNNet; const PoseConfig: TViTPoseConfig;
+  Image: TNNetVolume; BoxX, BoxY, BoxW, BoxH: TNeuralFloat): TPoseJointArray;
+
 // ===========================================================================
 // DETR object-detection import (HF model_type "detr",
 // facebook/detr-resnet-50) - the repo's FIRST object-detection importer.
@@ -92028,6 +92067,178 @@ begin
       end;
       Inc(hmPos, K);
     end;
+end;
+
+function ViTPoseBoxToCenterScale(BoxX, BoxY, BoxW, BoxH: TNeuralFloat;
+  InputW, InputH: integer): TViTPoseBoxTransform;
+const
+  csNormalizeFactor = 200.0;
+  csPaddingFactor = 1.25;
+var
+  AspectRatio, Width, Height: double;
+begin
+  AspectRatio := InputW / InputH;
+  Width := BoxW;
+  Height := BoxH;
+  Result.CenterX := BoxX + Width * 0.5;
+  Result.CenterY := BoxY + Height * 0.5;
+  if Width > AspectRatio * Height then Height := Width / AspectRatio
+  else if Width < AspectRatio * Height then Width := Height * AspectRatio;
+  // float32 scale first, then the padding multiply, as transformers.
+  Result.ScaleX := single(Width / csNormalizeFactor);
+  Result.ScaleY := single(Height / csNormalizeFactor);
+  Result.ScaleX := Result.ScaleX * single(csPaddingFactor);
+  Result.ScaleY := Result.ScaleY * single(csPaddingFactor);
+end;
+
+procedure ViTPoseCropPerson(Image, Crop: TNNetVolume;
+  const Box: TViTPoseBoxTransform; InputW, InputH: integer;
+  const Mean, Std: array of TNeuralFloat);
+var
+  Matrix: TImageAffineMatrix;
+  TargetW, TargetH, OffsetX, OffsetY: single;
+  ScaleX, ScaleY: double;
+  Channel, MaxChannel, PixelPos, MaxPixelPos, Depth: integer;
+  ByteValue: TNeuralFloat;
+begin
+  if (Length(Mean) < Image.Depth) or (Length(Std) < Image.Depth) then
+    raise EArgumentException.Create('ViTPoseCropPerson: Mean and Std need ' +
+      'one value per image channel.');
+  // get_warp_matrix(0, center * 2, input size - 1, scale * 200) in float32.
+  TargetW := Box.ScaleX * single(200.0);
+  TargetH := Box.ScaleY * single(200.0);
+  ScaleX := (InputW - 1) / TargetW;
+  ScaleY := (InputH - 1) / TargetH;
+  OffsetX := -Box.CenterX + single(0.5) * TargetW;
+  OffsetY := -Box.CenterY + single(0.5) * TargetH;
+  Matrix[0] := single(ScaleX);
+  Matrix[1] := 0;
+  Matrix[2] := single(ScaleX * OffsetX);
+  Matrix[3] := 0;
+  Matrix[4] := single(ScaleY);
+  Matrix[5] := single(ScaleY * OffsetY);
+  WarpImageAffine(Image, Crop, Matrix, InputW, InputH, [], {BlendsBorder=}false);
+  // scipy writes the warp into the uint8 photo dtype: round half up.
+  Depth := Crop.Depth;
+  MaxChannel := Depth - 1;
+  MaxPixelPos := Crop.Size - Depth;
+  PixelPos := 0;
+  while PixelPos <= MaxPixelPos do
+  begin
+    for Channel := 0 to MaxChannel do
+    begin
+      ByteValue := EnsureRange(Floor(Crop.FData[PixelPos + Channel] + 0.5), 0, 255);
+      Crop.FData[PixelPos + Channel] :=
+        (ByteValue * single(1 / 255) - Mean[Channel]) / Std[Channel];
+    end;
+    Inc(PixelPos, Depth);
+  end;
+end;
+
+function DecodeViTPoseKeypointsInImage(Heatmaps: TNNetVolume;
+  const Box: TViTPoseBoxTransform; KernelSize: integer): TPoseJointArray;
+const
+  csDarkSigma = 0.8;
+  csFloat32Epsilon = 1.1920928955078125e-07;
+var
+  Peaks: TViTPoseKeypointArray;
+  Smoothed: TNNetVolume;
+  HeatW, HeatH, JointCount, Joint, MaxJoint, PeakX, PeakY: integer;
+  Center, Right, Down, RightDown, LeftUp, Left, Up: single;
+  GradX, GradY, CurveXX, CurveYY, CurveXY: single;
+  Hxx, Hyy, Hxy, Determinant, CoordX, CoordY: double;
+  CropW, CropH, StepX, StepY: single;
+
+  // log(clip(smoothed, 0.001, 50)) of joint Joint at (X, Y), edge pixels repeated.
+  function LogHeat(X, Y: integer): single;
+  begin
+    X := EnsureRange(X, 0, HeatW - 1);
+    Y := EnsureRange(Y, 0, HeatH - 1);
+    Result := Ln(EnsureRange(Smoothed[X, Y, Joint], single(0.001), single(50)));
+  end;
+
+begin
+  if (KernelSize < 1) or not Odd(KernelSize) then
+    raise EArgumentException.Create('DecodeViTPoseKeypointsInImage: ' +
+      'KernelSize must be odd and >= 1.');
+  HeatW := Heatmaps.SizeX;
+  HeatH := Heatmaps.SizeY;
+  JointCount := Heatmaps.Depth;
+  Peaks := DecodeViTPoseKeypoints(Heatmaps);
+  SetLength(Result, JointCount);
+  CropW := Box.ScaleX * single(200.0);
+  CropH := Box.ScaleY * single(200.0);
+  StepX := CropW / (HeatW - 1);
+  StepY := CropH / (HeatH - 1);
+  Smoothed := TNNetVolume.Create;
+  try
+    GaussianFilterImageScipy(Heatmaps, Smoothed, csDarkSigma,
+      (KernelSize - 1) div 2);
+    MaxJoint := JointCount - 1;
+    for Joint := 0 to MaxJoint do
+    begin
+      // transformers marks a non-positive peak as (-1, -1) before refining.
+      if Peaks[Joint].Score > 0 then
+      begin
+        PeakX := Peaks[Joint].X;
+        PeakY := Peaks[Joint].Y;
+      end
+      else
+      begin
+        PeakX := -1;
+        PeakY := -1;
+      end;
+      Center := LogHeat(PeakX, PeakY);
+      Right := LogHeat(PeakX + 1, PeakY);
+      Down := LogHeat(PeakX, PeakY + 1);
+      RightDown := LogHeat(PeakX + 1, PeakY + 1);
+      LeftUp := LogHeat(PeakX - 1, PeakY - 1);
+      Left := LogHeat(PeakX - 1, PeakY);
+      Up := LogHeat(PeakX, PeakY - 1);
+      GradX := single(0.5) * (Right - Left);
+      GradY := single(0.5) * (Down - Up);
+      CurveXX := Right - single(2) * Center + Left;
+      CurveYY := Down - single(2) * Center + Up;
+      CurveXY := single(0.5) * (RightDown - Right - Down + Center + Center -
+        Left - Up + LeftUp);
+      // Newton step: coords -= inverse(Hessian + eps I) * gradient.
+      Hxx := CurveXX + csFloat32Epsilon;
+      Hyy := CurveYY + csFloat32Epsilon;
+      Hxy := CurveXY;
+      Determinant := Hxx * Hyy - Hxy * Hxy;
+      CoordX := PeakX;
+      CoordY := PeakY;
+      if Determinant <> 0 then
+      begin
+        CoordX := single(CoordX - (Hyy * GradX - Hxy * GradY) / Determinant);
+        CoordY := single(CoordY - (Hxx * GradY - Hxy * GradX) / Determinant);
+      end;
+      Result[Joint].X := single(CoordX) * StepX + Box.CenterX - CropW * single(0.5);
+      Result[Joint].Y := single(CoordY) * StepY + Box.CenterY - CropH * single(0.5);
+      Result[Joint].Score := Peaks[Joint].Score;
+    end;
+  finally
+    Smoothed.Free;
+  end;
+end;
+
+function EstimateViTPoseInBox(PoseNN: TNNet; const PoseConfig: TViTPoseConfig;
+  Image: TNNetVolume; BoxX, BoxY, BoxW, BoxH: TNeuralFloat): TPoseJointArray;
+var
+  Box: TViTPoseBoxTransform;
+  Crop: TNNetVolume;
+begin
+  Box := ViTPoseBoxToCenterScale(BoxX, BoxY, BoxW, BoxH, PoseConfig.ImageW,
+    PoseConfig.ImageH);
+  Crop := TNNetVolume.Create;
+  try
+    ViTPoseCropPerson(Image, Crop, Box, PoseConfig.ImageW, PoseConfig.ImageH,
+      csViTPoseImageMean, csViTPoseImageStd);
+    PoseNN.Compute(Crop);
+    Result := DecodeViTPoseKeypointsInImage(PoseNN.GetLastLayer().Output, Box);
+  finally
+    Crop.Free;
+  end;
 end;
 
 // ===========================================================================

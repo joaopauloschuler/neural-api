@@ -2182,7 +2182,7 @@ rather than acted on.
       (`--photo` + `CannyEdges`). Nothing turns a photo into the pose image that
       `lllyasviel/sd-controlnet-openpose` / `control_v11p_sd15_openpose` expect.
       Steps, each ending green with a commit:
-      - [ ] Top-down ViTPose like transformers `VitPoseImageProcessor`: person
+      - [X] Top-down ViTPose like transformers `VitPoseImageProcessor`: person
             box (xywh) -> center/scale with the 1.25 padding and the 3:4
             aspect fix, affine warp of the crop to the model input size
             (bilinear, reuse the existing resize/affine sampling code), then
@@ -2190,6 +2190,7 @@ rather than acted on.
             pixels plus the quarter-pixel heatmap refinement (and optional
             flip test). Pico parity vs transformers in the ~/x venv on
             `tests/fixtures/tiny_vitpose*` with one non-square box.
+            Done: `EstimateViTPoseInBox`, 2.3e-5 px; transformers refines with DARK (not quarter-pixel), no flip test.
       - [ ] Multi-person driver: YOLO (`BuildYolo` + `DecodeYoloDetections`,
             class 0 = person, score threshold) feeds the boxes, one ViTPose
             pass per box; a plain `TPoseKeypoints` result per person.
