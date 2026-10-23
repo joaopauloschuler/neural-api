@@ -361,6 +361,38 @@ rather than acted on.
       box (`--gpu`, also CPU) and compare the mask with the official
       `transformers` remote-code output before README calls it supported.
 
+- [ ] ViTMatte trimap-based image matting importer (Yao et al. 2023,
+      arXiv:2305.15272; transformers `VitMatteForImageMatting`, checkpoints
+      hustvl/vitmatte-small-composition-1k / -base-composition-1k). BiRefNet
+      gives a hard foreground mask and RVM targets video; ViTMatte turns an
+      RGB image plus a trimap (0 = background, 128 = unknown, 255 = foreground)
+      into a fine alpha matte (hair, fur, glass edges). Plan:
+  - [ ] `BuildViTMatteFromSafeTensors[Ex]` + `TViTMatteConfig` (reads the
+        `backbone_config` sub-block). The VitDet backbone takes a 4-channel
+        input (RGB + trimap). REUSE the SAM ViTDet blocks behind
+        `BuildSAMVisionTower` (windowed + global decomposed-rel-pos attention)
+        instead of copying them. Add only what SAM does not have: the
+        residual bottleneck conv blocks at `residual_block_indices`, the
+        bicubic resize of the absolute position embedding from
+        `pretrain_image_size`, and rel-pos table interpolation for any input
+        size. The detail-capture head (ConvStream 3x3 stride-2 conv+BN+ReLU
+        stages, bilinear x2 fusion blocks, conv + sigmoid matting head) is
+        built from existing layers only.
+  - [ ] `ViTMattePreprocess` (rescale 1/255, normalize mean/std 0.5, append
+        trimap/255, pad to a multiple of 32 as `VitMatteImageProcessor` does)
+        and a crop back to the input size afterwards.
+  - [ ] Pico fixture (`tools/make_pico_vitmatte_fixture.py`, ~/x venv) and a
+        `TestViTMatteParity` logit test against transformers, plus OpenCL
+        parity on the same fixture.
+  - [ ] examples/ImageMatting (`--image`, `--trimap FILE`, or `--auto-trimap`:
+        build the trimap from a BiRefNet mask by eroding and dilating it with
+        the existing `BoxFilter` + threshold, band width `--unknown-band N`).
+        Writes the alpha PNG and an RGBA cut-out. Add a README.md, plus a row
+        in examples/README.md.
+  - [ ] Real hustvl/vitmatte-small-composition-1k run on the GPU box (`--gpu`,
+        also CPU) compared with the transformers output before README calls
+        it supported.
+
 - [ ] Robust Video Matting (Lin et al. WACV 2022, arXiv:2108.11515,
       PeterL1n/RobustVideoMatting; `rvm_mobilenetv3.pth` is GPL-3.0, so load it
       at run time and never ship it). The MobileNetV3 importer
