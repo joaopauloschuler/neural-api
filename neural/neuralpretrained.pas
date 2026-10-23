@@ -14907,6 +14907,94 @@ procedure GFPGANComposeOutput(NetOutput, Restored: TNNetVolume);
 procedure GFPGANRestoreFace(NN: TNNet; const Config: TGFPGANConfig;
   Face, Restored: TNNetVolume);
 
+// Face (W, H, 3) RGB 0..255 -> NetInput (FaceSize, FaceSize, 3) in [-1,1], the
+// input of GFPGAN and CodeFormer (bilinear resize when the size differs).
+procedure FaceRestorerPrepareInput(Face: TNNetVolume; FaceSize: integer;
+  NetInput: TNNetVolume);
+
+// ---------------------------------------------------------------------------
+// CodeFormer BLIND FACE RESTORATION IMPORT (Zhou et al., "Towards Robust Blind
+// Face Restoration with Codebook Lookup Transformer", NeurIPS 2022,
+// arXiv:2206.11253; sczhou/CodeFormer codeformer_arch.py + vqgan_arch.py, the
+// codeformer.pth release, S-Lab License 1.0: non-commercial use only).
+// Input: an ALIGNED, CROPPED face (ImageSize, ImageSize, 3) in [-1,1]; output:
+// the restored face at the same size in [-1,1] (unclamped).
+//   - VQGAN encoder: 3x3 conv, per level NumResBlocks ResBlocks (GroupNorm eps
+//     1e-6 + swish, AddVaeResnetBlockWithNorms) [+ AttnBlock], the asymmetric
+//     stride-2 downsample; mid ResBlock-AttnBlock-ResBlock; GroupNorm; 3x3
+//     conv to EmbDim (no swish before it).
+//   - feat_emb Linear EmbDim->DimEmbd + learned position_emb (added to the
+//     queries and keys only) -> NumLayers pre-norm TransformerSALayer (MHA,
+//     GELU MLP) -> idx_pred LayerNorm + Linear (no bias) -> code logits.
+//   - top-1 code: softmax -> TNNetTopKGate(1) (an exact one-hot) -> bias-free
+//     1x1 conv holding the codebook (the gather) -> [TNNetAdaIN onto the encoder
+//     latent: adain=True, as inference_codeformer.py runs it].
+//   - VQGAN generator (3x3 conv, mid blocks, per level ResBlocks [+ AttnBlock],
+//     nearest 2x + 3x3 conv, GroupNorm, 3x3 conv to RGB); at each fused level a
+//     Fuse_sft_block after the level's FIRST ResBlock: ResBlock on
+//     concat(enc, dec) -> scale / shift (conv-LeakyReLU-conv), then
+//     dec + w * (dec * scale + shift), with the encoder features taken after
+//     the level's LAST ResBlock. w is a TNNetMulByConstant (CodeFormerSetFidelity).
+// Face detection and alignment are not part of the net. Coded by Claude (AI).
+type
+  TCodeFormerConfig = record
+    ImageSize: integer;        // face resolution (512)
+    NumFeat: integer;          // nf, the level-0 width (64)
+    LevelCount: integer;       // len(ch_mult) (6)
+    ChannelMult: array[0..7] of integer;        // ch_mult (1,2,2,4,4,8)
+    LevelHasAttention: array[0..7] of boolean;  // AttnBlocks at level i (16x16)
+    LevelHasFuse: array[0..7] of boolean;       // Fuse_sft_block at level i
+    NumResBlocks: integer;     // ResBlocks per level (2)
+    EmbDim: integer;           // codebook entry width (256)
+    CodebookSize: integer;     // codebook entries (1024)
+    LatentGrid: integer;       // latent side, ImageSize shr (LevelCount-1) (16)
+    DimEmbd: integer;          // transformer width (512)
+    NumHeads: integer;         // attention heads (8; not in the tensors)
+    NumLayers: integer;        // TransformerSALayer count (9)
+    DimMlp: integer;           // transformer MLP width (1024)
+    NormGroups: integer;       // GroupNorm groups (32; not in the tensors)
+    Fidelity: TNeuralFloat;    // w, 0 = quality .. 1 = identity (0.5)
+    AdaIN: boolean;            // AdaIN of the codes onto the encoder latent (true)
+  end;
+
+// The codeformer.pth arguments, w = 0.5 and adain = True (inference_codeformer.py).
+function DefaultCodeFormerConfig(): TCodeFormerConfig;
+
+// Reads a CodeFormer config.json (n_head, norm_num_groups, fidelity_weight,
+// adain); missing = default. Shape fields come from InferCodeFormerConfigFromTensors.
+function ReadCodeFormerConfigFromJSONFile(const FileName: string): TCodeFormerConfig;
+
+// Overwrites the shape-determined fields of Config (every field except
+// NumHeads, NormGroups, Fidelity and AdaIN) from Reader.
+procedure InferCodeFormerConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TCodeFormerConfig);
+
+function CodeFormerConfigToString(const Config: TCodeFormerConfig): string;
+
+// Builds CodeFormer and loads every weight from Reader (caller owns Reader);
+// the fusion weight starts at Config.Fidelity.
+function BuildCodeFormer(Reader: TNNetSafeTensorsReader;
+  const Config: TCodeFormerConfig; pTrainable: boolean = true): TNNet;
+
+// Same from a .pth ({'params_ema': ...} unwrapped) / .bin / .safetensors file.
+function BuildCodeFormerFromSafeTensorsEx(const FileName: string;
+  const Config: TCodeFormerConfig; pTrainable: boolean = true): TNNet;
+
+// Config from ConfigFileName (default: config.json beside FileName, else the
+// codeformer.pth defaults), shape fields from the checkpoint.
+function BuildCodeFormerFromSafeTensors(const FileName: string;
+  out Config: TCodeFormerConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// Sets the fidelity weight w of every Fuse_sft_block of a BuildCodeFormer net
+// (no rebuild); returns how many blocks were set.
+function CodeFormerSetFidelity(NN: TNNet; Fidelity: TNeuralFloat): integer;
+
+// FaceRestorerPrepareInput -> NN.Compute -> GFPGANComposeOutput, at the w the
+// net currently holds (ImageSize x ImageSize, RGB 0..255).
+procedure CodeFormerRestoreFace(NN: TNNet; const Config: TCodeFormerConfig;
+  Face, Restored: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // BiRefNet / RMBG-2.0 BACKGROUND-REMOVAL IMPORT (Zheng et al., "Bilateral
 // Reference for High-Resolution Dichotomous Image Segmentation", CAAI AIR 2024,
@@ -74675,9 +74763,12 @@ begin
     CreateGroupNorm(Config.NormNumGroups, Config.NormEps), Refs);
 end;
 
+// Loads Prefix norm1/conv1/norm2/conv2 and, when present, the 1x1 shortcut
+// named ShortcutName (the taming/CodeFormer ResBlock calls it 'conv_out').
 procedure LoadVaeResnetBlock(Reader: TNNetSafeTensorsReader;
   const Refs: TVaeResnetLayers; const Prefix: string;
-  InCh, OutCh: integer; const Config: TVaeDecoderConfig);
+  InCh, OutCh: integer; const Config: TVaeDecoderConfig;
+  const ShortcutName: string = 'conv_shortcut');
 begin
   LoadVaeGroupNorm(Reader, Refs.Norm1, Prefix + 'norm1', InCh, Config.NormEps);
   LoadVaeConv(Reader, Refs.Conv1, Prefix + 'conv1.weight', Prefix + 'conv1.bias',
@@ -74686,8 +74777,8 @@ begin
   LoadVaeConv(Reader, Refs.Conv2, Prefix + 'conv2.weight', Prefix + 'conv2.bias',
     OutCh, OutCh, 3);
   if Refs.Shortcut <> nil then
-    LoadVaeConv(Reader, Refs.Shortcut, Prefix + 'conv_shortcut.weight',
-      Prefix + 'conv_shortcut.bias', OutCh, InCh, 1);
+    LoadVaeConv(Reader, Refs.Shortcut, Prefix + ShortcutName + '.weight',
+      Prefix + ShortcutName + '.bias', OutCh, InCh, 1);
 end;
 
 type
@@ -85492,19 +85583,24 @@ begin
   end;
 end;
 
-procedure GFPGANPrepareInput(Face: TNNetVolume; const Config: TGFPGANConfig;
+procedure FaceRestorerPrepareInput(Face: TNNetVolume; FaceSize: integer;
   NetInput: TNNetVolume);
 begin
   if Face.Depth <> 3 then
-    ImportError(csGFPGANImporter + ': GFPGANPrepareInput needs an RGB image, ' +
-      'got depth ' + IntToStr(Face.Depth) + '.');
-  if (Face.SizeX = Config.OutSize) and (Face.SizeY = Config.OutSize) then
+    ImportError('FaceRestorerPrepareInput needs an RGB image, got depth ' +
+      IntToStr(Face.Depth) + '.');
+  if (Face.SizeX = FaceSize) and (Face.SizeY = FaceSize) then
     NetInput.Copy(Face)
   else
-    ResizeImageBilinearNoAntialias(Face, NetInput, Config.OutSize,
-      Config.OutSize);
+    ResizeImageBilinearNoAntialias(Face, NetInput, FaceSize, FaceSize);
   NetInput.Mul(1 / 127.5);
   NetInput.Sub(1.0);
+end;
+
+procedure GFPGANPrepareInput(Face: TNNetVolume; const Config: TGFPGANConfig;
+  NetInput: TNNetVolume);
+begin
+  FaceRestorerPrepareInput(Face, Config.OutSize, NetInput);
 end;
 
 procedure GFPGANComposeOutput(NetOutput, Restored: TNNetVolume);
@@ -90950,9 +91046,10 @@ end;
 // Loads a 1x1 Conv2d (weight [O,I,1,1], with bias) into a pointwise conv layer.
 // HF DETR's input_projection is a 1x1 conv (not an nn.Linear), so its weight
 // carries the two trailing singleton kernel dims; squeeze them and load like a
-// linear (each neuron's I weights are the channel weights, plus the bias).
+// linear (each neuron's I weights are the channel weights, plus the bias)
+// into neurons NeuronBase..NeuronBase+O-1 (a slice of a fused Q|K|V conv).
 procedure LoadDetr1x1Conv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
-  const WName, BName: string; OutCh, InCh: integer);
+  const WName, BName: string; OutCh, InCh: integer; NeuronBase: integer = 0);
 var
   W, B: TNNetVolume;
   o, OutChM1, SrcBase: integer;
@@ -90976,9 +91073,9 @@ begin
     SrcBase := 0;
     for o := 0 to OutChM1 do
     begin
-      Move(W.FData[SrcBase], Layer.FArrNeurons[o].Weights.FData[0],
+      Move(W.FData[SrcBase], Layer.FArrNeurons[NeuronBase + o].Weights.FData[0],
         InCh * csNeuralFloatSize);
-      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+      Layer.FArrNeurons[NeuronBase + o].BiasWeight := B.FData[o];
       Inc(SrcBase, InCh);
     end;
     Layer.FlushWeightCache();
@@ -110192,6 +110289,591 @@ begin
       Config.ImageHeight / Image.SizeY);
   finally
     Output.Free;
+    NetInput.Free;
+  end;
+end;
+
+// ===========================================================================
+// CodeFormer BLIND FACE RESTORATION IMPORT
+// ===========================================================================
+
+const
+  csCodeFormerImporter = 'CodeFormer import';
+  csCodeFormerNormEps = 1e-6;
+  csCodeFormerMaxLevels = 8;
+
+type
+  TCodeFormerBlockKind = (cbkMissing, cbkTensor, cbkResBlock, cbkAttention,
+    cbkDownsample);
+
+function DefaultCodeFormerConfig(): TCodeFormerConfig;
+const
+  OfficialChannelMult: array[0..5] of integer = (1, 2, 2, 4, 4, 8);
+var
+  LevelPos: integer;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.ImageSize := 512;
+  Result.NumFeat := 64;
+  Result.LevelCount := 6;
+  for LevelPos := 0 to 5 do
+    Result.ChannelMult[LevelPos] := OfficialChannelMult[LevelPos];
+  Result.LevelHasAttention[5] := true;
+  // connect_list 32, 64, 128, 256 = levels 4..1 of the 512 px net.
+  for LevelPos := 1 to 4 do Result.LevelHasFuse[LevelPos] := true;
+  Result.NumResBlocks := 2;
+  Result.EmbDim := 256;
+  Result.CodebookSize := 1024;
+  Result.LatentGrid := 16;
+  Result.DimEmbd := 512;
+  Result.NumHeads := 8;
+  Result.NumLayers := 9;
+  Result.DimMlp := 1024;
+  Result.NormGroups := 32;
+  Result.Fidelity := 0.5;
+  Result.AdaIN := true;
+end;
+
+function ReadCodeFormerConfigFromJSONFile(const FileName: string): TCodeFormerConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError(csCodeFormerImporter + ': config file not found: ' + FileName);
+  Result := DefaultCodeFormerConfig();
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(csCodeFormerImporter + ': config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError(csCodeFormerImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.NumHeads := Obj.Get('n_head', Result.NumHeads);
+    Result.NormGroups := Obj.Get('norm_num_groups', Result.NormGroups);
+    Result.Fidelity := Obj.Get('fidelity_weight', double(Result.Fidelity));
+    Result.AdaIN := Obj.Get('adain', Result.AdaIN);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+// The VQGAN block at Prefix ('encoder.blocks.N'), told apart by its tensors.
+function CodeFormerBlockKind(Reader: TNNetSafeTensorsReader;
+  const Prefix: string): TCodeFormerBlockKind;
+begin
+  if Reader.HasTensor(Prefix + '.norm1.weight') then Result := cbkResBlock
+  else if Reader.HasTensor(Prefix + '.q.weight') then Result := cbkAttention
+  else if Reader.HasTensor(Prefix + '.conv.weight') then Result := cbkDownsample
+  else if Reader.HasTensor(Prefix + '.weight') then Result := cbkTensor
+  else Result := cbkMissing;
+end;
+
+procedure InferCodeFormerConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TCodeFormerConfig);
+var
+  BlockPos, DownsampleCount, LevelPos, ResPos, MaxLevelPos, MaxResPos: integer;
+  LevelCh, TokenCount, LayerCount: integer;
+
+  function EncoderBlock(Pos: integer): string;
+  begin
+    Result := 'encoder.blocks.' + IntToStr(Pos);
+  end;
+
+  procedure ExpectBlock(Kind: TCodeFormerBlockKind; const What: string);
+  begin
+    if CodeFormerBlockKind(Reader, EncoderBlock(BlockPos)) <> Kind then
+      ImportError(csCodeFormerImporter + ': ' + EncoderBlock(BlockPos) +
+        ' is not the expected ' + What + '.');
+    Inc(BlockPos);
+  end;
+
+begin
+  if not (Reader.HasTensor('encoder.blocks.0.weight') and
+    Reader.HasTensor('position_emb') and
+    Reader.HasTensor('quantize.embedding.weight') and
+    Reader.HasTensor('idx_pred_layer.1.weight')) then
+    ImportError(csCodeFormerImporter + ': ' + Reader.FileName +
+      ' has no encoder.blocks.0 / position_emb / quantize / idx_pred_layer ' +
+      'tensors - not a CodeFormer checkpoint?');
+  Config.NumFeat := Reader.DimSize('encoder.blocks.0.weight', 0);
+  // Encoder level loop: ResBlocks [+ AttnBlocks], a Downsample between levels.
+  DownsampleCount := 0;
+  Config.NumResBlocks := 0;
+  BlockPos := 1;
+  while CodeFormerBlockKind(Reader, EncoderBlock(BlockPos)) <> cbkMissing do
+  begin
+    case CodeFormerBlockKind(Reader, EncoderBlock(BlockPos)) of
+      cbkDownsample: Inc(DownsampleCount);
+      cbkResBlock: if DownsampleCount = 0 then Inc(Config.NumResBlocks);
+    end;
+    Inc(BlockPos);
+  end;
+  Config.LevelCount := DownsampleCount + 1;
+  if (Config.LevelCount < 2) or (Config.LevelCount > csCodeFormerMaxLevels) then
+    ImportError(csCodeFormerImporter + ': ' + IntToStr(Config.LevelCount) +
+      ' encoder levels, expected 2..' + IntToStr(csCodeFormerMaxLevels) + '.');
+  if Config.NumResBlocks < 1 then
+    ImportError(csCodeFormerImporter + ': no ResBlock before the first ' +
+      'encoder downsample.');
+  MaxLevelPos := Config.LevelCount - 1;
+  MaxResPos := Config.NumResBlocks - 1;
+  BlockPos := 1;
+  for LevelPos := 0 to MaxLevelPos do
+  begin
+    Config.LevelHasAttention[LevelPos] := false;
+    for ResPos := 0 to MaxResPos do
+    begin
+      if ResPos = 0 then
+      begin
+        LevelCh := Reader.DimSize(EncoderBlock(BlockPos) + '.conv1.weight', 0);
+        if LevelCh mod Config.NumFeat <> 0 then
+          ImportError(csCodeFormerImporter + ': level ' + IntToStr(LevelPos) +
+            ' width ' + IntToStr(LevelCh) + ' is not a multiple of nf ' +
+            IntToStr(Config.NumFeat) + '.');
+        Config.ChannelMult[LevelPos] := LevelCh div Config.NumFeat;
+      end;
+      ExpectBlock(cbkResBlock, 'ResBlock');
+      if CodeFormerBlockKind(Reader, EncoderBlock(BlockPos)) = cbkAttention then
+      begin
+        Config.LevelHasAttention[LevelPos] := true;
+        Inc(BlockPos);
+      end;
+    end;
+    if LevelPos < MaxLevelPos then ExpectBlock(cbkDownsample, 'Downsample');
+  end;
+  ExpectBlock(cbkResBlock, 'mid ResBlock');
+  ExpectBlock(cbkAttention, 'mid AttnBlock');
+  ExpectBlock(cbkResBlock, 'mid ResBlock');
+  ExpectBlock(cbkTensor, 'GroupNorm');
+  ExpectBlock(cbkTensor, 'latent conv');
+  TokenCount := Reader.DimSize('position_emb', 0);
+  Config.LatentGrid := Round(Sqrt(TokenCount));
+  if Config.LatentGrid * Config.LatentGrid <> TokenCount then
+    ImportError(csCodeFormerImporter + ': position_emb has ' +
+      IntToStr(TokenCount) + ' rows, not a square latent grid.');
+  Config.ImageSize := Config.LatentGrid shl MaxLevelPos;
+  Config.DimEmbd := Reader.DimSize('position_emb', 1);
+  Config.CodebookSize := Reader.DimSize('quantize.embedding.weight', 0);
+  Config.EmbDim := Reader.DimSize('quantize.embedding.weight', 1);
+  LayerCount := 0;
+  while Reader.HasTensor('ft_layers.' + IntToStr(LayerCount) + '.norm1.weight') do
+    Inc(LayerCount);
+  if LayerCount < 1 then
+    ImportError(csCodeFormerImporter + ': no ft_layers found.');
+  Config.NumLayers := LayerCount;
+  Config.DimMlp := Reader.DimSize('ft_layers.0.linear1.weight', 0);
+  for LevelPos := 0 to MaxLevelPos do
+    Config.LevelHasFuse[LevelPos] := Reader.HasTensor('fuse_convs_dict.' +
+      IntToStr(Config.ImageSize shr LevelPos) + '.scale.0.weight');
+end;
+
+function CodeFormerConfigToString(const Config: TCodeFormerConfig): string;
+var
+  LevelPos, MaxLevelPos: integer;
+  ChannelMultText, AttentionText, FuseText: string;
+begin
+  ChannelMultText := '';
+  AttentionText := '';
+  FuseText := '';
+  MaxLevelPos := Config.LevelCount - 1;
+  for LevelPos := 0 to MaxLevelPos do
+  begin
+    if LevelPos > 0 then ChannelMultText := ChannelMultText + ',';
+    ChannelMultText := ChannelMultText + IntToStr(Config.ChannelMult[LevelPos]);
+    if Config.LevelHasAttention[LevelPos] then
+      AttentionText := AttentionText + ' ' +
+        IntToStr(Config.ImageSize shr LevelPos);
+    if Config.LevelHasFuse[LevelPos] then
+      FuseText := FuseText + ' ' + IntToStr(Config.ImageSize shr LevelPos);
+  end;
+  Result := 'codeformer config: image_size=' + IntToStr(Config.ImageSize) +
+    ', nf=' + IntToStr(Config.NumFeat) + ', ch_mult=' + ChannelMultText +
+    ', res_blocks=' + IntToStr(Config.NumResBlocks) +
+    ', attn_resolutions=' + Trim(AttentionText) +
+    ', connect_list=' + Trim(FuseText) +
+    ', emb_dim=' + IntToStr(Config.EmbDim) +
+    ', codebook_size=' + IntToStr(Config.CodebookSize) +
+    ', latent=' + IntToStr(Config.LatentGrid) +
+    ', dim_embd=' + IntToStr(Config.DimEmbd) +
+    ', n_head=' + IntToStr(Config.NumHeads) +
+    ', n_layers=' + IntToStr(Config.NumLayers) +
+    ', dim_mlp=' + IntToStr(Config.DimMlp) +
+    ', norm_groups=' + IntToStr(Config.NormGroups) +
+    ', w=' + FloatToStr(Config.Fidelity) +
+    ', adain=' + BoolToStr(Config.AdaIN, true);
+end;
+
+// Neuron e of the bias-free 1x1 gather conv := column e of the codebook
+// [CodebookSize, EmbDim], so a one-hot code row selects its codebook entry.
+procedure LoadCodeFormerCodebook(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; CodebookSize, EmbDim: integer);
+const
+  cName = 'quantize.embedding.weight';
+var
+  Codebook: TNNetVolume;
+begin
+  if (Reader.DimCount(cName) <> 2) or (Reader.DimSize(cName, 0) <> CodebookSize) or
+     (Reader.DimSize(cName, 1) <> EmbDim) then
+    ImportError(csCodeFormerImporter + ': "' + cName + '" must have shape [' +
+      IntToStr(CodebookSize) + ', ' + IntToStr(EmbDim) + '], got ' +
+      Reader.ShapeAsString(cName));
+  EnsureWritableImportWeights(Layer);
+  Codebook := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(cName, Codebook);
+    CopySlabColumnsToNeurons(Codebook, {SrcBase=}0, {Stride=}EmbDim,
+      {Rows=}CodebookSize, {ColBase=}0, {ColCount=}EmbDim, Layer,
+      {NeuronBase=}0);
+  finally
+    Codebook.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function BuildCodeFormer(Reader: TNNetSafeTensorsReader;
+  const Config: TCodeFormerConfig; pTrainable: boolean = true): TNNet;
+var
+  NN: TNNet;
+  Vae: TVaeDecoderConfig;
+  Feat, LqFeat, PosEmb, Hidden, Normed, QKInput, QK, Values, Branch: TNNetLayer;
+  EncoderSkips: array[0..csCodeFormerMaxLevels - 1] of TNNetLayer;
+  BlockPos, LevelPos, ResPos, MaxLevelPos, MaxResPos, LayerPos, MaxLayerPos: integer;
+  InCh, OutCh, TokenCount: integer;
+  Prefix: string;
+
+  function Trainable(Layer: TNNetLayer): TNNetLayer;
+  begin
+    Result := VaeLayerTrainable(Layer, pTrainable);
+  end;
+
+  function BlockName(const Part: string; Pos: integer): string;
+  begin
+    Result := Part + '.blocks.' + IntToStr(Pos);
+  end;
+
+  function AddConv3x3(Src: TNNetLayer; const Name: string;
+    pOutCh, pInCh: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(Trainable(TNNetConvolutionLinear.Create(pOutCh,
+      3, 1, 1, 0)), Src);
+    LoadVaeConv(Reader, Result, Name + '.weight', Name + '.bias', pOutCh,
+      pInCh, 3);
+  end;
+
+  function AddGroupNorm(const Name: string; Channels: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayer(Trainable(CreateGroupNorm(Config.NormGroups,
+      csCodeFormerNormEps)));
+    LoadVaeGroupNorm(Reader, Result, Name, Channels, csCodeFormerNormEps);
+  end;
+
+  // vqgan_arch ResBlock on the last layer (1x1 shortcut "conv_out").
+  procedure AddResBlock(const Name: string; pInCh, pOutCh: integer);
+  var
+    Refs: TVaeResnetLayers;
+  begin
+    AddVaeResnetBlockWithNorms(NN, pInCh, pOutCh,
+      CreateGroupNorm(Config.NormGroups, csCodeFormerNormEps),
+      CreateGroupNorm(Config.NormGroups, csCodeFormerNormEps), Refs, pTrainable);
+    LoadVaeResnetBlock(Reader, Refs, Name + '.', pInCh, pOutCh, Vae, 'conv_out');
+  end;
+
+  // vqgan_arch AttnBlock on the last layer: q/k/v/proj_out are 1x1 convs.
+  procedure AddAttnBlock(const Name: string; Channels: integer);
+  var
+    Refs: TVaeAttnLayers;
+  begin
+    AddVaeAttentionWithNorm(NN, Channels, CreateGroupNorm(Config.NormGroups,
+      csCodeFormerNormEps), Refs, pTrainable);
+    LoadVaeGroupNorm(Reader, Refs.Norm, Name + '.norm', Channels,
+      csCodeFormerNormEps);
+    LoadDetr1x1Conv(Reader, Refs.QKV, Name + '.q.weight', Name + '.q.bias',
+      Channels, Channels, 0);
+    LoadDetr1x1Conv(Reader, Refs.QKV, Name + '.k.weight', Name + '.k.bias',
+      Channels, Channels, Channels);
+    LoadDetr1x1Conv(Reader, Refs.QKV, Name + '.v.weight', Name + '.v.bias',
+      Channels, Channels, 2 * Channels);
+    LoadDetr1x1Conv(Reader, Refs.AttnOut, Name + '.proj_out.weight',
+      Name + '.proj_out.bias', Channels, Channels);
+  end;
+
+  // conv -> LeakyReLU(0.2) -> conv (the scale / shift branches).
+  function AddSftBranch(Src: TNNetLayer; const Name: string;
+    Channels: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(TNNetLeakyReLU.Create(0.2),
+      AddConv3x3(Src, Name + '.0', Channels, Channels));
+    Result := AddConv3x3(Result, Name + '.2', Channels, Channels);
+  end;
+
+  // Fuse_sft_block on the last layer: dec + w * (dec * scale + shift).
+  procedure AddFuseBlock(EncFeat: TNNetLayer; Resolution, Channels: integer);
+  var
+    Name: string;
+    Dec, EncodedPair, Scale, Shift, Residual: TNNetLayer;
+  begin
+    Name := 'fuse_convs_dict.' + IntToStr(Resolution);
+    Dec := NN.GetLastLayer();
+    NN.AddLayer(TNNetDeepConcat.Create([EncFeat, Dec]));
+    AddResBlock(Name + '.encode_enc', 2 * Channels, Channels);
+    EncodedPair := NN.GetLastLayer();
+    Scale := AddSftBranch(EncodedPair, Name + '.scale', Channels);
+    Shift := AddSftBranch(EncodedPair, Name + '.shift', Channels);
+    Residual := NN.AddLayerAfter(TNNetCellMulByCell.Create(Dec, Scale), Dec);
+    Residual := NN.AddLayerAfter(TNNetSum.Create([Residual, Shift]), Residual);
+    // Created at 1 (Create rejects 0), then set to w, which may be 0.
+    Residual := NN.AddLayerAfter(TNNetMulByConstant.Create(1.0), Residual);
+    TNNetMulByConstant(Residual).Multiplier := Config.Fidelity;
+    NN.AddLayerAfter(TNNetSum.Create([Dec, Residual]), Residual);
+  end;
+
+  function AddTokenLayerNorm(Src: TNNetLayer; const Name: string): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(Trainable(TNNetTokenLayerNorm.Create()), Src);
+    LoadLayerNormWeights(Reader, Result, Name + '.weight', Name + '.bias',
+      Config.DimEmbd);
+  end;
+
+  function AddTokenLinear(Src: TNNetLayer; const Name: string;
+    pInDim, pOutDim: integer): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(Trainable(
+      TNNetPointwiseConvLinear.Create(pOutDim)), Src);
+    LoadLlamaLinearWeights(Reader, Result, Name + '.weight', pInDim, pOutDim,
+      0, -1, 0, Name + '.bias');
+  end;
+
+begin
+  if (Config.LevelCount < 2) or (Config.LevelCount > csCodeFormerMaxLevels) then
+    ImportError(csCodeFormerImporter + ': LevelCount must be 2..' +
+      IntToStr(csCodeFormerMaxLevels) + ', got ' +
+      IntToStr(Config.LevelCount) + '.');
+  if (Config.NumResBlocks < 1) or (Config.NumHeads < 1) or
+     (Config.DimEmbd mod Config.NumHeads <> 0) then
+    ImportError(csCodeFormerImporter + ': needs NumResBlocks >= 1 and a ' +
+      'DimEmbd divisible by NumHeads.');
+  if Config.LatentGrid shl (Config.LevelCount - 1) <> Config.ImageSize then
+    ImportError(csCodeFormerImporter + ': ImageSize ' +
+      IntToStr(Config.ImageSize) + ' <> LatentGrid shl (LevelCount - 1).');
+  if Config.LevelHasFuse[Config.LevelCount - 1] then
+    ImportError(csCodeFormerImporter + ': a Fuse_sft_block at the latent ' +
+      'resolution is not supported.');
+  MaxLevelPos := Config.LevelCount - 1;
+  MaxResPos := Config.NumResBlocks - 1;
+  MaxLayerPos := Config.NumLayers - 1;
+  TokenCount := Config.LatentGrid * Config.LatentGrid;
+  FillChar(Vae, SizeOf(Vae), 0);
+  Vae.NormNumGroups := Config.NormGroups;
+  Vae.NormEps := csCodeFormerNormEps;
+  for LevelPos := 0 to csCodeFormerMaxLevels - 1 do EncoderSkips[LevelPos] := nil;
+  NN := TNNet.Create();
+  try
+    // -------- VQGAN encoder --------
+    Feat := NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize, 3));
+    AddConv3x3(Feat, BlockName('encoder', 0), Config.NumFeat, 3);
+    BlockPos := 1;
+    InCh := Config.NumFeat;
+    for LevelPos := 0 to MaxLevelPos do
+    begin
+      OutCh := Config.NumFeat * Config.ChannelMult[LevelPos];
+      for ResPos := 0 to MaxResPos do
+      begin
+        AddResBlock(BlockName('encoder', BlockPos), InCh, OutCh);
+        Inc(BlockPos);
+        InCh := OutCh;
+        if ResPos = MaxResPos then EncoderSkips[LevelPos] := NN.GetLastLayer();
+        if Config.LevelHasAttention[LevelPos] then
+        begin
+          AddAttnBlock(BlockName('encoder', BlockPos), InCh);
+          Inc(BlockPos);
+        end;
+      end;
+      if LevelPos < MaxLevelPos then
+      begin
+        Feat := AddVaeAsymmetricDownsample(NN, InCh, pTrainable);
+        LoadVaeConv(Reader, Feat, BlockName('encoder', BlockPos) + '.conv.weight',
+          BlockName('encoder', BlockPos) + '.conv.bias', InCh, InCh, 3);
+        Inc(BlockPos);
+      end;
+    end;
+    AddResBlock(BlockName('encoder', BlockPos), InCh, InCh);
+    AddAttnBlock(BlockName('encoder', BlockPos + 1), InCh);
+    AddResBlock(BlockName('encoder', BlockPos + 2), InCh, InCh);
+    AddGroupNorm(BlockName('encoder', BlockPos + 3), InCh);
+    LqFeat := AddConv3x3(NN.GetLastLayer(), BlockName('encoder', BlockPos + 4),
+      Config.EmbDim, InCh);
+    // -------- transformer over the row-major latent tokens --------
+    Hidden := AddTokenLinear(NN.AddLayerAfter(Trainable(TNNetReshape.Create(
+      TokenCount, 1, Config.EmbDim)), LqFeat), 'feat_emb', Config.EmbDim,
+      Config.DimEmbd);
+    PosEmb := AddLearnedConstant(NN, TokenCount, 1, Config.DimEmbd);
+    LoadDetrLearnedPosEmbed(Reader, PosEmb, 'position_emb', TokenCount,
+      Config.DimEmbd);
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Prefix := 'ft_layers.' + IntToStr(LayerPos) + '.';
+      // Pre-norm self attention: q = k = norm1(x) + pos, v = norm1(x).
+      Normed := AddTokenLayerNorm(Hidden, Prefix + 'norm1');
+      QKInput := NN.AddLayerAfter(TNNetSum.Create([Normed, PosEmb]), Normed);
+      QK := NN.AddLayerAfter(Trainable(
+        TNNetPointwiseConvLinear.Create(2 * Config.DimEmbd)), QKInput);
+      LoadLlamaLinearWeights(Reader, QK, Prefix + 'self_attn.in_proj_weight',
+        Config.DimEmbd, 2 * Config.DimEmbd, 0, -1, 0,
+        Prefix + 'self_attn.in_proj_bias', 1.0, 0, {SrcRowBase=}0,
+        {SrcRows=}3 * Config.DimEmbd);
+      Values := NN.AddLayerAfter(Trainable(
+        TNNetPointwiseConvLinear.Create(Config.DimEmbd)), Normed);
+      LoadLlamaLinearWeights(Reader, Values, Prefix + 'self_attn.in_proj_weight',
+        Config.DimEmbd, Config.DimEmbd, 0, -1, 0,
+        Prefix + 'self_attn.in_proj_bias', 1.0, 0,
+        {SrcRowBase=}2 * Config.DimEmbd, {SrcRows=}3 * Config.DimEmbd);
+      NN.AddLayer(TNNetDeepConcat.Create([QK, Values]));
+      Branch := NN.AddMultiHeadSelfAttention(Config.NumHeads);
+      LoadLlamaLinearWeights(Reader, Branch, Prefix + 'self_attn.out_proj.weight',
+        Config.DimEmbd, Config.DimEmbd, 0, -1, 0,
+        Prefix + 'self_attn.out_proj.bias');
+      Hidden := NN.AddLayerAfter(TNNetSum.Create([Hidden, Branch]), Branch);
+      // Pre-norm MLP with the exact (erf) GELU of F.gelu.
+      Branch := AddTokenLinear(AddTokenLayerNorm(Hidden, Prefix + 'norm2'),
+        Prefix + 'linear1', Config.DimEmbd, Config.DimMlp);
+      Branch := NN.AddLayerAfter(TNNetGELUErf.Create(), Branch);
+      Branch := AddTokenLinear(Branch, Prefix + 'linear2', Config.DimMlp,
+        Config.DimEmbd);
+      Hidden := NN.AddLayerAfter(TNNetSum.Create([Hidden, Branch]), Branch);
+    end;
+    // -------- top-1 code -> codebook entry --------
+    Branch := NN.AddLayerAfter(Trainable(TNNetPointwiseConvLinear.Create(
+      Config.CodebookSize, {SuppressBias=}1)),
+      AddTokenLayerNorm(Hidden, 'idx_pred_layer.0'));
+    LoadLlamaLinearWeights(Reader, Branch, 'idx_pred_layer.1.weight',
+      Config.DimEmbd, Config.CodebookSize);
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    // The single survivor renormalizes to exactly 1: a one-hot code row.
+    NN.AddLayer(TNNetTopKGate.Create(1));
+    Branch := NN.AddLayer(Trainable(TNNetPointwiseConvLinear.Create(
+      Config.EmbDim, {SuppressBias=}1)));
+    LoadCodeFormerCodebook(Reader, Branch, Config.CodebookSize, Config.EmbDim);
+    Feat := NN.AddLayer(TNNetReshape.Create(Config.LatentGrid,
+      Config.LatentGrid, Config.EmbDim));
+    // torch .var is unbiased; with equal content / style grids the N/(N-1)
+    // factors cancel up to an eps/N shift of the variance (~4e-8 at 16x16).
+    if Config.AdaIN then Feat := NN.AddLayer(TNNetAdaIN.Create(Feat, LqFeat));
+    // -------- VQGAN generator with the fusion blocks --------
+    InCh := Config.NumFeat * Config.ChannelMult[MaxLevelPos];
+    AddConv3x3(Feat, BlockName('generator', 0), InCh, Config.EmbDim);
+    AddResBlock(BlockName('generator', 1), InCh, InCh);
+    AddAttnBlock(BlockName('generator', 2), InCh);
+    AddResBlock(BlockName('generator', 3), InCh, InCh);
+    BlockPos := 4;
+    for LevelPos := MaxLevelPos downto 0 do
+    begin
+      OutCh := Config.NumFeat * Config.ChannelMult[LevelPos];
+      for ResPos := 0 to MaxResPos do
+      begin
+        AddResBlock(BlockName('generator', BlockPos), InCh, OutCh);
+        Inc(BlockPos);
+        InCh := OutCh;
+        if (ResPos = 0) and Config.LevelHasFuse[LevelPos] then
+          AddFuseBlock(EncoderSkips[LevelPos], Config.ImageSize shr LevelPos,
+            OutCh);
+        if Config.LevelHasAttention[LevelPos] then
+        begin
+          AddAttnBlock(BlockName('generator', BlockPos), InCh);
+          Inc(BlockPos);
+        end;
+      end;
+      if LevelPos > 0 then
+      begin
+        // Nearest 2x (TNNetDeMaxPool) + 3x3 conv.
+        NN.AddLayer(TNNetDeMaxPool.Create(2));
+        AddConv3x3(NN.GetLastLayer(), BlockName('generator', BlockPos) + '.conv',
+          InCh, InCh);
+        Inc(BlockPos);
+      end;
+    end;
+    AddGroupNorm(BlockName('generator', BlockPos), InCh);
+    AddConv3x3(NN.GetLastLayer(), BlockName('generator', BlockPos + 1), 3, InCh);
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildCodeFormerFromSafeTensorsEx(const FileName: string;
+  const Config: TCodeFormerConfig; pTrainable: boolean = true): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildCodeFormer(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildCodeFormerFromSafeTensors(const FileName: string;
+  out Config: TCodeFormerConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+  Reader: TNNetSafeTensorsReader;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  if (ConfigFileName <> '') or FileExists(ConfigPath) then
+    Config := ReadCodeFormerConfigFromJSONFile(ConfigPath)
+  else
+    Config := DefaultCodeFormerConfig();
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    InferCodeFormerConfigFromTensors(Reader, Config);
+    Result := BuildCodeFormer(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function CodeFormerSetFidelity(NN: TNNet; Fidelity: TNeuralFloat): integer;
+var
+  LayerPos, MaxLayerPos: integer;
+begin
+  // BuildCodeFormer adds no TNNetMulByConstant other than the fusion weights.
+  Result := 0;
+  MaxLayerPos := NN.Layers.Count - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    if NN.Layers[LayerPos].ClassType = TNNetMulByConstant then
+    begin
+      TNNetMulByConstant(NN.Layers[LayerPos]).Multiplier := Fidelity;
+      Inc(Result);
+    end;
+end;
+
+procedure CodeFormerRestoreFace(NN: TNNet; const Config: TCodeFormerConfig;
+  Face, Restored: TNNetVolume);
+var
+  NetInput: TNNetVolume;
+begin
+  NetInput := TNNetVolume.Create;
+  try
+    FaceRestorerPrepareInput(Face, Config.ImageSize, NetInput);
+    NN.Compute(NetInput);
+    NN.GetOutput(Restored);
+    GFPGANComposeOutput(Restored, Restored);
+  finally
     NetInput.Free;
   end;
 end;

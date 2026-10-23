@@ -9419,9 +9419,14 @@ type
   /// This layer multiplies the learning in previous layers. It can speed up
   // learning but can also provoke overflows.
   TNNetMulLearning = class(TNNetIdentity)
+    private
+      function GetMultiplier(): TNeuralFloat;
+      procedure SetMultiplier(pMul: TNeuralFloat);
     public
       constructor Create(pMul: TNeuralFloat); reintroduce; overload;
       procedure Backpropagate(); override;
+      // The constant (FFloatSt[0]); unlike Create, the setter accepts 0.
+      property Multiplier: TNeuralFloat read GetMultiplier write SetMultiplier;
   end;
 
   /// This layer multiplies the output by a constant.
@@ -90707,6 +90712,16 @@ begin
   begin
     FErrorProc('TNNetMulLearning or TNNetMulByConstant can not be zero.');
   end;
+end;
+
+function TNNetMulLearning.GetMultiplier(): TNeuralFloat;
+begin
+  Result := FFloatSt[0];
+end;
+
+procedure TNNetMulLearning.SetMultiplier(pMul: TNeuralFloat);
+begin
+  FFloatSt[0] := pMul;
 end;
 
 procedure TNNetMulLearning.Backpropagate();

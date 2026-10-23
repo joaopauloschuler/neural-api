@@ -872,36 +872,28 @@ rather than acted on.
         composite with out.png (isolates the paste from GFPGAN noise; expect
         < 1 gray level mean, facexlib truncates to uint8); (c) the full
         inference_gfpgan.py composite only after the ParseNet item above.
-- [ ] CodeFormer importer (Zhou et al., "Towards Robust Blind Face Restoration
-      with Codebook Lookup Transformer", NeurIPS 2022, arXiv:2206.11253;
-      sczhou/CodeFormer `codeformer_arch.py` + `vqgan_arch.py`; `codeformer.pth`,
-      key `params_ema`; S-Lab License 1.0, non-commercial, so state it in the
-      README row). CodeFormer is the other restorer that facexlib's
-      FaceRestoreHelper drives, and it holds identity better than GFPGAN on badly
-      degraded faces. Its `w` fidelity knob trades quality against identity.
-      Net: a taming-style VQGAN encoder (nf 64, ch_mult 1,2,2,4,4,8, 2 res
-      blocks, attention at 16x16, emb_dim 256) -> `feat_emb` Linear 256->512 +
-      learned `position_emb` (256x512) -> 9 pre-norm `TransformerSALayer` (8
-      heads, MLP 1024, GELU) -> `idx_pred_layer` (LayerNorm + Linear 512->1024, no
-      bias) -> top-1 code id per 16x16 position -> codebook row (1024x256) ->
-      VQGAN generator, with a `Fuse_sft_block` at 32/64/128/256: a ResBlock on
-      concat(enc, dec) produces scale and shift, then
-      dec + w * (dec * scale + shift) with the encoder skip features.
-      Reuse: the encoder/decoder ResNet + attention blocks (AddVaeResnetBlock /
-      AddVaeAttention, with swish and GroupNorm 32 eps 1e-6), the asymmetric
-      downsample of the VQModel import, TNNetVqModel's codebook gather (here
-      the transformer picks the index, not argmin L2), and the stock
-      transformer-encoder layers.
-      Deliverables: `BuildCodeFormer[FromSafeTensors[Ex]]` + `TCodeFormerConfig`
-      (inferred from the tensors) in neuralpretrained.pas; generalize
-      `RestoreFacesInImage` so it takes either restorer, through a small restorer
-      abstraction. Today it takes a `TGFPGANConfig`, so it is GFPGAN-only. In
-      examples/FaceRestoration, add `--model codeformer.pth --fidelity W`
-      (default 0.5, as inference_codeformer.py) and update the example README.
-      Tests: pico parity against a torch oracle built from the two arch files
-      in the ~/x venv (w = 0 and w = 0.7, so the fusion path is checked), then
-      OpenCL parity. Real `codeformer.pth` check on the user's box before the
-      README calls it supported.
+- [ ] CodeFormer follow-ups (Zhou et al., NeurIPS 2022, arXiv:2206.11253;
+      sczhou/CodeFormer; S-Lab License 1.0, non-commercial, so state it in the
+      README row). The importer core LANDED in neuralpretrained.pas:
+      `TCodeFormerConfig` (shape fields from InferCodeFormerConfigFromTensors;
+      n_head / norm_num_groups / fidelity_weight / adain from an optional
+      config.json, default 8 / 32 / 0.5 / true), `BuildCodeFormer[FromSafeTensors[Ex]]`
+      (reads `codeformer.pth`, `params_ema` unwrapped), `CodeFormerSetFidelity(NN, w)`
+      (no rebuild; the w of each Fuse_sft_block is a TNNetMulByConstant),
+      `CodeFormerRestoreFace` and the shared `FaceRestorerPrepareInput`. One TNNet,
+      stock layers only: top-1 = softmax -> TNNetTopKGate(1) (exact one-hot) ->
+      bias-free 1x1 conv holding the codebook; adain = TNNetAdaIN (on by default,
+      as inference_codeformer.py). Pico parity vs the official arch files
+      (tools/codeformer_tiny_fixture.py, tests/fixtures/tiny_codeformer*):
+      TestCodeFormerParity (w = 0.7 1.5e-5, w = 0 5e-6, codes, round trip),
+      TestCodeFormerNoAdaINParity (1.1e-5). OPEN: (a) generalize
+      `RestoreFacesInImage` through a small restorer abstraction (today it takes a
+      `TGFPGANConfig`); (b) examples/FaceRestoration `--model codeformer.pth
+      --fidelity W` (default 0.5) + its README; (c) OpenCL parity of the tiny
+      fixture (TNNetTopKGate / TNNetAdaIN / fusion path untested on OpenCL);
+      (d) real `codeformer.pth` on the user's box before the README calls it
+      supported. A Fuse_sft_block at the latent level (the official table puts
+      '16' after the 2nd ResBlock) is rejected; codeformer.pth does not use it.
 - [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
       landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`
       and `ddcolor_modelscope` on real grayscale photos (CPU and `--gpu`) against

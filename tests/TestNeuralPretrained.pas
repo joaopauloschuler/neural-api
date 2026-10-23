@@ -207,6 +207,9 @@ type
     procedure CheckRetinaFaceParity(const Base, Tag: string;
       out Config: TRetinaFaceConfig; out FaceCount: integer);
     procedure RunRetinaFaceOpenCLParity(const Base, Tag: string);
+    // Max |diff| between NN's output for NetInput and the IO tensor Key.
+    function CodeFormerOutputMaxDiff(NN: TNNet; IO: TNNetSafeTensorsReader;
+      NetInput: TNNetVolume; const Key: string): double;
     function GFPGANParityMaxDiff(const WeightsFile, IOFile, ConfigFile: string;
       pRoundTrip: boolean; out Config: TGFPGANConfig): double;
     function RestormerParityMaxDiff(const Stem, WeightsFile: string;
@@ -1552,6 +1555,10 @@ type
     procedure TestGFPGANPrepareAndCompose;
     // The tiny fixture with EnableOpenCL against the host net, every layer.
     procedure TestGFPGANOpenCLParity;
+    // tiny_codeformer.*: inferred config, top-1 codes, w = 0.7 and w = 0
+    // (CodeFormerSetFidelity) with adain, and the save/load round trip.
+    procedure TestCodeFormerParity;
+    procedure TestCodeFormerNoAdaINParity;
     procedure TestBiRefNetParity;
     procedure TestBiRefNetInfersConfig;
     procedure TestBiRefNetPrepareAndCompose;
@@ -56702,6 +56709,142 @@ begin
     Restored.Free;
     NetInput.Free;
     Face.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.CodeFormerOutputMaxDiff(NN: TNNet;
+  IO: TNNetSafeTensorsReader; NetInput: TNNetVolume; const Key: string): double;
+var
+  Expected: TNNetVolume;
+begin
+  Expected := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, Key, Expected);
+    NN.Compute(NetInput);
+    AssertTrue('the reference ' + Key + ' is not degenerate',
+      Expected.GetMaxAbs() > 0.1);
+    Result := MaxAbsVolumeDiff(NN.GetLastLayer().Output, Expected);
+  finally
+    Expected.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestCodeFormerParity;
+var
+  Config: TCodeFormerConfig;
+  NN, Reloaded: TNNet;
+  IO: TNNetSafeTensorsReader;
+  NetInput, Codes: TNNetVolume;
+  CodeRows: TNNetLayer;
+  LayerPos, TokenPos, MaxTokenPos, CodePos, MaxCodePos, BestCode: integer;
+  DiffW07, DiffW0: double;
+begin
+  NN := BuildCodeFormerFromSafeTensors(FixturePath('tiny_codeformer.pth'),
+    Config, {pTrainable=}false, FixturePath('tiny_codeformer_config.json'));
+  Reloaded := nil;
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_codeformer_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  Codes := TNNetVolume.Create;
+  try
+    AssertEquals('image size', 32, Config.ImageSize);
+    AssertEquals('nf', 8, Config.NumFeat);
+    AssertEquals('levels', 4, Config.LevelCount);
+    AssertEquals('ch_mult[1]', 2, Config.ChannelMult[1]);
+    AssertEquals('ch_mult[3]', 1, Config.ChannelMult[3]);
+    AssertEquals('res blocks', 2, Config.NumResBlocks);
+    AssertTrue('attention only at the 4x4 level', Config.LevelHasAttention[3] and
+      not Config.LevelHasAttention[2]);
+    AssertTrue('fusion at 32, 16, 8', Config.LevelHasFuse[0] and
+      Config.LevelHasFuse[1] and Config.LevelHasFuse[2] and
+      not Config.LevelHasFuse[3]);
+    AssertEquals('emb_dim', 16, Config.EmbDim);
+    AssertEquals('codebook', 32, Config.CodebookSize);
+    AssertEquals('latent', 4, Config.LatentGrid);
+    AssertEquals('dim_embd', 32, Config.DimEmbd);
+    AssertEquals('n_layers', 2, Config.NumLayers);
+    AssertEquals('dim_mlp', 64, Config.DimMlp);
+    AssertEquals('n_head (json)', 2, Config.NumHeads);
+    AssertEquals('norm groups (json)', 4, Config.NormGroups);
+    AssertEquals('default w', 0.5, Config.Fidelity, 1e-7);
+    AssertTrue('default adain', Config.AdaIN);
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    AssertEquals('fusion blocks', 3, CodeFormerSetFidelity(NN, 0.7));
+    DiffW07 := CodeFormerOutputMaxDiff(NN, IO, NetInput, 'w07_adain');
+    // The top-1 code rows: the one-hot output of the TNNetTopKGate.
+    CodeRows := nil;
+    for LayerPos := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[LayerPos] is TNNetTopKGate then CodeRows := NN.Layers[LayerPos];
+    AssertTrue('code gate present', CodeRows <> nil);
+    IO.LoadTensorFlat('codes', Codes);
+    MaxTokenPos := Codes.Size - 1;
+    MaxCodePos := Config.CodebookSize - 1;
+    for TokenPos := 0 to MaxTokenPos do
+    begin
+      BestCode := 0;
+      for CodePos := 1 to MaxCodePos do
+        if CodeRows.Output[TokenPos, 0, CodePos] >
+           CodeRows.Output[TokenPos, 0, BestCode] then BestCode := CodePos;
+      AssertEquals('code at token ' + IntToStr(TokenPos),
+        Round(Codes.FData[TokenPos]), BestCode);
+      AssertEquals('one-hot row', 1.0, CodeRows.Output[TokenPos, 0, BestCode], 0);
+    end;
+    Reloaded := TNNet.Create();
+    Reloaded.LoadFromString(NN.SaveToString());
+    Reloaded.SetTrainable();
+    Reloaded.Compute(NetInput);
+    AssertEquals('save/load round trip reproduces the face', 0,
+      MaxAbsVolumeDiff(Reloaded.GetLastLayer().Output, NN.GetLastLayer().Output),
+      1e-5);
+    AssertEquals('fusion blocks', 3, CodeFormerSetFidelity(NN, 0));
+    DiffW0 := CodeFormerOutputMaxDiff(NN, IO, NetInput, 'w0_adain');
+    WriteLn('  CodeFormer max|diff| w=0.7 ', DiffW07:0:9, ' w=0 ', DiffW0:0:9);
+    AssertTrue('w=0.7 max |diff| = ' + FloatToStr(DiffW07) + ' must be < 1e-4',
+      DiffW07 < 1e-4);
+    AssertTrue('w=0 max |diff| = ' + FloatToStr(DiffW0) + ' must be < 1e-4',
+      DiffW0 < 1e-4);
+  finally
+    Codes.Free;
+    NetInput.Free;
+    IO.Free;
+    Reloaded.Free;
+    NN.Free;
+  end;
+end;
+
+// adain = False (CodeFormer.forward's default) at w = 0.7, the config from
+// the tensors alone plus the two fields the tensors cannot carry.
+procedure TTestNeuralPretrained.TestCodeFormerNoAdaINParity;
+var
+  Config: TCodeFormerConfig;
+  NN: TNNet;
+  IO, Reader: TNNetSafeTensorsReader;
+  NetInput: TNNetVolume;
+  MaxDiff: double;
+begin
+  Config := DefaultCodeFormerConfig();
+  Config.NumHeads := 2;
+  Config.NormGroups := 4;
+  Config.Fidelity := 0.7;
+  Config.AdaIN := false;
+  Reader := CreatePretrainedTensorReader(FixturePath('tiny_codeformer.pth'));
+  try
+    InferCodeFormerConfigFromTensors(Reader, Config);
+    NN := BuildCodeFormer(Reader, Config, {pTrainable=}false);
+  finally
+    Reader.Free;
+  end;
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_codeformer_io.safetensors'));
+  NetInput := TNNetVolume.Create;
+  try
+    LoadDDColorTorchImage(IO, 'input', NetInput);
+    MaxDiff := CodeFormerOutputMaxDiff(NN, IO, NetInput, 'w07');
+    WriteLn('  CodeFormer (adain off) max|diff| = ', MaxDiff:0:9);
+    AssertTrue('max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+      MaxDiff < 1e-4);
+  finally
+    NetInput.Free;
+    IO.Free;
+    NN.Free;
   end;
 end;
 
