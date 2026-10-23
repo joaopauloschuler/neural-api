@@ -126,7 +126,7 @@ rather than acted on.
 ## Infrastructure / dev experience
 
 - [ ] OpenCL test suite under 2 minutes (user goal and authorization
-      2026-10-05; today ~600 s on PoCL). Diagnosis (single-test runs): idle
+      2026-10-05; ~600 s on PoCL before S1-S5). Diagnosis (single-test runs): idle
       scheduler workers spin hot against PoCL (one VAE test: OpenCL + parallel
       pass 95 s vs 3.3 s serial, 415k clock syscalls); neural.cl is built again
       for every EnableOpenCL; a few heavy test shapes. Serial tasks, each with a
@@ -1490,10 +1490,11 @@ rather than acted on.
         component in memory at a time, OnPhase/OnStep) and a CLI that loads it;
         examples/TextToVideo takes only a single .safetensors today.
   - [ ] CFG in the TextToVideo loop with a real empty-prompt uncond branch.
-        Blocked on the T5 tower + tokenizer (the TCogVideoXPipeline item
-        above): the example's text states are synthetic, so an "empty-prompt"
-        branch would be invented too and `--cfg` would mean nothing. When it
-        lands: eps = uncond + scale * (cond - uncond), two
+        Blocked on the TCogVideoXPipeline item above (the landed T5 tower +
+        tokenizer are not wired into the example yet): the example's text
+        states are synthetic, so an "empty-prompt" branch would be invented
+        too and `--cfg` would mean nothing. With the pipeline in place:
+        eps = uncond + scale * (cond - uncond), two
         `TCogVideoXSampler.PredictNoise` calls per step, each branch with its
         own `TDiTFirstBlockCache` (PredictNoise takes the cache as a
         parameter).
@@ -2200,8 +2201,8 @@ rather than acted on.
             scipy.optimize.linear_sum_assignment), caller-owned work buffers.
             Tests: random N x M matrices vs brute force at small sizes and vs
             a scipy oracle in the ~/x venv; ties and N <> M.
-      - [ ] Use it in the DETR set-criterion matcher (neuralnetwork.pas
-            ~3704 documents the "v1: GREEDY, not optimal Hungarian" gap):
+      - [ ] Use it in the DETR set-criterion matcher (a neuralnetwork.pas
+            comment documents the "v1: GREEDY, not optimal Hungarian" gap):
             keep greedy selectable, make exact the default, and pin a case
             where greedy and optimal assignments differ.
       - [ ] `TByteTracker` (a plain class, not a layer) in neuralpretrained.pas
