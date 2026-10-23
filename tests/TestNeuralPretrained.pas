@@ -1393,7 +1393,7 @@ type
     procedure TestMergeSafeTensorsFiles;
     procedure TestMarigoldWidenUNetConvIn;
     procedure TestMarigoldPipelineMatchesPredict;
-    procedure TestMarigoldTiledVaeEncode;
+    procedure TestMarigoldTiledVaeEncodeDecode;
     procedure TestStableDiffusionPipelineTokens;
     procedure TestStableDiffusionPipelineFastTokenizer;
     procedure TestStableDiffusionPipelineEmbeds;
@@ -54576,18 +54576,20 @@ end;
 
 // Marigold tiled encode on the pico VAE (16x16 padded image, 8x8 latent):
 // MarigoldEncodePadded with a 6-cell tile encoder runs 2 x 2 tiles (starts 0
-// and 2, overlap 2) and matches a hand blend of the four tile encodes; the
-// pipeline's VaeTileSize at the padded size is the plain Predict bit for bit.
-procedure TTestNeuralPretrained.TestMarigoldTiledVaeEncode;
+// and 2, overlap 2) and matches a hand blend of the four tile encodes;
+// MarigoldDecodeMember with a 6-cell tile decoder keeps the corner tiles' own
+// pixels; the pipeline's VaeTileSize at the padded size is the plain Predict.
+procedure TTestNeuralPretrained.TestMarigoldTiledVaeEncodeDecode;
 const
   cSeed = 4242;
 var
   Folder, VaeFile: string;
   VaeConfig: TVaeDecoderConfig;
-  TileEnc, WholeEnc: TNNet;
+  TileEnc, WholeEnc, TileDec, WholeDec: TNNet;
   Pipeline: TMarigoldPipeline;
   Padded, Tiled, Whole, Crop, Tile00, Tile10, Tile11, Plain, Got,
-    EncStates, Image: TNNetVolume;
+    EncStates, Image, DecodedWhole, DecodedTiled, Field, MemberWhole,
+    MemberTiled: TNNetVolume;
   X, Y, C: integer;
   IsRefused: boolean;
 begin
@@ -54595,7 +54597,11 @@ begin
     'cai_marigold_tiled_pico');
   VaeFile := Folder + 'vae' + DirectorySeparator +
     'diffusion_pytorch_model.safetensors';
-  TileEnc := nil; WholeEnc := nil; Pipeline := nil;
+  TileEnc := nil; WholeEnc := nil; TileDec := nil; WholeDec := nil;
+  Pipeline := nil;
+  DecodedWhole := TNNetVolume.Create; DecodedTiled := TNNetVolume.Create;
+  Field := TNNetVolume.Create; MemberWhole := TNNetVolume.Create;
+  MemberTiled := TNNetVolume.Create;
   Padded := TNNetVolume.Create(16, 16, 3);
   Tiled := TNNetVolume.Create; Whole := TNNetVolume.Create;
   Crop := TNNetVolume.Create; Tile00 := TNNetVolume.Create;
@@ -54646,6 +54652,48 @@ begin
         Tiled[2, 0, C], 1e-6);
     end;
 
+    // Decode the whole latent: decoder tile (tx, ty) covers latent cells
+    // 2 * (tx, ty) .. + 5, pixels 4 * (tx, ty) .. + 11.
+    VaeConfig := ReadVaeDecoderConfigFromJSONFile(Folder + 'vae' +
+      DirectorySeparator + 'config.json');
+    VaeConfig.LatentGrid := 8;
+    WholeDec := BuildVaeDecoderFromSafeTensorsEx(VaeFile, VaeConfig,
+      {pTrainable=}false);
+    VaeConfig.LatentGrid := 6;
+    TileDec := BuildVaeDecoderFromSafeTensorsEx(VaeFile, VaeConfig,
+      {pTrainable=}false);
+    MarigoldDecodeMember(WholeDec, Whole, {PredictNormals=}false,
+      {UseFullZRange=}true, 0, 0, DecodedWhole, Field, MemberWhole);
+    MarigoldDecodeMember(TileDec, Whole, {PredictNormals=}false,
+      {UseFullZRange=}true, 0, 0, DecodedTiled, Field, MemberTiled);
+    AssertEquals('whole decode width', 16, DecodedWhole.SizeX);
+    AssertTrue('tiled decode = whole shape',
+      DecodedTiled.SameSize(DecodedWhole));
+    AssertTrue('tiled member = whole shape', MemberTiled.SameSize(MemberWhole));
+    for X := 0 to DecodedTiled.Size - 1 do
+      AssertFalse('finite tiled decode', IsNan(DecodedTiled.FData[X]) or
+        IsInfinite(DecodedTiled.FData[X]));
+    AssertTrue('the decoder tiles differ from the whole decode',
+      MaxAbsVolumeDiff(DecodedTiled, DecodedWhole) > 1e-4);
+    // The untrained pico decoder sees only its tile (GroupNorm, attention), so
+    // close here means a mean |difference| below the mean |pixel| (about 0.53).
+    AssertTrue('the tiled decode stays close to the whole decode',
+      DecodedTiled.SumDiff(DecodedWhole) < DecodedWhole.GetSumAbs());
+    Crop.CopyCropping(Whole, 0, 0, 6, 6);
+    TileDec.Compute(Crop); TileDec.GetOutput(Tile00);
+    Crop.CopyCropping(Whole, 2, 2, 6, 6);
+    TileDec.Compute(Crop); TileDec.GetOutput(Tile11);
+    for C := 0 to DecodedTiled.Depth - 1 do
+      // Pixels 0..3 only tile (0, 0) reaches; pixels 12..15 only tile (1, 1).
+      for Y := 0 to 3 do
+        for X := 0 to 3 do
+        begin
+          AssertEquals('first decoder tile pixel', Tile00[X, Y, C],
+            DecodedTiled[X, Y, C], 0);
+          AssertEquals('last decoder tile pixel', Tile11[X + 8, Y + 8, C],
+            DecodedTiled[X + 12, Y + 12, C], 0);
+        end;
+
     Pipeline := TMarigoldPipeline.Create(Folder);
     EncStates.ReSize(2, 1, Pipeline.UNetConfig.CrossAttentionDim);
     EncStates.RandomizeGaussian(0.5);
@@ -54659,10 +54707,14 @@ begin
     Pipeline.Predict(Image, 0, 1, -1, cSeed, Got);
     AssertEquals('a tile over the padded image = plain', 0,
       MaxAbsVolumeDiff(Plain, Got), 0);
+    Pipeline.VaeTileSize := 32;
+    Pipeline.Predict(Image, 0, 1, -1, cSeed, Got);
+    AssertEquals('a tile above the padded image = plain', 0,
+      MaxAbsVolumeDiff(Plain, Got), 0);
     Pipeline.VaeTileSize := 12;
     Pipeline.Predict(Image, 0, 1, -1, cSeed, Got);
     AssertTrue('tiled prediction shape', Got.SameSize(Plain));
-    AssertTrue('the tiled encode reaches the prediction',
+    AssertTrue('the tiled VAE reaches the prediction',
       MaxAbsVolumeDiff(Plain, Got) > 0);
     for X := 0 to Got.Size - 1 do
       AssertFalse('finite tiled prediction', IsNan(Got.FData[X]) or
@@ -54676,7 +54728,9 @@ begin
     end;
     AssertTrue('a tile off the VAE factor is refused', IsRefused);
   finally
-    Pipeline.Free; TileEnc.Free; WholeEnc.Free;
+    Pipeline.Free; TileEnc.Free; WholeEnc.Free; TileDec.Free; WholeDec.Free;
+    DecodedWhole.Free; DecodedTiled.Free; Field.Free; MemberWhole.Free;
+    MemberTiled.Free;
     Padded.Free; Tiled.Free; Whole.Free; Crop.Free; Tile00.Free;
     Tile10.Free; Tile11.Free; Plain.Free; Got.Free; EncStates.Free;
     Image.Free;

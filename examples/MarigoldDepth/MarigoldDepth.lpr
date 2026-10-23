@@ -44,6 +44,8 @@ type
     EnsembleSize: integer;
     Seed: cardinal;
     QuantizeInt8: boolean;
+    // TMarigoldPipeline.VaeTileSize: square VAE tile in pixels, 0 = one pass.
+    VaeTileSize: integer;
     UseOpenCL: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
@@ -64,6 +66,8 @@ begin
     '(default: default_processing_resolution, 768 for v1-1)');
   WriteLn('  --seed N             noise seed (default 0)');
   WriteLn('  --int8               int8 UNet weights');
+  WriteLn('  --vae-tile N         VAE encode + decode in N-pixel square tiles, ',
+    'a multiple of the VAE scale (8 for v1-1); default 0 = one pass');
   WriteLn('  --gpu                run the nets on OpenCL (needs a build with ',
     '-dOpenCL)');
   WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
@@ -92,6 +96,7 @@ begin
   Opt.EnsembleSize := 1;
   Opt.Seed := 0;
   Opt.QuantizeInt8 := false;
+  Opt.VaeTileSize := 0;
   Opt.UseOpenCL := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
@@ -109,6 +114,7 @@ begin
       Opt.ProcessingResolution := StrToInt(NextArg())
     else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
     else if Arg = '--int8' then Opt.QuantizeInt8 := true
+    else if Arg = '--vae-tile' then Opt.VaeTileSize := StrToInt(NextArg())
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
@@ -172,6 +178,7 @@ begin
       raise Exception.Create('could not load ' + Opt.InputFile);
     Image.Divi(255.0);
     Pipeline.QuantizeInt8 := Opt.QuantizeInt8;
+    Pipeline.VaeTileSize := Opt.VaeTileSize;
     ComputeText := 'CPU';
     if Opt.UseOpenCL then
     begin
@@ -195,6 +202,8 @@ begin
       {$ENDIF}
     end;
     if Opt.QuantizeInt8 then ComputeText := ComputeText + ', int8 UNet';
+    if Opt.VaeTileSize > 0 then
+      ComputeText := ComputeText + Format(', VAE tile %d px', [Opt.VaeTileSize]);
     WriteLn(Format('Marigold %s (prediction_type "%s") on %dx%d, %s',
       [BoolToStr(Pipeline.PredictNormals, 'normals', 'depth'),
        Pipeline.PredictionType, Image.SizeX, Image.SizeY, ComputeText]));

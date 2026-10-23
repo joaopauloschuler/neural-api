@@ -12351,6 +12351,12 @@ procedure MarigoldEnsembleNormals(const Members: array of TNNetVolume;
 procedure MarigoldEncodePadded(VaeEncoder: TNNet;
   Padded, ImageLatent: TNNetVolume);
 
+// Member := the unpadded field of VaeDecoder(Target), tiled (TiledVaeDecode,
+// overlap 0.25) for a smaller square decoder; Decoded, Field: caller scratch.
+procedure MarigoldDecodeMember(VaeDecoder: TNNet; Target: TNNetVolume;
+  PredictNormals, UseFullZRange: boolean; PadX, PadY: integer;
+  Decoded, Field, Member: TNNetVolume);
+
 // Marigold depth (W,H,1 in [0,1]) or normals (W,H,3 unit) at Image's size; one
 // ensemble member per StartNoises latent. UNet TextSeqLen must be EncStates.SizeX.
 procedure MarigoldPredict(VaeEncoder, UNet, VaeDecoder: TNNet;
@@ -12414,8 +12420,8 @@ type
       read FDefaultProcessingResolution;
     // int8 UNet weights (TNNet.QuantizeWeightsInt8) for later Predict calls.
     property QuantizeInt8: boolean read FQuantizeInt8 write FQuantizeInt8;
-    // > 0: the VAE encodes a padded image larger than this many pixels in
-    // square tiles of this side (TiledVaeEncode, overlap 0.25); 0: one pass.
+    // > 0: the VAE encodes and decodes a padded image larger than this many
+    // pixels in square tiles of this side (overlap 0.25); 0: one pass each.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
     property UNetConfig: TSDUNetConfig read FUNetConfig;
   end;
@@ -81005,16 +81011,23 @@ begin
   end;
 end;
 
+// True when NetInput is a square tile smaller than Source, so the VAE net
+// runs over Source in tiles.
+function MarigoldIsVaeTile(NetInput, Source: TNNetVolume): boolean;
+begin
+  Result := (NetInput.SizeX = NetInput.SizeY) and
+    (NetInput.Depth = Source.Depth) and
+    (NetInput.SizeX <= Min(Source.SizeX, Source.SizeY)) and
+    not Source.SameSize(NetInput);
+end;
+
 procedure MarigoldEncodePadded(VaeEncoder: TNNet;
   Padded, ImageLatent: TNNetVolume);
 var
   EncoderInput, TiledLatent: TNNetVolume;
 begin
   EncoderInput := VaeEncoder.Layers[0].Output;
-  if (EncoderInput.SizeX = EncoderInput.SizeY) and
-     (EncoderInput.Depth = Padded.Depth) and
-     (EncoderInput.SizeX <= Min(Padded.SizeX, Padded.SizeY)) and
-     not Padded.SameSize(EncoderInput) then
+  if MarigoldIsVaeTile(EncoderInput, Padded) then
   begin
     TiledLatent := TiledVaeEncode(VaeEncoder, Padded,
       VaeEncoder.GetLastLayer().Output.SizeX, 0.25);
@@ -81035,14 +81048,28 @@ begin
   VaeEncoder.GetOutput(ImageLatent);
 end;
 
-// Member := the unpadded depth or normals field of VaeDecoder(Target).
-// Decoded and Field are caller scratch.
 procedure MarigoldDecodeMember(VaeDecoder: TNNet; Target: TNNetVolume;
   PredictNormals, UseFullZRange: boolean; PadX, PadY: integer;
   Decoded, Field, Member: TNNetVolume);
+var
+  DecoderInput, TiledImage: TNNetVolume;
 begin
-  VaeDecoder.Compute(Target);
-  VaeDecoder.GetOutput(Decoded);
+  DecoderInput := VaeDecoder.Layers[0].Output;
+  if MarigoldIsVaeTile(DecoderInput, Target) then
+  begin
+    TiledImage := TiledVaeDecode(VaeDecoder, Target, DecoderInput.SizeX, 0.25);
+    try
+      Decoded.ReSize(TiledImage);
+      Decoded.Copy(TiledImage);
+    finally
+      TiledImage.Free;
+    end;
+  end
+  else
+  begin
+    VaeDecoder.Compute(Target);
+    VaeDecoder.GetOutput(Decoded);
+  end;
   if PredictNormals then
     MarigoldNormalsFromDecoded(Decoded, Field, UseFullZRange)
   else
@@ -102721,7 +102748,7 @@ var
   StepConfig: TSDUNetConfig;
   Net: TNNet;
   VaeWeightsFile: string;
-  StepCount, Resolution, Alignment, LatentGrid: integer;
+  StepCount, Resolution, Alignment, LatentGrid, VaeGrid: integer;
   PadX, PadY, MemberPos, MaxMemberPos: integer;
   SavedSeed: cardinal;
 begin
@@ -102753,11 +102780,12 @@ begin
     VaeWeightsFile := SafeTensorsFolderWeightsFile(ComponentFolder('vae'),
       'diffusion_pytorch_model');
 
+    // Tile-sized VAE nets make MarigoldEncodePadded / MarigoldDecodeMember tile.
+    VaeGrid := VaeTileCellsForGrid(FVaeTileSize, Alignment, LatentGrid,
+      LatentGrid, 'TMarigoldPipeline');
+    if VaeGrid = 0 then VaeGrid := LatentGrid;
     EncoderConfig := FVaeEncoderConfig;
-    // A tile-sized encoder makes MarigoldEncodePadded encode in tiles.
-    EncoderConfig.LatentGrid := VaeTileCellsForGrid(FVaeTileSize, Alignment,
-      LatentGrid, LatentGrid, 'TMarigoldPipeline');
-    if EncoderConfig.LatentGrid = 0 then EncoderConfig.LatentGrid := LatentGrid;
+    EncoderConfig.LatentGrid := VaeGrid;
     Net := BuildVaeEncoderFromSafeTensorsEx(VaeWeightsFile, EncoderConfig,
       {pTrainable=}false);
     try
@@ -102802,7 +102830,7 @@ begin
     end;
 
     DecoderConfig := FVaeDecoderConfig;
-    DecoderConfig.LatentGrid := LatentGrid;
+    DecoderConfig.LatentGrid := VaeGrid;
     Net := BuildVaeDecoderFromSafeTensorsEx(VaeWeightsFile, DecoderConfig,
       {pTrainable=}false);
     try

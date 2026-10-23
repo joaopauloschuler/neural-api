@@ -38,6 +38,9 @@ MarigoldDepth --model DIR --input IMG --output PNG [options]
                        (default: default_processing_resolution)
   --seed N             noise seed (default 0)
   --int8               int8 UNet weights
+  --vae-tile N         VAE encode + decode in N-pixel square tiles, a
+                       multiple of the VAE scale (8 for v1-1); 0 = one pass
+                       (default)
   --gpu                run the nets on OpenCL (build with -dOpenCL)
   --gpu-platform N     OpenCL platform index (default 0)
   --gpu-device N       OpenCL device index (default 0)
@@ -60,6 +63,19 @@ Outputs:
   x 65535, as diffusers `export_depth_to_16bit_png`), 0 = near.
 * normals: the unit normal `n` as an RGB PNG of `(n + 1) / 2`, as diffusers
   `visualize_normals` with no axis flips.
+
+`--vae-tile N` sets `TMarigoldPipeline.VaeTileSize`. When the padded image
+is larger than N pixels, `Predict` builds the VAE encoder and the VAE decoder
+at an N-pixel tile: `MarigoldEncodePadded` runs `TiledVaeEncode` and
+`MarigoldDecodeMember` runs `TiledVaeDecode`, both with overlap 0.25 and a
+linear blend over the seams. VAE memory is then bounded by the tile, not by the
+processing resolution. A tile at or above the padded size is the one-pass
+encode and decode, bit for bit. A smaller tile changes the prediction: each
+tile sees only its own pixels in the VAE's group norms and attention. On the
+pico smoke, `--vae-tile 16` (the padded size) writes the same PNGs as no flag;
+`--vae-tile 12`, `8` and `4` write finite, different predictions. Not measured
+yet on a real checkpoint: the tiled-vs-whole error (e.g. `--vae-tile 512` at
+the 768 processing resolution).
 
 The processing resolution must give a latent grid divisible by the UNet's
 downsampling factor (a multiple of 64 for the SD2 UNet); `Predict` raises

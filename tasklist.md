@@ -687,13 +687,9 @@ rather than acted on.
                 (`TQwenImage21VaeEncoder.EncodeTiled`, default 256/192, runs
                 for every img2img / inpaint / edit encode) and its encode
                 memory at 1024x1024; and on a real Marigold checkpoint with
-                `TMarigoldPipeline.VaeTileSize` (e.g. 512 at 768 processing
+                `TMarigoldPipeline.VaeTileSize` (encode and decode; e.g.
+                `examples/MarigoldDepth --vae-tile 512` at 768 processing
                 resolution) against the untiled depth map.
-          - [ ] Marigold: `VaeTileSize` tiles only the encode; the decode is
-                still one pass (`MarigoldDecodeMember`), so the decoder bounds
-                memory. Tile the decode too (TiledVaeDecode under the same
-                property), then add `--vae-tile` to examples/MarigoldDepth
-                (no flag today: the example has no decode tile option).
         - [ ] Refused with windows today: DeepCache over several windows (one
               cache set per window), GLIGEN (boxes in image coordinates mapped
               per window), Prompt-to-Prompt, DDIM / null-text inversion.
