@@ -8383,9 +8383,9 @@ type
   // [1] fused qkv bias (3C), [2] output proj weight (C x C), [3] output proj
   // bias (C), [4] packed rel_pos_h (rows 0..2H-2) then rel_pos_w
   // (rows 2H-1..) each of width HeadDim. Heads / WindowSize / HeadDim live in
-  // FStruct[0..2]. Backward propagates dL/dInput through the full chain (qkv,
-  // attention, rel-pos, proj) so the layer trains, though its primary use is
-  // inference-only checkpoint import.
+  // FStruct[0..2]. Backward recomputes each window's forward and propagates
+  // dL/dInput plus the qkv, proj and rel-pos weight gradients through the
+  // whole chain, so the layer trains; its primary use is checkpoint import.
   // Coded by Claude (AI).
   TNNetSAMVisionAttention = class(TNNetLayer)
   private
@@ -8398,6 +8398,9 @@ type
     FQ, FK, FV, FCtx: TNNetVolume; // per-window q/k/v/context [winTokens x 1 x C]
     // scratch: the width rel-pos bias of one query row, indexed by kj
     FBiasW: TNNetVolume;
+    // Backward scratch (trainable only): dL/d(q|k|v) [winTokens x 1 x 3C],
+    // dL/dcontext [winTokens x 1 x C], one dL/dscore row and its key-column sums.
+    FQKVGrad, FCtxGrad, FScoreGrad, FScoreGradColSums: TNNetVolume;
     {$IFDEF OpenCL}
     FSAMAttentionCL: TNNetSAMVisionAttentionCL;
     // Binds (or uploads) the source and leaves the output in OpenCL memory.
@@ -8405,16 +8408,34 @@ type
     procedure ComputeOpenCL();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure CreateScratch();
     procedure AllocBuffers();
+    procedure SizeBackpropScratch();
+    procedure FreeBackpropScratch();
     // One window's WinH x WinW token grid and the window counts over the
     // zero-padded grid; a global block (WindowSize 0) is one window.
     procedure WindowLayout(out WinH, WinW, WindowsY, WindowsX: integer);
+    // FQ/FK/FV of window (WinY, WinX); a token past the grid edge reads a zero
+    // input row, so its q/k/v is the bias (HF zero padding).
+    procedure BuildWindowQKV(WinY, WinX, WinH, WinW: integer);
+    // FAttn := exp(score - max) of query (QueryY, QueryX) of the head at
+    // HeadOfs against every window key; returns the sum of the exps.
+    function ScoreRow(HeadOfs, QueryY, QueryX, WinH, WinW: integer): TNeuralFloat;
+    // FCtx := softmax(scores) . V for every head and query of the window.
+    procedure AttendWindow(WinH, WinW: integer);
+    // Output projection of FCtx, scattered to the grid without padded tokens.
+    procedure ProjectWindow(WinY, WinX, WinH, WinW: integer);
+    // Backward of one window after BuildWindowQKV and AttendWindow: weight
+    // deltas += -LearningRate * grad, and dL/dInput when HasInputGrad.
+    procedure BackpropagateWindow(WinY, WinX, WinH, WinW: integer;
+      HasInputGrad: boolean);
   public
     constructor Create(pHeads, pWindowSize, pHeadDim, pChannels: integer); reintroduce; overload;
     constructor Create(); overload; override;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     procedure InitDefault(); override;
     function SaveStructureToString(): string; override;
     // Direct weight-load accessors used by the importer.
@@ -8424,7 +8445,7 @@ type
     procedure SetProjBias(const B: TNNetVolume);
     procedure SetRelPos(const RelH, RelW: TNNetVolume);
     {$IFDEF OpenCL}
-    // Inference only: Backpropagate passes no gradient through this forward.
+    // Inference only: a trainable layer runs the CPU forward.
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
@@ -53096,12 +53117,7 @@ begin
   FStruct[1] := FWindowSize;
   FStruct[2] := FHeadDim;
   FStruct[3] := FChannels;
-  FAttn := TNNetVolume.Create();
-  FQ := TNNetVolume.Create();
-  FK := TNNetVolume.Create();
-  FV := TNNetVolume.Create();
-  FCtx := TNNetVolume.Create();
-  FBiasW := TNNetVolume.Create();
+  CreateScratch();
 end;
 
 constructor TNNetSAMVisionAttention.Create();
@@ -53109,17 +53125,26 @@ begin
   // Parameterless ctor used by CreateLayer / LoadFromString; FStruct is then
   // restored from the serialized string and the buffers re-created.
   inherited Create();
+  CreateScratch();
+  FHeads := FStruct[0];
+  FWindowSize := FStruct[1];
+  FHeadDim := FStruct[2];
+  FChannels := FStruct[3];
+  if FHeadDim > 0 then FInvSqrtHd := 1.0 / Sqrt(FHeadDim);
+end;
+
+procedure TNNetSAMVisionAttention.CreateScratch();
+begin
   FAttn := TNNetVolume.Create();
   FQ := TNNetVolume.Create();
   FK := TNNetVolume.Create();
   FV := TNNetVolume.Create();
   FCtx := TNNetVolume.Create();
   FBiasW := TNNetVolume.Create();
-  FHeads := FStruct[0];
-  FWindowSize := FStruct[1];
-  FHeadDim := FStruct[2];
-  FChannels := FStruct[3];
-  if FHeadDim > 0 then FInvSqrtHd := 1.0 / Sqrt(FHeadDim);
+  FQKVGrad := TNNetVolume.Create();
+  FCtxGrad := TNNetVolume.Create();
+  FScoreGrad := TNNetVolume.Create();
+  FScoreGradColSums := TNNetVolume.Create();
 end;
 
 destructor TNNetSAMVisionAttention.Destroy();
@@ -53133,6 +53158,10 @@ begin
   FV.Free;
   FCtx.Free;
   FBiasW.Free;
+  FQKVGrad.Free;
+  FCtxGrad.Free;
+  FScoreGrad.Free;
+  FScoreGradColSums.Free;
   inherited Destroy();
 end;
 
@@ -53165,6 +53194,8 @@ begin
 end;
 
 procedure TNNetSAMVisionAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WinH, WinW, WindowsY, WindowsX, RelPosRows: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
   if pPrevLayer.FOutput.Depth <> FChannels then
@@ -53182,10 +53213,50 @@ begin
   FNeurons[2].FWeights.ReSize(FChannels, 1, FChannels);
   FNeurons[3].FWeights.ReSize(1, 1, FChannels);
   // rel_pos: rows 0..(2H-2) = rel_pos_h, rows (2H-1).. = rel_pos_w, width
-  // HeadDim. Sized lazily on first weight-load (SetRelPos), so here it is
-  // only created empty.
+  // HeadDim; zero until SetRelPos loads the tables.
   AllocBuffers();
+  WindowLayout(WinH, WinW, WindowsY, WindowsX);
+  RelPosRows := 2 * WinH + 2 * WinW - 2;
+  if FNeurons[4].FWeights.Size <> RelPosRows * FHeadDim then
+  begin
+    FNeurons[4].FWeights.ReSize(FHeadDim, 1, RelPosRows);
+    FNeurons[4].FWeights.Fill(0);
+  end;
+  if FIsTrainable then SizeBackpropScratch();
   AfterWeightUpdate();
+end;
+
+procedure TNNetSAMVisionAttention.SizeBackpropScratch();
+var
+  WinH, WinW, WindowsY, WindowsX, NeuronPos: integer;
+begin
+  WindowLayout(WinH, WinW, WindowsY, WindowsX);
+  FQKVGrad.ReSize(WinH * WinW, 1, 3 * FChannels);
+  FCtxGrad.ReSize(WinH * WinW, 1, FChannels);
+  FScoreGrad.ReSize(WinH * WinW, 1, 1);
+  FScoreGradColSums.ReSize(WinW, 1, 1);
+  for NeuronPos := 0 to FNeurons.Count - 1 do
+    if FNeurons[NeuronPos].FDelta <> nil then
+    begin
+      FNeurons[NeuronPos].FDelta.ReSize(FNeurons[NeuronPos].FWeights);
+      FNeurons[NeuronPos].FBackInertia.ReSize(FNeurons[NeuronPos].FWeights);
+    end;
+end;
+
+procedure TNNetSAMVisionAttention.FreeBackpropScratch();
+begin
+  FQKVGrad.ReSize(1, 1, 1);
+  FCtxGrad.ReSize(1, 1, 1);
+  FScoreGrad.ReSize(1, 1, 1);
+  FScoreGradColSums.ReSize(1, 1, 1);
+end;
+
+function TNNetSAMVisionAttention.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if not pTrainable then FreeBackpropScratch()
+  else if FIsTrainable and Assigned(FPrevLayer) then SizeBackpropScratch();
 end;
 
 procedure TNNetSAMVisionAttention.InitDefault();
@@ -53259,24 +53330,19 @@ begin
   // fills rows [0..Lh-1], rel_pos_w fills rows [Lh..Lh+Lw-1], width hd each.
   Move(RelH.FData[0], W.FData[0], Lh * hd * csNeuralFloatSize);
   Move(RelW.FData[0], W.FData[Lh * hd], Lw * hd * csNeuralFloatSize);
+  if FNeurons[4].FDelta <> nil then
+  begin
+    FNeurons[4].FDelta.ReSize(W);
+    FNeurons[4].FBackInertia.ReSize(W);
+  end;
   AfterWeightUpdate();
 end;
 
 procedure TNNetSAMVisionAttention.Compute();
 var
   StartTime: double;
-  Prev: TNNetVolume;
-  H, W, padH, padW, nWy, nWx, ws: integer;
-  wy, wx, ty, tx, gy, gx, tok, winTok, head, hOfs: integer;
-  i, j, c, d, qi, qj, ki, kj, Lh: integer;
-  posK, posV, dhBase, dwOfs, dwSeed, qBase: integer;
-  HM1, WM1, FChannelsM1, ThreeChanM1, FHeadDimM1, TwoChan: integer;
-  FWindowSizeM1, FHeadsM1, nWyM1, nWxM1, gyM1, gxM1, winTokM1: integer;
-  dBase, tokBase: integer;
-  QkvW, QkvB, ProjW, ProjB, RelP: TNNetVolume;
-  Score, MaxScore, SumExp, acc, biasH: TNeuralFloat;
-  QPtr, KPtr, OutP, ctxPtr: TNeuralFloatArrPtr;
-  inRange: boolean;
+  WinH, WinW, WindowsY, WindowsX, WinY, WinX: integer;
+  MaxWindowYPos, MaxWindowXPos: integer;
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
@@ -53293,199 +53359,165 @@ begin
   // buffer a previous OpenCL forward left resident.
   MarkOutputWrittenOnRAM();
   {$ENDIF}
-  Prev := FPrevLayer.FOutput;
-  // CAI volume convention: GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth+d, so the X
-  // axis is the FAST (inner) axis. HF SAM lays out the patch grid (gridH,
-  // gridW) row-major; in this volume that maps gridW -> X (fast) and gridH -> Y
-  // (slow). So image HEIGHT (row) = SizeY and WIDTH (col) = SizeX, and a token
-  // is accessed as GetRawPtr(col, row).
-  H := Prev.SizeY; W := Prev.SizeX;
-  HM1 := H - 1; WM1 := W - 1;
-  FChannelsM1 := FChannels - 1;
-  ThreeChanM1 := 3 * FChannels - 1;
-  TwoChan := 2 * FChannels;                    // #5
-  FHeadDimM1 := FHeadDim - 1;
-  FWindowSizeM1 := FWindowSize - 1;
-  FHeadsM1 := FHeads - 1;
-  QkvW := FNeurons[0].FWeights; QkvB := FNeurons[1].FWeights;
-  ProjW := FNeurons[2].FWeights; ProjB := FNeurons[3].FWeights;
-  RelP := FNeurons[4].FWeights;
-  // rel_pos_h holds 2*WinH-1 rows (SetRelPos checks it); rel_pos_w follows.
-  if FWindowSize > 0 then Lh := 2 * FWindowSize - 1 else Lh := 2 * H - 1;
-  if FWindowSize > 0 then ws := FWindowSize else ws := 0;
-  if ws > 0 then
-  begin
-    padH := H + ((ws - H mod ws) mod ws);
-    padW := W + ((ws - W mod ws) mod ws);
-    nWy := padH div ws; nWx := padW div ws;
-  end
-  else
-  begin
-    padH := H; padW := W; ws := 0; nWy := 1; nWx := 1;
-  end;
-  nWyM1 := nWy - 1; nWxM1 := nWx - 1;
-  // Iterate windows. winTok tokens per window arranged row-major (ws x ws),
-  // or (H x W) for a global block.
-  for wy := 0 to nWyM1 do
-   for wx := 0 to nWxM1 do
-   begin
-    if FWindowSize > 0 then
+  WindowLayout(WinH, WinW, WindowsY, WindowsX);
+  MaxWindowYPos := WindowsY - 1;
+  MaxWindowXPos := WindowsX - 1;
+  for WinY := 0 to MaxWindowYPos do
+    for WinX := 0 to MaxWindowXPos do
     begin
-      winTok := FWindowSize * FWindowSize;
-      // Build q/k/v for this window. Padded (out-of-grid) tokens contribute a
-      // zero input row -> qkv = bias only (matches HF F.pad zero padding).
-      for ty := 0 to FWindowSizeM1 do
-       for tx := 0 to FWindowSizeM1 do
-       begin
-        tok := ty * FWindowSize + tx;
-        gy := wy * FWindowSize + ty;
-        gx := wx * FWindowSize + tx;
-        inRange := (gy < H) and (gx < W);
-        if inRange then QPtr := Prev.GetRawPtr(gx, gy); // (col=X, row=Y)
-        tokBase := tok * FChannels;
-        dBase := 0;
-        for d := 0 to ThreeChanM1 do
-        begin
-          acc := QkvB.FData[d];
-          if inRange then
-            acc := acc + TNNetVolume.DotProduct(@QkvW.FData[dBase], QPtr, FChannels);
-          if d < FChannels then FQ.FData[tokBase + d] := acc
-          else if d < TwoChan then
-            FK.FData[tokBase + (d - FChannels)] := acc
-          else FV.FData[tokBase + (d - TwoChan)] := acc;
-          Inc(dBase, FChannels);
-        end;
-       end;
-    end
-    else
-    begin
-      winTok := H * W;
-      for gy := 0 to HM1 do
-       for gx := 0 to WM1 do
-       begin
-        tok := gy * W + gx;
-        QPtr := Prev.GetRawPtr(gx, gy); // (col=X, row=Y)
-        tokBase := tok * FChannels;
-        dBase := 0;
-        for d := 0 to ThreeChanM1 do
-        begin
-          acc := QkvB.FData[d] +
-            TNNetVolume.DotProduct(@QkvW.FData[dBase], QPtr, FChannels);
-          if d < FChannels then FQ.FData[tokBase + d] := acc
-          else if d < TwoChan then
-            FK.FData[tokBase + (d - FChannels)] := acc
-          else FV.FData[tokBase + (d - TwoChan)] := acc;
-          Inc(dBase, FChannels);
-        end;
-       end;
+      BuildWindowQKV(WinY, WinX, WinH, WinW);
+      AttendWindow(WinH, WinW);
+      ProjectWindow(WinY, WinX, WinH, WinW);
     end;
-    // window grid dims (square ws or H x W)
-    if FWindowSize > 0 then begin gy := FWindowSize; gx := FWindowSize; end
-    else begin gy := H; gx := W; end;
-    winTokM1 := winTok - 1;
-    gyM1 := gy - 1; gxM1 := gx - 1;
-    // Per-head scaled dot-product attention with decomposed rel-pos.
-    for head := 0 to FHeadsM1 do
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSAMVisionAttention.BuildWindowQKV(WinY, WinX, WinH, WinW: integer);
+var
+  Prev, QkvW, QkvB: TNNetVolume;
+  H, W, ty, tx, gy, gx, d, dBase, tokBase: integer;
+  MaxWinYPos, MaxWinXPos, MaxQKVPos, TwoChan: integer;
+  acc: TNeuralFloat;
+  InputPtr: TNeuralFloatArrPtr;
+  inRange: boolean;
+begin
+  // CAI volume convention: GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth+d, so X is
+  // the fast axis: HF's row-major (gridH, gridW) maps gridW -> X, gridH -> Y.
+  Prev := FPrevLayer.FOutput;
+  H := Prev.SizeY; W := Prev.SizeX;
+  QkvW := FNeurons[0].FWeights; QkvB := FNeurons[1].FWeights;
+  MaxWinYPos := WinH - 1; MaxWinXPos := WinW - 1;
+  MaxQKVPos := 3 * FChannels - 1;
+  TwoChan := 2 * FChannels;
+  InputPtr := nil;
+  tokBase := 0;
+  for ty := 0 to MaxWinYPos do
+  begin
+    gy := WinY * WinH + ty;
+    for tx := 0 to MaxWinXPos do
     begin
-      hOfs := head * FHeadDim;
-      for qi := 0 to gyM1 do
-       for qj := 0 to gxM1 do
-       begin
-        i := qi * gx + qj;
-        qBase := i * FChannels + hOfs;             // #4: shared FQ/FCtx offset
-        QPtr := @FQ.FData[qBase];
-        MaxScore := -1e30;
-        // decomposed rel-pos bias: Q . rel_pos_h[dh] + Q . rel_pos_w[dw].
-        // dh*FHeadDim is invariant across kj (#11 -> dhBase per ki); as kj
-        // advances dw decreases by 1, so dwOfs steps down by FHeadDim (#12).
-        // The key row offset j*FChannels+hOfs steps up by FChannels (#12).
-        posK := hOfs;
-        dwSeed := (Lh + qj + gxM1) * FHeadDim;      // #11: ki-invariant, once per query
-        // Q.rel_pos_w depends only on (qj, kj), so the whole kj row of width
-        // biases is invariant across ki (#11) -- build it once per query
-        // instead of re-dotting it gy times.
-        dwOfs := dwSeed;
-        for kj := 0 to gxM1 do
-        begin
-          FBiasW.FData[kj] := TNNetVolume.DotProduct(QPtr,
-            @RelP.FData[dwOfs], FHeadDim);
-          Dec(dwOfs, FHeadDim);
-        end;
-        for ki := 0 to gyM1 do
-        begin
-         dhBase := (qi - ki + gyM1) * FHeadDim;
-         biasH := TNNetVolume.DotProduct(QPtr,
-           @RelP.FData[dhBase], FHeadDim);            // #11: Q.rel_pos_h invariant across kj
-         for kj := 0 to gxM1 do
-         begin
-          j := ki * gx + kj;
-          KPtr := @FK.FData[posK];
-          Score := TNNetVolume.DotProduct(QPtr, KPtr, FHeadDim);
-          Score := Score * FInvSqrtHd;
-          Score := Score + biasH + FBiasW.FData[kj];
-          FAttn.FData[j] := Score;
-          if Score > MaxScore then MaxScore := Score;
-          Inc(posK, FChannels);
-         end;
-        end;
-        // #18: one fused exp-shift-and-sum pass over the window scores.
-        SumExp := TNNetVolume.ExpShiftSum(@FAttn.FData[0], @FAttn.FData[0],
-          MaxScore, winTok);
+      gx := WinX * WinW + tx;
+      inRange := (gy < H) and (gx < W);
+      if inRange then InputPtr := Prev.GetRawPtr(gx, gy);
+      dBase := 0;
+      for d := 0 to MaxQKVPos do
+      begin
+        acc := QkvB.FData[d];
+        if inRange then
+          acc := acc + TNNetVolume.DotProduct(@QkvW.FData[dBase], InputPtr, FChannels);
+        if d < FChannels then FQ.FData[tokBase + d] := acc
+        else if d < TwoChan then
+          FK.FData[tokBase + (d - FChannels)] := acc
+        else FV.FData[tokBase + (d - TwoChan)] := acc;
+        Inc(dBase, FChannels);
+      end;
+      Inc(tokBase, FChannels);
+    end;
+  end;
+end;
+
+function TNNetSAMVisionAttention.ScoreRow(HeadOfs, QueryY, QueryX, WinH,
+  WinW: integer): TNeuralFloat;
+var
+  RelP: TNNetVolume;
+  QPtr: TNeuralFloatArrPtr;
+  ki, kj, j, posK, dwOfs, MaxWinYPos, MaxWinXPos: integer;
+  Score, MaxScore, biasH: TNeuralFloat;
+begin
+  RelP := FNeurons[4].FWeights;
+  MaxWinYPos := WinH - 1; MaxWinXPos := WinW - 1;
+  QPtr := @FQ.FData[(QueryY * WinW + QueryX) * FChannels + HeadOfs];
+  // Decomposed rel-pos bias Q . rel_pos_h[qi-ki+WinH-1] + Q . rel_pos_w[qj-kj
+  // +WinW-1]; the width term depends only on (qj, kj), so build its row once.
+  dwOfs := (2 * WinH - 1 + QueryX + MaxWinXPos) * FHeadDim;
+  for kj := 0 to MaxWinXPos do
+  begin
+    FBiasW.FData[kj] := TNNetVolume.DotProduct(QPtr, @RelP.FData[dwOfs], FHeadDim);
+    Dec(dwOfs, FHeadDim);
+  end;
+  MaxScore := -1e30;
+  posK := HeadOfs;
+  j := 0;
+  for ki := 0 to MaxWinYPos do
+  begin
+    biasH := TNNetVolume.DotProduct(QPtr,
+      @RelP.FData[(QueryY - ki + MaxWinYPos) * FHeadDim], FHeadDim);
+    for kj := 0 to MaxWinXPos do
+    begin
+      Score := TNNetVolume.DotProduct(QPtr, @FK.FData[posK], FHeadDim) *
+        FInvSqrtHd + biasH + FBiasW.FData[kj];
+      FAttn.FData[j] := Score;
+      if Score > MaxScore then MaxScore := Score;
+      Inc(posK, FChannels);
+      Inc(j);
+    end;
+  end;
+  Result := TNNetVolume.ExpShiftSum(@FAttn.FData[0], @FAttn.FData[0],
+    MaxScore, WinH * WinW);
+end;
+
+procedure TNNetSAMVisionAttention.AttendWindow(WinH, WinW: integer);
+var
+  head, hOfs, qi, qj, j, qBase, posV: integer;
+  MaxHeadPos, MaxWinYPos, MaxWinXPos, MaxWinTokenPos: integer;
+  SumExp: TNeuralFloat;
+  OutP: TNeuralFloatArrPtr;
+begin
+  MaxHeadPos := FHeads - 1;
+  MaxWinYPos := WinH - 1; MaxWinXPos := WinW - 1;
+  MaxWinTokenPos := WinH * WinW - 1;
+  for head := 0 to MaxHeadPos do
+  begin
+    hOfs := head * FHeadDim;
+    qBase := hOfs;
+    for qi := 0 to MaxWinYPos do
+      for qj := 0 to MaxWinXPos do
+      begin
+        SumExp := ScoreRow(hOfs, qi, qj, WinH, WinW);
         OutP := @FCtx.FData[qBase];
         FillDWord(OutP^, FHeadDim, 0);
         posV := hOfs;
-        for j := 0 to winTokM1 do
+        for j := 0 to MaxWinTokenPos do
         begin
-          KPtr := @FV.FData[posV];
-          TNNetVolume.MulAdd(OutP, KPtr, FAttn.FData[j], FHeadDim);
+          TNNetVolume.MulAdd(OutP, @FV.FData[posV], FAttn.FData[j], FHeadDim);
           Inc(posV, FChannels);
         end;
         // #5: scale the head vector once instead of every attention weight.
         TNNetVolume.Mul(OutP, 1 / SumExp, FHeadDim);
-       end;
-    end;
-    // Output projection per token, scatter back to grid (skip padded tokens).
-    if FWindowSize > 0 then
+        Inc(qBase, FChannels);
+      end;
+  end;
+end;
+
+procedure TNNetSAMVisionAttention.ProjectWindow(WinY, WinX, WinH, WinW: integer);
+var
+  ProjW, ProjB: TNNetVolume;
+  H, W, ty, tx, gy, gx, d, dBase, MaxWinYPos, MaxWinXPos, MaxChannelPos: integer;
+  OutP, CtxPtr: TNeuralFloatArrPtr;
+begin
+  ProjW := FNeurons[2].FWeights; ProjB := FNeurons[3].FWeights;
+  H := FOutput.SizeY; W := FOutput.SizeX;
+  MaxWinYPos := WinH - 1; MaxWinXPos := WinW - 1;
+  MaxChannelPos := FChannels - 1;
+  for ty := 0 to MaxWinYPos do
+  begin
+    gy := WinY * WinH + ty;
+    if gy >= H then break;
+    for tx := 0 to MaxWinXPos do
     begin
-      for ty := 0 to FWindowSizeM1 do
-       for tx := 0 to FWindowSizeM1 do
-       begin
-        gy := wy * FWindowSize + ty;
-        gx := wx * FWindowSize + tx;
-        if (gy >= H) or (gx >= W) then continue;
-        tok := ty * FWindowSize + tx;
-        OutP := FOutput.GetRawPtr(gx, gy); // (col=X, row=Y)
-        ctxPtr := @FCtx.FData[tok * FChannels];
-        dBase := 0;
-        for d := 0 to FChannelsM1 do
-        begin
-          acc := ProjB.FData[d] +
-            TNNetVolume.DotProduct(@ProjW.FData[dBase], ctxPtr, FChannels);
-          OutP^[d] := acc;
-          Inc(dBase, FChannels);
-        end;
-       end;
-    end
-    else
-    begin
-      for gy := 0 to HM1 do
-       for gx := 0 to WM1 do
-       begin
-        tok := gy * W + gx;
-        OutP := FOutput.GetRawPtr(gx, gy); // (col=X, row=Y)
-        ctxPtr := @FCtx.FData[tok * FChannels];
-        dBase := 0;
-        for d := 0 to FChannelsM1 do
-        begin
-          acc := ProjB.FData[d] +
-            TNNetVolume.DotProduct(@ProjW.FData[dBase], ctxPtr, FChannels);
-          OutP^[d] := acc;
-          Inc(dBase, FChannels);
-        end;
-       end;
+      gx := WinX * WinW + tx;
+      if gx >= W then break;
+      OutP := FOutput.GetRawPtr(gx, gy);
+      CtxPtr := @FCtx.FData[(ty * WinW + tx) * FChannels];
+      dBase := 0;
+      for d := 0 to MaxChannelPos do
+      begin
+        OutP^[d] := ProjB.FData[d] +
+          TNNetVolume.DotProduct(@ProjW.FData[dBase], CtxPtr, FChannels);
+        Inc(dBase, FChannels);
+      end;
     end;
-   end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
+  end;
 end;
 
 procedure TNNetSAMVisionAttention.WindowLayout(out WinH, WinW, WindowsY,
@@ -53610,15 +53642,199 @@ end;
 {$ENDIF}
 
 procedure TNNetSAMVisionAttention.Backpropagate();
+var
+  StartTime: double;
+  WinH, WinW, WindowsY, WindowsX, WinY, WinX, NeuronPos: integer;
+  MaxWindowYPos, MaxWindowXPos: integer;
+  HasInputGrad: boolean;
 begin
-  // Inference-import layer: a numerically-correct dense backward through the
-  // fused qkv / decomposed-rel-pos attention / proj chain is heavy and unused
-  // by the importer (the encoder is loaded inference-only). Propagate a zero
-  // gradient to the previous layer so the graph stays consistent if this layer
-  // is ever placed mid-network during training.
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // The backward scratch and the weight deltas exist only on a trainable layer.
+  if FIsTrainable and (FOutputError.Size = FOutput.Size) then
+  begin
+    HasInputGrad := (FPrevLayer.FOutput.Size > 0) and
+      (FPrevLayer.FOutput.Size = FPrevLayer.FOutputError.Size);
+    WindowLayout(WinH, WinW, WindowsY, WindowsX);
+    MaxWindowYPos := WindowsY - 1;
+    MaxWindowXPos := WindowsX - 1;
+    for WinY := 0 to MaxWindowYPos do
+      for WinX := 0 to MaxWindowXPos do
+      begin
+        BuildWindowQKV(WinY, WinX, WinH, WinW);
+        AttendWindow(WinH, WinW);
+        BackpropagateWindow(WinY, WinX, WinH, WinW, HasInputGrad);
+      end;
+    if not FBatchUpdate then
+    begin
+      for NeuronPos := 0 to FNeurons.Count - 1 do
+        FNeurons[NeuronPos].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSAMVisionAttention.BackpropagateWindow(WinY, WinX, WinH,
+  WinW: integer; HasInputGrad: boolean);
+var
+  Prev, PrevErr, QkvW, ProjW, RelP: TNNetVolume;
+  QkvWDelta, QkvBDelta, ProjWDelta, ProjBDelta, RelPDelta: TNNetVolume;
+  H, W, ty, tx, gy, gx, d, dBase, head, hOfs, qi, qj, ki, kj, j: integer;
+  qBase, qkvBase, posK, posKGrad, posV, posVGrad, relOfs: integer;
+  MaxWinYPos, MaxWinXPos, MaxWinTokenPos, MaxChannelPos, MaxQKVPos: integer;
+  MaxHeadPos, ThreeChan, WinTokens: integer;
+  NegLR, Grad, ScaledGrad, WeightedGradSum, RowSum: TNeuralFloat;
+  OutErrPtr, CtxPtr, CtxGradPtr, QPtr, QGradPtr, InputPtr, InputGradPtr,
+    QKVGradPtr: TNeuralFloatArrPtr;
+begin
+  Prev := FPrevLayer.FOutput; PrevErr := FPrevLayer.FOutputError;
+  QkvW := FNeurons[0].FWeights; ProjW := FNeurons[2].FWeights;
+  RelP := FNeurons[4].FWeights;
+  QkvWDelta := FNeurons[0].FDelta; QkvBDelta := FNeurons[1].FDelta;
+  ProjWDelta := FNeurons[2].FDelta; ProjBDelta := FNeurons[3].FDelta;
+  RelPDelta := FNeurons[4].FDelta;
+  H := Prev.SizeY; W := Prev.SizeX;
+  MaxWinYPos := WinH - 1; MaxWinXPos := WinW - 1;
+  WinTokens := WinH * WinW;
+  MaxWinTokenPos := WinTokens - 1;
+  MaxChannelPos := FChannels - 1;
+  ThreeChan := 3 * FChannels;
+  MaxQKVPos := ThreeChan - 1;
+  MaxHeadPos := FHeads - 1;
+  NegLR := -FLearningRate;
+  // Output projection out = ProjW . ctx + ProjB; padded tokens have no output.
+  FCtxGrad.Fill(0);
+  for ty := 0 to MaxWinYPos do
+  begin
+    gy := WinY * WinH + ty;
+    if gy >= H then break;
+    for tx := 0 to MaxWinXPos do
+    begin
+      gx := WinX * WinW + tx;
+      if gx >= W then break;
+      OutErrPtr := FOutputError.GetRawPtr(gx, gy);
+      CtxPtr := @FCtx.FData[(ty * WinW + tx) * FChannels];
+      CtxGradPtr := @FCtxGrad.FData[(ty * WinW + tx) * FChannels];
+      TNNetVolume.MulAdd(@ProjBDelta.FData[0], OutErrPtr, NegLR, FChannels);
+      dBase := 0;
+      for d := 0 to MaxChannelPos do
+      begin
+        Grad := OutErrPtr^[d];
+        if Grad <> 0 then
+        begin
+          TNNetVolume.MulAdd(CtxGradPtr, @ProjW.FData[dBase], Grad, FChannels);
+          TNNetVolume.MulAdd(@ProjWDelta.FData[dBase], CtxPtr, NegLR * Grad, FChannels);
+        end;
+        Inc(dBase, FChannels);
+      end;
+    end;
+  end;
+  // Attention: score = Q.K/sqrt(hd) + Q.rel_pos_h + Q.rel_pos_w, ctx = P . V.
+  FQKVGrad.Fill(0);
+  for head := 0 to MaxHeadPos do
+  begin
+    hOfs := head * FHeadDim;
+    qBase := hOfs;
+    qkvBase := hOfs;
+    for qi := 0 to MaxWinYPos do
+      for qj := 0 to MaxWinXPos do
+      begin
+        TNNetVolume.Mul(@FAttn.FData[0], 1 / ScoreRow(hOfs, qi, qj, WinH, WinW),
+          WinTokens);
+        QPtr := @FQ.FData[qBase];
+        CtxGradPtr := @FCtxGrad.FData[qBase];
+        QGradPtr := @FQKVGrad.FData[qkvBase];
+        // dP[j] = dctx . V[j]; dV[j] += P[j] * dctx.
+        posV := hOfs;
+        posVGrad := 2 * FChannels + hOfs;
+        for j := 0 to MaxWinTokenPos do
+        begin
+          FScoreGrad.FData[j] := TNNetVolume.DotProduct(CtxGradPtr,
+            @FV.FData[posV], FHeadDim);
+          TNNetVolume.MulAdd(@FQKVGrad.FData[posVGrad], CtxGradPtr,
+            FAttn.FData[j], FHeadDim);
+          Inc(posV, FChannels);
+          Inc(posVGrad, ThreeChan);
+        end;
+        // Softmax Jacobian: dScore[j] = P[j] * (dP[j] - sum_k P[k] dP[k]).
+        WeightedGradSum := TNNetVolume.DotProduct(@FScoreGrad.FData[0],
+          @FAttn.FData[0], WinTokens);
+        for j := 0 to MaxWinTokenPos do
+          FScoreGrad.FData[j] := FAttn.FData[j] *
+            (FScoreGrad.FData[j] - WeightedGradSum);
+        FScoreGradColSums.Fill(0);
+        posK := hOfs;
+        posKGrad := FChannels + hOfs;
+        j := 0;
+        for ki := 0 to MaxWinYPos do
+        begin
+          RowSum := 0;
+          for kj := 0 to MaxWinXPos do
+          begin
+            Grad := FScoreGrad.FData[j];
+            RowSum := RowSum + Grad;
+            FScoreGradColSums.FData[kj] := FScoreGradColSums.FData[kj] + Grad;
+            if Grad <> 0 then
+            begin
+              ScaledGrad := Grad * FInvSqrtHd;
+              TNNetVolume.MulAdd(QGradPtr, @FK.FData[posK], ScaledGrad, FHeadDim);
+              TNNetVolume.MulAdd(@FQKVGrad.FData[posKGrad], QPtr, ScaledGrad, FHeadDim);
+            end;
+            Inc(posK, FChannels);
+            Inc(posKGrad, ThreeChan);
+            Inc(j);
+          end;
+          // The height bias of row ki is shared by its WinW keys.
+          relOfs := (qi - ki + MaxWinYPos) * FHeadDim;
+          TNNetVolume.MulAdd(QGradPtr, @RelP.FData[relOfs], RowSum, FHeadDim);
+          TNNetVolume.MulAdd(@RelPDelta.FData[relOfs], QPtr, NegLR * RowSum, FHeadDim);
+        end;
+        relOfs := (2 * WinH - 1 + qj + MaxWinXPos) * FHeadDim;
+        for kj := 0 to MaxWinXPos do
+        begin
+          Grad := FScoreGradColSums.FData[kj];
+          TNNetVolume.MulAdd(QGradPtr, @RelP.FData[relOfs], Grad, FHeadDim);
+          TNNetVolume.MulAdd(@RelPDelta.FData[relOfs], QPtr, NegLR * Grad, FHeadDim);
+          Dec(relOfs, FHeadDim);
+        end;
+        Inc(qBase, FChannels);
+        Inc(qkvBase, ThreeChan);
+      end;
+  end;
+  // qkv projection: padded tokens read a zero input, so only the bias learns.
+  InputGradPtr := nil;
+  QKVGradPtr := @FQKVGrad.FData[0];
+  for ty := 0 to MaxWinYPos do
+  begin
+    gy := WinY * WinH + ty;
+    for tx := 0 to MaxWinXPos do
+    begin
+      gx := WinX * WinW + tx;
+      TNNetVolume.MulAdd(@QkvBDelta.FData[0], QKVGradPtr, NegLR, ThreeChan);
+      if (gy < H) and (gx < W) then
+      begin
+        InputPtr := Prev.GetRawPtr(gx, gy);
+        if HasInputGrad then InputGradPtr := PrevErr.GetRawPtr(gx, gy);
+        dBase := 0;
+        for d := 0 to MaxQKVPos do
+        begin
+          Grad := QKVGradPtr^[d];
+          if Grad <> 0 then
+          begin
+            if HasInputGrad then
+              TNNetVolume.MulAdd(InputGradPtr, @QkvW.FData[dBase], Grad, FChannels);
+            TNNetVolume.MulAdd(@QkvWDelta.FData[dBase], InputPtr, NegLR * Grad, FChannels);
+          end;
+          Inc(dBase, FChannels);
+        end;
+      end;
+      QKVGradPtr := TNeuralFloatArrPtr(@QKVGradPtr^[ThreeChan]);
+    end;
+  end;
 end;
 
 { TNNetSinkAttention }

@@ -376,9 +376,10 @@ rather than acted on.
       arXiv:2305.15272; `BuildViTMatteFromSafeTensors[Ex]`, `ViTMatteEstimateAlpha`,
       `TrimapFromMask` and examples/ImageMatting are done; pico parity
       `TestViTMatteParity` plus OpenCL parity):
-  - [ ] TNNetSAMVisionAttention's class comment says Backpropagate passes
+  - [X] TNNetSAMVisionAttention's class comment says Backpropagate passes
         dL/dInput through the chain; it passes a zero gradient. Fix the comment
-        or implement the backward.
+        or implement the backward. Done: the real backward (input, qkv, proj and
+        rel-pos gradients), covered by TestSAMVisionAttentionGradientCheck.
   - [ ] Real hustvl/vitmatte-small-composition-1k run on the GPU box (`--gpu`,
         also CPU) compared with the transformers output before README calls
         it supported.

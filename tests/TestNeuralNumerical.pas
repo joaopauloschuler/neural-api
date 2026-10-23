@@ -1121,6 +1121,9 @@ type
     // resident chain with ForceOpenCL off.
     procedure TransposedChannelAttentionOpenCLParity;
     procedure TransposedChannelAttentionResidentChainOpenCL;
+    // TNNetSAMVisionAttention numerical input and weight gradients (qkv, proj,
+    // rel-pos) on a padded windowed grid and on a non-square global block.
+    procedure TestSAMVisionAttentionGradientCheck;
     // TNNetSAMVisionAttention OpenCL forward vs CPU (padded windows, exact
     // windows, a global block; host and resident sources), and a resident chain.
     procedure SAMVisionAttentionOpenCLParity;
@@ -92015,6 +92018,122 @@ end;
 // grid (the last two past one 64-key flash tile), fed by a host-only
 // TNNetIdentity (upload) or the resident TNNetInput (bind); a weight change
 // between OpenCL forwards reaches the kernels. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestSAMVisionAttentionGradientCheck;
+const
+  CaseCount = 2;
+  csEpsilon = 1e-3;
+  SizeXs: array[0..CaseCount-1] of integer = (5, 3);
+  SizeYs: array[0..CaseCount-1] of integer = (4, 2);
+  HeadCounts: array[0..CaseCount-1] of integer = (2, 1);
+  HeadDims: array[0..CaseCount-1] of integer = (2, 3);
+  WindowSizes: array[0..CaseCount-1] of integer = (3, 0);
+var
+  NN: TNNet;
+  Input, Desired, AnalyticalInputGrad: TNNetVolume;
+  Attn: TNNetSAMVisionAttention;
+  CaseIdx, NeuronPos, Pos, MaxPos, Channels: integer;
+  Saved, LossPlus, LossMinus, Numerical, Analytical, MaxErr: TNeuralFloat;
+  Weights: TNNetVolume;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    OutPos, MaxOutPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    MaxOutPos := NN.GetLastLayer.Output.Size - 1;
+    for OutPos := 0 to MaxOutPos do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutPos] - Desired.Raw[OutPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  for CaseIdx := 0 to CaseCount - 1 do
+  begin
+    Channels := HeadCounts[CaseIdx] * HeadDims[CaseIdx];
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Channels);
+    Desired := TNNetVolume.Create(SizeXs[CaseIdx], SizeYs[CaseIdx], Channels);
+    AnalyticalInputGrad := TNNetVolume.Create();
+    MaxErr := 0;
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Channels, 1));
+      Attn := TNNetSAMVisionAttention(NN.AddLayer(TNNetSAMVisionAttention.Create(
+        HeadCounts[CaseIdx], WindowSizes[CaseIdx], HeadDims[CaseIdx], Channels)));
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(true);
+      for NeuronPos := 0 to 4 do
+      begin
+        Weights := Attn.Neurons[NeuronPos].Weights;
+        for Pos := 0 to Weights.Size - 1 do
+          Weights.Raw[Pos] := 0.5 * Sin(Pos * 1.37 + NeuronPos * 0.71 + CaseIdx);
+      end;
+      for Pos := 0 to Input.Size - 1 do
+      begin
+        Input.Raw[Pos] := Sin(Pos * 0.53 + 0.2) * 0.8;
+        Desired.Raw[Pos] := Cos(Pos * 0.31) * 0.5;
+      end;
+
+      // Analytical gradients: BatchUpdate keeps Delta = -lr * grad, lr = 1.
+      ComputeLoss();
+      for NeuronPos := 0 to 4 do Attn.Neurons[NeuronPos].ClearDelta;
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      AnalyticalInputGrad.Copy(NN.Layers[0].OutputError);
+
+      for NeuronPos := 0 to 4 do
+      begin
+        Weights := Attn.Neurons[NeuronPos].Weights;
+        AssertEquals('delta size of neuron ' + IntToStr(NeuronPos),
+          Weights.Size, Attn.Neurons[NeuronPos].Delta.Size);
+        for Pos := 0 to Weights.Size - 1 do
+        begin
+          Analytical := -Attn.Neurons[NeuronPos].Delta.Raw[Pos];
+          Saved := Weights.Raw[Pos];
+          Weights.Raw[Pos] := Saved + csEpsilon;
+          LossPlus := ComputeLoss();
+          Weights.Raw[Pos] := Saved - csEpsilon;
+          LossMinus := ComputeLoss();
+          Weights.Raw[Pos] := Saved;
+          Numerical := (LossPlus - LossMinus) / (2 * csEpsilon);
+          MaxErr := Max(MaxErr, Abs(Numerical - Analytical));
+          AssertTrue('case ' + IntToStr(CaseIdx) + ' neuron ' +
+            IntToStr(NeuronPos) + ' weight ' + IntToStr(Pos) + ' num=' +
+            FloatToStr(Numerical) + ' ana=' + FloatToStr(Analytical),
+            Abs(Numerical - Analytical) < 5e-3);
+        end;
+      end;
+
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+      begin
+        Saved := Input.Raw[Pos];
+        Input.Raw[Pos] := Saved + csEpsilon;
+        LossPlus := ComputeLoss();
+        Input.Raw[Pos] := Saved - csEpsilon;
+        LossMinus := ComputeLoss();
+        Input.Raw[Pos] := Saved;
+        Numerical := (LossPlus - LossMinus) / (2 * csEpsilon);
+        Analytical := AnalyticalInputGrad.Raw[Pos];
+        MaxErr := Max(MaxErr, Abs(Numerical - Analytical));
+        AssertTrue('case ' + IntToStr(CaseIdx) + ' input gradient at ' +
+          IntToStr(Pos) + ' num=' + FloatToStr(Numerical) + ' ana=' +
+          FloatToStr(Analytical), Abs(Numerical - Analytical) < 5e-3);
+      end;
+      WriteLn('  SAMVisionAttention gradient check case ', CaseIdx,
+        ' max-abs-error: ', MaxErr:0:6);
+    finally
+      AnalyticalInputGrad.Free;
+      Desired.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralNumerical.SAMVisionAttentionOpenCLParity;
 {$IFDEF OpenCL}
 const
