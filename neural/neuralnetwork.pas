@@ -15748,16 +15748,19 @@ type
     FUseFFT: boolean;
     // Per-instance FFT scratch (sized N in SetPrevLayer); avoids per-pass alloc.
     // ComputeFFT (forward) and the two backward FFT helpers never run on the
-    // stack simultaneously for one instance, so they share these by name.
+    // stack simultaneously for one instance, so they share these by name. Every
+    // signal is real, so each spectrum is the half spectrum, bins 0..N div 2;
+    // the Re buffer also holds the real signal itself (RealFFTForward and
+    // RealFFTInverse run in place).
     FcReBuf, FcImBuf, FxReBuf, FxImBuf, FeReBuf, FeImBuf: array of Double;
-    // Cached FFT of the kernel c, valid while FcSpecW still mirrors the kernel
+    // Cached half spectrum of the kernel c, valid while FcSpecW still mirrors the kernel
     // weights. Guarded by a value snapshot rather than an AfterWeightUpdate hook
     // so a directly hand-edited weight (a finite-difference perturbation, a
     // freshly loaded net) is honoured.
     FcSpecRe, FcSpecIm: array of Double;
     FcSpecW: array of TNeuralFloat;
     FcSpecValid: boolean;
-    FFFTPlan: TFFTPlan;   // length-N plan, built in SetPrevLayer
+    FRealPlan: TRealFFTPlan;   // length-N real plan, built in SetPrevLayer
     // Reversed copy of the input (FxRevBuf[0] = x[0], FxRevBuf[p] = x[n-p]),
     // sized N in SetPrevLayer. It makes the direct forward's kernel index
     // ascend, so each output is two contiguous dot products.
@@ -96752,7 +96755,7 @@ begin
   SetLength(FcSpecRe, N); SetLength(FcSpecIm, N);
   SetLength(FcSpecW, N);
   FcSpecValid := False;
-  FFTPlanInit(FFFTPlan, N);
+  RealFFTPlanInit(FRealPlan, N);
   InitDefault();
   // The kernel c is the only learned operator; keep the bias neuron at 0 so the
   // layer starts as a (near-)identity-magnitude circular convolution.
@@ -96949,21 +96952,19 @@ begin
       end;
   if not Stale then exit;
   for i := 0 to NM1 do
-  begin
     FcSpecRe[i] := Kernel.FData[i];
-    FcSpecIm[i] := 0;
-  end;
-  FFTPlanExecute(FFFTPlan, FcSpecRe, FcSpecIm, false);
+  RealFFTForward(FRealPlan, FcSpecRe, FcSpecRe, FcSpecIm);
   Move(Kernel.FData[0], FcSpecW[0], N * csNeuralFloatSize);
   FcSpecValid := True;
 end;
 
 // FFT forward: y = IFFT( FFT(c) .* FFT(x) ) + bias. This equals the direct
-// circular convolution y[i] = sum_k c[(i-k) mod n] * x[k] to < 1e-5.
+// circular convolution y[i] = sum_k c[(i-k) mod n] * x[k] to < 1e-5. C .* X is
+// Hermitian, so the product runs on the half spectrum.
 procedure TNNetCirculantLinear.ComputeFFT();
 var
   N, i: integer;
-  NM1: integer;
+  NM1, MaxHalfBinPos: integer;
   Bias, PrevOut: TNNetVolume;
   yRe, yIm: Double;
 begin
@@ -96971,20 +96972,19 @@ begin
   NM1 := N - 1;
   Bias := FArrNeurons[1].FWeights;
   PrevOut := FPrevLayer.FOutput;
+  MaxHalfBinPos := N div 2;
   EnsureKernelSpectrum(N);
   for i := 0 to NM1 do
-  begin
-    FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
-  end;
-  FFTPlanExecute(FFFTPlan, FxReBuf, FxImBuf, false);
+    FxReBuf[i] := PrevOut.FData[i];
+  RealFFTForward(FRealPlan, FxReBuf, FxReBuf, FxImBuf);
   // Pointwise complex product C .* X.
-  for i := 0 to NM1 do
+  for i := 0 to MaxHalfBinPos do
   begin
     yRe := FcSpecRe[i] * FxReBuf[i] - FcSpecIm[i] * FxImBuf[i];
     yIm := FcSpecRe[i] * FxImBuf[i] + FcSpecIm[i] * FxReBuf[i];
     FcReBuf[i] := yRe; FcImBuf[i] := yIm;
   end;
-  FFTPlanExecute(FFFTPlan, FcReBuf, FcImBuf, true);
+  RealFFTInverse(FRealPlan, FcReBuf, FcImBuf, FcReBuf);
   if FSuppressBias = 0 then
     for i := 0 to NM1 do
       FOutput.FData[i] := FcReBuf[i] + Bias.FData[i]
@@ -97000,27 +97000,26 @@ end;
 procedure TNNetCirculantLinear.ComputePreviousLayerErrorFFT();
 var
   N, i: integer;
-  NM1: integer;
+  NM1, MaxHalfBinPos: integer;
   LocalPrevError: TNNetVolume;
   gRe, gIm: Double;
 begin
   N := FOutput.Size;
   NM1 := N - 1;
+  MaxHalfBinPos := N div 2;
   LocalPrevError := FPrevLayer.OutputError;
   EnsureKernelSpectrum(N);
   for i := 0 to NM1 do
-  begin
-    FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
-  end;
-  FFTPlanExecute(FFFTPlan, FeReBuf, FeImBuf, false);
-  // conj(C) .* E
-  for i := 0 to NM1 do
+    FeReBuf[i] := FOutputError.FData[i];
+  RealFFTForward(FRealPlan, FeReBuf, FeReBuf, FeImBuf);
+  // conj(C) .* E on the half spectrum.
+  for i := 0 to MaxHalfBinPos do
   begin
     gRe := FcSpecRe[i] * FeReBuf[i] + FcSpecIm[i] * FeImBuf[i];
     gIm := FcSpecRe[i] * FeImBuf[i] - FcSpecIm[i] * FeReBuf[i];
     FcReBuf[i] := gRe; FcImBuf[i] := gIm;
   end;
-  FFTPlanExecute(FFFTPlan, FcReBuf, FcImBuf, true);
+  RealFFTInverse(FRealPlan, FcReBuf, FcImBuf, FcReBuf);
   for i := 0 to NM1 do
     LocalPrevError.FData[i] := LocalPrevError.FData[i] + FcReBuf[i];
 end;
@@ -97032,7 +97031,7 @@ end;
 procedure TNNetCirculantLinear.BackpropagateKernelBiasFFT();
 var
   N, i: integer;
-  NM1: integer;
+  NM1, MaxHalfBinPos: integer;
   KernelDelta, BiasDelta, PrevOut: TNNetVolume;
   gRe, gIm, lr: Double;
 begin
@@ -97042,21 +97041,22 @@ begin
   BiasDelta := FArrNeurons[1].FDelta;
   PrevOut := FPrevLayer.FOutput;
   lr := -FLearningRate;
+  MaxHalfBinPos := N div 2;
   for i := 0 to NM1 do
   begin
-    FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
-    FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
+    FxReBuf[i] := PrevOut.FData[i];
+    FeReBuf[i] := FOutputError.FData[i];
   end;
-  FFTPlanExecute(FFFTPlan, FxReBuf, FxImBuf, false);
-  FFTPlanExecute(FFFTPlan, FeReBuf, FeImBuf, false);
-  // conj(X) .* E
-  for i := 0 to NM1 do
+  RealFFTForward(FRealPlan, FxReBuf, FxReBuf, FxImBuf);
+  RealFFTForward(FRealPlan, FeReBuf, FeReBuf, FeImBuf);
+  // conj(X) .* E on the half spectrum.
+  for i := 0 to MaxHalfBinPos do
   begin
     gRe := FxReBuf[i] * FeReBuf[i] + FxImBuf[i] * FeImBuf[i];
     gIm := FxReBuf[i] * FeImBuf[i] - FxImBuf[i] * FeReBuf[i];
     FxReBuf[i] := gRe; FxImBuf[i] := gIm;
   end;
-  FFTPlanExecute(FFFTPlan, FxReBuf, FxImBuf, true);
+  RealFFTInverse(FRealPlan, FxReBuf, FxImBuf, FxReBuf);
   for i := 0 to NM1 do
   begin
     KernelDelta.FData[i] := KernelDelta.FData[i] + lr * FxReBuf[i];

@@ -2581,10 +2581,12 @@ cannot pay for its own transfer.
       (both CPU-only today); when this lands, add `TNNetConvolution` to the
       device-backward list at the top of "OpenCL forward coverage".
 
-- [ ] Real-input FFTs that still run a full complex FFT with Im = 0 and are not
-      a drop-in for `RealFFTForward` / `RealFFTInverse`:
-      - `TNNetCirculantLinear` FFT path: real kernel, input and error; would need
-        the product and inverse on the half spectrum (kernel spectrum too).
+- [x] Real-input FFTs that still ran a full complex FFT with Im = 0 and were not
+      a drop-in for `RealFFTForward` / `RealFFTInverse` (all four DONE; shared
+      primitives `RealFFTForwardBins` / `RealFFTInverseRealPart` in neuralvolume):
+      - [x] `TNNetCirculantLinear` FFT path: kernel spectrum, products and
+        inverses on the half spectrum (`RealFFTForward` / `RealFFTInverse` in
+        place). CPU A/B ~1.25x (N 1024), ~2x (N 1000) forward+backward.
       - [x] `TNNetSpectralConv1D`: `RealFFTForwardBins` (modes above Nyquist
         by conjugate symmetry) and `RealFFTInverseRealPart`. CPU A/B ~1.4x
         (256x1x32 m16), ~1.5x (200x1x32 m64) forward+backward.

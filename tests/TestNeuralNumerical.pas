@@ -97577,6 +97577,9 @@ begin
   CirculantLinearFFTEquivalenceCheck(Self, 16);  // radix-2 plan
   CirculantLinearFFTEquivalenceCheck(Self, 12);  // Bluestein plan
   CirculantLinearFFTEquivalenceCheck(Self, 7);
+  // Degenerate half spectra: DC only, and DC plus Nyquist.
+  CirculantLinearFFTEquivalenceCheck(Self, 1);
+  CirculantLinearFFTEquivalenceCheck(Self, 2);
 end;
 
 procedure TTestNeuralNumerical.TestKANLayerGradientCheck;
