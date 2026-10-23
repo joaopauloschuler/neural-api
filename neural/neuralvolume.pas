@@ -1867,6 +1867,27 @@ type
   procedure FFTPlanExecute(var Plan: TFFTPlan; var Re, Im: array of Double;
     Inverse: boolean);
 
+type
+  { Real-input FFT plan built by RealFFTPlanInit: even N runs one N/2-point complex
+    FFT plus a twiddle split, odd N one N-point complex FFT. Not thread-safe. }
+  TRealFFTPlan = record
+    N: integer;
+    Complex: TFFTPlan;
+    TwiddleCos, TwiddleSin: array of Double;
+    WorkRe, WorkIm: array of Double;
+  end;
+
+  // Builds Plan for any N >= 1; allocates only when N changes.
+  procedure RealFFTPlanInit(var Plan: TRealFFTPlan; N: integer);
+  { OutRe/OutIm[0..N div 2] := bins 0..N div 2 of the forward DFT of real X[0..N-1].
+    Out may alias X; no allocation. }
+  procedure RealFFTForward(var Plan: TRealFFTPlan; const X: array of Double;
+    var OutRe, OutIm: array of Double);
+  { X[0..N-1] := Re(inverse DFT) of the Hermitian half spectrum InRe/InIm[0..N div 2],
+    divided by N as FFTPlanExecute; Im of DC and Nyquist ignored. X may alias In. }
+  procedure RealFFTInverse(var Plan: TRealFFTPlan; const InRe, InIm: array of Double;
+    var X: array of Double);
+
   { NeuralBoxIoU returns the Intersection-over-Union of two axis-aligned boxes
     given in corner (x1,y1,x2,y2) format (x2>=x1, y2>=y1; pixel or any
     consistent unit). Degenerate boxes are clamped to zero area, and a zero
@@ -5708,6 +5729,148 @@ begin
     cIm := Plan.ChirpIm[SampleCnt];
     Re[SampleCnt] := (xRe * cRe - xIm * cIm) * OutScale;
     Im[SampleCnt] := (xRe * cIm + xIm * cRe) * OutImScale;
+  end;
+end;
+
+procedure RealFFTPlanInit(var Plan: TRealFFTPlan; N: integer);
+var
+  HalfN, MaxBinPos, BinCnt, ComplexN: integer;
+  Ang: Double;
+begin
+  if N < 1 then
+    raise Exception.Create('RealFFTPlanInit: N must be >= 1, got ' + IntToStr(N));
+  if (Plan.N = N) and (Length(Plan.WorkRe) > 0) then Exit;
+  Plan.N := N;
+  HalfN := N div 2;
+  if Odd(N) then ComplexN := N else ComplexN := HalfN;
+  FFTPlanInit(Plan.Complex, ComplexN);
+  SetLength(Plan.WorkRe, ComplexN);
+  SetLength(Plan.WorkIm, ComplexN);
+  if Odd(N) then
+  begin
+    SetLength(Plan.TwiddleCos, 0);
+    SetLength(Plan.TwiddleSin, 0);
+    Exit;
+  end;
+  SetLength(Plan.TwiddleCos, HalfN + 1);
+  SetLength(Plan.TwiddleSin, HalfN + 1);
+  MaxBinPos := HalfN;
+  for BinCnt := 0 to MaxBinPos do
+  begin
+    Ang := 2 * Pi * BinCnt / N;
+    Plan.TwiddleCos[BinCnt] := Cos(Ang);
+    Plan.TwiddleSin[BinCnt] := Sin(Ang);
+  end;
+end;
+
+procedure RealFFTForward(var Plan: TRealFFTPlan; const X: array of Double;
+  var OutRe, OutIm: array of Double);
+var
+  HalfN, MaxHalfPos, SampleCnt, BinCnt, MirrorBin, BinBytes: integer;
+  ZRe, ZIm, MirrorRe, MirrorIm, EvenRe, EvenIm, OddRe, OddIm, TwCos, TwSin: Double;
+begin
+  HalfN := Plan.N div 2;
+  if Odd(Plan.N) then
+  begin
+    BinBytes := (HalfN + 1) * csDoubleSize;
+    Move(X[0], Plan.WorkRe[0], Plan.N * csDoubleSize);
+    FillChar(Plan.WorkIm[0], Plan.N * csDoubleSize, 0);
+    FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, false);
+    Move(Plan.WorkRe[0], OutRe[0], BinBytes);
+    Move(Plan.WorkIm[0], OutIm[0], BinBytes);
+    Exit;
+  end;
+  // z[m] = x[2m] + i*x[2m+1]; Z = FFT_{N/2}(z) holds the even and odd half-DFTs.
+  MaxHalfPos := HalfN - 1;
+  SampleCnt := 0;
+  for BinCnt := 0 to MaxHalfPos do
+  begin
+    Plan.WorkRe[BinCnt] := X[SampleCnt];
+    Plan.WorkIm[BinCnt] := X[SampleCnt + 1];
+    Inc(SampleCnt, 2);
+  end;
+  FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, false);
+  ZRe := Plan.WorkRe[0];
+  ZIm := Plan.WorkIm[0];
+  OutRe[0] := ZRe + ZIm;
+  OutIm[0] := 0;
+  OutRe[HalfN] := ZRe - ZIm;
+  OutIm[HalfN] := 0;
+  // E_k = (Z_k + conj Z_{M-k}) / 2, O_k = (Z_k - conj Z_{M-k}) / 2i, X_k = E_k + W^k O_k.
+  MirrorBin := MaxHalfPos;
+  for BinCnt := 1 to MaxHalfPos do
+  begin
+    ZRe := Plan.WorkRe[BinCnt];
+    ZIm := Plan.WorkIm[BinCnt];
+    MirrorRe := Plan.WorkRe[MirrorBin];
+    MirrorIm := Plan.WorkIm[MirrorBin];
+    EvenRe := 0.5 * (ZRe + MirrorRe);
+    EvenIm := 0.5 * (ZIm - MirrorIm);
+    OddRe := 0.5 * (ZIm + MirrorIm);
+    OddIm := 0.5 * (MirrorRe - ZRe);
+    TwCos := Plan.TwiddleCos[BinCnt];
+    TwSin := Plan.TwiddleSin[BinCnt];
+    OutRe[BinCnt] := EvenRe + TwCos * OddRe + TwSin * OddIm;
+    OutIm[BinCnt] := EvenIm + TwCos * OddIm - TwSin * OddRe;
+    Dec(MirrorBin);
+  end;
+end;
+
+procedure RealFFTInverse(var Plan: TRealFFTPlan; const InRe, InIm: array of Double;
+  var X: array of Double);
+var
+  HalfN, MaxHalfPos, MaxMirrorPos, SampleCnt, BinCnt, MirrorBin: integer;
+  BinRe, BinIm, MirrorRe, MirrorIm, EvenRe, EvenIm, DiffRe, DiffIm, OddRe, OddIm: Double;
+  TwCos, TwSin: Double;
+begin
+  HalfN := Plan.N div 2;
+  if Odd(Plan.N) then
+  begin
+    MaxMirrorPos := HalfN;
+    Move(InRe[0], Plan.WorkRe[0], (HalfN + 1) * csDoubleSize);
+    Move(InIm[0], Plan.WorkIm[0], (HalfN + 1) * csDoubleSize);
+    for BinCnt := 1 to MaxMirrorPos do
+    begin
+      Plan.WorkRe[Plan.N - BinCnt] := Plan.WorkRe[BinCnt];
+      Plan.WorkIm[Plan.N - BinCnt] := -Plan.WorkIm[BinCnt];
+    end;
+    FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, true);
+    Move(Plan.WorkRe[0], X[0], Plan.N * csDoubleSize);
+    Exit;
+  end;
+  // Inverse split: E_k = (X_k + conj X_{M-k}) / 2, O_k = W^-k (X_k - conj X_{M-k}) / 2,
+  // Z_k = E_k + i*O_k is the N/2-point DFT of x[2m] + i*x[2m+1].
+  MaxHalfPos := HalfN - 1;
+  BinRe := InRe[0];
+  MirrorRe := InRe[HalfN];
+  Plan.WorkRe[0] := 0.5 * (BinRe + MirrorRe);
+  Plan.WorkIm[0] := 0.5 * (BinRe - MirrorRe);
+  MirrorBin := MaxHalfPos;
+  for BinCnt := 1 to MaxHalfPos do
+  begin
+    BinRe := InRe[BinCnt];
+    BinIm := InIm[BinCnt];
+    MirrorRe := InRe[MirrorBin];
+    MirrorIm := InIm[MirrorBin];
+    EvenRe := 0.5 * (BinRe + MirrorRe);
+    EvenIm := 0.5 * (BinIm - MirrorIm);
+    DiffRe := 0.5 * (BinRe - MirrorRe);
+    DiffIm := 0.5 * (BinIm + MirrorIm);
+    TwCos := Plan.TwiddleCos[BinCnt];
+    TwSin := Plan.TwiddleSin[BinCnt];
+    OddRe := DiffRe * TwCos - DiffIm * TwSin;
+    OddIm := DiffRe * TwSin + DiffIm * TwCos;
+    Plan.WorkRe[BinCnt] := EvenRe - OddIm;
+    Plan.WorkIm[BinCnt] := EvenIm + OddRe;
+    Dec(MirrorBin);
+  end;
+  FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, true);
+  SampleCnt := 0;
+  for BinCnt := 0 to MaxHalfPos do
+  begin
+    X[SampleCnt] := Plan.WorkRe[BinCnt];
+    X[SampleCnt + 1] := Plan.WorkIm[BinCnt];
+    Inc(SampleCnt, 2);
   end;
 end;
 

@@ -18010,6 +18010,8 @@ type
   protected
     FSpatialW, FSpatialH, FChannels, FHalfW: integer;
     FPlanW, FPlanH: TFFTPlan;
+    // Row plan of a lone channel (C = 1 or the odd tail of the pairing).
+    FRealPlanW: TRealFFTPlan;
     FRowRe, FRowIm: array of Double;
     FColRe, FColIm: array of Double;
     FSpecRe, FSpecIm: array of Double;
@@ -99779,6 +99781,7 @@ begin
   FHalfW := pSpatialW div 2 + 1;
   FFTPlanInit(FPlanW, FSpatialW);
   FFTPlanInit(FPlanH, FSpatialH);
+  RealFFTPlanInit(FRealPlanW, FSpatialW);
   SetLength(FRowRe, FSpatialW);
   SetLength(FRowIm, FSpatialW);
   SetLength(FColRe, FSpatialH);
@@ -99794,7 +99797,7 @@ procedure TNNetRealFFT2DBase.RealToHalfSpectrum(Src, Dst: TNNetVolume);
 var
   ChannelCnt, SpatialX, SpatialY, BinCnt, MirrorBin: integer;
   MaxSpatialX, MaxSpatialY, MaxBinPos: integer;
-  SrcPos, SpecPos, RowBytes, BinBytes: integer;
+  SrcPos, SpecPos, BinBytes: integer;
   ZRe, ZIm, MirrorRe, MirrorIm: Double;
   HasPair: boolean;
 
@@ -99831,7 +99834,6 @@ begin
   MaxSpatialX := FSpatialW - 1;
   MaxSpatialY := FSpatialH - 1;
   MaxBinPos := FHalfW - 1;
-  RowBytes := FSpatialW * csDoubleSize;
   BinBytes := FHalfW * csDoubleSize;
   ChannelCnt := 0;
   while ChannelCnt < FChannels do
@@ -99876,8 +99878,7 @@ begin
           FRowRe[SpatialX] := Src.FData[SrcPos];
           Inc(SrcPos, FChannels);
         end;
-        FillChar(FRowIm[0], RowBytes, 0);
-        FFTPlanExecute(FPlanW, FRowRe, FRowIm, false);
+        RealFFTForward(FRealPlanW, FRowRe, FRowRe, FRowIm);
         Move(FRowRe[0], FSpecRe[SpecPos], BinBytes);
         Move(FRowIm[0], FSpecIm[SpecPos], BinBytes);
       end;
@@ -99899,7 +99900,7 @@ procedure TNNetRealFFT2DBase.HalfSpectrumToReal(Src, Dst: TNNetVolume;
 var
   ChannelCnt, SpatialX, SpatialY, BinCnt, MirrorBin, NyquistBin: integer;
   MaxSpatialX, MaxSpatialY, MaxBinPos, MaxMirrorPos: integer;
-  SpecPos, DstPos, BinBytes, TailBytes: integer;
+  SpecPos, DstPos, BinBytes: integer;
   OutScale, MirrorScale, XRe, XIm, YRe, YIm: Double;
   HasPair: boolean;
 
@@ -99937,7 +99938,6 @@ begin
   MaxMirrorPos := (FSpatialW - 1) div 2;
   if Odd(FSpatialW) then NyquistBin := -1 else NyquistBin := FSpatialW div 2;
   BinBytes := FHalfW * csDoubleSize;
-  TailBytes := (FSpatialW - FHalfW) * csDoubleSize;
   // Re(ifft(S)) = ifft((S_k + conj S_{W-k}) / 2): zero-padded bins k, W-k halve.
   if Hermitian then MirrorScale := 1.0 else MirrorScale := 0.5;
   // FFTPlanExecute's inverse divides by H and by W; the caller's Scale excludes it.
@@ -99987,21 +99987,13 @@ begin
       begin
         Move(FSpecRe[SpecPos], FRowRe[0], BinBytes);
         Move(FSpecIm[SpecPos], FRowIm[0], BinBytes);
-        if Hermitian then
-        begin
-          // Bins W-k mirror k as conj; Re() below drops Im of DC and Nyquist, as c2r does.
+        if not Hermitian then
           for BinCnt := 1 to MaxMirrorPos do
           begin
-            FRowRe[FSpatialW - BinCnt] := FRowRe[BinCnt];
-            FRowIm[FSpatialW - BinCnt] := -FRowIm[BinCnt];
+            FRowRe[BinCnt] := FRowRe[BinCnt] * MirrorScale;
+            FRowIm[BinCnt] := FRowIm[BinCnt] * MirrorScale;
           end;
-        end
-        else if TailBytes > 0 then
-        begin
-          FillChar(FRowRe[FHalfW], TailBytes, 0);
-          FillChar(FRowIm[FHalfW], TailBytes, 0);
-        end;
-        FFTPlanExecute(FPlanW, FRowRe, FRowIm, true);
+        RealFFTInverse(FRealPlanW, FRowRe, FRowIm, FRowRe);
         for SpatialX := 0 to MaxSpatialX do
         begin
           Dst.FData[DstPos] := FRowRe[SpatialX] * OutScale;

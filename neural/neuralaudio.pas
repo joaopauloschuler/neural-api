@@ -240,6 +240,8 @@ type
     FBinRe, FBinIm: TNeuralFloatDynArr;
     FWindow, FFftRe, FFftIm: array of double;
     FFftPlan: TFFTPlan;
+    // Lone (odd tail) frame: one real FFT instead of a pair.
+    FRealFftPlan: TRealFFTPlan;
     procedure CheckWave(Wave: TNNetVolume);
     procedure SetUseFFT(Value: boolean);
     // Re/Im of frame FrameIdx of Wave into RePtr^/ImPtr^ (BinCount each), direct DFT.
@@ -275,7 +277,7 @@ type
     FUseFFT: boolean;
     FWindow, FWindowSquared, FCosTab, FSinTab: array of double;
     FFftRe, FFftIm: array of double;
-    FFftPlan: TFFTPlan;
+    FFftPlan: TRealFFTPlan;
     FAccSig, FAccEnv: array of double;
     FRe, FIm: TNNetVolume;
     // Overlap-adds every frame into FAccSig / FAccEnv; returns the uncentred length.
@@ -1379,7 +1381,7 @@ var
   WinNorm: double;                // sqrt(sum(window^2))
   Filt: TNNetVolume;
   Re, Im: array of double;        // FFT scratch (NFFT)
-  FftPlan: TFFTPlan;              // length-NFFT plan (any NFFT)
+  FftPlan: TRealFFTPlan;          // length-NFFT real-input plan (any NFFT)
   Power: array of double;         // one frame's power spectrum (NumBins)
   RawChroma: array of double;     // (NumFrames x NumChroma)
   FrameStart, FrameCnt, TapCnt, BinCnt, ChCnt, SrcIdx, ArgMax: integer;
@@ -1437,7 +1439,7 @@ begin
   SetLength(Power, NumBins);
   SetLength(RawChroma, NumFrames * NumChroma);
   // Built once for the whole call (preprocessing, not a Compute path).
-  FFTPlanInit(FftPlan, NFFT);
+  RealFFTPlanInit(FftPlan, NFFT);
   try
     BuildChromaFilterBank(Filt, SampleRate, NFFT, NumChroma);
 
@@ -1447,9 +1449,6 @@ begin
       // FrameCnt*Hop - PadLeft in the ORIGINAL signal.
       FrameStart := FrameCnt * Hop - PadLeft;
       rowBase := FrameCnt * NumChroma;      // RawChroma row base (rule #4)
-      // The imaginary part is a constant zero fill: IEEE +0.0 is all-zero bits,
-      // so one FillChar replaces NFFT stores interleaved with the tap work.
-      FillChar(Im[0], NFFT * csDoubleSize, 0);
       // Whether this frame needs reflection is fixed for the whole tap loop, so
       // the test is unswitched out of it (#20); the interior case then walks
       // Samples through a carried offset (#12).
@@ -1465,7 +1464,7 @@ begin
       else
         for TapCnt := 0 to NFFTM1 do
           Re[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
-      FFTPlanExecute(FftPlan, Re, Im, false);
+      RealFFTForward(FftPlan, Re, Re, Im);
       // one-sided power spectrum, normalized by the window L2 energy
       for BinCnt := 0 to NumBinsM1 do
       begin
@@ -1543,17 +1542,14 @@ begin
     FWindowSquared[TapCnt] := FWindow[TapCnt] * FWindow[TapCnt];
   end;
 
-  // With FUseFFT the per-frame O(NFFT*NumBins) inverse DFT becomes one
-  // O(NFFT*log NFFT) forward FFT. The one-sided spectrum is mirrored back to full
-  // length with the conjugate the storage convention implies (stored Im =
-  // +sum x*sin, so x[t] = Re(FFT(Y))/NFFT for Y[k] = Re[k] + i*Im[k],
-  // Y[NFFT-k] = Re[k] - i*Im[k]).
+  // With FUseFFT the per-frame O(NFFT*NumBins) inverse DFT becomes one real
+  // inverse FFT. Stored Im = +sum x*sin, so the spectrum it inverts is Re - i*Im.
   FUseFFT := ((NFFT and NFFTM1) = 0) or (NFFT >= csISTFTMinBluesteinNFFT);
   if FUseFFT then
   begin
     SetLength(FFftRe, NFFT);
     SetLength(FFftIm, NFFT);
-    FFTPlanInit(FFftPlan, NFFT);
+    RealFFTPlanInit(FFftPlan, NFFT);
   end
   else
   begin
@@ -1594,7 +1590,6 @@ var
   Acc0, Acc1, Acc2, Acc3, SelfConj, Sample, WinTap: double;
   ReVal0, ReVal1, ReVal2, ReVal3: double;
   ImVal0, ImVal1, ImVal2, ImVal3: double;
-  MirrorCnt, MirrorSrc: integer;
 begin
   TransformLength := FNFFT;
   NumBins := FBinCount;
@@ -1634,21 +1629,12 @@ begin
       for BinCnt := 0 to NumBinsM1 do
       begin
         FFftRe[BinCnt] := Re.FData[frameBase + BinCnt];
-        FFftIm[BinCnt] := Im.FData[frameBase + BinCnt];
+        FFftIm[BinCnt] := -Im.FData[frameBase + BinCnt];
       end;
-      // Y[MirrorCnt] = conj(Y[NFFT - MirrorCnt]); the first mirrored bin is
-      // NumBins, so the source starts at NFFT - NumBins (odd or even NFFT).
-      MirrorSrc := TransformLength - NumBins;
-      for MirrorCnt := NumBins to NFFTM1 do
-      begin
-        FFftRe[MirrorCnt] := Re.FData[frameBase + MirrorSrc];
-        FFftIm[MirrorCnt] := -Im.FData[frameBase + MirrorSrc];
-        Dec(MirrorSrc);
-      end;
-      FFTPlanExecute(FFftPlan, FFftRe, FFftIm, false);
+      RealFFTInverse(FFftPlan, FFftRe, FFftIm, FFftRe);
       for TapCnt := 0 to NFFTM1 do
       begin
-        Sample := FFftRe[TapCnt] * invNFFT;
+        Sample := FFftRe[TapCnt];
         OutIdx := FrameStart + TapCnt;
         FAccSig[OutIdx] := FAccSig[OutIdx] + Sample * FWindow[TapCnt];
         FAccEnv[OutIdx] := FAccEnv[OutIdx] + FWindowSquared[TapCnt];
@@ -1917,6 +1903,7 @@ begin
       SetLength(FFftRe, FNFFT);
       SetLength(FFftIm, FNFFT);
       FFTPlanInit(FFftPlan, FNFFT);
+      RealFFTPlanInit(FRealFftPlan, FNFFT);
     end;
     exit;
   end;
@@ -2035,9 +2022,13 @@ var
   ZRe, ZIm, MirrorRe, MirrorIm: double;
 begin
   LoadWindowedFrame(Wave, FrameIdx, FFftRe);
-  if HasSecond then LoadWindowedFrame(Wave, FrameIdx + 1, FFftIm)
-  else FillChar(FFftIm[0], FNFFT * csDoubleSize, 0);
-  FFTPlanExecute(FFftPlan, FFftRe, FFftIm, false);
+  if HasSecond then
+  begin
+    LoadWindowedFrame(Wave, FrameIdx + 1, FFftIm);
+    FFTPlanExecute(FFftPlan, FFftRe, FFftIm, false);
+  end
+  else
+    RealFFTForward(FRealFftPlan, FFftRe, FFftRe, FFftIm);
   MaxBinPos := FBinCount - 1;
   if HasSecond then
   begin

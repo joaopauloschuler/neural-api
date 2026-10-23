@@ -197,6 +197,8 @@ type
     // Shared FFT (neuralvolume.pas) against a naive DFT.
     procedure TestFFTRadix2MatchesNaiveDFT;
     procedure TestFFTPlanAnyNMatchesNaiveDFT;
+    // RealFFTForward / RealFFTInverse (N/2 packing, odd-N fallback) vs the full complex FFT.
+    procedure TestRealFFTPlanMatchesComplexFFT;
 
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -355,6 +357,8 @@ type
     procedure TestRealFFT2DSerializationRoundTrip;
     // Paired-channel row FFTs (forward and backward of both layers) vs one row FFT per channel.
     procedure TestRealFFT2DPairedRowsMatchSingleChannel;
+    // Lone-channel real row FFT (C = 1 and the odd tail of C = 3): forward vs naive, input gradient.
+    procedure TestRealFFT2DLoneChannelRealRowFFT;
     // TNNetFreeUFourierFilter (FreeU skip filter): input gradient, odd, even
     // and 1-wide sides; structure round trip.
     procedure TestFreeUFourierFilterGradientCheck;
@@ -9058,6 +9062,86 @@ begin
   begin
     AssertEquals('Hermitian re k=' + IntToStr(i), Re[i], Re[10 - i], 1e-12);
     AssertEquals('Hermitian im k=' + IntToStr(i), Im[i], -Im[10 - i], 1e-12);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRealFFTPlanMatchesComplexFFT;
+const
+  Sizes: array[0..15] of integer = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 16, 30, 96, 97, 100);
+var
+  SizeIdx, N, HalfN, i: integer;
+  Plan: TRealFFTPlan;
+  Complex: TFFTPlan;
+  Src, Re, Im, RefRe, RefIm, HalfRe, HalfIm: array of Double;
+  MaxDiff, RefMax: Double;
+  Tag: string;
+begin
+  RandSeed := 314159;
+  Plan.N := 0;
+  Complex.N := 0;
+  for SizeIdx := Low(Sizes) to High(Sizes) do
+  begin
+    N := Sizes[SizeIdx];
+    HalfN := N div 2;
+    Tag := 'N=' + IntToStr(N);
+    RealFFTPlanInit(Plan, N);
+    FFTPlanInit(Complex, N);
+    SetLength(Src, N); SetLength(Re, N); SetLength(Im, N);
+    SetLength(RefRe, N); SetLength(RefIm, N);
+    SetLength(HalfRe, HalfN + 1); SetLength(HalfIm, HalfN + 1);
+    // Forward: real input, output aliasing the input, vs the full complex FFT with Im = 0.
+    for i := 0 to N - 1 do
+    begin
+      Src[i] := Random - 0.5;
+      RefRe[i] := Src[i];
+      RefIm[i] := 0;
+    end;
+    FFTPlanExecute(Complex, RefRe, RefIm, false);
+    Re := Copy(Src);
+    RealFFTForward(Plan, Re, Re, Im);
+    MaxDiff := 0; RefMax := 1e-300;
+    for i := 0 to HalfN do
+    begin
+      MaxDiff := Max(MaxDiff, Max(Abs(Re[i] - RefRe[i]), Abs(Im[i] - RefIm[i])));
+      RefMax := Max(RefMax, Max(Abs(RefRe[i]), Abs(RefIm[i])));
+    end;
+    AssertTrue('real forward vs complex ' + Tag + ' diff=' + FloatToStr(MaxDiff),
+      MaxDiff / RefMax < 1e-13);
+    // Inverse: a half spectrum with nonzero Im at DC and Nyquist, which c2r ignores.
+    for i := 0 to HalfN do
+    begin
+      HalfRe[i] := Random - 0.5;
+      HalfIm[i] := Random - 0.5;
+    end;
+    for i := 0 to HalfN do
+    begin
+      RefRe[i] := HalfRe[i];
+      RefIm[i] := HalfIm[i];
+    end;
+    for i := 1 to (N - 1) div 2 do
+    begin
+      RefRe[N - i] := HalfRe[i];
+      RefIm[N - i] := -HalfIm[i];
+    end;
+    FFTPlanExecute(Complex, RefRe, RefIm, true);
+    Re := Copy(HalfRe);
+    SetLength(Re, N);
+    RealFFTInverse(Plan, Re, HalfIm, Re);
+    MaxDiff := 0; RefMax := 1e-300;
+    for i := 0 to N - 1 do
+    begin
+      MaxDiff := Max(MaxDiff, Abs(Re[i] - RefRe[i]));
+      RefMax := Max(RefMax, Abs(RefRe[i]));
+    end;
+    AssertTrue('real inverse vs complex ' + Tag + ' diff=' + FloatToStr(MaxDiff),
+      MaxDiff / RefMax < 1e-13);
+    // Round trip forward -> inverse returns the real input.
+    RealFFTForward(Plan, Src, HalfRe, HalfIm);
+    RealFFTInverse(Plan, HalfRe, HalfIm, Re);
+    MaxDiff := 0;
+    for i := 0 to N - 1 do
+      MaxDiff := Max(MaxDiff, Abs(Re[i] - Src[i]));
+    AssertTrue('real round trip ' + Tag + ' diff=' + FloatToStr(MaxDiff), MaxDiff < 1e-13);
   end;
 end;
 
@@ -67323,6 +67407,80 @@ begin
     PairedGrad.Free;
     SingleOut.Free;
     PairedOut.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRealFFT2DLoneChannelRealRowFFT;
+const
+  cWidths: array[0..7] of integer = (1, 2, 5, 7, 8, 10, 12, 16);
+  cChannels: array[0..1] of integer = (1, 3);
+var
+  Input, Output, InputGrad, Expected: TNNetVolume;
+  WidthCnt, ChannelIdx, Norm, LayerCnt, PairCnt, i, W, H, C: integer;
+  Diff, Err: Double;
+  LayerName: string;
+begin
+  Input := TNNetVolume.Create();
+  Output := TNNetVolume.Create();
+  InputGrad := TNNetVolume.Create();
+  Expected := TNNetVolume.Create();
+  try
+    H := 5;
+    for WidthCnt := 0 to High(cWidths) do
+      for ChannelIdx := 0 to High(cChannels) do
+        for Norm := csFFTNormBackward to csFFTNormForward do
+          for LayerCnt := 0 to 1 do
+            for PairCnt := 0 to 1 do
+            begin
+              W := cWidths[WidthCnt];
+              C := cChannels[ChannelIdx];
+              if LayerCnt = 0 then
+              begin
+                LayerName := 'rfft2';
+                Input.ReSize(W, H, C);
+              end
+              else
+              begin
+                LayerName := 'irfft2';
+                Input.ReSize(W div 2 + 1, H, 2 * C);
+              end;
+              for i := 0 to Input.Size - 1 do
+                Input.Raw[i] := Sin(i * 0.47 + Norm) * 0.8 + 0.03 * (i mod 4);
+              LayerName := LayerName + ' W=' + IntToStr(W) + ' C=' + IntToStr(C) +
+                ' norm=' + IntToStr(Norm) + ' paired=' + IntToStr(PairCnt);
+              if LayerCnt = 0 then
+              begin
+                RunRealFFT2DLayer(TNNetRealFFT2D.Create(Norm), Input, Output, InputGrad, PairCnt = 1);
+                NaiveRealFFT2D(Input, Expected, Norm);
+              end
+              else
+              begin
+                RunRealFFT2DLayer(TNNetInverseRealFFT2D.Create(W, Norm), Input, Output,
+                  InputGrad, PairCnt = 1);
+                NaiveInverseRealFFT2D(Input, Expected, W, Norm);
+              end;
+              Diff := MaxScaledDiff(Output, Expected);
+              AssertTrue(LayerName + ' vs naive DFT diff=' + FloatToStr(Diff), Diff < 1e-5);
+            end;
+    // The lone-channel adjoint (rfft2 backward runs the real inverse, irfft2 backward the real forward).
+    for WidthCnt := 2 to 6 do
+      for ChannelIdx := 0 to High(cChannels) do
+      begin
+        W := cWidths[WidthCnt];
+        C := cChannels[ChannelIdx];
+        Err := RealFFT2DGradientError(TNNetRealFFT2D.Create(csFFTNormOrtho), W, 3, C);
+        AssertTrue('lone rfft2 input gradient W=' + IntToStr(W) + ' C=' + IntToStr(C) +
+          ' err=' + FloatToStr(Err), Err < 1e-2);
+        Err := RealFFT2DGradientError(TNNetInverseRealFFT2D.Create(W, csFFTNormBackward),
+          W div 2 + 1, 3, 2 * C);
+        AssertTrue('lone irfft2 input gradient W=' + IntToStr(W) + ' C=' + IntToStr(C) +
+          ' err=' + FloatToStr(Err), Err < 1e-2);
+      end;
+  finally
+    Expected.Free;
+    InputGrad.Free;
+    Output.Free;
     Input.Free;
   end;
 end;
