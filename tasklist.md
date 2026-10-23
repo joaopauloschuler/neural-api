@@ -866,6 +866,28 @@ rather than acted on.
       landed; pico parity and OpenCL parity only): run GFPGANv1.3.pth and
       GFPGANv1.4.pth on real aligned 512x512 faces (CPU and `--gpu`) against the
       official `gfpgan` inference output before README calls it supported.
+- [ ] Whole-photo face restoration: RetinaFace detector + 5-point alignment +
+      paste-back (port of facexlib `FaceRestoreHelper`, what `gfpgan`'s
+      inference_gfpgan.py runs by default). FaceRestoration currently needs a
+      pre-aligned 512x512 crop (the GFPGAN importer comment says "Face detection
+      and alignment are not part of the net"), so it cannot restore a real group
+      photo. Steps: (1) `BuildRetinaFace[FromSafeTensors[Ex]]` for facexlib's
+      `detection_mobilenet0.25_Final.pth` (MobileNet0.25 + FPN + SSH heads; load
+      the .pth through neuraltorchbin) and `detection_Resnet50_Final.pth` (reuse
+      the BuildResNet trunk taps); prior-box decode of boxes + 5 landmarks and box
+      NMS shared with the YOLO post-process (`TYoloDetectionArray` NMS) instead of
+      a copy; (2) a least-squares similarity transform (Umeyama, 4 DOF) from the
+      5 landmarks to the FFHQ 512 template, and a bilinear affine warp that writes
+      a fixed-size crop (reuse the TNNetAffineGridSample/TNNetGridSample sampling
+      code; `AugAffineWarp` is nearest and in-place, so it does not fit);
+      (3) inverse-warp the restored face back with an eroded + Gaussian-feathered
+      mask (reuse `GaussianBlurImage` in neuralimageresize.pas) and blend; optional
+      background upsampling through the landed RealESRGAN importer
+      (`--bg-upsampler`, like gfpgan's). Example: `FaceRestoration --input
+      photo.jpg` (no `--aligned`) restores every detected face; keep the current
+      aligned mode as `--aligned`. Parity: detector boxes/landmarks and the
+      aligned crop vs facexlib on a real photo (oracle in the ~/x venv), then the
+      final composite vs inference_gfpgan.py. Pico fixtures for the suite.
 - [ ] DDColor follow-up (`BuildDDColorFromSafeTensors[Ex]` + examples/ColorizePhoto
       landed; pico parity and OpenCL parity only): run `piddnad/ddcolor_paper_tiny`
       and `ddcolor_modelscope` on real grayscale photos (CPU and `--gpu`) against
