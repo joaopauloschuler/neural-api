@@ -11672,6 +11672,10 @@ type
 // rejected loudly.
 function ReadVGGConfigFromJSONFile(const FileName: string): TVGGConfig;
 
+// Canonical torchvision vgg16 / vgg19 config (plain, 224 image, 1000 labels, no
+// truncation), for a torchvision safetensors file that ships no config.json.
+function DefaultVGGConfig(Depth: integer = 16): TVGGConfig;
+
 function VGGConfigToString(const Config: TVGGConfig): string;
 
 // Builds the torchvision VGG described by Config and loads every conv + FC
@@ -11788,6 +11792,41 @@ function ComputePerceptualLossAndGradient(NN: TNNet;
   const TapLayerIdx: array of integer; Gen, Target: TNNetVolume;
   out GradImage: TNNetVolume;
   const StageWeights: TNeuralFloatArray = nil): TNeuralFloat;
+
+type
+  // Perceptual training objective for an image-output net: AddToOutputError
+  // has the TNeuralFitBase.OutputErrorFn signature and adds
+  // Weight * d(perceptual loss)/d(output) to the pixel error. Output pixels are
+  // mapped to the VGG input as ((v*PixelScale + PixelOffset) - Mean_c)/Std_c
+  // (defaults: CAI csEncodeRGB, v = (x-128)/64). Calls are serialized (one
+  // frozen VGG shared by every training thread). Coded by Claude (AI).
+  TNNetPerceptualLoss = class(TObject)
+  private
+    FVGG: TNNet;
+    FTapLayerIdx: array[0..4] of integer;
+    FWeight: TNeuralFloat;
+    // Per-channel affine from output pixels to the VGG input.
+    FNormScale, FNormOffset: array[0..2] of TNeuralFloat;
+    FVGGGen, FVGGTarget, FVGGGrad: TNNetVolume;
+    FLock: TRTLCriticalSection;
+    FLossSum: TNeuralFloat;
+    FLossCount: integer;
+    procedure MapToVGGInput(V: TNNetVolume);
+  public
+    // Takes ownership of pVGG (a BuildVGG feature extractor whose input size
+    // equals the training output size; error-only or trainable).
+    constructor Create(pVGG: TNNet; const pTapLayerIdx: array of integer;
+      pWeight: TNeuralFloat; const pMean, pStd: array of TNeuralFloat;
+      pPixelScale: TNeuralFloat = 64/255; pPixelOffset: TNeuralFloat = 128/255);
+    destructor Destroy(); override;
+    procedure AddToOutputError(pInput, pExpectedOutput, pFoundOutput,
+      pOutputError: TNNetVolume; ThreadId: integer);
+    procedure ResetLossStats();
+    // Mean unweighted perceptual loss over the calls since ResetLossStats.
+    function AverageLoss(): TNeuralFloat;
+    property VGG: TNNet read FVGG;
+    property Weight: TNeuralFloat read FWeight write FWeight;
+  end;
 
 // ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE DECODER IMPORT (diffusers AutoencoderKL DECODER only,
@@ -75167,7 +75206,7 @@ var
   Obj: TJSONObject;
   LabelObj, ArrData: TJSONData;
   Arr: TJSONArray;
-  i: integer;
+  i, ConfigDepth: integer;
 begin
   if not FileExists(FileName) then
     ImportError('VGG import: config file not found: ' + FileName);
@@ -75186,23 +75225,20 @@ begin
       ImportError('VGG import: config "' + FileName +
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
-    Result.ModelType := Obj.Get('model_type', 'vgg');
-    Result.Depth := Obj.Get('depth', 16);
+    ConfigDepth := Obj.Get('depth', 16);
     // Canonical conv counts + widths keyed by depth; overridable below.
-    case Result.Depth of
-      16: for i := 0 to 4 do Result.StageConvs[i] := cVGG16StageConvs[i];
-      19: for i := 0 to 4 do Result.StageConvs[i] := cVGG19StageConvs[i];
-    else
-      // Unknown depth is allowed only if stage_convs is supplied explicitly.
+    // Unknown depth is allowed only if stage_convs is supplied explicitly.
+    if (ConfigDepth <> 16) and (ConfigDepth <> 19) then
+    begin
       if Obj.Find('stage_convs') = nil then
-        ImportError('VGG import: unsupported depth ' + IntToStr(Result.Depth) +
+        ImportError('VGG import: unsupported depth ' + IntToStr(ConfigDepth) +
           ' - only vgg16 / vgg19 are supported (supply "stage_convs" to ' +
           'override).');
-    end;
-    Result.StageWidths[0] := 64;  Result.StageWidths[1] := 128;
-    Result.StageWidths[2] := 256; Result.StageWidths[3] := 512;
-    Result.StageWidths[4] := 512;
-    Result.FCHidden[0] := 4096;   Result.FCHidden[1] := 4096;
+      Result := DefaultVGGConfig(16);
+    end
+    else Result := DefaultVGGConfig(ConfigDepth);
+    Result.Depth := ConfigDepth;
+    Result.ModelType := Obj.Get('model_type', 'vgg');
     // pico-fixture overrides.
     ArrData := Obj.Find('stage_convs');
     if (ArrData <> nil) and (ArrData is TJSONArray) then
@@ -75257,6 +75293,31 @@ begin
     Root.Free;
     JsonText.Free;
   end;
+end;
+
+function DefaultVGGConfig(Depth: integer): TVGGConfig;
+var
+  i: integer;
+begin
+  case Depth of
+    16: for i := 0 to 4 do Result.StageConvs[i] := cVGG16StageConvs[i];
+    19: for i := 0 to 4 do Result.StageConvs[i] := cVGG19StageConvs[i];
+  else
+    ImportError('VGG import: unsupported depth ' + IntToStr(Depth) +
+      ' - only vgg16 / vgg19 have a canonical config.');
+  end;
+  Result.Depth := Depth;
+  Result.ModelType := 'vgg';
+  Result.StageWidths[0] := 64;  Result.StageWidths[1] := 128;
+  Result.StageWidths[2] := 256; Result.StageWidths[3] := 512;
+  Result.StageWidths[4] := 512;
+  Result.FCHidden[0] := 4096;   Result.FCHidden[1] := 4096;
+  Result.BatchNorm := false;
+  Result.AdaptivePool := 7;
+  Result.ImageSize := 224;
+  Result.NumChannels := 3;
+  Result.NumLabels := 1000;
+  Result.FeatureTapStage := 0;
 end;
 
 function VGGConfigToString(const Config: TVGGConfig): string;
@@ -75719,6 +75780,101 @@ begin
     for Stage := 0 to 4 do
       if TargetFeat[Stage] <> nil then TargetFeat[Stage].Free;
   end;
+end;
+
+// Coded by Claude (AI).
+constructor TNNetPerceptualLoss.Create(pVGG: TNNet;
+  const pTapLayerIdx: array of integer; pWeight: TNeuralFloat;
+  const pMean, pStd: array of TNeuralFloat;
+  pPixelScale: TNeuralFloat; pPixelOffset: TNeuralFloat);
+var
+  Stage, Channel: integer;
+begin
+  inherited Create();
+  if (Length(pMean) < 3) or (Length(pStd) < 3) then
+    ImportError('Perceptual loss: Mean and Std need 3 (RGB) entries.');
+  FVGG := pVGG;
+  // An error-only build does not collect the input error by itself; the
+  // pixel gradient is read from it.
+  if FVGG.Layers[0] is TNNetInput then
+  begin
+    TNNetInput(FVGG.Layers[0]).EnableErrorCollection();
+    FVGG.RefreshPrevLayerErrorCaches();
+  end;
+  for Stage := 0 to 4 do
+    if Stage <= High(pTapLayerIdx) then FTapLayerIdx[Stage] := pTapLayerIdx[Stage]
+    else FTapLayerIdx[Stage] := -1;
+  FWeight := pWeight;
+  for Channel := 0 to 2 do
+  begin
+    FNormScale[Channel] := pPixelScale / pStd[Channel];
+    FNormOffset[Channel] := (pPixelOffset - pMean[Channel]) / pStd[Channel];
+  end;
+  FVGGGen := TNNetVolume.Create();
+  FVGGTarget := TNNetVolume.Create();
+  FVGGGrad := TNNetVolume.Create();
+  NeuralInitCriticalSection(FLock);
+  ResetLossStats();
+end;
+
+destructor TNNetPerceptualLoss.Destroy();
+begin
+  NeuralDoneCriticalSection(FLock);
+  FVGGGrad.Free;
+  FVGGTarget.Free;
+  FVGGGen.Free;
+  FVGG.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetPerceptualLoss.MapToVGGInput(V: TNNetVolume);
+var
+  Channel: integer;
+begin
+  for Channel := 0 to 2 do
+  begin
+    V.MulAtDepth(Channel, FNormScale[Channel]);
+    V.AddAtDepth(Channel, FNormOffset[Channel]);
+  end;
+end;
+
+procedure TNNetPerceptualLoss.AddToOutputError(pInput, pExpectedOutput,
+  pFoundOutput, pOutputError: TNNetVolume; ThreadId: integer);
+var
+  Channel: integer;
+  Loss: TNeuralFloat;
+begin
+  if pFoundOutput.Depth <> 3 then
+    ImportError('Perceptual loss: the net output must have 3 (RGB) channels, ' +
+      'got ' + IntToStr(pFoundOutput.Depth) + '.');
+  EnterCriticalSection(FLock);
+  try
+    FVGGGen.Copy(pFoundOutput);
+    MapToVGGInput(FVGGGen);
+    FVGGTarget.Copy(pExpectedOutput);
+    MapToVGGInput(FVGGTarget);
+    Loss := ComputePerceptualLossAndGradient(FVGG, FTapLayerIdx, FVGGGen,
+      FVGGTarget, FVGGGrad);
+    for Channel := 0 to 2 do
+      FVGGGrad.MulAtDepth(Channel, FWeight * FNormScale[Channel]);
+    pOutputError.Add(FVGGGrad);
+    FLossSum := FLossSum + Loss;
+    Inc(FLossCount);
+  finally
+    LeaveCriticalSection(FLock);
+  end;
+end;
+
+procedure TNNetPerceptualLoss.ResetLossStats();
+begin
+  FLossSum := 0;
+  FLossCount := 0;
+end;
+
+function TNNetPerceptualLoss.AverageLoss(): TNeuralFloat;
+begin
+  if FLossCount > 0 then Result := FLossSum / FLossCount
+  else Result := 0;
 end;
 
 // ===========================================================================

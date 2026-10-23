@@ -22,7 +22,7 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, testutils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
-  neuralg2p,
+  neuralg2p, neuralfit,
   neuralchatengine, neuralchat, neuralkokorosession, neuraldecisionheads,
   neuraldecode, neuraldiffusion, neuralthread, neuralimageresize;
 
@@ -1363,6 +1363,7 @@ type
     procedure TestLPIPSDistanceParity;
     procedure TestPerceptualLossGradientCheck;
     procedure TestPerceptualLossSelfZero;
+    procedure TestPerceptualLossTrainingHook;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestTiledVaeDecodeParity;
@@ -45580,6 +45581,138 @@ begin
     NN.Free;
     X.Free;
     Grad.Free;
+  end;
+end;
+
+// TNNetPerceptualLoss as a TNeuralFit OutputErrorFn over the pico VGG fixture:
+// the added error is Weight * d(perceptual)/d(output) (central differences,
+// through the pixel->ImageNet mapping), and a tiny 2x pixel-shuffle SR net
+// trained on pixel MSE + perceptual lowers that combined loss.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestPerceptualLossTrainingHook;
+const
+  cMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  cStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+  cWeight = 0.5;
+  cPairCount = 4;
+var
+  Config: TVGGConfig;
+  Tap: array[0..4] of integer;
+  VGG, SR: TNNet;
+  Perceptual: TNNetPerceptualLoss;
+  Pairs: TNNetVolumePairList;
+  Pair: TNNetVolumePair;
+  Fit: TNeuralFit;
+  Found, FoundPert, Err, ErrPert: TNNetVolume;
+  PairIdx, X, Y, D, ProbeIdx, Probe: integer;
+  LossBefore, LossAfter, LossPlus, LossMinus, NumGrad, AnaGrad: TNeuralFloat;
+
+  function PerceptualAt(AFound, ATarget: TNNetVolume): TNeuralFloat;
+  begin
+    Perceptual.ResetLossStats();
+    ErrPert.ReSize(AFound);
+    ErrPert.Fill(0);
+    Perceptual.AddToOutputError(nil, ATarget, AFound, ErrPert, 0);
+    Result := Perceptual.AverageLoss();
+  end;
+
+  function CombinedLoss(): TNeuralFloat;
+  var
+    LossPairIdx: integer;
+  begin
+    Result := 0;
+    for LossPairIdx := 0 to cPairCount - 1 do
+    begin
+      SR.Compute(Pairs[LossPairIdx].I);
+      SR.GetOutput(Found);
+      Result := Result + 0.5 * Found.GetDistanceSqr(Pairs[LossPairIdx].O) +
+        cWeight * PerceptualAt(Found, Pairs[LossPairIdx].O);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Config := ReadVGGConfigFromJSONFile(FixturePath('tiny_vgg16_config.json'));
+  Config.FeatureTapStage := 2;
+  Config.ImageSize := 8;
+  VGG := BuildVGGFromSafeTensorsEx(FixturePath('tiny_vgg16.safetensors'),
+    Config, Tap, {pTrainable=}false);
+  VGG.SetErrorOnlyBackprop(true);
+  Perceptual := TNNetPerceptualLoss.Create(VGG, Tap, cWeight, cMean, cStd);
+  SR := TNNet.Create();
+  Pairs := TNNetVolumePairList.Create();
+  Found := TNNetVolume.Create();
+  FoundPert := TNNetVolume.Create();
+  Err := TNNetVolume.Create();
+  ErrPert := TNNetVolume.Create();
+  Fit := nil;
+  try
+    SR.AddLayer(TNNetInput.Create(4, 4, 3));
+    SR.AddLayer(TNNetConvolutionLinear.Create(12, 3, 1, 1, 0));
+    SR.AddLayer(TNNetPixelShuffle.Create(2));
+    for PairIdx := 0 to cPairCount - 1 do
+    begin
+      Pair := TNNetVolumePair.Create();
+      Pair.I.ReSize(4, 4, 3);
+      Pair.O.ReSize(8, 8, 3);
+      for X := 0 to 3 do
+        for Y := 0 to 3 do
+          for D := 0 to 2 do
+            Pair.I[X, Y, D] := Sin(PairIdx * 1.3 + X * 0.9 + Y * 0.5 + D * 0.7);
+      for X := 0 to 7 do
+        for Y := 0 to 7 do
+          for D := 0 to 2 do
+            Pair.O[X, Y, D] := Pair.I[X div 2, Y div 2, D];
+      Pairs.Add(Pair);
+    end;
+
+    // Gradient: the hook adds Weight * dP/dFound on top of the incoming error.
+    SR.Compute(Pairs[0].I);
+    SR.GetOutput(Found);
+    Err.ReSize(Found);
+    Err.Fill(0);
+    Perceptual.AddToOutputError(nil, Pairs[0].O, Found, Err, 0);
+    for ProbeIdx := 0 to 4 do
+    begin
+      Probe := (ProbeIdx * 41 + 3) mod Found.Size;
+      FoundPert.Copy(Found);
+      FoundPert.FData[Probe] := Found.FData[Probe] + 1e-3;
+      LossPlus := PerceptualAt(FoundPert, Pairs[0].O);
+      FoundPert.FData[Probe] := Found.FData[Probe] - 1e-3;
+      LossMinus := PerceptualAt(FoundPert, Pairs[0].O);
+      NumGrad := cWeight * (LossPlus - LossMinus) / 2e-3;
+      AnaGrad := Err.FData[Probe];
+      AssertTrue('hook gradient at ' + IntToStr(Probe) + ' num=' +
+        FloatToStr(NumGrad) + ' ana=' + FloatToStr(AnaGrad),
+        Abs(NumGrad - AnaGrad) <= 1e-3 + 0.02 * Abs(NumGrad));
+    end;
+
+    LossBefore := CombinedLoss();
+    Fit := TNeuralFit.Create;
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.002;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.L2Decay := 0;
+    Fit.LoadBestAtEnd := False;
+    Fit.OutputErrorFn := {$IFDEF FPC}@{$ENDIF}Perceptual.AddToOutputError;
+    Fit.Fit(SR, Pairs, nil, nil, {BatchSize=}cPairCount, {Epochs=}20);
+    LossAfter := CombinedLoss();
+    WriteLn('  [PerceptualTraining] combined loss ', LossBefore:0:5, ' -> ',
+      LossAfter:0:5);
+    AssertTrue('combined loss must fall: ' + FloatToStr(LossBefore) + ' -> ' +
+      FloatToStr(LossAfter), LossAfter < 0.5 * LossBefore);
+  finally
+    Fit.Free;
+    ErrPert.Free;
+    Err.Free;
+    FoundPert.Free;
+    Found.Free;
+    Pairs.Free;
+    SR.Free;
+    Perceptual.Free;
   end;
 end;
 

@@ -357,6 +357,11 @@ type
 
   TNeuralSaveBest = (SaveBestAccuracy, SaveBestLoss);
 
+  // Training-step loss hook: pOutputError arrives holding the default error
+  // pFoundOutput - pExpectedOutput (dLoss/dOutput of 0.5*SSE); edit it in place.
+  TNNetOutputErrorProc = procedure(pInput, pExpectedOutput, pFoundOutput,
+    pOutputError: TNNetVolume; ThreadId: integer) of object;
+
   /// This is a base class. Do not use it directly.
   TNeuralFitBase = class(TMObject)
     protected
@@ -405,6 +410,7 @@ type
       FNaNGuard: boolean;
       FTargetAccuracy: single;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
+      FOutputErrorFn: TNNetOutputErrorProc;
       FRunning, FShouldQuit: boolean;
       FSaveBest: TNeuralSaveBest;
       FTrainingAccuracy, FValidationAccuracy, FTestAccuracy: TNeuralFloat;
@@ -466,6 +472,10 @@ type
       // pass and must not run per sample - see the tripwire at the training
       // loops' call sites.
       function NaNGuardTripped(pNN: TNNet): boolean;
+      // One training sample's backward pass: Backpropagate(pExpected), or with
+      // OutputErrorFn the hook-edited error held in the pOutputError scratch.
+      procedure BackpropagateSample(pNN: TNNet; pInput, pExpected, pFound,
+        pOutputError: TNNetVolume; ThreadId: integer);
 
       // Merges every worker's deltas into FThreadNN[0] over a binary tree, so
       // the reduction costs log2(FThreadNum) sequential full-parameter adds
@@ -533,6 +543,9 @@ type
       property OnAfterStep: TNotifyEvent read FOnAfterStep write FOnAfterStep;
       property OnAfterEpoch: TNotifyEvent read FOnAfterEpoch write FOnAfterEpoch;
       property OnStart: TNotifyEvent read FOnStart write FOnStart;
+      // Custom training loss: when assigned, each training sample backpropagates
+      // the last-layer error this hook leaves in pOutputError. nil = default.
+      property OutputErrorFn: TNNetOutputErrorProc read FOutputErrorFn write FOutputErrorFn;
       property Optimizer: TNeuralOptimizer read FOptimizer write SetOptimizer;
       property SaveBest: TNeuralSaveBest read FSaveBest write FSaveBest;
       // Optional learning-rate scheduler (neuralscheduler.pas). Defaults to nil.
@@ -1860,7 +1873,7 @@ var
   LocalNN: TNNet;
   vInput: TNNetVolume;
   vInputCopy: TNNetVolume;
-  pOutput, vOutput: TNNetVolume;
+  pOutput, vOutput, vOutputError: TNNetVolume;
   I: integer;
   CurrentLoss, CurrentError: TNeuralFloat;
   LocalHit, LocalMiss: integer;
@@ -1878,6 +1891,7 @@ begin
   pOutput    := TNNetVolume.Create();
   vOutput    := TNNetVolume.Create();
   vInputCopy := TNNetVolume.Create();
+  vOutputError := TNNetVolume.Create();
 
   LocalHit := 0;
   LocalMiss := 0;
@@ -1977,7 +1991,7 @@ begin
       )
       then
     begin
-      LocalNN.Backpropagate( vOutput );
+      BackpropagateSample(LocalNN, vInput, vOutput, pOutput, vOutputError, Index);
     end;
 
     // Per-sample tripwire. A non-finite activation or gradient reaches the
@@ -2051,6 +2065,7 @@ begin
   vInputCopy.Free;
   vInput.Free;
   vOutput.Free;
+  vOutputError.Free;
   pOutput.Free;
 end;
 
@@ -2696,6 +2711,7 @@ begin
   FCustomLearningRateScheduleFn := nil;
   FCustomLearningRateScheduleObjFn := nil;
   FOnAfterStep := nil;
+  FOutputErrorFn := nil;
   FOnAfterEpoch := nil;
   FOnStart := nil;
   FTrainingAccuracy := 0;
@@ -2821,6 +2837,19 @@ begin
     Inc(Level);
     Stride := Stride * 2;
   end;
+end;
+
+procedure TNeuralFitBase.BackpropagateSample(pNN: TNNet; pInput, pExpected,
+  pFound, pOutputError: TNNetVolume; ThreadId: integer);
+begin
+  if Assigned(FOutputErrorFn) then
+  begin
+    pOutputError.Copy(pFound);
+    pOutputError.Sub(pExpected);
+    FOutputErrorFn(pInput, pExpected, pFound, pOutputError, ThreadId);
+    pNN.BackpropagateFromOutputError(pOutputError);
+  end
+  else pNN.Backpropagate(pExpected);
 end;
 
 function TNeuralFitBase.NaNGuardTripped(pNN: TNNet): boolean;
@@ -3656,7 +3685,7 @@ var
   LocalNN: TNNet;
   ImgInput, ImgInputCp: TNNetVolume;
   LocalImg, LocalPartner: TNNetVolume;
-  pOutput, vOutput: TNNetVolume;
+  pOutput, vOutput, vOutputError: TNNetVolume;
   I, ImgIdx, PartnerIdx, PartnerTag: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
   LocalHit, LocalMiss: integer;
@@ -3672,6 +3701,7 @@ begin
   ImgInputCp := TNNetVolume.Create();
   pOutput := TNNetVolume.Create(FNumClasses,1,1);
   vOutput := TNNetVolume.Create(FNumClasses,1,1);
+  vOutputError := TNNetVolume.Create(FNumClasses,1,1);
 
   LocalHit := 0;
   LocalMiss := 0;
@@ -3853,7 +3883,7 @@ begin
         (CurrentError > FCurrentTrainingError*FMinBackpropagationErrorProportion)
       ) then
     begin
-      LocalNN.Backpropagate(vOutput);
+      BackpropagateSample(LocalNN, ImgInput, vOutput, pOutput, vOutputError, Index);
     end
     else
     begin
@@ -3924,6 +3954,7 @@ begin
   ImgInputCp.Free;
   ImgInput.Free;
   vOutput.Free;
+  vOutputError.Free;
   pOutput.Free;
 end;
 

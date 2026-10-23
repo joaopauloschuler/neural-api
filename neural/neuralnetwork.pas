@@ -22676,6 +22676,9 @@ type
       // for the previously called "compute" forward pass method.
       procedure Backpropagate(pOutput: array of TNeuralFloat); overload;
       procedure BackpropagateForIdx(pOutput: TNNetVolume; const aIdx: array of integer);
+      // Backward pass from a caller-computed last-layer error (dLoss/dOutput,
+      // same size as the output) instead of Output - pOutput: custom losses.
+      procedure BackpropagateFromOutputError(pOutputError: TNNetVolume);
       procedure BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
       // Returns the output.
       procedure GetOutput(pOutput: TNNetVolume);
@@ -25018,6 +25021,9 @@ type
       // the flag is enabled; it is OFF by default.
       procedure CheckForwardAnomaly(LayerCnt: integer);
       procedure CheckBackwardAnomaly();
+      // Seeds the last layer from pTarget (an expected output, or with
+      // IsOutputError the error itself) and runs the whole backward pass.
+      procedure BackpropagateFromLastLayer(pTarget: TNNetVolume; IsOutputError: boolean);
       // Runs FromLayerIdx..EndLayerIdx once the input layer holds the input,
       // then downloads the last layer or drains the queue.
       procedure ComputeFromFilledInput(FromLayerIdx: integer; Parallel: boolean;
@@ -146540,9 +146546,21 @@ begin
 end;
 
 procedure TNNet.Backpropagate(pOutput: TNNetVolume);
+begin
+  BackpropagateFromLastLayer(pOutput, false);
+end;
+
+procedure TNNet.BackpropagateFromOutputError(pOutputError: TNNetVolume);
+begin
+  BackpropagateFromLastLayer(pOutputError, true);
+end;
+
+procedure TNNet.BackpropagateFromLastLayer(pTarget: TNNetVolume;
+  IsOutputError: boolean);
 var
   LastLayer: integer;
   StartTime: double;
+  LastLayerError: TNNetVolume;
 begin
   StartTime := Now();
   if FLayers.Count > 1 then
@@ -146550,7 +146568,18 @@ begin
     ResetBackpropCallCurrCnt();
     LastLayer := GetLastLayerIdx();
     if (FLayers[LastLayer].FDepartingBranchesCnt = 0) then FLayers[LastLayer].IncDepartingBranchesCnt();
-    FLayers[LastLayer].ComputeOutputErrorWith(pOutput);
+    if IsOutputError then
+    begin
+      LastLayerError := FLayers[LastLayer].OutputError;
+      if (LastLayerError = nil) or (LastLayerError.Size <> pTarget.Size) then
+      begin
+        FErrorProc('BackpropagateFromOutputError - output error size ' +
+          IntToStr(pTarget.Size) + ' differs from the last layer''s.');
+        exit;
+      end;
+      LastLayerError.CopyNoChecks(pTarget);
+    end
+    else FLayers[LastLayer].ComputeOutputErrorWith(pTarget);
     FLayers[LastLayer].Backpropagate();
     ComputeL2Decay();
     if FDetectAnomaly then CheckBackwardAnomaly();

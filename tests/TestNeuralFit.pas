@@ -64,6 +64,15 @@ type
     procedure AfterStep(Sender: TObject);
   end;
 
+  // OutputErrorFn probe: multiplies the default training error by Factor.
+  TOutputErrorScaler = class
+  public
+    Factor: TNeuralFloat;
+    CallCount: integer;
+    procedure ScaleError(pInput, pExpectedOutput, pFoundOutput,
+      pOutputError: TNNetVolume; ThreadId: integer);
+  end;
+
   TTestNeuralFit = class(TTestCase)
   private
     function RunAccumFit(MicroBatch, AccumSteps, Epochs: integer;
@@ -144,9 +153,19 @@ type
     procedure TestMixedSoftTargetSameTag;
     procedure TestMixupImageFitConverges;
     procedure TestCutMixImageFitConverges;
+
+    // Custom output-error hook (OutputErrorFn)
+    procedure TestOutputErrorFnDrivesTheStep;
   end;
 
 implementation
+
+procedure TOutputErrorScaler.ScaleError(pInput, pExpectedOutput, pFoundOutput,
+  pOutputError: TNNetVolume; ThreadId: integer);
+begin
+  pOutputError.Mul(Factor);
+  Inc(CallCount);
+end;
 
 constructor TNaNGuardProbe.Create;
 begin
@@ -1944,6 +1963,87 @@ begin
   Acc := RunImageFitConverges(bamCutMix);
   AssertTrue('CutMix image-fit must reach high accuracy (' + FloatToStr(Acc) + ')',
     Acc >= 0.9);
+end;
+
+// Trains the BuildFitPairs net for one epoch (one batch of 4) with an optional
+// OutputErrorFn hook and returns the trained last-layer weights.
+function RunOutputErrorFit(LearningRate: TNeuralFloat;
+  Scaler: TOutputErrorScaler; out InitialW: TNNetVolume): TNNetVolume;
+var
+  Net: TNNet;
+  Fit: TNeuralFit;
+  Pairs: TNNetVolumePairList;
+begin
+  RandSeed := 424242;
+  Net := TNNet.Create();
+  Net.AddLayer([
+    TNNetInput.Create(2),
+    TNNetFullConnectLinear.Create(3),
+    TNNetFullConnectLinear.Create(1)
+  ]);
+  InitialW := TNNetVolume.Create();
+  InitialW.Copy(Net.GetLastLayer.Neurons[0].Weights);
+  Pairs := BuildFitPairs();
+  RandSeed := 100;
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := LearningRate;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.Inertia := 0.0;
+    Fit.L2Decay := 0;
+    Fit.ClipNorm := 0;
+    Fit.ClipDelta := 0;
+    Fit.MinBackpropagationError := 0;
+    Fit.MinBackpropagationErrorProportion := 0;
+    Fit.LoadBestAtEnd := False;
+    if Assigned(Scaler) then
+      Fit.OutputErrorFn := {$IFDEF FPC}@{$ENDIF}Scaler.ScaleError;
+    Fit.Fit(Net, Pairs, nil, nil, {BatchSize=}4, {Epochs=}1);
+    Result := TNNetVolume.Create();
+    Result.Copy(Net.GetLastLayer.Neurons[0].Weights);
+  finally
+    Fit.Free;
+    Pairs.Free;
+    Net.Free;
+  end;
+end;
+
+// Plain SGD deltas are linear in the output error and in the learning rate, so
+// a hook that doubles the error at LR must land exactly on the plain LR*2 step.
+procedure TTestNeuralFit.TestOutputErrorFnDrivesTheStep;
+var
+  Scaler: TOutputErrorScaler;
+  WHook, WRef, WInitHook, WInitRef: TNNetVolume;
+  I: integer;
+begin
+  Scaler := TOutputErrorScaler.Create;
+  WHook := nil; WRef := nil; WInitHook := nil; WInitRef := nil;
+  try
+    Scaler.Factor := 2.0;
+    Scaler.CallCount := 0;
+    WHook := RunOutputErrorFit(0.01, Scaler, WInitHook);
+    WRef := RunOutputErrorFit(0.02, nil, WInitRef);
+    // The (0,0) sample has zero error at init and is skipped by the
+    // MinBackpropagationError gate, so up to one call per other sample.
+    AssertTrue('the hook ran: ' + IntToStr(Scaler.CallCount),
+      Scaler.CallCount > 0);
+    AssertEquals('weight vector sizes', WRef.Size, WHook.Size);
+    AssertTrue('the step moved the weights',
+      WRef.GetDistanceSqr(WInitRef) > 1e-10);
+    for I := 0 to WRef.Size - 1 do
+      AssertEquals('hooked step = reference step at weight ' + IntToStr(I),
+        WRef.FData[I], WHook.FData[I], 1e-6);
+  finally
+    Scaler.Free;
+    WHook.Free;
+    WRef.Free;
+    WInitHook.Free;
+    WInitRef.Free;
+  end;
 end;
 
 initialization

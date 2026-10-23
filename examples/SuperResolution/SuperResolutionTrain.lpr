@@ -1,5 +1,6 @@
 ///This example trains a super resolution neural network with
-//the TinyImageNet 200 dataset: https://tiny-imagenet.herokuapp.com/ .
+//the CIFAR-10 dataset. Optional: --perceptual-vgg FILE [--perceptual-weight W]
+//adds a VGG perceptual loss (Johnson et al. 2016) to the pixel loss.
 program SuperResolutionTrain;
 (*
  Coded by Joao Paulo Schwarz Schuler.
@@ -9,7 +10,11 @@ program SuperResolutionTrain;
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, CustApp, neuralnetwork, neuralvolume, Math, neuraldatasets,
-  neuralfit, usuperresolutionexample;
+  neuralfit, neuralpretrained, usuperresolutionexample;
+
+const
+  // relu1_2 + relu2_2: the low-level VGG features Johnson et al. use for SR.
+  csPerceptualTapStage = 2;
 
 type
 
@@ -19,7 +24,10 @@ type
   protected
     ImgTrainingVolumes, ImgValidationVolumes, ImgTestVolumes: TNNetVolumeList;
     ImgTrainingSmall, ImgValidationSmall, ImgTestSmall: TNNetVolumeList;
+    FPerceptual: TNNetPerceptualLoss;
     procedure DoRun; override;
+    function CreatePerceptualLoss(ImageSize: integer): TNNetPerceptualLoss;
+    procedure ReportPerceptualLoss(Sender: TObject);
   public
     procedure GetTrainingPair(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
     procedure GetValidationPair(Idx: integer; ThreadId: integer; pInput, pOutput: TNNetVolume);
@@ -66,11 +74,21 @@ type
     NeuralFit.EnableBipolar99HitComparison();
     NeuralFit.AvgWeightEpochCount := 1;
     //NeuralFit.MaxThreadNum := 16;
+    FPerceptual := nil;
+    if HasOption('perceptual-vgg') then
+    begin
+      FPerceptual := CreatePerceptualLoss(32);
+      NeuralFit.OutputErrorFn := @FPerceptual.AddToOutputError;
+      NeuralFit.OnAfterEpoch := @ReportPerceptualLoss;
+    end
+    else if HasOption('perceptual-weight') then
+      WriteLn('--perceptual-weight is ignored without --perceptual-vgg.');
     NeuralFit.FitLoading(NN,
       ImgTrainingVolumes.Count, ImgValidationVolumes.Count, ImgTestVolumes.Count,
       {batchsize=}64, {epochs=}50,
       @GetTrainingPair, @GetValidationPair, @GetTestPair);
     NeuralFit.Free;
+    FPerceptual.Free;
 
     NN.Free;
     NNMaxPool.Free;
@@ -81,6 +99,40 @@ type
     ImgValidationSmall.Free;
     ImgTestSmall.Free;
     Terminate;
+  end;
+
+  function TTestCNNAlgo.CreatePerceptualLoss(ImageSize: integer): TNNetPerceptualLoss;
+  var
+    VGGFile, ConfigFile: string;
+    Config: TVGGConfig;
+    TapIdx: array[0..4] of integer;
+    VGG: TNNet;
+    Weight: TNeuralFloat;
+  begin
+    VGGFile := GetOptionValue('perceptual-vgg');
+    Weight := 1.0;
+    if HasOption('perceptual-weight') then
+      Weight := StrToFloat(GetOptionValue('perceptual-weight'));
+    // torchvision ships no config.json: canonical VGG-16 unless one sits beside.
+    ConfigFile := ExtractFilePath(VGGFile) + 'config.json';
+    if FileExists(ConfigFile) then
+      Config := ReadVGGConfigFromJSONFile(ConfigFile)
+    else
+      Config := DefaultVGGConfig(16);
+    Config.FeatureTapStage := csPerceptualTapStage;
+    Config.ImageSize := ImageSize;
+    WriteLn('Loading perceptual VGG from ', VGGFile, ' (', VGGConfigToString(Config), ')');
+    VGG := BuildVGGFromSafeTensorsEx(VGGFile, Config, TapIdx, {pTrainable=}false);
+    VGG.SetErrorOnlyBackprop(true);
+    WriteLn('Training loss: pixel MSE + ', Weight:0:4, ' * perceptual (relu1_2 + relu2_2).');
+    Result := TNNetPerceptualLoss.Create(VGG, TapIdx, Weight,
+      csImageNetMean, csImageNetStd);
+  end;
+
+  procedure TTestCNNAlgo.ReportPerceptualLoss(Sender: TObject);
+  begin
+    WriteLn('Mean perceptual loss over the epoch: ', FPerceptual.AverageLoss():0:6);
+    FPerceptual.ResetLossStats();
   end;
 
   procedure TTestCNNAlgo.GetTrainingPair(Idx: integer; ThreadId: integer;
