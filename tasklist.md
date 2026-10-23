@@ -2157,10 +2157,7 @@ rather than acted on.
             magic-leap-community/superpoint (check its preprocessor_config
             do_grayscale and the tensor names); the torchvision-backend
             processor (uint8 grayscale before an antialiased resize) is not
-            matched, only the PIL backend. (Done: the
-            post_process_keypoint_detection rescale to the original image size,
-            `TSuperPointKeypoints.ImageX` / `ImageY`, used by
-            examples/KeypointMatching.)
+            matched, only the PIL backend.
 
 - [ ] CoTracker3 point tracking importer + examples/PointTracking (Karaev et al.
       2024, *CoTracker3: Simpler and Better Point Tracking by Pseudo-Labelling
@@ -2207,10 +2204,10 @@ rather than acted on.
       mark both READMEs supported.
       `DrawOpenPoseBodies` and `tools/make_openpose_draw_oracle.py` were
       checked line by line against the controlnet_aux 0.0.10 sdist (equal to
-      GitHub master) on 2026-10-23: dwpose/wholebody.py:100-116 (neck and
-      reorder), dwpose/__init__.py:54-65 (/W, /H, score > 0.3) and
-      dwpose/util.py:67-108 (draw_bodypose) all match; nothing changed.
-      OpenposeDetector (open_pose/__init__.py:56-58, open_pose/util.py:69-123)
+      GitHub master) on 2026-10-23: dwpose/wholebody.py (neck and
+      reorder), dwpose/__init__.py (/W, /H, score > 0.3) and
+      dwpose/util.py (draw_bodypose) all match; nothing changed.
+      OpenposeDetector (open_pose/__init__.py, open_pose/util.py)
       draws differently: limbs then dots PER PERSON, with color * 0.6 at fill
       time, so a later person's limbs cover an earlier person's dots. Compare
       the `--pose-out` image against DWpose output, not OpenposeDetector output.
@@ -2222,52 +2219,6 @@ rather than acted on.
             resize-draw-resize route as an option of `DrawOpenPoseBodies`'
             callers (ControlNetCanny already resizes to the generation size).
 
-- [X] Multi-object VIDEO tracking: exact assignment + ByteTrack (Zhang et al.
-      ECCV 2022, arXiv:2110.06864) over the landed YOLOv8 detector, plus
-      examples/ObjectTracking (.lpr + .lpi + README.md). Today the library
-      detects per image only (`BuildYolo`, `DecodeYoloDetections`,
-      examples/YoloDetect) and nothing carries identities across frames.
-      - [X] `NeuralLinearSumAssignment` in neuralvolume.pas next to
-            `NeuralBoxIoU` / `NeuralBoxGIoU`: rectangular min-cost assignment
-            (shortest augmenting path, the algorithm of
-            scipy.optimize.linear_sum_assignment; Rows > Cols solved through a
-            transposed stride view). Caller-owned `TNeuralAssignmentWork`
-            grows on demand; an overload allocates its own. Tested in
-            `TestNeuralLinearSumAssignment` against brute force (every N x M
-            up to 6 x 6, real and tied costs, 0-size, 1x1, the scipy docs 3x3).
-      - [X] DETR set-criterion matcher (`TNNetDETRSetPredictionLoss`) solves
-            the cost matrix exactly by default; `GreedyMatching` (saved in
-            FStruct[1]) keeps the greedy path. `TestDETRSetPredictionLossExactVsGreedy`
-            pins a 2x2 case where the two differ (L1 0.4 vs 0.6).
-      - [X] `TByteTracker` in neuralpretrained.pas next to the YOLO helpers:
-            port of the official ifzhang byte_tracker.py BYTETracker (mot20 =
-            False, so fuse_score in the first and unconfirmed stages),
-            `ByteTrackKalmanInitiate/Predict/Update` (float64 xyah filter),
-            `Update(TYoloDetectionArray): TByteTrackedBoxArray` (track id,
-            class id, score, Kalman box), `Reset`, per-instance ids from 1.
-            lapjv cost_limit emulated by `NeuralLinearSumAssignment` on Rows x
-            (Cols + Rows) with dummy columns at the limit; ties among equal
-            optimal assignments may resolve differently and a pair at exactly
-            the limit is rejected. IoU keeps cython_bbox's +1 pixel. Kept
-            official quirks: score == track_thresh is dropped, unconfirmed
-            births spend an id, a timed-out lost track stays matchable one
-            more frame. Deviation: boxes with y2 <= y1 are skipped. Tested by
-            `TestByteTrackKalmanPredictUpdate`, `TestByteTrackerSyntheticSequence`,
-            `TestByteTrackerLostBufferAndReset`; no run against the Python
-            reference.
-      - [X] examples/ObjectTracking: a folder of frames (move the
-            `ListFrames` routine of examples/VideoMatting into a shared unit
-            so both examples use one copy) -> YOLO per frame -> tracker ->
-            boxes drawn with one color per id and the id as text, PPM/PNG
-            frames and `--gif` through neuralgif.pas, `--gpu`, `--int8`,
-            `--classes` filter. Mark the README "planned (coded)" until the
-            user runs a real yolov8n on a real clip.
-            Done: `ListImageFilesInFolder` in neuraldatasets.pas (VideoMatting
-            uses it too; now also lists .ppm), covered by
-            `TestListImageFilesInFolder`. Boxes drawn with `DrawLineCV2`, the
-            id with a 3x5 digit font local to the example (no text renderer
-            existed). No-argument run = pico fixture smoke on 4 synthetic
-            frames (ids stable across frames, PNGs + GIF written).
 - [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
