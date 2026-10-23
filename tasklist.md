@@ -2195,6 +2195,13 @@ rather than acted on.
       draws differently: limbs then dots PER PERSON, with color * 0.6 at fill
       time, so a later person's limbs cover an earlier person's dots. Compare
       the `--pose-out` image against DWpose output, not OpenposeDetector output.
+      - [ ] Draw resolution: DWpose draws at `detect_resolution` (short side
+            512, rounded to a multiple of 64) and then resizes with
+            INTER_LINEAR, so stick width 4 / dot radius 4 are relative to that
+            size. examples/PoseEstimation `--openpose-out` draws at the photo's
+            native size (thinner sticks on large photos). Add the DWpose
+            resize-draw-resize route as an option of `DrawOpenPoseBodies`'
+            callers (ControlNetCanny already resizes to the generation size).
 
 - [X] Multi-object VIDEO tracking: exact assignment + ByteTrack (Zhang et al.
       ECCV 2022, arXiv:2110.06864) over the landed YOLOv8 detector, plus
@@ -2242,6 +2249,22 @@ rather than acted on.
             id with a 3x5 digit font local to the example (no text renderer
             existed). No-argument run = pico fixture smoke on 4 synthetic
             frames (ids stable across frames, PNGs + GIF written).
+- [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
+      - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
+            box, also `--gpu` and `--int8`), then mark its README supported.
+      - [ ] `TByteTracker`: no test covers `remove_duplicate_stracks` (a
+            tracked and a lost track with IoU distance < 0.15); add one with
+            hand-derived expectations.
+      - [ ] A reusable text renderer (bitmap font into a `TNNetVolume`, e.g.
+            next to `DrawLineCV2` in neuralimageresize.pas), so labels in
+            ObjectTracking, YoloDetect and PoseEstimation share one routine;
+            then replace the 3x5 digit table local to ObjectTracking.lpr.
+      - [ ] `TNNet.PermutationAlignReport` (Git Re-Basin weight/activation
+            matching, neuralnetwork.pas) still pairs units greedily; switch it
+            to `NeuralLinearSumAssignment` (maximize similarity = minimize the
+            negated score) and keep the permutation-invariance assertion.
+      - [ ] Optional: BoT-SORT / OC-SORT style camera-motion compensation is
+            not ported; ByteTrack only.
 
 ## OpenCL forward coverage — layers still on the host
 
