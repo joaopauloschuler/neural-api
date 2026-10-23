@@ -24090,14 +24090,13 @@ type
       //   2. Walk them front-to-back. A HIDDEN trainable layer is one that is
       //      followed by a later trainable layer; for each such layer L find the
       //      permutation P_L of B's output neurons that best aligns B's units to
-      //      A's. Two scoring modes share one greedy solver: WEIGHT matching
+      //      A's. Two scoring modes share one exact solver: WEIGHT matching
       //      maximises the per-row weight-vector cosine <row_i^A, row_{P(i)}^B>,
       //      and ACTIVATION matching correlates the two nets' per-unit
       //      activations over Samples (forward both nets once per probe, read
-      //      Layer.Output[unit]). Greedy correlation-descent (repeatedly take the
-      //      globally-best unmatched (A-unit, B-unit) pair) is used at toy width
-      //      — a Hungarian/auction solve is the principled optimum but greedy
-      //      avoids new numerical code and is near-optimal here.
+      //      Layer.Output[unit]). NeuralLinearSumAssignment maximises the total
+      //      similarity (minimises the negated score); a non-finite score is
+      //      treated as worse than any finite one.
       //   3. Apply each P_L CONSISTENTLY so the function B computes is unchanged:
       //      reorder layer L's output neurons (their weight rows AND biases) by
       //      P_L, and reorder the NEXT trainable layer's matching INPUT-weight
@@ -135981,6 +135980,7 @@ const
   cReduceFrac   = 0.90;  // post <= 90% of pre -> "partially reduced"
   cAbsTol       = 1e-6;  // absolute floor so a ~0 barrier reads collapsed
   cInvTol       = 1e-4;  // permutation-invariance bit-for-bit tolerance
+  cNonFiniteNegatedScore = 2.0;
 var
   MaxLossSamplePos: integer;
   MaxLossOutputPos: integer;
@@ -135994,6 +135994,7 @@ var
   MaxActBSamplePos: integer;
   MaxCheckSamplePos: integer;
   MaxCheckOutputPos: integer;
+  MaxNegatedScorePos: integer;
   LastLayerIdx, NumAlphaM1, TrIdxsHigh, TrIdxsHighM1, HiddenPosHigh, WidthM1: integer;
   Lines: TStringList;
   NetB: TNNet;
@@ -136011,18 +136012,15 @@ var
   InvOK, MonoOK, SelfMode, Restored, AllIdentity: boolean;
   Bar, MarkStr: string;
   Width, AWidth: integer;
-  ScoreMat: array of TNeuralFloatDynArr;      // [A-unit, B-unit]
-  SRow: TNeuralFloatDynArr;                   // bound score row
+  // row-major [A-unit * Width + B-unit] negated similarity
+  NegatedScores: array of TNeuralFloat;
+  AssignmentWork: TNeuralAssignmentWork;
   RowA, RowB: TNeuralFloatDynArr;             // bound activation rows
   ANorm, BNorm: array of TNeuralFloat;
-  UsedA, UsedB: array of boolean;
-  // per-A-unit best unmatched B unit, refreshed only when that unit is taken
-  RowBestJ: array of integer;
-  RowBestVal: array of TNeuralFloat;
   ActA, ActB: array of TNeuralFloatDynArr;    // [unit, sample] activations
   PreOut: array of array of TNeuralFloat;     // cached B outputs pre-permutation
-  bestI, bestJ, mI, mJ, SampleCount: integer;
-  bestScore, sVal, dotv: TNeuralFloat;
+  mJ, SampleCount, ScoreRowBase: integer;
+  sVal, dotv: TNeuralFloat;
   WVol: TNNetVolume;
   outV: TNNetVolume;
   pr: TNNetVolumePair;
@@ -136295,10 +136293,9 @@ begin
       WidthM1 := Width - 1;
       SetLength(Perm[HCount], Width);
 
-      // Build the WidthxWidth score matrix: score[a][b] = similarity of A-unit a
-      // to B-unit b. Higher is better; greedy picks the global best repeatedly.
-      SetLength(ScoreMat, Width);
-      for I := 0 to WidthM1 do SetLength(ScoreMat[I], Width);
+      // NegatedScores[a * Width + b] = -(cosine similarity of A-unit a to
+      // B-unit b), so the min-cost assignment is the max-similarity one.
+      SetLength(NegatedScores, Width * Width);
 
       if ScoreMode = 1 then
       begin
@@ -136349,14 +136346,14 @@ begin
         for I := 0 to WidthM1 do
         begin
           RowA := ActA[I];
-          SRow := ScoreMat[I];
+          ScoreRowBase := I * Width;
           sVal := ANorm[I];
           for J := 0 to WidthM1 do
           begin
             RowB := ActB[J];
             dotv := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@RowA[0]),
               TNeuralFloatArrPtr(@RowB[0]), SampleCount);
-            SRow[J] := dotv / (sVal * BNorm[J] + cEps);
+            NegatedScores[ScoreRowBase + J] := -dotv / (sVal * BNorm[J] + cEps);
           end;
         end;
       end
@@ -136372,75 +136369,25 @@ begin
         for I := 0 to WidthM1 do
         begin
           WVol := Layer.Neurons[I].Weights;
-          SRow := ScoreMat[I];
+          ScoreRowBase := I * Width;
           sVal := ANorm[I];
           for J := 0 to WidthM1 do
           begin
             dotv := WVol.DotProduct(LayerB.Neurons[J].Weights);
-            SRow[J] := dotv / (sVal * BNorm[J] + cEps);
+            NegatedScores[ScoreRowBase + J] := -dotv / (sVal * BNorm[J] + cEps);
           end;
         end;
       end;
 
-      // Greedy correlation-descent: repeatedly take the best unmatched pair.
-      SetLength(UsedA, Width); SetLength(UsedB, Width);
-      SetLength(RowBestJ, Width); SetLength(RowBestVal, Width);
-      for I := 0 to WidthM1 do begin UsedA[I] := false; UsedB[I] := false; Perm[HCount][I] := -1; end;
-      // Each A-unit caches its best UNMATCHED B-unit. A pick can only
-      // invalidate the rows that pointed at the B-unit it took, so the whole
-      // score matrix is rescanned once instead of once per pick. Scanning J
-      // then I with a strict '>' keeps the original lowest-(I,J) tie-break.
-      for I := 0 to WidthM1 do
-      begin
-        SRow := ScoreMat[I];
-        mJ := -1; sVal := -1e30;
-        for J := 0 to WidthM1 do
-          if SRow[J] > sVal then begin sVal := SRow[J]; mJ := J; end;
-        RowBestVal[I] := sVal; RowBestJ[I] := mJ;
-      end;
-      for mI := 0 to WidthM1 do
-      begin
-        bestScore := -1e30; bestI := -1; bestJ := -1;
-        for I := 0 to WidthM1 do
-        begin
-          if UsedA[I] then Continue;
-          if (RowBestJ[I] >= 0) and (RowBestVal[I] > bestScore) then
-          begin
-            bestScore := RowBestVal[I]; bestI := I; bestJ := RowBestJ[I];
-          end;
-        end;
-        if (bestI < 0) or (bestJ < 0) then Break;
-        UsedA[bestI] := true; UsedB[bestJ] := true;
-        for I := 0 to WidthM1 do
-        begin
-          if UsedA[I] or (RowBestJ[I] <> bestJ) then Continue;
-          SRow := ScoreMat[I];
-          mJ := -1; sVal := -1e30;
-          for J := 0 to WidthM1 do
-            if (not UsedB[J]) and (SRow[J] > sVal) then
-            begin sVal := SRow[J]; mJ := J; end;
-          RowBestVal[I] := sVal; RowBestJ[I] := mJ;
-        end;
-        // A-unit bestI is matched by B-unit bestJ: after permutation, B's
-        // output position bestI should hold B-unit bestJ. Perm maps NEW position
-        // -> OLD B-unit index.
-        Perm[HCount][bestI] := bestJ;
-      end;
-
-      // The greedy loop stops early when every remaining A-unit has no best
-      // B-unit (a whole score row of NaN, e.g. non-finite weights with the FPU
-      // exceptions masked). Perm must still be a genuine permutation — both the
-      // neuron reorder and the next layer's column compensation index by it — so
-      // pair the leftovers in ascending index order.
-      J := 0;
-      for I := 0 to WidthM1 do
-        if Perm[HCount][I] < 0 then
-        begin
-          while (J <= WidthM1) and UsedB[J] do Inc(J);
-          if J > WidthM1 then Break;
-          Perm[HCount][I] := J;
-          UsedB[J] := true;
-        end;
+      // The solver needs a finite matrix; a NaN cosine (non-finite weights with
+      // the FPU exceptions masked) ranks below every finite cosine (>= -1).
+      MaxNegatedScorePos := High(NegatedScores);
+      for I := 0 to MaxNegatedScorePos do
+        if IsNan(NegatedScores[I]) or IsInfinite(NegatedScores[I]) then
+          NegatedScores[I] := cNonFiniteNegatedScore;
+      // Perm maps NEW position (A-unit) -> OLD B-unit index.
+      NeuralLinearSumAssignment(NegatedScores, Width, Width, Perm[HCount],
+        AssignmentWork);
 
       // Churn = fraction of positions whose B-unit changed.
       mJ := 0;

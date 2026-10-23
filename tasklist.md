@@ -2225,10 +2225,6 @@ rather than acted on.
       - [ ] YoloDetect labels boxes with the class id (`DrawBitmapText`): no
             class names reach `TYoloConfig`; read a `names` / `id2label` map
             from config.json when present and label with the name.
-      - [ ] `TNNet.PermutationAlignReport` (Git Re-Basin weight/activation
-            matching, neuralnetwork.pas) still pairs units greedily; switch it
-            to `NeuralLinearSumAssignment` (maximize similarity = minimize the
-            negated score) and keep the permutation-invariance assertion.
       - [ ] Optional: BoT-SORT / OC-SORT style camera-motion compensation is
             not ported; ByteTrack only.
 

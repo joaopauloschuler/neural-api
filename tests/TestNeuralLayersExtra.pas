@@ -145,6 +145,7 @@ type
     procedure TestModeConnectivityReportSmoke;
     procedure TestPermutationAlignReportSmoke;
     procedure TestPermutationAlignDegenerateScoreRow;
+    procedure TestPermutationAlignPicksExactAssignment;
     procedure TestIntrinsicDimensionReportSmoke;
     procedure TestNeuralTangentKernelReportSmoke;
     procedure TestActivationPatchingReportSmoke;
@@ -6444,10 +6445,8 @@ begin
   end;
 end;
 
-// A non-finite weight makes one A-unit's whole similarity row NaN, so that unit
-// never wins a greedy pick and the alignment loop ends with positions still
-// unassigned. The permutation must still be complete: the neuron reorder indexes
-// the saved weight rows by it, so a leftover -1 reads out of bounds.
+// A non-finite weight makes one A-unit's whole similarity row NaN. The assignment
+// must still yield a complete permutation: the neuron reorder indexes by it.
 procedure TTestNeuralLayersExtra.TestPermutationAlignDegenerateScoreRow;
 var
   NN, NNB: TNNet;
@@ -6510,6 +6509,69 @@ begin
     NN.Free;
     NNB.Free;
     SetExceptionMask(OldMask);
+    RandSeed := SavedSeed;
+  end;
+end;
+
+// Hand-built 2-unit hidden layer whose weight-row cosines (A rows, B columns)
+// are [[0.970, 0.600], [0.243, -0.800]]: greedy takes the 0.970 pair first and
+// totals 0.170 (identity, churn 0), the exact assignment swaps for 0.843.
+procedure TTestNeuralLayersExtra.TestPermutationAlignPicksExactAssignment;
+var
+  NN, NNB: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  SnapB, Report: string;
+  I: integer;
+  SavedSeed: longword;
+
+  procedure BuildNet(ANN: TNNet);
+  begin
+    ANN.AddLayer(TNNetInput.Create(2, 1, 1));
+    ANN.AddLayer(TNNetFullConnectReLU.Create(2));
+    ANN.AddLayer(TNNetFullConnectLinear.Create(1));
+    ANN.InitWeights();
+  end;
+
+  procedure SetHiddenRow(ANN: TNNet; Unit_: integer; W0, W1: TNeuralFloat);
+  begin
+    ANN.Layers[1].Neurons[Unit_].Weights.FData[0] := W0;
+    ANN.Layers[1].Neurons[Unit_].Weights.FData[1] := W1;
+  end;
+
+begin
+  SavedSeed := RandSeed;
+  NN := TNNet.Create();
+  NNB := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    RandSeed := 31;
+    BuildNet(NN);
+    BuildNet(NNB);
+    SetHiddenRow(NN, 0, 1.0, 0.0);
+    SetHiddenRow(NN, 1, 0.0, 1.0);
+    SetHiddenRow(NNB, 0, 4.0, 1.0);
+    SetHiddenRow(NNB, 1, 0.6, -0.8);
+    for I := 1 to 4 do
+    begin
+      X := TNNetVolume.Create(2, 1, 1);
+      Y := TNNetVolume.Create(1, 1, 1);
+      X.FData[0] := I * 0.5;
+      X.FData[1] := 1.0 - I * 0.3;
+      Y.FData[0] := I * 0.1;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+    SnapB := NNB.SaveDataToString();
+
+    Report := TNNet.PermutationAlignReport(NN, SnapB, Samples, 0, 4);
+    AssertTrue('exact assignment swaps both units (greedy would keep them)',
+      Pos('churn = 1.000', Report) > 0);
+    AssertTrue('exact assignment keeps permutation invariance',
+      Pos('Check 1 permutation invariance: PASS', Report) > 0);
+  finally
+    Samples.Free;
+    NN.Free;
+    NNB.Free;
     RandSeed := SavedSeed;
   end;
 end;
