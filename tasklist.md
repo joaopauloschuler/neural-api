@@ -386,7 +386,7 @@ rather than acted on.
         parity on the same fixture.
   - [ ] examples/ImageMatting (`--image`, `--trimap FILE`, or `--auto-trimap`:
         build the trimap from a BiRefNet mask by eroding and dilating it with
-        the existing `BoxFilter` + threshold, band width `--unknown-band N`).
+        the existing `TNNetBoxFilter` layer + a threshold, band width `--unknown-band N`).
         Writes the alpha PNG and an RGBA cut-out. Add a README.md, plus a row
         in examples/README.md.
   - [ ] Real hustvl/vitmatte-small-composition-1k run on the GPU box (`--gpu`,
