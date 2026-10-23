@@ -1244,10 +1244,22 @@ rather than acted on.
           rank-1 `MulAdd`s. Batching them needs a [SeqLen][4*Depth] dGates
           scratch and a transposing variant of `PackDotProductRows` (packed A^T
           for dX = dGates W_i, X^T / H^T for the weight gradients).
-        - [ ] The per-step recurrent product W_h* h_{t-1} is 4*Depth single-row
-          `DotProduct` calls. No multi-row GEMV kernel exists (`DotProductsPacked`
-          with one B row does 6x the FMAs); a 4-row dot kernel would share each
-          h load across the four gates.
+        - [X] The per-step recurrent product W_h* h_{t-1} is 4*Depth single-row
+          `DotProduct` calls. DONE c4ef0979: `TNNetVolume.AddDotProductRows`
+          (AVX2 4-row kernel, each h load feeds four rows; per-row `DotProduct`
+          fallback) in `TNNetLSTMCell`, `TNNetGRUCell`, `TNNetSLSTMCell`,
+          `TNNetEchoStateReservoir` and `TNNetPlainOps.RunLSTMDirection`.
+          Measured (1-core VM, noisy): per-step 4 x 256 x 256 product
+          0.052-0.054 -> 0.028-0.043 ms; LSTM cell forward SeqLen 100, In 640,
+          Hidden 256: median ~10.1 -> ~8.7 ms. Follow-ups:
+          - [ ] No plain-AVX / 32-bit asm body: those builds take the per-row
+            `DotProduct` path (unchanged speed).
+          - [ ] The recurrent GEMV runs on one thread (no row split over the
+            pool); not measured (1-core box).
+          - [ ] Other per-row GEMV loops that fit `AddDotProductRows`:
+            `TNNetPlainOps.ComputeStyleChannelAffine` (gamma/beta rows x
+            style), the per-step q/k/v projections of `TNNetMLSTMCell`,
+            `TNNetDeltaNet`, `TNNetClosedFormContinuous`.
         - [ ] Borrowing builds (stage A): each borrower cell packs its own
           `FInputRowsPacked` copy of W_i* (~2.6 MB per Kokoro cell, 10 cells) on
           its first forward after every `PrepareStageA`. The owner could hold
