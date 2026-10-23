@@ -1719,6 +1719,30 @@ rather than acted on.
       first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
       smoke + a real-checkpoint parity follow-up.
 
+- [ ] VGGT multi-view 3D reconstruction importer + examples/MultiViewReconstruct
+      (BuildVGGTFromSafeTensors[Ex], facebook/VGGT-1B, model.safetensors via
+      PyTorchModelHubMixin; CC BY-NC 4.0, VGGT-1B-Commercial is gated). Input: N
+      photos of one scene (518px, patch 14). Output per frame: camera extrinsics +
+      intrinsics, a depth map with confidence, and a world-space point map, in one
+      forward pass (no SfM / bundle adjustment). Nothing in the tree estimates
+      camera poses or writes a 3D point cloud today. Reuse: the DINOv2 patch
+      embed (BuildDINOv2), TNNetQKNormAttention, TNNetVisionRoPE2D (VGGT's 2-D
+      RoPE uses base 100 and shifts patch positions by +1 so the camera token and
+      the 4 register tokens sit at position 0, i.e. unrotated — check that the
+      NumPrefix path matches), and the DPT head from BuildDPTFromSafeTensors for
+      the depth and point heads (expp1 confidence activation). New code: (1) the
+      aggregator, 24 ALTERNATING blocks of frame attention (tokens of one frame)
+      and global attention (tokens of all N frames), with frame 0 using its own
+      camera/register token embeddings; (2) the camera head (4-block trunk with
+      adaLN modulation, 4 refinement iterations, pose encoding = translation 3 +
+      quaternion 4 + FoV 2) and a PoseEncodingToExtriIntri helper; (3) a binary
+      PLY writer for coloured point clouds filtered by confidence percentile. The
+      track head is out of scope. The example takes a folder of images and writes
+      scene.ply + per-frame depth PNGs + cameras.txt. Parity: pico fixture against
+      the reference `vggt` package — needs a NEW Python oracle script in tools/,
+      so ask the user before writing it; the PLY writer and pose-encoding
+      conversion can be tested by hand-derived cases without it.
+
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
       detection model family from the landed DETR (ResNet+sinusoidal+vanilla
