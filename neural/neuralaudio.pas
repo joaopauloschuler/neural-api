@@ -53,8 +53,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 // Coded by Claude (AI).
 unit neuralaudio;
 
+{$include neuralnetwork.inc}
+
 {$IFDEF FPC}
-{$mode objfpc}
 {$H+}
 {$ENDIF}
 
@@ -226,19 +227,30 @@ procedure ISTFTCenteredMagnitudePhase(Magnitude, Phase, Wave: TNNetVolume;
 type
   // torch.stft defaults (center reflect pad, periodic Hann, onesided) and sign:
   // X[k] = sum w[n] x[n] exp(-2 pi i k n / NFFT); ISTFTOverlapAddReIm takes -Im.
-  // Direct DFT, tables built in Create: for short NFFT (any, not only 2^n).
+  // Direct DFT for short NFFT, else TFFTPlan on two frames per complex FFT (UseFFT).
   // Outputs are (FrameCount, 1, BinCount), time along SizeX. Coded by Claude (AI).
   TNNetForwardSTFT = class(TObject)
   private
     FNFFT, FHopLength, FBinCount, FPadding: integer;
+    FUseFFT: boolean;
     // Row Bin holds w[n]*cos(2 pi Bin n / NFFT) / -w[n]*sin(...), n = 0..NFFT-1.
     FWindowedCos, FWindowedNegSin: TNeuralFloatDynArr;
     FEdgeFrame: TNeuralFloatDynArr;
+    // Two frames' bins: frame A at 0, frame B at BinCount.
     FBinRe, FBinIm: TNeuralFloatDynArr;
+    FWindow, FFftRe, FFftIm: array of double;
+    FFftPlan: TFFTPlan;
     procedure CheckWave(Wave: TNNetVolume);
-    // Re/Im of frame FrameIdx of Wave into RePtr^/ImPtr^ (BinCount each).
+    procedure SetUseFFT(Value: boolean);
+    // Re/Im of frame FrameIdx of Wave into RePtr^/ImPtr^ (BinCount each), direct DFT.
     procedure ComputeFrameBins(Wave: TNNetVolume; FrameIdx: integer;
       RePtr, ImPtr: TNeuralFloatArrPtr);
+    // Windowed frame FrameIdx of Wave (reflect padded) into Dst[0..NFFT-1].
+    procedure LoadWindowedFrame(Wave: TNNetVolume; FrameIdx: integer;
+      var Dst: array of double);
+    // FFT path: frames FrameIdx and, when HasSecond, FrameIdx + 1 into A and B.
+    procedure ComputeFramePairBins(Wave: TNNetVolume; FrameIdx: integer;
+      HasSecond: boolean; ReAPtr, ImAPtr, ReBPtr, ImBPtr: TNeuralFloatArrPtr);
   public
     constructor Create(NFFT, HopLength: integer);
     // 1 + SampleCount div HopLength for an even NFFT (torch's center=True count).
@@ -251,6 +263,8 @@ type
     property NFFT: integer read FNFFT;
     property HopLength: integer read FHopLength;
     property BinCount: integer read FBinCount;
+    // Create picks by NFFT (measured threshold); writable to force a path.
+    property UseFFT: boolean read FUseFFT write SetUseFFT;
   end;
 
   // Reusable inverse STFT (ISTFTOverlapAddReIm / ISTFTCenteredMagnitudePhase):
@@ -1857,10 +1871,20 @@ end;
 
 { TNNetForwardSTFT }
 
+const
+  // Smallest NFFT where TFFTPlan (two frames per FFT) beat the direct DFT, measured
+  // A/B; the AVX DotProduct moves both crossovers up. Bluestein pads to >= 2*NFFT-1.
+  {$IFDEF AVXANY}
+  csForwardSTFTMinRadix2NFFT = 128;
+  csForwardSTFTMinBluesteinNFFT = 768;
+  {$ELSE}
+  csForwardSTFTMinRadix2NFFT = 32;
+  csForwardSTFTMinBluesteinNFFT = 192;
+  {$ENDIF}
+
 constructor TNNetForwardSTFT.Create(NFFT, HopLength: integer);
 var
-  BinPos, TapPos, MaxBinPos, MaxTapPos, TableIdx, TwiddleIdx: integer;
-  WindowValue, Angle: double;
+  TapPos, MaxTapPos: integer;
 begin
   inherited Create();
   if (NFFT < 2) or (HopLength < 1) then
@@ -1870,30 +1894,55 @@ begin
   FHopLength := HopLength;
   FBinCount := NFFT div 2 + 1;
   FPadding := NFFT div 2;
-  SetLength(FWindowedCos, FBinCount * NFFT);
-  SetLength(FWindowedNegSin, FBinCount * NFFT);
-  SetLength(FEdgeFrame, NFFT);
-  SetLength(FBinRe, FBinCount);
-  SetLength(FBinIm, FBinCount);
-  MaxBinPos := FBinCount - 1;
+  SetLength(FBinRe, 2 * FBinCount);
+  SetLength(FBinIm, 2 * FBinCount);
+  SetLength(FWindow, NFFT);
   MaxTapPos := NFFT - 1;
+  for TapPos := 0 to MaxTapPos do
+    FWindow[TapPos] := 0.5 - 0.5 * Cos(2.0 * Pi * TapPos / NFFT);
+  if IsPowerOfTwo(NFFT) then SetUseFFT(NFFT >= csForwardSTFTMinRadix2NFFT)
+  else SetUseFFT(NFFT >= csForwardSTFTMinBluesteinNFFT);
+end;
+
+procedure TNNetForwardSTFT.SetUseFFT(Value: boolean);
+var
+  BinPos, TapPos, MaxBinPos, MaxTapPos, TableIdx, TwiddleIdx: integer;
+  WindowValue, Angle: double;
+begin
+  FUseFFT := Value;
+  if Value then
+  begin
+    if Length(FFftRe) = 0 then
+    begin
+      SetLength(FFftRe, FNFFT);
+      SetLength(FFftIm, FNFFT);
+      FFTPlanInit(FFftPlan, FNFFT);
+    end;
+    exit;
+  end;
+  if Length(FWindowedCos) > 0 then exit;
+  SetLength(FWindowedCos, FBinCount * FNFFT);
+  SetLength(FWindowedNegSin, FBinCount * FNFFT);
+  SetLength(FEdgeFrame, FNFFT);
+  MaxBinPos := FBinCount - 1;
+  MaxTapPos := FNFFT - 1;
   TableIdx := 0;
   for BinPos := 0 to MaxBinPos do
   begin
     TwiddleIdx := 0;
     for TapPos := 0 to MaxTapPos do
     begin
-      WindowValue := 0.5 - 0.5 * Cos(2.0 * Pi * TapPos / NFFT);
-      Angle := 2.0 * Pi * TwiddleIdx / NFFT;
+      WindowValue := FWindow[TapPos];
+      Angle := 2.0 * Pi * TwiddleIdx / FNFFT;
       FWindowedCos[TableIdx] := WindowValue * Cos(Angle);
       // The DC and Nyquist rows have no imaginary part: exact zeros.
-      if (TwiddleIdx = 0) or (2 * TwiddleIdx = NFFT) then
+      if (TwiddleIdx = 0) or (2 * TwiddleIdx = FNFFT) then
         FWindowedNegSin[TableIdx] := 0
       else
         FWindowedNegSin[TableIdx] := -WindowValue * Sin(Angle);
       Inc(TableIdx);
       Inc(TwiddleIdx, BinPos);
-      if TwiddleIdx >= NFFT then Dec(TwiddleIdx, NFFT);
+      if TwiddleIdx >= FNFFT then Dec(TwiddleIdx, FNFFT);
     end;
   end;
 end;
@@ -1951,15 +2000,107 @@ begin
   if (FNFFT and 1) = 0 then ImPtr^[MaxBinPos] := 0;
 end;
 
+procedure TNNetForwardSTFT.LoadWindowedFrame(Wave: TNNetVolume;
+  FrameIdx: integer; var Dst: array of double);
+var
+  FrameStart, SampleCount, TapPos, MaxTapPos, SampleIdx: integer;
+begin
+  SampleCount := Wave.Size;
+  FrameStart := FrameIdx * FHopLength - FPadding;
+  MaxTapPos := FNFFT - 1;
+  if (FrameStart >= 0) and (FrameStart + FNFFT <= SampleCount) then
+  begin
+    for TapPos := 0 to MaxTapPos do
+      Dst[TapPos] := FWindow[TapPos] * Wave.FData[FrameStart + TapPos];
+  end
+  else
+  begin
+    // Reflect padding (np.pad 'reflect', the edge sample not repeated).
+    for TapPos := 0 to MaxTapPos do
+    begin
+      SampleIdx := FrameStart + TapPos;
+      if SampleIdx < 0 then SampleIdx := -SampleIdx;
+      if SampleIdx >= SampleCount then
+        SampleIdx := 2 * SampleCount - 2 - SampleIdx;
+      Dst[TapPos] := FWindow[TapPos] * Wave.FData[SampleIdx];
+    end;
+  end;
+end;
+
+procedure TNNetForwardSTFT.ComputeFramePairBins(Wave: TNNetVolume;
+  FrameIdx: integer; HasSecond: boolean;
+  ReAPtr, ImAPtr, ReBPtr, ImBPtr: TNeuralFloatArrPtr);
+var
+  BinPos, MaxBinPos, MirrorBin: integer;
+  ZRe, ZIm, MirrorRe, MirrorIm: double;
+begin
+  LoadWindowedFrame(Wave, FrameIdx, FFftRe);
+  if HasSecond then LoadWindowedFrame(Wave, FrameIdx + 1, FFftIm)
+  else FillChar(FFftIm[0], FNFFT * csDoubleSize, 0);
+  FFTPlanExecute(FFftPlan, FFftRe, FFftIm, false);
+  MaxBinPos := FBinCount - 1;
+  if HasSecond then
+  begin
+    // z = a + i*b: A_k = (Z_k + conj Z_{N-k}) / 2, B_k = (Z_k - conj Z_{N-k}) / 2i.
+    ReAPtr^[0] := FFftRe[0];
+    ReBPtr^[0] := FFftIm[0];
+    MirrorBin := FNFFT - 1;
+    for BinPos := 1 to MaxBinPos do
+    begin
+      ZRe := FFftRe[BinPos];
+      ZIm := FFftIm[BinPos];
+      MirrorRe := FFftRe[MirrorBin];
+      MirrorIm := FFftIm[MirrorBin];
+      ReAPtr^[BinPos] := 0.5 * (ZRe + MirrorRe);
+      ImAPtr^[BinPos] := 0.5 * (ZIm - MirrorIm);
+      ReBPtr^[BinPos] := 0.5 * (ZIm + MirrorIm);
+      ImBPtr^[BinPos] := 0.5 * (MirrorRe - ZRe);
+      Dec(MirrorBin);
+    end;
+    ImBPtr^[0] := 0;
+    if (FNFFT and 1) = 0 then ImBPtr^[MaxBinPos] := 0;
+  end
+  else
+  begin
+    for BinPos := 0 to MaxBinPos do
+    begin
+      ReAPtr^[BinPos] := FFftRe[BinPos];
+      ImAPtr^[BinPos] := FFftIm[BinPos];
+    end;
+  end;
+  // +0, not -0: angle() of a negative real bin is then +pi, as in torch.
+  ImAPtr^[0] := 0;
+  if (FNFFT and 1) = 0 then ImAPtr^[MaxBinPos] := 0;
+end;
+
 procedure TNNetForwardSTFT.Transform(Wave, Re, Im: TNNetVolume);
 var
   FramePos, MaxFramePos, RowOffset: integer;
+  ReAPtr, ImAPtr: TNeuralFloatArrPtr;
 begin
   CheckWave(Wave);
   MaxFramePos := FrameCount(Wave.Size) - 1;
   Re.ReSize(MaxFramePos + 1, 1, FBinCount);
   Im.ReSize(MaxFramePos + 1, 1, FBinCount);
   RowOffset := 0;
+  if FUseFFT then
+  begin
+    FramePos := 0;
+    while FramePos <= MaxFramePos do
+    begin
+      ReAPtr := TNeuralFloatArrPtr(@Re.FData[RowOffset]);
+      ImAPtr := TNeuralFloatArrPtr(@Im.FData[RowOffset]);
+      if FramePos < MaxFramePos then
+        ComputeFramePairBins(Wave, FramePos, true, ReAPtr, ImAPtr,
+          TNeuralFloatArrPtr(@Re.FData[RowOffset + FBinCount]),
+          TNeuralFloatArrPtr(@Im.FData[RowOffset + FBinCount]))
+      else
+        ComputeFramePairBins(Wave, FramePos, false, ReAPtr, ImAPtr, ReAPtr, ImAPtr);
+      Inc(FramePos, 2);
+      Inc(RowOffset, 2 * FBinCount);
+    end;
+    exit;
+  end;
   for FramePos := 0 to MaxFramePos do
   begin
     ComputeFrameBins(Wave, FramePos, TNeuralFloatArrPtr(@Re.FData[RowOffset]),
@@ -1971,7 +2112,8 @@ end;
 procedure TNNetForwardSTFT.TransformToMagnitudePhase(Wave,
   MagnitudePhase: TNNetVolume);
 var
-  FramePos, MaxFramePos, BinPos, MaxBinPos, RowOffset: integer;
+  FramePos, MaxFramePos, BinPos, MaxBinPos, RowOffset, PairFrameCount,
+    PairFramePos, MaxPairFramePos, BinOffset: integer;
   BinRe, BinIm: Single;
 begin
   CheckWave(Wave);
@@ -1979,20 +2121,39 @@ begin
   MaxBinPos := FBinCount - 1;
   MagnitudePhase.ReSize(MaxFramePos + 1, 1, 2 * FBinCount);
   RowOffset := 0;
-  for FramePos := 0 to MaxFramePos do
+  FramePos := 0;
+  while FramePos <= MaxFramePos do
   begin
-    ComputeFrameBins(Wave, FramePos, TNeuralFloatArrPtr(@FBinRe[0]),
-      TNeuralFloatArrPtr(@FBinIm[0]));
-    for BinPos := 0 to MaxBinPos do
+    if FUseFFT then
     begin
-      BinRe := FBinRe[BinPos];
-      BinIm := FBinIm[BinPos];
-      MagnitudePhase.FData[RowOffset + BinPos] :=
-        Sqrt(BinRe * BinRe + BinIm * BinIm);
-      MagnitudePhase.FData[RowOffset + FBinCount + BinPos] :=
-        pcr_atan2f(BinIm, BinRe);
+      if FramePos < MaxFramePos then PairFrameCount := 2 else PairFrameCount := 1;
+      ComputeFramePairBins(Wave, FramePos, PairFrameCount = 2,
+        TNeuralFloatArrPtr(@FBinRe[0]), TNeuralFloatArrPtr(@FBinIm[0]),
+        TNeuralFloatArrPtr(@FBinRe[FBinCount]), TNeuralFloatArrPtr(@FBinIm[FBinCount]));
+    end
+    else
+    begin
+      PairFrameCount := 1;
+      ComputeFrameBins(Wave, FramePos, TNeuralFloatArrPtr(@FBinRe[0]),
+        TNeuralFloatArrPtr(@FBinIm[0]));
     end;
-    Inc(RowOffset, 2 * FBinCount);
+    MaxPairFramePos := PairFrameCount - 1;
+    BinOffset := 0;
+    for PairFramePos := 0 to MaxPairFramePos do
+    begin
+      for BinPos := 0 to MaxBinPos do
+      begin
+        BinRe := FBinRe[BinOffset + BinPos];
+        BinIm := FBinIm[BinOffset + BinPos];
+        MagnitudePhase.FData[RowOffset + BinPos] :=
+          Sqrt(BinRe * BinRe + BinIm * BinIm);
+        MagnitudePhase.FData[RowOffset + FBinCount + BinPos] :=
+          pcr_atan2f(BinIm, BinRe);
+      end;
+      Inc(BinOffset, FBinCount);
+      Inc(RowOffset, 2 * FBinCount);
+    end;
+    Inc(FramePos, PairFrameCount);
   end;
 end;
 

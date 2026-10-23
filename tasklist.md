@@ -1282,8 +1282,22 @@ rather than acted on.
           `albert-*` checkpoints) is untested; no config reader for model_type
           "albert"; pooler / classifier / int8 refused.
   - 2.9 Forward complex STFT follow-ups:
-        - [ ] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
+        - [X] `TNNetForwardSTFT` is O(NFFT * bins) per frame; a long NFFT would
           want `RealFramePowerSpectrum`'s two-factor path with complex output.
+          DONE (commit "perf(audio): TNNetForwardSTFT FFT path"): `UseFFT` runs
+          `TFFTPlan` on two frames per complex FFT; Create picks it for a power
+          of two >= 128 (no AVX: 32) or any NFFT >= 768 (no AVX: 192), else the
+          direct DFT (Kokoro's 20 stays direct: 0.46 ms direct vs 3.7 ms FFT).
+          AVX2 Release, 16000 samples, hop 5: 256 16.8 -> 9.1 ms, 512 60.3 -> 16.8,
+          1024 374 -> 34, 800 200 -> 185; no AVX: 64 3.9 -> 1.9, 256 136 -> 8.6,
+          400 339 -> 84. The two-factor path with complex output was built and
+          measured NO-GO: slower than the AVX direct DFT at every NFFT 8-1200
+          (400: 118 vs 46 ms), and slower than TFFTPlan where that wins.
+        - [ ] `ComputeWhisperLogMel` runs `RealFramePowerSpectrum`'s two-factor
+          path at N = 400; in the STFT A/B above that path was 2.6x slower than
+          an AVX direct DFT over windowed tables. Not measured in log-mel itself.
+        - [ ] `TFFTPlan` is scalar Double; a Single AVX radix-2 would move the
+          STFT (and inverse STFT) crossovers down.
         - [ ] The harmonic source runs scalar `pcr_sinf` (arguments up to ~4e4
           rad need its exact range reduction; the vector `Sin` was not checked
           at that range) on one thread; 41 ms total is small next to the nets.
@@ -2599,9 +2613,8 @@ cannot pay for its own transfer.
       device-backward list at the top of "OpenCL forward coverage".
 
 - [X] `TNNetRealFFT2D` row FFTs: transform two real channels as one complex FFT
-      (the even/odd split trick) to halve the row cost. DONE (commit "perf(fft):
-      pair channel rows"): `RealToHalfSpectrum` and `HalfSpectrumToReal` pair
-      channels c, c+1 (forward and backward of rfft2 and irfft2; odd C runs a
+      (the even/odd split trick) to halve the row cost. DONE 106ffb8d:
+      `RealToHalfSpectrum` and `HalfSpectrumToReal` pair channels c, c+1 (forward and backward of rfft2 and irfft2; odd C runs a
       single-channel tail; `PairChannelRows` = false restores one FFT per channel).
       OpenCL untouched: its kernels are per-element direct DFTs, no row FFT to pair.
       AVX2 Release, 100-rep min of 5, noisy 1-core VM: rfft2 64x64x16 1.29 -> 1.09 ms,

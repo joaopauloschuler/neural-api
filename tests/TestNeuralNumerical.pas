@@ -1601,11 +1601,13 @@ type
     // Input and per-channel alpha gradients.
     procedure TestSnakePerChannelGradientCheck;
     // TNNetForwardSTFT Re/Im and magnitude/phase vs torch.stft (center reflect
-    // pad, periodic Hann) for n_fft 20 / 16 / 15 (odd).
+    // pad, periodic Hann) for n_fft 20 / 16 / 15 (odd), direct and FFT paths.
     procedure TestForwardSTFTTorchParity;
     // A cosine on bin 3: interior frames hold A*NFFT/4 at bin 3, A*NFFT/8 at
     // bins 2 and 4 (the Hann window's spectrum) and ~0 elsewhere.
     procedure TestForwardSTFTCosinePeakBins;
+    // FFT path (UseFFT) vs the direct DFT: Re/Im, magnitude/phase, +0 DC/Nyquist Im.
+    procedure TestForwardSTFTFFTMatchesDirect;
     // TNNetHarmonicSource (zero noise) vs the kokoro SourceModuleHnNSF:
     // upsampled F0 and voicing exact, har_source.
     procedure TestHarmonicSourceTorchParity;
@@ -80664,6 +80666,7 @@ var
   RefRe, RefIm, RefMag, RefPhase, MaxRefMag, MaxComplexDiff, MaxMagDiff,
     MaxPhaseDiff, PhaseDiff: double;
   CaseName: string;
+  UseFFTPass: boolean;
 begin
   Oracle := LoadJSONFixture('stft_harmonic_source_oracle.json');
   if Oracle = nil then
@@ -80681,60 +80684,64 @@ begin
     for CasePos := 0 to Cases.Count - 1 do
     begin
       OracleCase := Cases.Objects[CasePos];
-      CaseName := OracleCase.Strings['name'];
       Wave.ReSize(OracleCase.Integers['length'], 1, 1);
       for SamplePos := 0 to Wave.Size - 1 do
         Wave.FData[SamplePos] := OracleCase.Arrays['input'].Floats[SamplePos];
       STFT := TNNetForwardSTFT.Create(OracleCase.Integers['n_fft'],
         OracleCase.Integers['hop']);
       try
-        STFT.Transform(Wave, Re, Im);
-        STFT.TransformToMagnitudePhase(Wave, MagnitudePhase);
-        BinCount := OracleCase.Arrays['re'].Count;
-        FrameCount := OracleCase.Arrays['re'].Arrays[0].Count;
-        AssertEquals(CaseName + ': bins', BinCount, STFT.BinCount);
-        AssertEquals(CaseName + ': frames', FrameCount, Re.SizeX);
-        AssertEquals(CaseName + ': FrameCount', FrameCount,
-          STFT.FrameCount(Wave.Size));
-        AssertEquals(CaseName + ': magnitude/phase depth', 2 * BinCount,
-          MagnitudePhase.Depth);
-        MaxRefMag := 0;
-        for BinPos := 0 to BinCount - 1 do
-          for FramePos := 0 to FrameCount - 1 do
-            MaxRefMag := Max(MaxRefMag, OracleCase.Arrays['magnitude'].
-              Arrays[BinPos].Floats[FramePos]);
-        MaxComplexDiff := 0;
-        MaxMagDiff := 0;
-        MaxPhaseDiff := 0;
-        for BinPos := 0 to BinCount - 1 do
-          for FramePos := 0 to FrameCount - 1 do
-          begin
-            RefRe := OracleCase.Arrays['re'].Arrays[BinPos].Floats[FramePos];
-            RefIm := OracleCase.Arrays['im'].Arrays[BinPos].Floats[FramePos];
-            RefMag := OracleCase.Arrays['magnitude'].Arrays[BinPos].
-              Floats[FramePos];
-            RefPhase := OracleCase.Arrays['phase'].Arrays[BinPos].
-              Floats[FramePos];
-            MaxComplexDiff := Max(MaxComplexDiff,
-              Max(Abs(Re[FramePos, 0, BinPos] - RefRe),
-              Abs(Im[FramePos, 0, BinPos] - RefIm)));
-            MaxMagDiff := Max(MaxMagDiff,
-              Abs(MagnitudePhase[FramePos, 0, BinPos] - RefMag));
-            // Phase only where the bin is not rounding noise; wrapped.
-            if RefMag > 1e-4 * MaxRefMag then
+        for UseFFTPass := false to true do
+        begin
+          STFT.UseFFT := UseFFTPass;
+          CaseName := OracleCase.Strings['name'] + ' UseFFT=' + BoolToStr(UseFFTPass, true);
+          STFT.Transform(Wave, Re, Im);
+          STFT.TransformToMagnitudePhase(Wave, MagnitudePhase);
+          BinCount := OracleCase.Arrays['re'].Count;
+          FrameCount := OracleCase.Arrays['re'].Arrays[0].Count;
+          AssertEquals(CaseName + ': bins', BinCount, STFT.BinCount);
+          AssertEquals(CaseName + ': frames', FrameCount, Re.SizeX);
+          AssertEquals(CaseName + ': FrameCount', FrameCount,
+            STFT.FrameCount(Wave.Size));
+          AssertEquals(CaseName + ': magnitude/phase depth', 2 * BinCount,
+            MagnitudePhase.Depth);
+          MaxRefMag := 0;
+          for BinPos := 0 to BinCount - 1 do
+            for FramePos := 0 to FrameCount - 1 do
+              MaxRefMag := Max(MaxRefMag, OracleCase.Arrays['magnitude'].
+                Arrays[BinPos].Floats[FramePos]);
+          MaxComplexDiff := 0;
+          MaxMagDiff := 0;
+          MaxPhaseDiff := 0;
+          for BinPos := 0 to BinCount - 1 do
+            for FramePos := 0 to FrameCount - 1 do
             begin
-              PhaseDiff := Abs(MagnitudePhase[FramePos, 0, BinCount + BinPos] -
-                RefPhase);
-              if PhaseDiff > Pi then PhaseDiff := 2 * Pi - PhaseDiff;
-              MaxPhaseDiff := Max(MaxPhaseDiff, PhaseDiff);
+              RefRe := OracleCase.Arrays['re'].Arrays[BinPos].Floats[FramePos];
+              RefIm := OracleCase.Arrays['im'].Arrays[BinPos].Floats[FramePos];
+              RefMag := OracleCase.Arrays['magnitude'].Arrays[BinPos].
+                Floats[FramePos];
+              RefPhase := OracleCase.Arrays['phase'].Arrays[BinPos].
+                Floats[FramePos];
+              MaxComplexDiff := Max(MaxComplexDiff,
+                Max(Abs(Re[FramePos, 0, BinPos] - RefRe),
+                Abs(Im[FramePos, 0, BinPos] - RefIm)));
+              MaxMagDiff := Max(MaxMagDiff,
+                Abs(MagnitudePhase[FramePos, 0, BinPos] - RefMag));
+              // Phase only where the bin is not rounding noise; wrapped.
+              if RefMag > 1e-4 * MaxRefMag then
+              begin
+                PhaseDiff := Abs(MagnitudePhase[FramePos, 0, BinCount + BinPos] -
+                  RefPhase);
+                if PhaseDiff > Pi then PhaseDiff := 2 * Pi - PhaseDiff;
+                MaxPhaseDiff := Max(MaxPhaseDiff, PhaseDiff);
+              end;
             end;
-          end;
-        AssertTrue(CaseName + ': Re/Im max |diff| = ' +
-          FloatToStr(MaxComplexDiff), MaxComplexDiff < 1e-5 * MaxRefMag);
-        AssertTrue(CaseName + ': magnitude max |diff| = ' +
-          FloatToStr(MaxMagDiff), MaxMagDiff < 1e-5 * MaxRefMag);
-        AssertTrue(CaseName + ': wrapped phase max |diff| = ' +
-          FloatToStr(MaxPhaseDiff), MaxPhaseDiff < 1e-3);
+          AssertTrue(CaseName + ': Re/Im max |diff| = ' +
+            FloatToStr(MaxComplexDiff), MaxComplexDiff < 1e-5 * MaxRefMag);
+          AssertTrue(CaseName + ': magnitude max |diff| = ' +
+            FloatToStr(MaxMagDiff), MaxMagDiff < 1e-5 * MaxRefMag);
+          AssertTrue(CaseName + ': wrapped phase max |diff| = ' +
+            FloatToStr(MaxPhaseDiff), MaxPhaseDiff < 1e-3);
+        end;
       finally
         STFT.Free;
       end;
@@ -80745,6 +80752,87 @@ begin
     Re.Free;
     Wave.Free;
     Oracle.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForwardSTFTFFTMatchesDirect;
+const
+  // (NFFT, hop, samples): odd / non-power-of-two / radix-2 NFFT, odd and even frame counts.
+  cCases: array[0..7, 0..2] of integer = ((7, 2, 40), (16, 4, 97), (20, 5, 200),
+    (20, 5, 205), (33, 8, 300), (64, 16, 500), (100, 25, 333), (128, 32, 1000));
+var
+  DirectSTFT, FFTSTFT: TNNetForwardSTFT;
+  Wave, DirectRe, DirectIm, FFTRe, FFTIm, DirectMP, FFTMP: TNNetVolume;
+  CaseCnt, SamplePos, ValuePos, BinCount, FramePos: integer;
+  MaxRef, MaxDiff, PhaseDiff: double;
+  CaseName: string;
+begin
+  Wave := TNNetVolume.Create();
+  DirectRe := TNNetVolume.Create();
+  DirectIm := TNNetVolume.Create();
+  FFTRe := TNNetVolume.Create();
+  FFTIm := TNNetVolume.Create();
+  DirectMP := TNNetVolume.Create();
+  FFTMP := TNNetVolume.Create();
+  try
+    for CaseCnt := 0 to High(cCases) do
+    begin
+      CaseName := 'NFFT=' + IntToStr(cCases[CaseCnt, 0]) + ' samples=' +
+        IntToStr(cCases[CaseCnt, 2]);
+      Wave.ReSize(cCases[CaseCnt, 2], 1, 1);
+      for SamplePos := 0 to Wave.Size - 1 do
+        Wave.FData[SamplePos] := Sin(SamplePos * 0.31) * 0.7 +
+          Cos(SamplePos * 0.043) * 0.2 - 0.05;
+      DirectSTFT := TNNetForwardSTFT.Create(cCases[CaseCnt, 0], cCases[CaseCnt, 1]);
+      FFTSTFT := TNNetForwardSTFT.Create(cCases[CaseCnt, 0], cCases[CaseCnt, 1]);
+      try
+        DirectSTFT.UseFFT := false;
+        FFTSTFT.UseFFT := true;
+        DirectSTFT.Transform(Wave, DirectRe, DirectIm);
+        FFTSTFT.Transform(Wave, FFTRe, FFTIm);
+        DirectSTFT.TransformToMagnitudePhase(Wave, DirectMP);
+        FFTSTFT.TransformToMagnitudePhase(Wave, FFTMP);
+        AssertEquals(CaseName + ' frames', DirectRe.SizeX, FFTRe.SizeX);
+        AssertEquals(CaseName + ' bins', DirectRe.Depth, FFTRe.Depth);
+        MaxRef := Max(DirectRe.GetMaxAbs(), DirectIm.GetMaxAbs());
+        MaxDiff := 0;
+        for ValuePos := 0 to DirectRe.Size - 1 do
+          MaxDiff := Max(MaxDiff, Max(Abs(FFTRe.FData[ValuePos] - DirectRe.FData[ValuePos]),
+            Abs(FFTIm.FData[ValuePos] - DirectIm.FData[ValuePos])));
+        AssertTrue(CaseName + ' Re/Im FFT vs direct diff=' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5 * MaxRef);
+        BinCount := FFTSTFT.BinCount;
+        for FramePos := 0 to FFTRe.SizeX - 1 do
+        begin
+          AssertTrue(CaseName + ' Im DC is +0', FFTIm[FramePos, 0, 0] = 0);
+          if not Odd(cCases[CaseCnt, 0]) then
+            AssertTrue(CaseName + ' Im Nyquist is +0', FFTIm[FramePos, 0, BinCount - 1] = 0);
+          for ValuePos := 0 to BinCount - 1 do
+          begin
+            AssertEquals(CaseName + ' magnitude', DirectMP[FramePos, 0, ValuePos],
+              FFTMP[FramePos, 0, ValuePos], 1e-5 * MaxRef);
+            if DirectMP[FramePos, 0, ValuePos] > 1e-3 * MaxRef then
+            begin
+              PhaseDiff := Abs(FFTMP[FramePos, 0, BinCount + ValuePos] -
+                DirectMP[FramePos, 0, BinCount + ValuePos]);
+              if PhaseDiff > Pi then PhaseDiff := 2 * Pi - PhaseDiff;
+              AssertTrue(CaseName + ' phase diff=' + FloatToStr(PhaseDiff), PhaseDiff < 1e-3);
+            end;
+          end;
+        end;
+      finally
+        FFTSTFT.Free;
+        DirectSTFT.Free;
+      end;
+    end;
+  finally
+    FFTMP.Free;
+    DirectMP.Free;
+    FFTIm.Free;
+    FFTRe.Free;
+    DirectIm.Free;
+    DirectRe.Free;
+    Wave.Free;
   end;
 end;
 
