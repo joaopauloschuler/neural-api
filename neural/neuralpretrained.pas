@@ -16501,7 +16501,8 @@ function RestoreFacesInImage(Detector: TNNet;
 // stride-8 head input (Conv3 -> ConvTranspose2d(2,s2,+bias) -> Conv3 -> Conv1)
 // giving a (ImageSize/4, ImageSize/4, num_masks) prototype map, read through
 // GetYoloProtoLayer. ComputeYoloMasks / DecodeYoloSegmentation turn kept
-// detections into masks (ultralytics 8.0 process_mask, the FastSAM default);
+// detections into masks (ultralytics 8.0 process_mask, or process_mask_native
+// at the net input size with RetinaMasks, FastSAM's CLI default);
 // FastSAMSelectByBox / FastSAMSelectByPoint are FastSAM's box / point prompts.
 // Coded by Claude (AI).
 type
@@ -16559,20 +16560,22 @@ type
 // keep cells whose best score >= ScoreThreshold; DFL-decode the 4 box sides
 // (softmax each reg_max-bin side, expected value = predicted ltrb distance from
 // the cell centre, in grid units), convert to an xyxy pixel box, then run
-// greedy IoU NMS at IoUThreshold. Config supplies strides / grid sizes /
-// reg_max. Returns the kept detections sorted by descending score.
+// greedy IoU NMS at IoUThreshold. Returns the first MaxDetections (ultralytics
+// max_det; <= 0 keeps all) kept detections sorted by descending score.
 function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
   ScoreThreshold: TNeuralFloat = 0.25;
-  IoUThreshold: TNeuralFloat = 0.45): TYoloDetectionArray;
+  IoUThreshold: TNeuralFloat = 0.45;
+  MaxDetections: integer = 300): TYoloDetectionArray;
 
 // The (ImageSize/4, ImageSize/4, NumMasks) Proto output layer of a segmentation
 // BuildYolo net. After an OpenCL Compute, call its ForceOutputOnRAM before reading.
 function GetYoloProtoLayer(NN: TNNet): TNNetLayer;
 
-// Masks := (ImageSize, ImageSize, Length(Dets)), channel k = mask of Dets[k]:
-// sigmoid(coefs . Proto), crop to the box at Proto scale, bilinear up, > 0.5.
+// Masks := (ImageSize, ImageSize, N); k = sigmoid(coefs . Proto) of Dets[k], box crop
+// at Proto scale, bilinear up, > 0.5. RetinaMasks crops at pixel scale after the upsample.
 procedure ComputeYoloMasks(Head, Proto: TNNetVolume; const Config: TYoloConfig;
-  const Dets: TYoloDetectionArray; Masks: TNNetVolume; Binarize: boolean = true);
+  const Dets: TYoloDetectionArray; Masks: TNNetVolume; Binarize: boolean = true;
+  RetinaMasks: boolean = false);
 
 // FastSAM post-NMS box step: snaps sides within BorderThreshold px of the image
 // edge to it, then boxes with IoU > FullBoxIoU vs the image become the image box.
@@ -16583,7 +16586,8 @@ procedure FastSAMAdjustBoxes(var Dets: TYoloDetectionArray; ImageSize: integer;
 // when IsFastSAM, then ComputeYoloMasks into Masks. Returns the detections.
 function DecodeYoloSegmentation(NN: TNNet; const Config: TYoloConfig;
   Masks: TNNetVolume; ScoreThreshold: TNeuralFloat = 0.25;
-  IoUThreshold: TNeuralFloat = 0.45; IsFastSAM: boolean = false): TYoloDetectionArray;
+  IoUThreshold: TNeuralFloat = 0.45; IsFastSAM: boolean = false;
+  RetinaMasks: boolean = false; MaxDetections: integer = 300): TYoloDetectionArray;
 
 // FastSAM box prompt: index of the mask (channel of Masks) with the highest
 // IoU vs the pixel box [X1,X2) x [Y1,Y2) (clamped); -1 when Masks is empty.
@@ -94638,7 +94642,8 @@ begin
 end;
 
 function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
-  ScoreThreshold: TNeuralFloat; IoUThreshold: TNeuralFloat): TYoloDetectionArray;
+  ScoreThreshold: TNeuralFloat; IoUThreshold: TNeuralFloat;
+  MaxDetections: integer): TYoloDetectionArray;
 var
   s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2: integer;
   rm, nc, OutDim, Stride, cellBase: integer;
@@ -94748,10 +94753,12 @@ begin
   end;
   KeptIdx := NeuralGreedyNMS(NX1, NY1, NX2, NY2, NScore, NCls,
     Length(Cand), IoUThreshold);
-  // KeptIdx is already in descending-score order (matches the prior in-place
-  // sort + suppression), so emit the kept candidates directly.
-  SetLength(Result, Length(KeptIdx));
+  // KeptIdx is already in descending-score order, so the max_det cap keeps
+  // the first MaxDetections kept candidates.
   KeptIdxHi := High(KeptIdx);
+  if (MaxDetections > 0) and (KeptIdxHi >= MaxDetections) then
+    KeptIdxHi := MaxDetections - 1;
+  SetLength(Result, KeptIdxHi + 1);
   for k := 0 to KeptIdxHi do
     Result[k] := Cand[KeptIdx[k]];
 end;
@@ -94773,13 +94780,39 @@ begin
 end;
 
 procedure ComputeYoloMasks(Head, Proto: TNNetVolume; const Config: TYoloConfig;
-  const Dets: TYoloDetectionArray; Masks: TNNetVolume; Binarize: boolean);
+  const Dets: TYoloDetectionArray; Masks: TNNetVolume; Binarize: boolean;
+  RetinaMasks: boolean);
 var
   Coefs, LowRes: TNNetVolume;
   NumMasks, DetCnt, MaxDetPos, DetPos, CoefOfs, ProtoW, ProtoH: integer;
-  X, Y, MaxX, MaxY, PixelBase, MaxValuePos, ValuePos: integer;
-  RatioX, RatioY: TNeuralFloat;
+  MaxValuePos, ValuePos: integer;
   BoxX1, BoxY1, BoxX2, BoxY2: TNeuralFloatDynArr;
+
+  // ultralytics crop_mask on Vol (channel k = Dets[k]): keeps x1 <= x < x2,
+  // y1 <= y < y2 of the pixel box scaled by (ScaleX, ScaleY).
+  procedure CropToBoxes(Vol: TNNetVolume; ScaleX, ScaleY: TNeuralFloat);
+  var
+    X, Y, MaxX, MaxY, PixelBase, CropDetPos: integer;
+  begin
+    for CropDetPos := 0 to MaxDetPos do
+    begin
+      BoxX1[CropDetPos] := Dets[CropDetPos].X1 * ScaleX;
+      BoxY1[CropDetPos] := Dets[CropDetPos].Y1 * ScaleY;
+      BoxX2[CropDetPos] := Dets[CropDetPos].X2 * ScaleX;
+      BoxY2[CropDetPos] := Dets[CropDetPos].Y2 * ScaleY;
+    end;
+    MaxX := Vol.SizeX - 1; MaxY := Vol.SizeY - 1;
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+      begin
+        PixelBase := Vol.GetRawPos(X, Y, 0);
+        for CropDetPos := 0 to MaxDetPos do
+          if (X < BoxX1[CropDetPos]) or (X >= BoxX2[CropDetPos]) or
+             (Y < BoxY1[CropDetPos]) or (Y >= BoxY2[CropDetPos]) then
+            Vol.FData[PixelBase + CropDetPos] := 0;
+      end;
+  end;
+
 begin
   NumMasks := Config.NumMasks;
   if NumMasks <= 0 then
@@ -94792,38 +94825,22 @@ begin
   MaxDetPos := DetCnt - 1;
   ProtoW := Proto.SizeX; ProtoH := Proto.SizeY;
   CoefOfs := 4 * Config.RegMax + Config.NumClasses;
-  RatioX := ProtoW / Config.ImageSize;
-  RatioY := ProtoH / Config.ImageSize;
   SetLength(BoxX1, DetCnt); SetLength(BoxY1, DetCnt);
   SetLength(BoxX2, DetCnt); SetLength(BoxY2, DetCnt);
   Coefs := TNNetVolume.Create(NumMasks * DetCnt, 1, 1);
   LowRes := TNNetVolume.Create(ProtoW, ProtoH, DetCnt);
   try
     for DetPos := 0 to MaxDetPos do
-    begin
       Move(Head.FData[Head.GetRawPos(Dets[DetPos].CellIndex, 0, CoefOfs)],
         Coefs.FData[DetPos * NumMasks], NumMasks * csNeuralFloatSize);
-      BoxX1[DetPos] := Dets[DetPos].X1 * RatioX;
-      BoxY1[DetPos] := Dets[DetPos].Y1 * RatioY;
-      BoxX2[DetPos] := Dets[DetPos].X2 * RatioX;
-      BoxY2[DetPos] := Dets[DetPos].Y2 * RatioY;
-    end;
     // LowRes[x, y, k] = coefs[k] . Proto[x, y, :]
     LowRes.DotProducts(DetCnt, ProtoW * ProtoH, NumMasks, Coefs, Proto);
     TNNetVolume.Sigmoid(LowRes.GetRawPtr(0), LowRes.GetRawPtr(0), LowRes.Size);
-    // ultralytics crop_mask: keep x1 <= x < x2, y1 <= y < y2 at Proto scale.
-    MaxX := ProtoW - 1; MaxY := ProtoH - 1;
-    for Y := 0 to MaxY do
-      for X := 0 to MaxX do
-      begin
-        PixelBase := LowRes.GetRawPos(X, Y, 0);
-        for DetPos := 0 to MaxDetPos do
-          if (X < BoxX1[DetPos]) or (X >= BoxX2[DetPos]) or
-             (Y < BoxY1[DetPos]) or (Y >= BoxY2[DetPos]) then
-            LowRes.FData[PixelBase + DetPos] := 0;
-      end;
+    if not RetinaMasks then
+      CropToBoxes(LowRes, ProtoW / Config.ImageSize, ProtoH / Config.ImageSize);
     InterpolateVolume2D(LowRes, Masks, Config.ImageSize, Config.ImageSize,
       {bilinear}1, {AlignCorners}0);
+    if RetinaMasks then CropToBoxes(Masks, 1, 1);
     if Binarize then
     begin
       MaxValuePos := Masks.Size - 1;
@@ -94863,17 +94880,18 @@ end;
 
 function DecodeYoloSegmentation(NN: TNNet; const Config: TYoloConfig;
   Masks: TNNetVolume; ScoreThreshold: TNeuralFloat;
-  IoUThreshold: TNeuralFloat; IsFastSAM: boolean): TYoloDetectionArray;
+  IoUThreshold: TNeuralFloat; IsFastSAM: boolean; RetinaMasks: boolean;
+  MaxDetections: integer): TYoloDetectionArray;
 var
   ProtoLayer: TNNetLayer;
 begin
   ProtoLayer := GetYoloProtoLayer(NN);
   ProtoLayer.ForceOutputOnRAM();
   Result := DecodeYoloDetections(NN.GetLastLayer().Output, Config,
-    ScoreThreshold, IoUThreshold);
+    ScoreThreshold, IoUThreshold, MaxDetections);
   if IsFastSAM then FastSAMAdjustBoxes(Result, Config.ImageSize);
   ComputeYoloMasks(NN.GetLastLayer().Output, ProtoLayer.Output, Config, Result,
-    Masks);
+    Masks, {Binarize=}true, RetinaMasks);
 end;
 
 function FastSAMSelectByBox(Masks: TNNetVolume; X1, Y1, X2, Y2: integer): integer;

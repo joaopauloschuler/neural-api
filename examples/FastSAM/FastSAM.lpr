@@ -43,7 +43,7 @@ type
   TFastSAMOptions = record
     ModelFile, ConfigFile, ImageFile, OutputFile: string;
     ScoreThreshold, IoUThreshold: TNeuralFloat;
-    HasBox: boolean;
+    HasBox, RetinaMasks: boolean;
     Box: array[0..3] of integer;
     PointX, PointY, PointLabels: array of integer;
     UseOpenCL: boolean;
@@ -66,6 +66,8 @@ begin
   WriteLn('  --output PNG         mask overlay (default fastsam.png)');
   WriteLn('  --conf X             score threshold (default 0.4, FastSAM)');
   WriteLn('  --iou X              NMS IoU threshold (default 0.9, FastSAM)');
+  WriteLn('  --no-retina          crop masks at prototype scale (process_mask)');
+  WriteLn('                       instead of FastSAM''s retina_masks default');
   WriteLn('  --box X1,Y1,X2,Y2    box prompt in image pixels');
   WriteLn('  --point X,Y,LABEL    point prompt in image pixels, LABEL 1 = keep,');
   WriteLn('                       0 = remove; repeat for several points');
@@ -116,6 +118,7 @@ begin
   Opt.ScoreThreshold := 0.4;
   Opt.IoUThreshold := 0.9;
   Opt.HasBox := false;
+  Opt.RetinaMasks := true;
   SetLength(Opt.PointX, 0);
   SetLength(Opt.PointY, 0);
   SetLength(Opt.PointLabels, 0);
@@ -149,6 +152,7 @@ begin
       Opt.PointY[PointCnt - 1] := PointValues[1];
       Opt.PointLabels[PointCnt - 1] := PointValues[2];
     end
+    else if Arg = '--no-retina' then Opt.RetinaMasks := false
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
@@ -267,7 +271,7 @@ begin
     StartTime := Now();
     NN.Compute(NetInput);
     Dets := DecodeYoloSegmentation(NN, Config, Masks, Opt.ScoreThreshold,
-      Opt.IoUThreshold, {IsFastSAM=}Config.ModelType = 'fastsam');
+      Opt.IoUThreshold, {IsFastSAM=}Config.ModelType = 'fastsam', Opt.RetinaMasks);
     WriteLn(Format('  %dx%d image -> %d mask(s) in %.2f s', [Image.SizeX,
       Image.SizeY, Length(Dets), (Now() - StartTime) * 86400.0]));
     if Opt.HasBox then

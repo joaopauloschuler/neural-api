@@ -291,8 +291,15 @@ rather than acted on.
       - [ ] Real-checkpoint run: FastSAM-s.pt / FastSAM-x.pt converted to
             safetensors on the user's box (config rows in
             examples/FastSAM/README.md); check masks against ultralytics.
-      - [ ] Retina-mask path (`retina_masks=True`, FastSAM's CLI default:
-            upsample to the image, then crop) and the `max_det` 300 cap.
+      - [X] Retina-mask path (`retina_masks=True`, FastSAM's CLI default):
+            `ComputeYoloMasks` / `DecodeYoloSegmentation` `RetinaMasks`
+            (8.0 `process_mask_native` at the net input size: upsample, then
+            crop in pixels; parity in `TestYoloSegParity`), default in
+            examples/FastSAM (`--no-retina`). Not done: the native path at the
+            ORIGINAL image size (unpad the prototype map, upsample to the image).
+      - [X] `max_det` cap: `MaxDetections` (default 300) on
+            `DecodeYoloDetections` / `DecodeYoloSegmentation`
+            (`TestYoloDetectionDecode`).
       - [ ] CLIP text prompt (`text_prompt`: crop each mask's box, CLIP
             image/text similarity, argmax).
 

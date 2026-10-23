@@ -70,7 +70,10 @@ and FastSAM, on the same pico backbone with nc=1 (FastSAM's single class):
   c4 = max(w2 // 4, nm). Per cell the CAI head is [box, cls, nm mask coefs].
   The oracle then runs DFL decode + NMS, FastSAM's border snap / full-box
   replacement, and ultralytics 8.0 process_mask (sigmoid(coef @ proto), crop
-  at proto resolution, bilinear upsample, > 0.5) in torch float64.
+  at proto resolution, bilinear upsample, > 0.5) in torch float64. It also
+  writes the retina masks (retina_masks=True, FastSAM's CLI default): 8.0
+  process_mask_native with shape = the net input, i.e. upsample first, then
+  crop with the pixel boxes (no letterbox unpad: the input is the image).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/yolo_tiny_fixture.py
@@ -515,22 +518,54 @@ def fastsam_adjust(dets, size, border=20.0, full_iou=0.9):
     return dets
 
 
-def process_mask(proto, coefs, boxes, size):
-    # ultralytics 8.0 ops.process_mask(upsample=True), the FastSAM default path.
+def crop_mask(m, boxes):
+    # ultralytics ops.crop_mask: keep x1 <= x < x2, y1 <= y < y2 per mask.
     import torch
-    import torch.nn.functional as F
+    n, h, w = m.shape
+    x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4, 1)
+    r = torch.arange(w, dtype=torch.float64)[None, None, :]
+    cc = torch.arange(h, dtype=torch.float64)[None, :, None]
+    return m * ((r >= x1) * (r < x2) * (cc >= y1) * (cc < y2))
+
+
+def mask_logits_sigmoid(proto, coefs):
+    import torch
     protos = torch.from_numpy(proto)
     c, mh, mw = protos.shape
-    m = (torch.from_numpy(coefs) @ protos.view(c, -1)).sigmoid().view(-1, mh, mw)
+    return (torch.from_numpy(coefs) @ protos.view(c, -1)).sigmoid().view(-1, mh, mw)
+
+
+def process_mask(proto, coefs, boxes, size):
+    # ultralytics 8.0 ops.process_mask(upsample=True), the predictor default path.
+    import torch
+    import torch.nn.functional as F
+    m = mask_logits_sigmoid(proto, coefs)
+    mh, mw = m.shape[1:]
     db = torch.from_numpy(np.array(boxes, dtype=np.float64)).clone()
     db[:, 0] *= mw / size; db[:, 2] *= mw / size
     db[:, 1] *= mh / size; db[:, 3] *= mh / size
-    x1, y1, x2, y2 = torch.chunk(db[:, :, None], 4, 1)
-    r = torch.arange(mw, dtype=torch.float64)[None, None, :]
-    cc = torch.arange(mh, dtype=torch.float64)[None, :, None]
-    m = m * ((r >= x1) * (r < x2) * (cc >= y1) * (cc < y2))
+    m = crop_mask(m, db)
     m = F.interpolate(m[None], (size, size), mode='bilinear',
                       align_corners=False)[0]
+    return m.numpy()
+
+
+def process_mask_native(proto, coefs, boxes, size):
+    # ultralytics 8.0 ops.process_mask_native(protos, masks_in, bboxes, shape)
+    # with shape = (size, size): gain = mh / size, so the letterbox unpad
+    # slice is the whole map; bilinear upsample, then crop in pixels.
+    import torch
+    import torch.nn.functional as F
+    m = mask_logits_sigmoid(proto, coefs)
+    mh, mw = m.shape[1:]
+    gain = min(mh / size, mw / size)
+    pad = (mw - size * gain) / 2, (mh - size * gain) / 2
+    top, left = int(pad[1]), int(pad[0])
+    bottom, right = int(mh - pad[1]), int(mw - pad[0])
+    m = m[:, top:bottom, left:right]
+    m = F.interpolate(m[None], (size, size), mode='bilinear',
+                      align_corners=False)[0]
+    m = crop_mask(m, torch.from_numpy(np.array(boxes, dtype=np.float64)))
     return m.numpy()
 
 
@@ -559,15 +594,21 @@ def main_seg():
     coef_ofs = 4 * REG_MAX + NC_SEG
     coefs = np.array([out[d[6], coef_ofs:coef_ofs + NM] for d in dets])
     soft = process_mask(proto, coefs, [d[0:4] for d in dets], INPUT)
+    retina = process_mask_native(proto, coefs, [d[0:4] for d in dets], INPUT)
     masks = (soft > 0.5).astype(np.float32)
     # pixels this close to 0.5 may binarize differently in float32; the
     # Pascal test compares the soft masks and skips them in the 0/1 check.
     near = int((np.abs(soft - 0.5) < 1e-4).sum())
+    retina_near = int((np.abs(retina - 0.5) < 1e-4).sum())
+    retina_differs = int(((retina > 0.5) != (soft > 0.5)).sum())
     print(f'head {out.shape}; proto {proto.shape}; conf {conf:.6f} '
           f'(margin {score_margin:.2e}); NMS IoU margin {iou_margin:.2e}')
     print(f'{len(dets)} dets; mask pixels on: {masks.sum(axis=(1, 2))}; '
           f'pixels within 1e-4 of 0.5: {near}')
+    print(f'retina masks: pixels within 1e-4 of 0.5: {retina_near}; '
+          f'binary pixels that differ from process_mask: {retina_differs}')
     assert score_margin > 1e-4 and iou_margin > 1e-3
+    assert retina_differs > 0
 
     save_file(sd_f32, 'tests/fixtures/tiny_yolo_seg.safetensors')
     config = {
@@ -599,6 +640,7 @@ def main_seg():
         'det_scores': f32([d[4] for d in dets]),
         'det_cells': f32([d[6] for d in dets]),
         'soft_masks': f32(soft),                       # (N, H, W); mask = > 0.5
+        'retina_soft_masks': f32(retina),              # (N, H, W); mask = > 0.5
     }, 'tests/fixtures/tiny_yolo_seg_io.safetensors')
     print('wrote tiny_yolo_seg.safetensors + config + io')
 

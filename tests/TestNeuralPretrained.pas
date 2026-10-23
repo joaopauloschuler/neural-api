@@ -42294,7 +42294,7 @@ var
   RefJson: TStringList;
   InArr: TJSONArray;
   Img, Output: TNNetVolume;
-  Dets: TYoloDetectionArray;
+  Dets, CappedDets: TYoloDetectionArray;
   x, yy, ch, FlatIdx, W, H, NumCh, c, BestCls, rm, side, b: integer;
   MaxLogit, SumExp, BestP, P, Dist: TNeuralFloat;
 begin
@@ -42326,6 +42326,20 @@ begin
       {IoUThreshold=}1.1);
     AssertEquals('all cells kept at thresh 0 / IoU>1', Output.SizeX,
       Length(Dets));
+    // max_det keeps the top-scoring prefix of the uncapped list.
+    CappedDets := DecodeYoloDetections(Output, Config, 0.0, 1.1, {MaxDetections=}5);
+    AssertEquals('max_det 5', 5, Length(CappedDets));
+    for c := 0 to High(CappedDets) do
+    begin
+      AssertEquals('capped cell ' + IntToStr(c), Dets[c].CellIndex,
+        CappedDets[c].CellIndex);
+      AssertEquals('capped score ' + IntToStr(c), Dets[c].Score,
+        CappedDets[c].Score, 0);
+    end;
+    AssertEquals('max_det 0 keeps all', Output.SizeX,
+      Length(DecodeYoloDetections(Output, Config, 0.0, 1.1, {MaxDetections=}0)));
+    AssertEquals('max_det above the count keeps all', Output.SizeX,
+      Length(DecodeYoloDetections(Output, Config, 0.0, 1.1, Output.SizeX + 7)));
     // Verify cell 0 (stride 8, gx=gy=0) class + DFL box against a manual decode.
     BestCls := 0; BestP := -1;
     for c := 0 to Config.NumClasses - 1 do
@@ -56166,8 +56180,7 @@ begin
 end;
 
 // Pico YOLOv8-seg / FastSAM (tools/yolo_tiny_fixture.py --seg) vs the float64
-// oracle: raw head (box, class, mask coefs) and Proto < 1e-4, NMS + FastSAM box
-// step, soft masks < 1e-4, binary masks equal away from the 0.5 threshold.
+// oracle: raw head, Proto, NMS + FastSAM box step, then process_mask and retina masks.
 procedure TTestNeuralPretrained.TestYoloSegParity;
 var
   NN: TNNet;
@@ -56176,9 +56189,25 @@ var
   Img, RefHead, RefProto, RefBoxes, RefScores, RefCells, RefSoft: TNNetVolume;
   Head, Proto, Masks, SoftMasks, Thresholds: TNNetVolume;
   Dets: TYoloDetectionArray;
-  HeadDiff, ProtoDiff, BoxDiff, SoftDiff: double;
-  DetPos, ValuePos, Mismatches, Ambiguous: integer;
-  RefBit: boolean;
+  HeadDiff, ProtoDiff, BoxDiff, SoftDiff, RetinaDiff: double;
+  DetPos, ValuePos, Mismatches, Ambiguous, RetinaMismatches, RetinaAmbiguous: integer;
+  RetinaVsPlain: integer;
+  IoUThreshold: TNeuralFloat;
+
+  // Pixels whose Binary bit disagrees with RefSoft > 0.5, skipping the
+  // Ambiguous ones within 1e-4 of the threshold.
+  function CountMaskMismatches(Binary, Ref: TNNetVolume; out AmbiguousCnt: integer): integer;
+  var
+    MaxPixelPos, PixelPos: integer;
+  begin
+    Result := 0; AmbiguousCnt := 0;
+    MaxPixelPos := Binary.Size - 1;
+    for PixelPos := 0 to MaxPixelPos do
+      if Abs(Ref.FData[PixelPos] - 0.5) < 1e-4 then Inc(AmbiguousCnt)
+      else if (Ref.FData[PixelPos] > 0.5) <> (Binary.FData[PixelPos] > 0.5) then
+        Inc(Result);
+  end;
+
 begin
   IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_yolo_seg_io.safetensors'));
   Img := TNNetVolume.Create; RefHead := TNNetVolume.Create;
@@ -56209,8 +56238,9 @@ begin
     ProtoDiff := MaxAbsVolumeDiff(Proto, RefProto);
     IO.LoadTensorFlat('conf', Thresholds);
     IO.LoadTensorFlat('iou', SoftMasks);
+    IoUThreshold := SoftMasks.FData[0];
     Dets := DecodeYoloSegmentation(NN, Config, Masks, Thresholds.FData[0],
-      SoftMasks.FData[0], {IsFastSAM=}true);
+      IoUThreshold, {IsFastSAM=}true);
     AssertEquals('detection count', RefScores.Size, Length(Dets));
     BoxDiff := 0;
     for DetPos := 0 to High(Dets) do
@@ -56226,13 +56256,7 @@ begin
     end;
     ComputeYoloMasks(Head, Proto, Config, Dets, SoftMasks, {Binarize=}false);
     SoftDiff := MaxAbsVolumeDiff(SoftMasks, RefSoft);
-    Mismatches := 0; Ambiguous := 0;
-    for ValuePos := 0 to Masks.Size - 1 do
-    begin
-      RefBit := RefSoft.FData[ValuePos] > 0.5;
-      if Abs(RefSoft.FData[ValuePos] - 0.5) < 1e-4 then Inc(Ambiguous)
-      else if RefBit <> (Masks.FData[ValuePos] > 0.5) then Inc(Mismatches);
-    end;
+    Mismatches := CountMaskMismatches(Masks, RefSoft, Ambiguous);
     WriteLn('  YOLO-seg head max|diff| = ', HeadDiff:0:9, ', proto ', ProtoDiff:0:9,
       ', boxes ', BoxDiff:0:9, ', soft masks ', SoftDiff:0:9, ', mask pixel ',
       'mismatches ', Mismatches, ' (', Ambiguous, ' within 1e-4 of 0.5 skipped)');
@@ -56241,6 +56265,25 @@ begin
     AssertTrue('box max |diff| ' + FloatToStr(BoxDiff), BoxDiff < 1e-3);
     AssertTrue('soft mask max |diff| ' + FloatToStr(SoftDiff), SoftDiff < 1e-4);
     AssertEquals('binary mask mismatches', 0, Mismatches);
+    // Retina masks (process_mask_native): upsample first, crop in pixels.
+    LoadDDColorTorchImage(IO, 'retina_soft_masks', RefSoft);
+    ComputeYoloMasks(Head, Proto, Config, Dets, SoftMasks, {Binarize=}false,
+      {RetinaMasks=}true);
+    RetinaDiff := MaxAbsVolumeDiff(SoftMasks, RefSoft);
+    RetinaVsPlain := 0;
+    for ValuePos := 0 to Masks.Size - 1 do
+      if (SoftMasks.FData[ValuePos] > 0.5) <> (Masks.FData[ValuePos] > 0.5) then
+        Inc(RetinaVsPlain);
+    Dets := DecodeYoloSegmentation(NN, Config, Masks, Thresholds.FData[0],
+      IoUThreshold, {IsFastSAM=}true, {RetinaMasks=}true);
+    RetinaMismatches := CountMaskMismatches(Masks, RefSoft, RetinaAmbiguous);
+    WriteLn('  YOLO-seg retina soft masks max|diff| = ', RetinaDiff:0:9,
+      ', mask pixel mismatches ', RetinaMismatches, ' (', RetinaAmbiguous,
+      ' skipped), pixels that differ from process_mask ', RetinaVsPlain);
+    AssertTrue('retina soft mask max |diff| ' + FloatToStr(RetinaDiff),
+      RetinaDiff < 1e-4);
+    AssertEquals('retina binary mask mismatches', 0, RetinaMismatches);
+    AssertTrue('retina masks differ from process_mask', RetinaVsPlain > 0);
   finally
     NN.Free; Thresholds.Free; SoftMasks.Free; Masks.Free; RefSoft.Free; RefCells.Free;
     RefScores.Free; RefBoxes.Free; RefProto.Free; RefHead.Free; Img.Free;
