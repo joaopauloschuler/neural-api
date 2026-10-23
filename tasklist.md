@@ -818,7 +818,22 @@ rather than acted on.
               under CFG (guidance 7.5) and Prompt-to-Prompt edits of it
               (`DenoiseEdit` from the inverted latents) stay faithful; today
               `--invert-image` with `--edit-prompt` is only faithful at
-              guidance 1.
+              guidance 1. Steps, each its own commit:
+          - [ ] (a) Gradient of the SD UNet output with respect to its text
+                (encoder_hidden_states) input: check whether `TNNet.Backpropagate`
+                already leaves the error on the text `TNNetInput` (the attn2 K/V
+                projections read it); if not, add it. Test: numerical gradient
+                on the pico UNet (tests/fixtures/tiny_sd15) at a few embed entries.
+          - [ ] (b) `NullTextInversion(Image, PromptEmbeds, Steps, Guidance,
+                InnerSteps = 10, LearningRate = 1e-2)` on TStableDiffusionPipeline:
+                the reference loop of Mokady et al. (google/prompt-to-prompt
+                null_text_w_ptp.ipynb): per step, Adam on the uncond embeds to
+                match the DDIM-inverted trajectory latent of step t-1 under CFG,
+                with the early stop `loss < 1e-5 + i * 2e-5`. Returns one uncond
+                embed per step. Parity vs an ad hoc torch run of that loop on the
+                pico folder (numbers hardcoded, no new tool).
+          - [ ] (c) `RunSteps` / `DenoiseEdit` take a per-step uncond embed list;
+                `--null-text` in examples/StableDiffusion with `--invert-image`.
         - [ ] Prompt-to-Prompt on a real checkpoint (SD 1.5) on the user's
               GPU box: swap, refine and reweight from a seed and from an
               inverted photo; LocalBlend (the reference's mask that limits
@@ -856,6 +871,11 @@ rather than acted on.
           (Heads loop) but only parity-verified at Heads=1;
       (d) a real-checkpoint smoke once a swin-tiny-semantic checkpoint is obtainable
           offline (the importer is config-driven and ready).
+      (e) `DecodeMask2FormerSemantic` skips transformers' 384x384 bilinear resize of
+          the mask logits that `post_process_semantic_segmentation` does before the
+          target-size resize (instance/panoptic do it, through
+          `Mask2FormerPixelMajorMasks`); route the semantic path through the same helper
+          and re-pin `TestMask2FormerParity`'s semantic map.
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
