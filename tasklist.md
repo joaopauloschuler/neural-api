@@ -837,8 +837,11 @@ rather than acted on.
         `x + conv_last(feat)` (TestSwinIRDenoiseParity); config field
         `upsampler`, or auto-detect from conv_up1 / conv_before_upsample keys.
   - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
-        not obtainable offline). Needs the PixelShuffle channel-order fix under
-        "Bugs" first.
+        not obtainable offline). The `pixelshuffle` tail needs the PixelShuffle
+        channel-order fix under "Bugs" first; the `nearest+conv` real-world
+        x4 checkpoint (003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth) and the
+        denoise checkpoints do not, so they can run now. They would also confirm
+        d6d3c6d2's LeakyReLU 0.01 (conv_before_upsample) and erf-GELU changes.
   - [ ] Lightweight-SR `pixelshuffledirect` tail (UpsampleOneStep: one 3x3
         conv embed_dim -> upscale^2*out_ch + PixelShuffle) not wired; the
         importer rejects it (TestSwinIRRejectsPixelShuffleDirect). Waits on
