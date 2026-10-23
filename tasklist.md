@@ -789,34 +789,37 @@ rather than acted on.
             TestStableDiffusionSAG*: pico parity vs diffusers with reference
             numbers hardcoded from an ad hoc run; tools/make_pico_sd_pipeline_fixture.py
             has no SAG mode).
-      - [ ] Prompt-to-Prompt editing with DDIM inversion in
-            TStableDiffusionPipeline (Hertz et al. 2022, arXiv:2208.01626;
-            diffusers `DDIMInverseScheduler`). Edits a generated or real image by
-            changing words in its prompt while the layout stays fixed: today
-            img2img / InstructPix2Pix are the only edit routes, and both redraw
-            the layout. Pieces:
-            (1) an inverse DDIM step on `TNNetDiffusionScheduler` (eta 0, the
-            `DDIMInverseScheduler` timestep order and `set_alpha_to_one`), plus
-            `--invert-image`: the VAE-encoded image walked from x0 to x_T with
-            the source prompt, parity vs diffusers `DDIMInverseScheduler` on the
-            pico folder;
-            (2) cross-attention control on the attn2 heads: the source-prompt
-            pass stores each head's attention probabilities and the target pass
-            replaces them for the first `cross_replace_steps` fraction of the
-            steps (word swap), maps them through a token alignment (refine:
-            added words), or scales chosen token columns (reweight). Reading
-            the maps can reuse `KeepAttentionWeights` (SAG does); writing them
-            needs a new injection hook in `TNNetScaledDotProductAttention`, and
-            the controlled heads leave the fused flash kernel on OpenCL as SAG's
-            heads do. Self-attention replacement for the first
-            `self_replace_steps` keeps the fine layout;
-            (3) `--edit-prompt`, `--edit-mode swap|refine|reweight`,
-            `--cross-replace` / `--self-replace` in examples/StableDiffusion, and
-            a README section. Parity: a float64 reimplementation of the
-            prompt-to-prompt controller on the pico folder (as done for prompt
-            weighting; the community pipeline is not in the ~/x venv). Null-text
-            inversion (per-step optimized uncond embeddings, needed for faithful
-            real-image edits under CFG) is a later step built on (1).
+      - [ ] Prompt-to-Prompt editing in TStableDiffusionPipeline (Hertz et al.
+            2022, arXiv:2208.01626). Edits a generated or real image by changing
+            words in its prompt while the layout stays fixed: today img2img /
+            InstructPix2Pix are the only edit routes, and both redraw the layout.
+        - [x] DDIM inversion (b8a04763): `TNNetDiffusionScheduler.
+              BuildInversionSchedule` / `InverseDDIMStep` (diffusers
+              `DDIMInverseScheduler`, eta 0, `set_alpha_to_one`, `steps_offset`),
+              `TStableDiffusionPipeline.InvertImage` / `InvertLatents`,
+              `--invert-image` / `--invert-steps` / `--invert-guidance`;
+              TestInverseDDIMVsDiffusers, TestStableDiffusionDDIMInversionParity.
+        - [ ] Cross-attention control on the attn2 heads of the SD UNet: the
+              source-prompt pass (starting from the `InvertImage` latents for a
+              real image) stores each head's attention probabilities and the
+              target pass replaces them for the first `cross_replace_steps`
+              fraction of the steps (word swap), maps them through a token
+              alignment (refine: added words), or scales chosen token columns
+              (reweight). Reading the maps can reuse `KeepAttentionWeights`
+              (SAG does); writing them needs a new injection hook in
+              `TNNetScaledDotProductAttention`, and the controlled heads leave
+              the fused flash kernel on OpenCL as SAG's heads do.
+              Self-attention replacement for the first `self_replace_steps`
+              keeps the fine layout.
+        - [ ] Prompt-to-Prompt CLI: `--edit-prompt`, `--edit-mode
+              swap|refine|reweight`, `--cross-replace` / `--self-replace` in
+              examples/StableDiffusion (combining with `--invert-image` for real
+              images), and a README section. Parity: a float64 reimplementation
+              of the prompt-to-prompt controller on the pico folder (as done for
+              prompt weighting; the community pipeline is not in the ~/x venv).
+              Null-text inversion (per-step optimized uncond embeddings, needed
+              for faithful real-image edits under CFG) is a later step on top of
+              `InvertImage`.
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close; and `gligen-1-4-inpainting-text-box` with
