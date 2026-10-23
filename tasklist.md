@@ -799,27 +799,30 @@ rather than acted on.
               `TStableDiffusionPipeline.InvertImage` / `InvertLatents`,
               `--invert-image` / `--invert-steps` / `--invert-guidance`;
               TestInverseDDIMVsDiffusers, TestStableDiffusionDDIMInversionParity.
-        - [ ] Cross-attention control on the attn2 heads of the SD UNet: the
-              source-prompt pass (starting from the `InvertImage` latents for a
-              real image) stores each head's attention probabilities and the
-              target pass replaces them for the first `cross_replace_steps`
-              fraction of the steps (word swap), maps them through a token
-              alignment (refine: added words), or scales chosen token columns
-              (reweight). Reading the maps can reuse `KeepAttentionWeights`
-              (SAG does); writing them needs a new injection hook in
-              `TNNetScaledDotProductAttention`, and the controlled heads leave
-              the fused flash kernel on OpenCL as SAG's heads do.
-              Self-attention replacement for the first `self_replace_steps`
-              keeps the fine layout.
-        - [ ] Prompt-to-Prompt CLI: `--edit-prompt`, `--edit-mode
-              swap|refine|reweight`, `--cross-replace` / `--self-replace` in
-              examples/StableDiffusion (combining with `--invert-image` for real
-              images), and a README section. Parity: a float64 reimplementation
-              of the prompt-to-prompt controller on the pico folder (as done for
-              prompt weighting; the community pipeline is not in the ~/x venv).
-              Null-text inversion (per-step optimized uncond embeddings, needed
-              for faithful real-image edits under CFG) is a later step on top of
-              `InvertImage`.
+        - [x] Cross- and self-attention control (9d6f7b7c):
+              `TSDPromptToPromptEdit` (swap / refine / reweight over refine),
+              `TStableDiffusionPipeline.DenoiseEdit` / `GenerateEditFromEmbeds`
+              / `CreatePromptToPromptEdit`, the `OnAttentionProbabilities` hook
+              on `TNNetScaledDotProductAttention` and `TNNetCrossAttention`, the
+              seq_aligner mappers (`SDPromptWordSwapMapper`,
+              `SDPromptRefinementMapper`, `SDPromptWordTokenPositions`,
+              `SDPromptTokenScales`); TestStableDiffusionPromptToPromptParity
+              vs diffusers float64 (ad hoc controller run).
+        - [x] Prompt-to-Prompt CLI (9d6f7b7c): `--edit-prompt`, `--edit-mode
+              swap|refine|reweight`, `--cross-replace`, `--self-replace`,
+              `--reweight` in examples/StableDiffusion, with `--invert-image`
+              for real images; README section.
+        - [ ] Null-text inversion (Mokady et al. 2022) for
+              TStableDiffusionPipeline: per-step optimized unconditional
+              embeds on top of `InvertImage`, so a real image reconstructs
+              under CFG (guidance 7.5) and Prompt-to-Prompt edits of it
+              (`DenoiseEdit` from the inverted latents) stay faithful; today
+              `--invert-image` with `--edit-prompt` is only faithful at
+              guidance 1.
+        - [ ] Prompt-to-Prompt on a real checkpoint (SD 1.5) on the user's
+              GPU box: swap, refine and reweight from a seed and from an
+              inverted photo; LocalBlend (the reference's mask that limits
+              the edit to the edited words' region) is not ported.
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close; and `gligen-1-4-inpainting-text-box` with
