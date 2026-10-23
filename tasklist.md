@@ -524,6 +524,10 @@ rather than acted on.
   - [ ] real keep_aspect_ratio run (518, ensure_multiple_of 14) with
         DPTPreprocessImage on a photo; the example has no image input yet.
 - [ ] Video Depth Anything importer (temporally consistent depth for long videos;
+      BLOCKED on user approval: the pico parity needs a NEW Python oracle script in
+      tools/ (reference DPTHeadTemporal forward in the ~/x venv); ask first.
+      Pascal-only pieces that can go ahead without it: the AlignDepthScaleShift
+      least-squares routine (hand-derived tests) and the frame-folder reader.
       DepthAnything/Video-Depth-Anything, video_depth_anything_vits.pth, Apache-2.0
       Small). It is the landed Depth Anything V2 stack (DINOv2 encoder per frame ->
       DPT neck) whose head gains temporal motion modules: self-attention along the
