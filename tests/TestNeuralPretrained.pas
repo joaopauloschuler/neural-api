@@ -1652,7 +1652,8 @@ type
     procedure TestSwinIRParity;
     procedure TestSwinIRNearestConvParity;
     procedure TestSwinIRDenoiseParity;
-    procedure TestSwinIRRejectsPixelShuffleDirect;
+    procedure TestSwinIRPixelShuffleX4Parity;
+    procedure TestSwinIRPixelShuffleDirectParity;
     procedure TestRestormerParity;
     procedure TestRestormerDualPixelBiasFreeParity;
     procedure TestRestormerDualPixelPackedParity;
@@ -59151,27 +59152,33 @@ begin
     ' must be < 1e-4', MaxDiff < 1e-4);
 end;
 
-// 'pixelshuffledirect' depends on the open PixelShuffle channel-order question,
-// so the importer must reject it instead of building a wrong tail.
-procedure TTestNeuralPretrained.TestSwinIRRejectsPixelShuffleDirect;
+// Classical SR x4 'pixelshuffle' tail: two conv (upsample.0, upsample.2) +
+// PixelShuffle(2) steps, as the official Upsample builds for a power of two.
+procedure TTestNeuralPretrained.TestSwinIRPixelShuffleX4Parity;
 var
   Config: TSwinIRConfig;
-  NN: TNNet;
-  Raised: boolean;
+  MaxDiff: double;
 begin
-  Config := ReadSwinIRConfigFromJSONFile(
-    FixturePath('tiny_swinir_config.json'));
-  Config.Upsampler := 'pixelshuffledirect';
-  Raised := false;
-  NN := nil;
-  try
-    NN := BuildSwinIRFromSafeTensorsEx(
-      FixturePath('tiny_swinir.safetensors'), Config);
-  except
-    on E: Exception do Raised := true;
-  end;
-  NN.Free;
-  AssertTrue('pixelshuffledirect must be rejected', Raised);
+  MaxDiff := SwinIRParityMaxDiff('tiny_swinir_x4', Config);
+  AssertEquals('auto-detected upsampler', 'pixelshuffle', Config.Upsampler);
+  AssertEquals('upscale', 4, Config.Upscale);
+  AssertTrue('pixelshuffle x4: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// Lightweight SR 'pixelshuffledirect' tail (UpsampleOneStep, x3): one 3x3 conv
+// embed_dim -> 9*in_chans + PixelShuffle(3), auto-detected from the keys.
+procedure TTestNeuralPretrained.TestSwinIRPixelShuffleDirectParity;
+var
+  Config: TSwinIRConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := SwinIRParityMaxDiff('tiny_swinir_direct', Config);
+  AssertEquals('auto-detected upsampler', 'pixelshuffledirect',
+    Config.Upsampler);
+  AssertEquals('upscale', 3, Config.Upscale);
+  AssertTrue('pixelshuffledirect x3: max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
 end;
 
 // Max |diff| of pico Restormer Stem (weights WeightsFile) vs its float64 torch

@@ -959,17 +959,16 @@ rather than acted on.
       window/shifted-window attention + 3x3 conv residual + pixel-shuffle upsample
       tail, reusing the landed Swin attention blocks, NO new leaf layers; pico parity
       TestSwinIRParity / TestSwinIRConfigFromJSONFile < 1e-4 vs a float64 numpy
-      oracle; examples/SwinIRRestore 2x SR smoke; the `nearest+conv` x4 and
-      upscale-1 denoise tails are pinned by TestSwinIRNearestConvParity and
-      TestSwinIRDenoiseParity):
+      oracle; examples/SwinIRRestore 2x SR smoke; the `nearest+conv` x4,
+      upscale-1 denoise, two-step `pixelshuffle` x4 and lightweight
+      `pixelshuffledirect` x3 tails are pinned by TestSwinIRNearestConvParity,
+      TestSwinIRDenoiseParity, TestSwinIRPixelShuffleX4Parity and
+      TestSwinIRPixelShuffleDirectParity):
   - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
         not obtainable offline). Every tail can run now, e.g. the `nearest+conv`
         real-world x4 checkpoint (003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth)
         and the denoise checkpoints. They would also confirm
         d6d3c6d2's LeakyReLU 0.01 (conv_before_upsample) and erf-GELU changes.
-  - [ ] Lightweight-SR `pixelshuffledirect` tail (UpsampleOneStep: one 3x3
-        conv embed_dim -> upscale^2*out_ch + PixelShuffle) not wired; the
-        importer rejects it (TestSwinIRRejectsPixelShuffleDirect).
 - [ ] Restormer image-restoration follow-ups (`TNNetTransposedChannelAttention`,
       7ded244f; `BuildRestormerFromSafeTensors[Ex]` + `TRestormerConfig` +
       examples/Restormer, c7363ab4; pico parity `TestRestormerParity`,

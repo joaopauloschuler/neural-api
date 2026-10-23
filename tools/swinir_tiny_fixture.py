@@ -12,12 +12,15 @@ same idiom as tools/nafnet_tiny_fixture.py and tools/rrdbnet_tiny_fixture.py). W
 the official SwinIR repo state_dict key scheme so the importer is exercised on a
 realistic key layout.
 
-Three variants share the body and differ in the reconstruction tail (the
+Five variants share the body and differ in the reconstruction tail (the
 official `upsampler` argument of network_swinir.py):
   tiny_swinir          'pixelshuffle' x2 (classical SR; config has no
                        `upsampler` key, so the importer auto-detects it)
   tiny_swinir_nearest  'nearest+conv' x4 (real-world SR)
   tiny_swinir_denoise  '' upscale 1 (denoise / JPEG: x + conv_last(feat))
+  tiny_swinir_x4       'pixelshuffle' x4 (two conv + PixelShuffle(2) steps)
+  tiny_swinir_direct   'pixelshuffledirect' x3 (lightweight SR UpsampleOneStep;
+                       auto-detected)
 
 Architecture (classical SR variant, upscale=2):
   conv_first       (3x3, 3->E, pad1, +bias)                       -> feat map F0
@@ -34,6 +37,8 @@ nearest+conv tail: conv_before_upsample -> LeakyReLU(0.01), then per x2 step
   nearest x2 -> conv_up1 / conv_up2 (3x3 Eup->Eup) -> LeakyReLU(0.2), then
   conv_hr (3x3) -> LeakyReLU(0.2) -> conv_last.
 denoise tail: out = input + conv_last(feat)   (conv_last E->3).
+pixelshuffledirect tail: upsample.0 (3x3, E->r*r*3) -> PixelShuffle(r), no conv_last.
+pixelshuffle x4: upsample.0 and upsample.2 (3x3, Eup->4*Eup) each -> PixelShuffle(2).
 
 One Swin layer (HF/SwinIR semantics, token sequence over the HxW grid):
   shortcut = x
@@ -47,7 +52,7 @@ Coded by Claude (AI).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/swinir_tiny_fixture.py
-writes tests/fixtures/<stem>{.safetensors,_config.json,_io.json} for the three
+writes tests/fixtures/<stem>{.safetensors,_config.json,_io.json} for the five
 stems above.
 Needs numpy + safetensors only.
 """
@@ -73,8 +78,17 @@ VARIANTS = (
     ('tiny_swinir', 'pixelshuffle', 2, False),
     ('tiny_swinir_nearest', 'nearest+conv', 4, True),
     ('tiny_swinir_denoise', '', 1, True),
+    ('tiny_swinir_x4', 'pixelshuffle', 4, False),
+    ('tiny_swinir_direct', 'pixelshuffledirect', 3, False),
 )
 rng = np.random.default_rng(SEED)
+
+
+def shuffle_steps(upscale):
+    # official Upsample: one PixelShuffle(3) step for x3, else log2(scale) x2 steps.
+    if upscale == 3:
+        return [3]
+    return [2] * (upscale.bit_length() - 1)
 
 
 def randn(*shape, std=1.0):
@@ -125,7 +139,8 @@ def build_state_dict(upsampler, upscale):
     add_conv(sd, 'conv_after_body', EMBED, EMBED, 3)
     if upsampler == 'pixelshuffle':
         add_conv(sd, 'conv_before_upsample.0', NUM_FEAT, EMBED, 3)
-        add_conv(sd, 'upsample.0', 4 * NUM_FEAT, NUM_FEAT, 3)
+        for s, r in enumerate(shuffle_steps(upscale)):
+            add_conv(sd, f'upsample.{2 * s}', r * r * NUM_FEAT, NUM_FEAT, 3)
         add_conv(sd, 'conv_last', IN_CH, NUM_FEAT, 3)
     elif upsampler == 'nearest+conv':
         add_conv(sd, 'conv_before_upsample.0', NUM_FEAT, EMBED, 3)
@@ -134,6 +149,9 @@ def build_state_dict(upsampler, upscale):
             add_conv(sd, 'conv_up2', NUM_FEAT, NUM_FEAT, 3)
         add_conv(sd, 'conv_hr', NUM_FEAT, NUM_FEAT, 3)
         add_conv(sd, 'conv_last', IN_CH, NUM_FEAT, 3)
+    elif upsampler == 'pixelshuffledirect':
+        # UpsampleOneStep: one 3x3 conv E -> upscale^2 * out_ch + PixelShuffle.
+        add_conv(sd, 'upsample.0', upscale * upscale * IN_CH, EMBED, 3)
     else:
         add_conv(sd, 'conv_last', IN_CH, EMBED, 3)
     return sd
@@ -326,13 +344,18 @@ def forward(inp, sd, upsampler, upscale):
     if upsampler == '':
         # denoise / JPEG tail: residual over the (normalized) input.
         return inp + conv2d(feat, sd['conv_last.weight'], sd['conv_last.bias'], 1)
+    if upsampler == 'pixelshuffledirect':
+        return pixel_shuffle(conv2d(feat, sd['upsample.0.weight'],
+                                    sd['upsample.0.bias'], 1), upscale)
     # conv_before_upsample is Sequential(conv, nn.LeakyReLU()) -> slope 0.01.
     u = conv2d(feat, sd['conv_before_upsample.0.weight'],
                sd['conv_before_upsample.0.bias'], 1)
     u = leaky_relu(u, 0.01)
     if upsampler == 'pixelshuffle':
-        u = conv2d(u, sd['upsample.0.weight'], sd['upsample.0.bias'], 1)
-        u = pixel_shuffle(u, upscale)
+        for s, r in enumerate(shuffle_steps(upscale)):
+            u = conv2d(u, sd[f'upsample.{2 * s}.weight'],
+                       sd[f'upsample.{2 * s}.bias'], 1)
+            u = pixel_shuffle(u, r)
     else:
         u = leaky_relu(conv2d(nearest2x(u), sd['conv_up1.weight'],
                               sd['conv_up1.bias'], 1), 0.2)
@@ -402,12 +425,16 @@ def make_variant(stem, upsampler, upscale, write_upsampler):
             'layers.0.residual_group.blocks.0.attn.qkv.weight',
             'layers.0.residual_group.blocks.1.attn.relative_position_bias_table',
             'layers.0.residual_group.blocks.0.mlp.fc1.weight',
-            'layers.0.conv.weight', 'conv_after_body.weight',
-            'conv_last.weight']
-    if upsampler != '':
+            'layers.0.conv.weight', 'conv_after_body.weight']
+    if upsampler == 'pixelshuffledirect':
+        keys.append('upsample.0.weight')
+    else:
+        keys.append('conv_last.weight')
+    if upsampler in ('pixelshuffle', 'nearest+conv'):
         keys.append('conv_before_upsample.0.weight')
     if upsampler == 'pixelshuffle':
-        keys.append('upsample.0.weight')
+        keys += [f'upsample.{2 * s}.weight'
+                 for s in range(len(shuffle_steps(upscale)))]
     if upsampler == 'nearest+conv':
         keys += ['conv_up1.weight', 'conv_hr.weight']
         if upscale == 4:

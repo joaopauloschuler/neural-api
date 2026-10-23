@@ -6,12 +6,13 @@ neuralpretrained.pas) -- a TRANSFORMER restoration import.
 SwinIR (Liang et al. 2021, "SwinIR: Image Restoration Using Swin Transformer",
 arXiv:2108.10257) stacks Residual Swin Transformer Blocks (RSTB = a few Swin
 window/shifted-window attention layers + a 3x3 conv + a residual over the block)
-on a shallow conv stem, then one of three reconstruction tails (the official
-`upsampler` argument): 'pixelshuffle' (classical SR), 'nearest+conv'
-(real-world SR: nearest x2 + conv steps) or '' (upscale 1 denoise / JPEG:
-input + conv_last). The importer detects the tail from the checkpoint keys
-(conv_up1 -> nearest+conv, conv_before_upsample -> pixelshuffle, neither ->
-denoise) when config.json has no "upsampler" field.
+on a shallow conv stem, then one of four reconstruction tails (the official
+`upsampler` argument): 'pixelshuffle' (classical SR), 'pixelshuffledirect'
+(lightweight SR: one conv + pixel shuffle), 'nearest+conv' (real-world SR:
+nearest x2 + conv steps) or '' (upscale 1 denoise / JPEG: input + conv_last).
+The importer detects the tail from the checkpoint keys (conv_up1 ->
+nearest+conv, conv_before_upsample -> pixelshuffle, upsample.0 alone ->
+pixelshuffledirect, none -> denoise) when config.json has no "upsampler" field.
 
 Architecturally distinct from the CNN-only RRDBNet/ESRGAN SR path and the
 SimpleGate-CNN NAFNet denoiser: this is transformer restoration. The window /
@@ -32,8 +33,9 @@ on a deterministic synthetic image, and reports the upscaled shape. Pass a real
 
 USAGE
   ./SwinIRRestore                 use the committed pico fixture (pixelshuffle x2)
-  ./SwinIRRestore --fixture nearest|denoise
-                                  use the nearest+conv x4 or denoise pico fixture
+  ./SwinIRRestore --fixture x4|direct|nearest|denoise
+                                  use the pixelshuffle x4, pixelshuffledirect x3,
+                                  nearest+conv x4 or denoise pico fixture
   ./SwinIRRestore model.safetensors [config.json]
                                   use a real checkpoint
 
@@ -148,10 +150,12 @@ begin
     begin
       if ParamStr(2) = 'nearest' then FixtureStem := 'tiny_swinir_nearest'
       else if ParamStr(2) = 'denoise' then FixtureStem := 'tiny_swinir_denoise'
+      else if ParamStr(2) = 'x4' then FixtureStem := 'tiny_swinir_x4'
+      else if ParamStr(2) = 'direct' then FixtureStem := 'tiny_swinir_direct'
       else if ParamStr(2) <> 'pixelshuffle' then
       begin
         WriteLn('Unknown --fixture "', ParamStr(2),
-          '" (pixelshuffle, nearest or denoise).');
+          '" (pixelshuffle, x4, direct, nearest or denoise).');
         Halt(1);
       end;
     end;

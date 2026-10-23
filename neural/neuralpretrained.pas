@@ -15268,10 +15268,13 @@ procedure RIFEInterpolateFrames(NN: TNNet; const Config: TRIFEConfig;
 //            tokens, + RSTB input (residual)
 //   token LayerNorm (norm) -> map -> conv_after_body 3x3, + conv_first map
 //   tail by upsampler: 'pixelshuffle' = conv_before_upsample 3x3 ->
-//     LeakyReLU(0.01) -> upsample.0 3x3 (Eup -> 4*Eup) -> PixelShuffle ->
-//     conv_last; 'nearest+conv' = conv_before_upsample -> LeakyReLU(0.01) ->
-//     per x2: nearest x2 -> conv_up1/conv_up2 -> LeakyReLU(0.2), then conv_hr ->
-//     LeakyReLU(0.2) -> conv_last; '' (upscale 1) = input + conv_last(feat).
+//     LeakyReLU(0.01) -> per x2 step (or one x3 step): upsample.<2s> 3x3
+//     (Eup -> r*r*Eup) -> PixelShuffle(r) -> conv_last; 'pixelshuffledirect'
+//     (lightweight SR) = upsample.0 3x3 (E -> upscale^2*in_chans) ->
+//     PixelShuffle(upscale); 'nearest+conv' = conv_before_upsample ->
+//     LeakyReLU(0.01) -> per x2: nearest x2 -> conv_up1/conv_up2 ->
+//     LeakyReLU(0.2), then conv_hr -> LeakyReLU(0.2) -> conv_last;
+//     '' (upscale 1) = input + conv_last(feat).
 // Keys follow the official SwinIR repo state_dict (single packed attn.qkv +
 // attn.proj, layers.L.residual_group.blocks.M.*, layers.L.conv.*).
 // ---------------------------------------------------------------------------
@@ -15288,7 +15291,8 @@ type
     MlpRatio: TNeuralFloat;       // MLP hidden = round(embed_dim * mlp_ratio)
     NumFeat: integer;             // conv_before_upsample / upsample channels
     LayerNormEps: TNeuralFloat;   // 1e-5
-    // 'pixelshuffle', 'nearest+conv', '' (denoise, upscale 1) or 'auto'
+    // 'pixelshuffle', 'pixelshuffledirect', 'nearest+conv', '' (denoise,
+    // upscale 1) or 'auto'
     // (resolved from the checkpoint keys by ResolveSwinIRUpsampler).
     Upsampler: string;
   end;
@@ -15303,7 +15307,7 @@ function ReadSwinIRConfigFromJSONFile(
 function SwinIRConfigToString(const Config: TSwinIRConfig): string;
 
 // Replaces Upsampler 'auto' with the tail the checkpoint keys describe, then
-// rejects tails the importer does not build (pixelshuffledirect, _aux).
+// rejects unknown tails (e.g. pixelshuffle_aux) and upscales a tail cannot take.
 procedure ResolveSwinIRUpsampler(Reader: TNNetSafeTensorsReader;
   var Config: TSwinIRConfig);
 
@@ -85462,8 +85466,16 @@ begin
   end;
   if Config.Upsampler = 'pixelshuffle' then
   begin
+    if (Config.Upscale < 2) or ((Config.Upscale <> 3) and
+       ((Config.Upscale and (Config.Upscale - 1)) <> 0)) then
+      ImportError('SwinIR import: upsampler "pixelshuffle" needs upscale 3 ' +
+        'or a power of two, got ' + IntToStr(Config.Upscale) + '.');
+  end
+  else if Config.Upsampler = 'pixelshuffledirect' then
+  begin
     if Config.Upscale < 2 then
-      ImportError('SwinIR import: upsampler "pixelshuffle" needs upscale >= 2.');
+      ImportError('SwinIR import: upsampler "pixelshuffledirect" needs ' +
+        'upscale >= 2.');
   end
   else if Config.Upsampler = 'nearest+conv' then
   begin
@@ -85479,7 +85491,8 @@ begin
   end
   else
     ImportError('SwinIR import: upsampler "' + Config.Upsampler +
-      '" is not supported (pixelshuffle, nearest+conv or "" only).');
+      '" is not supported (pixelshuffle, pixelshuffledirect, nearest+conv or "" ' +
+      'only).');
 end;
 
 type
@@ -85653,8 +85666,12 @@ function BuildSwinIRFromSafeTensors(Reader: TNNetSafeTensorsReader;
   const Config: TSwinIRConfig; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
-  ConvFirst, ConvAfterBody, ConvBeforeUp, UpConv, ConvLast: TNNetLayer;
+  ConvFirst, ConvAfterBody, ConvBeforeUp, ConvLast: TNNetLayer;
   ConvUp1, ConvUp2, ConvHR: TNNetLayer;
+  UpConvs: array of TNNetLayer;
+  UpStepCount, UpFactor, UpOutCh, UpInCh, StepPos, MaxStepPos: integer;
+  RemainingScale, ConvLastInCh: integer;
+  UpKey: string;
   Resolved: TSwinIRConfig;
   RSTBConv: array of TNNetLayer;
   LayerRefs: array of array of TSwinIRLayerRefs;
@@ -85735,26 +85752,56 @@ begin
 
     // ---------------- Reconstruction / upsample tail ----------------
     ConvBeforeUp := nil;
-    UpConv := nil;
+    ConvLast := nil;
     ConvUp1 := nil;
     ConvUp2 := nil;
     ConvHR := nil;
-    if Resolved.Upsampler <> '' then
+    // Pixel-shuffle steps (official Upsample / UpsampleOneStep): step s is a 3x3
+    // conv UpInCh -> UpFactor^2 * UpOutCh at key upsample.<2s>, then PixelShuffle.
+    UpStepCount := 0;
+    UpFactor := Config.Upscale;
+    UpOutCh := Config.NumFeat;
+    UpInCh := Config.NumFeat;
+    if Resolved.Upsampler = 'pixelshuffle' then
+    begin
+      // x3 is one PixelShuffle(3) step; a power of two is log2(upscale) x2 steps.
+      if Config.Upscale = 3 then UpStepCount := 1
+      else
+      begin
+        UpFactor := 2;
+        RemainingScale := Config.Upscale;
+        while RemainingScale > 1 do
+        begin
+          Inc(UpStepCount);
+          RemainingScale := RemainingScale div 2;
+        end;
+      end;
+    end
+    else if Resolved.Upsampler = 'pixelshuffledirect' then
+    begin
+      UpStepCount := 1;
+      UpOutCh := Config.InChans;
+      UpInCh := Dim;
+    end;
+    if (Resolved.Upsampler = 'pixelshuffle') or
+       (Resolved.Upsampler = 'nearest+conv') then
     begin
       // nn.Sequential(conv, nn.LeakyReLU()): torch's default slope 0.01.
       ConvBeforeUp := NN.AddLayer(
         TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetLeakyReLU.Create(0.01) );
     end;
-    if Resolved.Upsampler = 'pixelshuffle' then
+    SetLength(UpConvs, UpStepCount);
+    MaxStepPos := UpStepCount - 1;
+    for StepPos := 0 to MaxStepPos do
     begin
-      // pixel-shuffle upsample: 3x3 conv -> upscale^2 * num_feat, PixelShuffle.
-      UpConv := NN.AddLayer( TNNetConvolutionLinear.Create(
-        Config.Upscale * Config.Upscale * Config.NumFeat, 3, 1, 1, 0).SetTrainable(pTrainable) );
-      NN.AddLayer( TNNetPixelShuffle.Create(Config.Upscale) );
+      UpConvs[StepPos] := NN.AddLayer( TNNetConvolutionLinear.Create(
+        UpFactor * UpFactor * UpOutCh, 3, 1, 1, 0).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetPixelShuffle.Create(UpFactor) );
+    end;
+    if Resolved.Upsampler = 'pixelshuffle' then
       ConvLast := NN.AddLayer(
-        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
-    end
+        TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) )
     else if Resolved.Upsampler = 'nearest+conv' then
     begin
       // Each x2 step: nearest x2 (TNNetDeMaxPool) -> 3x3 conv -> LeakyReLU(0.2).
@@ -85775,7 +85822,7 @@ begin
       ConvLast := NN.AddLayer(
         TNNetConvolutionLinear.Create(Config.InChans, 3, 1, 1, 0).SetTrainable(pTrainable) );
     end
-    else
+    else if Resolved.Upsampler = '' then
     begin
       // Denoise / JPEG tail: residual over the network input.
       ConvLast := NN.AddLayer(
@@ -85803,32 +85850,31 @@ begin
     LoadLayerNormWeights(Reader, FinalNorm, 'norm.weight', 'norm.bias', Dim);
     LoadVaeConv(Reader, ConvAfterBody, 'conv_after_body.weight',
       'conv_after_body.bias', Dim, Dim, 3);
-    if Resolved.Upsampler <> '' then
-    begin
+    if ConvBeforeUp <> nil then
       LoadVaeConv(Reader, ConvBeforeUp, 'conv_before_upsample.0.weight',
         'conv_before_upsample.0.bias', Config.NumFeat, Dim, 3);
-      if UpConv <> nil then
-      begin
-        LoadVaeConv(Reader, UpConv, 'upsample.0.weight', 'upsample.0.bias',
-          Config.Upscale * Config.Upscale * Config.NumFeat, Config.NumFeat, 3);
-        PermuteLayerNeurons(UpConv, TorchPixelShuffleNeurons(Config.NumFeat,
-          Config.Upscale));
-      end;
-      if ConvUp1 <> nil then
-        LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias',
-          Config.NumFeat, Config.NumFeat, 3);
-      if ConvUp2 <> nil then
-        LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias',
-          Config.NumFeat, Config.NumFeat, 3);
-      if ConvHR <> nil then
-        LoadVaeConv(Reader, ConvHR, 'conv_hr.weight', 'conv_hr.bias',
-          Config.NumFeat, Config.NumFeat, 3);
+    for StepPos := 0 to MaxStepPos do
+    begin
+      UpKey := 'upsample.' + IntToStr(2 * StepPos);
+      LoadVaeConv(Reader, UpConvs[StepPos], UpKey + '.weight', UpKey + '.bias',
+        UpFactor * UpFactor * UpOutCh, UpInCh, 3);
+      PermuteLayerNeurons(UpConvs[StepPos],
+        TorchPixelShuffleNeurons(UpOutCh, UpFactor));
+    end;
+    if ConvUp1 <> nil then
+      LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias',
+        Config.NumFeat, Config.NumFeat, 3);
+    if ConvUp2 <> nil then
+      LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias',
+        Config.NumFeat, Config.NumFeat, 3);
+    if ConvHR <> nil then
+      LoadVaeConv(Reader, ConvHR, 'conv_hr.weight', 'conv_hr.bias',
+        Config.NumFeat, Config.NumFeat, 3);
+    if ConvBeforeUp <> nil then ConvLastInCh := Config.NumFeat
+    else ConvLastInCh := Dim;
+    if ConvLast <> nil then
       LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
-        Config.InChans, Config.NumFeat, 3);
-    end
-    else
-      LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
-        Config.InChans, Dim, 3);
+        Config.InChans, ConvLastInCh, 3);
 
     Result := NN;
   except
