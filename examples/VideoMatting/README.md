@@ -16,7 +16,12 @@ matches the CPU forward (`TestRVMOpenCLParity`). The ResNet-50 variant
 (`rvm_resnet50.pth`) is coded and parity-tested on a random pico net with the
 real ResNet50Encoder wiring (`TestRVMResNet50Parity`, 1.8e-7 over 3 frames;
 OpenCL in `TestRVMResNet50OpenCLParity`), but not yet run with the real
-checkpoint. The real MobileNetV3
+checkpoint. The `fast_guided_filter` refiner and the segmentation pass are
+parity-tested on pico nets of both backbones (`TestRVMFastGuidedFilterParity`
+1.6e-5, `TestRVMResNet50FastGuidedFilterParity` 4.4e-5 -- float32 torch itself
+is 0.7e-5 / 1.3e-5 off its float64 run there, since `cov / (var + eps)` is ill
+conditioned; `TestRVMSegmentationParity` 8.9e-8,
+`TestRVMResNet50SegmentationParity` 4.1e-8). The real MobileNetV3
 checkpoint matched the official model to 2.9e-6 on a 128x96 clip (a one-off
 check). On a 640x480 4-frame clip on one CPU core, the example took about
 1.4 s per frame after the first (ratio 0.75) and about 1.7 GB of RAM.
@@ -28,13 +33,19 @@ check). On a 640x480 4-frame clip on one CPU core, the example took about
 2. It builds the net for the first frame's size and `--ratio`. With a ratio
    below 1, the net downsamples the frame, runs the backbone (MobileNetV3, or
    ResNet-50 with a dilated layer4, picked from the checkpoint keys) + LR-ASPP + the
-   recurrent decoder at low resolution, and the Deep Guided Filter refiner
-   brings the matte back to full resolution.
+   recurrent decoder at low resolution, and a guided-filter refiner brings the
+   matte back to full resolution (see "Refiner" below).
 3. `TRVMMatting.Step` runs one frame and copies the four ConvGRU outputs back
    into the state inputs for the next frame.
 4. For each frame it writes `<frame>_rgba.png` (foreground RGB + alpha) and
    `<frame>_green.png` (the foreground over RVM's green,
    `fgr * alpha + green * (1 - alpha)`), and prints the alpha range.
+
+With `--segmentation` the net runs RVM's segmentation pass instead
+(`segmentation_pass=True` in the official `model.py`): the decoder output goes
+through `project_seg`, there is no refiner, and the program writes only
+`<frame>_seg.png`, a 16-bit grayscale PNG of `sigmoid(logits)` at the
+downsampled size (`floor(width * ratio) x floor(height * ratio)`).
 
 A frame of another size needs another net: the program prints a notice,
 rebuilds the net and starts the recurrent state over. An animated `--gif` keeps
@@ -64,7 +75,22 @@ ffmpeg -framerate 30 -i matted/%05d_green.png matted.mp4
 | `--ratio R` | downsample ratio in (0, 1] for the backbone | see below |
 | `--gif FILE` | also write the green-screen frames as an animated GIF | |
 | `--fps N` | GIF frame rate | 25 |
+| `--refiner NAME` | `deep_guided_filter` or `fast_guided_filter` (used when the ratio is below 1) | from the checkpoint |
+| `--segmentation` | write `<frame>_seg.png` (segmentation pass) instead of the matte | off |
 | `--gpu`, `--gpu-platform N`, `--gpu-device N` | run the net on OpenCL (a build with `-dOpenCL`, the `.lpi` default) | CPU |
+
+### Refiner
+
+The official `MattingNetwork` has two refiners. `deep_guided_filter` (the
+default, and the one the released checkpoints were trained with) has trained
+weights under `refiner.*`. `fast_guided_filter` (`model/fast_guided_filter.py`)
+has no weights: a plain guided filter (box radius 1, eps 1e-5) fitted at low
+resolution, with its coefficients bilinearly resized to the full frame. A
+checkpoint saved from `MattingNetwork(refiner='fast_guided_filter')` therefore
+has no `refiner.*` keys; the importer picks `fast_guided_filter` when
+`refiner.box_filter.weight` is missing and `deep_guided_filter` otherwise.
+`--refiner fast_guided_filter` also runs the weight-free filter on a released
+checkpoint (cheaper; the RVM authors report a slightly worse matte).
 
 ### Choosing `--ratio`
 
@@ -98,7 +124,9 @@ a slightly better matte.
 With no arguments, the program writes three 44x36 frames and one 40x32 frame of
 a disc moving over a gradient into `rvm_smoke_frames/`, mattes them with the
 committed random pico net (`tests/fixtures/tiny_rvm_mobilenetv3.pth`) at ratio
-0.5, and writes `rvm_smoke_out/` and `rvm_smoke.gif`. The weights are random,
+0.5, and writes `rvm_smoke_out/` and `rvm_smoke.gif`, then repeats with
+`--refiner fast_guided_filter` into `rvm_smoke_out_fgf/` and with
+`--segmentation` into `rvm_smoke_out_seg/`. The weights are random,
 so the matte is meaningless; the smoke run only exercises loading, the
 recurrent forward, the rebuild on a size change and the PNG / GIF output. It
 must be run from this folder (the fixture path is relative).

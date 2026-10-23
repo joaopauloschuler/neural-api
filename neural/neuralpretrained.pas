@@ -15924,12 +15924,17 @@ procedure DDColorColorize(NN: TNNet; const Config: TDDColorConfig;
 // downsample by DownsampleRatio -> MobileNetV3-Large (last stage dilated) or
 // ResNet-50 (layer4 dilated, no input normalization) -> LR-ASPP ->
 // recurrent decoder (ConvGRU on half the channels at 1/16, 1/8, 1/4, 1/2) ->
-// fgr residual + alpha, then (ratio < 1) the Deep Guided Filter refiner back to
-// full size. Output (W, H, 4) = clamped foreground RGB + alpha. The four GRU
+// fgr residual + alpha, then (ratio < 1) the Deep or Fast Guided Filter refiner
+// back to full size. Output (W, H, 4) = clamped foreground RGB + alpha; with
+// SegmentationPass, (W*r, H*r, 1) project_seg logits and no refiner. The four GRU
 // states enter as extra TNNetInput layers; TRVMMatting carries them between
 // frames. The low-res net and the refiner share one graph so one Compute runs
 // a frame and the OpenCL path keeps every intermediate resident.
 // Coded by Claude (AI).
+const
+  csRVMDeepGuidedFilter = 'deep_guided_filter';
+  csRVMFastGuidedFilter = 'fast_guided_filter';
+
 type
   TRVMConfig = record
     Variant: string;                         // 'mobilenetv3' or 'resnet50'
@@ -15938,14 +15943,17 @@ type
     FeatureChannels: array[0..3] of integer; // f1, f2, f3 widths + LR-ASPP width
     DecoderChannels: array[0..3] of integer; // decode3, decode2, decode1, decode0
     RefinerHidden: integer;                  // DGF hid_channels (16); 0 = absent
+    // 'deep_guided_filter' (trained) or 'fast_guided_filter' (no weights, r=1).
+    Refiner: string;
+    SegmentationPass: boolean;               // output project_seg logits
     FrameWidth, FrameHeight: integer;        // full-resolution net input
     // torch interpolate(scale_factor); exact parity needs Frame*Ratio integral.
     DownsampleRatio: double;
     BnEps: TNeuralFloat;                     // decoder/LR-ASPP/refiner BN eps
   end;
 
-// Detects the variant from the backbone keys, reads every width from the
-// checkpoint shapes and sets the frame size and downsample ratio (0, 1].
+// Detects the variant from the backbone keys and the refiner (fast_guided_filter
+// without refiner.* keys), reads the widths and sets frame size and ratio (0, 1].
 function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
   FrameWidth, FrameHeight: integer; DownsampleRatio: double): TRVMConfig;
 
@@ -15959,10 +15967,12 @@ function BuildRVM(Reader: TNNetSafeTensorsReader; const Config: TRVMConfig;
 function BuildRVMFromSafeTensorsEx(const FileName: string;
   const Config: TRVMConfig; pTrainable: boolean = true): TNNet;
 
-// Same with the config inferred from the .pth / .safetensors checkpoint.
+// Same with the config inferred from the .pth / .safetensors checkpoint;
+// pRefiner <> '' overrides the detected refiner.
 function BuildRVMFromSafeTensors(const FileName: string;
   FrameWidth, FrameHeight: integer; DownsampleRatio: double;
-  out Config: TRVMConfig; pTrainable: boolean = true): TNNet;
+  out Config: TRVMConfig; pTrainable: boolean = true;
+  const pRefiner: string = ''; pSegmentationPass: boolean = false): TNNet;
 
 type
   // Per-frame driver of a BuildRVM net: copies the four GRU outputs back into
@@ -15978,10 +15988,13 @@ type
     destructor Destroy(); override;
     // Zeroes the recurrent state (the first frame of a new clip).
     procedure ResetState();
-    // Frame (W, H, 3) RGB in [0,1] -> Matte (W, H, 4) foreground RGB + alpha.
+    // Frame (W, H, 3) RGB in [0,1] -> Matte (W, H, 4) foreground RGB + alpha, or
+    // for a SegmentationPass net the (W*r, H*r, 1) segmentation logits.
     procedure Step(Frame, Matte: TNNetVolume);
     // Level 1..4 = r1..r4 after the last Step (host copy).
     function HiddenState(Level: integer): TNNetVolume;
+    // True for a SegmentationPass net (one output channel).
+    function IsSegmentation(): boolean;
     property Net: TNNet read FNet;
   end;
 
@@ -108946,6 +108959,9 @@ const
   csRVMFeatureBlocks: array[0..2] of integer = (0, 2, 5);
   csRVMImageMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
   csRVMImageStd: array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+  // FastGuidedFilter(r=1, eps=1e-5) in model/fast_guided_filter.py.
+  csRVMFastGuidedFilterRadius = 1;
+  csRVMFastGuidedFilterEps = 1e-5;
 
 function RVMDim(Reader: TNNetSafeTensorsReader; const Name: string;
   Axis: integer): integer;
@@ -109109,6 +109125,12 @@ begin
     Result.RefinerHidden := Reader.DimSize('refiner.conv.0.weight', 0)
   else
     Result.RefinerHidden := 0;
+  // FastGuidedFilterRefiner has no parameters, so its checkpoint has no refiner.*.
+  if Reader.HasTensor('refiner.box_filter.weight') then
+    Result.Refiner := csRVMDeepGuidedFilter
+  else
+    Result.Refiner := csRVMFastGuidedFilter;
+  Result.SegmentationPass := false;
 end;
 
 // Channel count of the trunk output that feeds LR-ASPP.
@@ -109140,7 +109162,9 @@ begin
     IntToStr(Config.DecoderChannels[0]) + ',' + IntToStr(Config.DecoderChannels[1]) +
     ',' + IntToStr(Config.DecoderChannels[2]) + ',' +
     IntToStr(Config.DecoderChannels[3]) + '], refiner_hidden=' +
-    IntToStr(Config.RefinerHidden) + ', frame=' + IntToStr(Config.FrameWidth) +
+    IntToStr(Config.RefinerHidden) + ', refiner=' + Config.Refiner +
+    ', segmentation_pass=' + BoolToStr(Config.SegmentationPass, true) +
+    ', frame=' + IntToStr(Config.FrameWidth) +
     'x' + IntToStr(Config.FrameHeight) + ', downsample_ratio=' +
     FloatToStr(Config.DownsampleRatio);
 end;
@@ -109259,6 +109283,7 @@ var
   Frame, Small, Pooled, Gate, Aspp1, Aspp2, ProjMat, Hid, X, Up, Merged: TNNetLayer;
   BaseX, MeanX, NegMeanX, MeanY, BoxXY, BoxXX, Cov, Variance: TNNetLayer;
   Refine1, Refine2, RefineConv, RefineA, RefineB, FineX, FineSrc, Combined: TNNetLayer;
+  ProjSeg: TNNetLayer;
   Sources: array[0..3] of TNNetLayer;  // s0 (low-res frame), s1, s2, s3
   Features: array[0..3] of TNNetLayer; // f1, f2, f3, LR-ASPP output
   UpConvs: array[0..3] of TNNetLayer;  // decode3, decode2, decode1, decode0 conv
@@ -109268,7 +109293,7 @@ var
   ResNetTrunk: TResNetTrunk;
   Values: TNNetVolume;
   LowWidth, LowHeight, Level, Channel, HalfC, InCh, TrunkWidth: integer;
-  HasRefiner, IsResNet: boolean;
+  IsDownsampled, HasRefiner, IsFastRefiner, IsResNet: boolean;
 
   // x = [a ; b] -> [a ; GRU(b, h)] with h a new TNNetInput state.
   function AddGRUBlock(Source: TNNetLayer; Channels, GRUPos: integer): TNNetLayer;
@@ -109298,6 +109323,17 @@ var
         Target.Output.SizeY));
   end;
 
+  // Refiner box mean of Source: the trained DGF 3x3 depthwise or the FGF r=1 box.
+  function AddRefinerBox(Source: TNNetLayer): TNNetLayer;
+  begin
+    if IsFastRefiner then
+      Result := NN.AddLayerAfter(TNNetBoxFilter.Create(
+        csRVMFastGuidedFilterRadius), Source)
+    else
+      Result := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1),
+        Source);
+  end;
+
 begin
   IsResNet := Config.Variant = 'resnet50';
   if not IsResNet and (Config.Variant <> 'mobilenetv3') then
@@ -109306,27 +109342,32 @@ begin
     ImportError(csRVMImporter + ': the backbone config needs ' +
       IntToStr(csRVMBlockCount) + ' blocks.');
   TrunkWidth := RVMTrunkWidth(Config);
-  HasRefiner := Config.DownsampleRatio < 1;
-  if HasRefiner then
+  IsFastRefiner := Config.Refiner = csRVMFastGuidedFilter;
+  if not IsFastRefiner and (Config.Refiner <> csRVMDeepGuidedFilter) then
+    ImportError(csRVMImporter + ': unsupported refiner "' + Config.Refiner +
+      '" (deep_guided_filter or fast_guided_filter).');
+  IsDownsampled := Config.DownsampleRatio < 1;
+  HasRefiner := IsDownsampled and not Config.SegmentationPass;
+  if IsDownsampled then
   begin
     // torch interpolate(scale_factor=r) sizes the output floor(size * r).
     LowWidth := Trunc(Config.FrameWidth * Config.DownsampleRatio);
     LowHeight := Trunc(Config.FrameHeight * Config.DownsampleRatio);
     if (LowWidth < 1) or (LowHeight < 1) then
       ImportError(csRVMImporter + ': the downsampled frame is empty.');
-    if Config.RefinerHidden < 1 then
-      ImportError(csRVMImporter + ': downsample ratio < 1 needs the ' +
-        'deep_guided_filter refiner, which this checkpoint lacks.');
-    if not Reader.HasTensor('refiner.box_filter.weight') then
-      ImportError(csRVMImporter + ': only the deep_guided_filter refiner is ' +
-        'supported.');
   end;
+  if HasRefiner and not IsFastRefiner and
+     ((Config.RefinerHidden < 1) or
+      not Reader.HasTensor('refiner.box_filter.weight')) then
+    ImportError(csRVMImporter + ': the deep_guided_filter refiner needs ' +
+      '"refiner.box_filter.weight" and "refiner.conv.*", which this checkpoint ' +
+      'lacks; use the fast_guided_filter refiner.');
   NN := TNNet.Create();
   Values := TNNetVolume.Create(3, 1, 1);
   try try
     // ---------------- Architecture ----------------
     Frame := NN.AddLayer(TNNetInput.Create(Config.FrameWidth, Config.FrameHeight, 3));
-    if HasRefiner then
+    if IsDownsampled then
       Small := NN.AddLayer(TNNetBilinearResize.Create(LowWidth, LowHeight, 0))
     else
       Small := Frame;
@@ -109387,46 +109428,73 @@ begin
     Decode0Conv2 := NN.AddLayer(TNNetConvolutionReLU.Create(
       Config.DecoderChannels[3], 3, 1, 1, 0).SetTrainable(pTrainable));
     Hid := Decode0Conv2;
-    // project_mat: [fgr residual (3) ; alpha (1)].
-    ProjMat := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0).
-      SetTrainable(pTrainable), Hid);
-    FineSrc := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Frame);
-    if HasRefiner then
-    begin
-      // Deep Guided Filter: A, b fitted at low res, then A * [src ; mean] + b.
-      BaseX := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Small);
-      MeanX := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), BaseX);
-      NegMeanX := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), BaseX);
-      MeanY := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1), ProjMat);
-      NN.AddLayer(TNNetCellMulByCell.Create(BaseX, ProjMat));
-      BoxXY := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1));
-      NN.AddLayer(TNNetCellMulByCell.Create(BaseX, BaseX));
-      BoxXX := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1));
-      Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, MeanY));
-      Cov := NN.AddLayer(TNNetSum.Create([BoxXY, Merged]));
-      Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, MeanX));
-      Variance := NN.AddLayer(TNNetSum.Create([BoxXX, Merged]));
-      NN.AddLayer(TNNetDeepConcat.Create([Cov, Variance, Hid]));
-      Refine1 := NN.AddLayer(TNNetConvolutionReLU.Create(Config.RefinerHidden,
-        1, 0, 1, 0).SetTrainable(pTrainable));
-      Refine2 := NN.AddLayer(TNNetConvolutionReLU.Create(Config.RefinerHidden,
-        1, 0, 1, 0).SetTrainable(pTrainable));
-      RefineConv := NN.AddLayer(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0).
-        SetTrainable(pTrainable));
-      Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, RefineConv));
-      RefineB := NN.AddLayer(TNNetSum.Create([MeanY, Merged]));
-      RefineA := NN.AddLayerAfter(TNNetBilinearResize.Create(Config.FrameWidth,
-        Config.FrameHeight, 0), RefineConv);
-      RefineB := NN.AddLayerAfter(TNNetBilinearResize.Create(Config.FrameWidth,
-        Config.FrameHeight, 0), RefineB);
-      FineX := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Frame);
-      Merged := NN.AddLayer(TNNetCellMulByCell.Create(RefineA, FineX));
-      Combined := NN.AddLayer(TNNetSum.Create([Merged, RefineB, FineSrc]));
-    end
+    ProjMat := nil;
+    ProjSeg := nil;
+    FineSrc := nil;
+    if Config.SegmentationPass then
+      // project_seg: one segmentation logit per low-res pixel, no refiner.
+      ProjSeg := NN.AddLayerAfter(TNNetConvolutionLinear.Create(1, 1, 0, 1, 0).
+        SetTrainable(pTrainable), Hid)
     else
-      Combined := NN.AddLayer(TNNetSum.Create([ProjMat, FineSrc]));
-    // fgr = residual + src and alpha, both clamped to [0, 1].
-    NN.AddLayerAfter(TNNetClamp.Create(0, 1), Combined);
+    begin
+      // project_mat: [fgr residual (3) ; alpha (1)].
+      ProjMat := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0).
+        SetTrainable(pTrainable), Hid);
+      FineSrc := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0),
+        Frame);
+      if HasRefiner then
+      begin
+        // Guided filter on x = [src ; mean], y = [fgr ; pha] at low res: A, b
+        // fitted per channel, bilinearly resized, then A * [src ; mean] + b.
+        BaseX := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Small);
+        MeanX := AddRefinerBox(BaseX);
+        if IsFastRefiner then
+          NegMeanX := NN.AddLayerAfter(TNNetNegate.Create(), MeanX)
+        else
+          NegMeanX := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1),
+            BaseX);
+        MeanY := AddRefinerBox(ProjMat);
+        BoxXY := AddRefinerBox(NN.AddLayer(TNNetCellMulByCell.Create(BaseX, ProjMat)));
+        BoxXX := AddRefinerBox(NN.AddLayer(TNNetCellMulByCell.Create(BaseX, BaseX)));
+        Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, MeanY));
+        Cov := NN.AddLayer(TNNetSum.Create([BoxXY, Merged]));
+        Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, MeanX));
+        Variance := NN.AddLayer(TNNetSum.Create([BoxXX, Merged]));
+        if IsFastRefiner then
+        begin
+          // A = cov / (var + eps).
+          NN.AddLayerAfter(TNNetAddConstant.Create(csRVMFastGuidedFilterEps),
+            Variance);
+          NN.AddLayer(TNNetReciprocal.Create());
+          RefineConv := NN.AddLayer(TNNetCellMulByCell.Create(Cov,
+            NN.GetLastLayer()));
+        end
+        else
+        begin
+          // DGF: A = conv stack over [cov ; var ; hid].
+          NN.AddLayer(TNNetDeepConcat.Create([Cov, Variance, Hid]));
+          Refine1 := NN.AddLayer(TNNetConvolutionReLU.Create(Config.RefinerHidden,
+            1, 0, 1, 0).SetTrainable(pTrainable));
+          Refine2 := NN.AddLayer(TNNetConvolutionReLU.Create(Config.RefinerHidden,
+            1, 0, 1, 0).SetTrainable(pTrainable));
+          RefineConv := NN.AddLayer(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0).
+            SetTrainable(pTrainable));
+        end;
+        Merged := NN.AddLayer(TNNetCellMulByCell.Create(NegMeanX, RefineConv));
+        RefineB := NN.AddLayer(TNNetSum.Create([MeanY, Merged]));
+        RefineA := NN.AddLayerAfter(TNNetBilinearResize.Create(Config.FrameWidth,
+          Config.FrameHeight, 0), RefineConv);
+        RefineB := NN.AddLayerAfter(TNNetBilinearResize.Create(Config.FrameWidth,
+          Config.FrameHeight, 0), RefineB);
+        FineX := NN.AddLayerAfter(TNNetConvolutionLinear.Create(4, 1, 0, 1, 0), Frame);
+        Merged := NN.AddLayer(TNNetCellMulByCell.Create(RefineA, FineX));
+        Combined := NN.AddLayer(TNNetSum.Create([Merged, RefineB, FineSrc]));
+      end
+      else
+        Combined := NN.AddLayer(TNNetSum.Create([ProjMat, FineSrc]));
+      // fgr = residual + src and alpha, both clamped to [0, 1].
+      NN.AddLayerAfter(TNNetClamp.Create(0, 1), Combined);
+    end;
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
@@ -109459,14 +109527,26 @@ begin
     LoadResNetConvFoldBN(Reader, Decode0Conv2, 'decoder.decode0.conv.3.weight',
       'decoder.decode0.conv.4', Config.DecoderChannels[3],
       Config.DecoderChannels[3], 3, Config.BnEps);
-    LoadResNetConvFoldBN(Reader, ProjMat, 'project_mat.conv.weight', '', 4,
-      Config.DecoderChannels[3], 1, 0);
-    LoadResNetConvBias(Reader, ProjMat, 'project_mat.conv.bias', 4);
-    RVMWriteFixedPointwise(FineSrc, csRVMWithZero, 4, 3);
+    if Config.SegmentationPass then
+    begin
+      LoadResNetConvFoldBN(Reader, ProjSeg, 'project_seg.conv.weight', '', 1,
+        Config.DecoderChannels[3], 1, 0);
+      LoadResNetConvBias(Reader, ProjSeg, 'project_seg.conv.bias', 1);
+    end
+    else
+    begin
+      LoadResNetConvFoldBN(Reader, ProjMat, 'project_mat.conv.weight', '', 4,
+        Config.DecoderChannels[3], 1, 0);
+      LoadResNetConvBias(Reader, ProjMat, 'project_mat.conv.bias', 4);
+      RVMWriteFixedPointwise(FineSrc, csRVMWithZero, 4, 3);
+    end;
     if HasRefiner then
     begin
       RVMWriteFixedPointwise(BaseX, csRVMWithMean, 4, 3);
       RVMWriteFixedPointwise(FineX, csRVMWithMean, 4, 3);
+    end;
+    if HasRefiner and not IsFastRefiner then
+    begin
       RVMLoadBoxFilter(Reader, MeanX, 1);
       RVMLoadBoxFilter(Reader, NegMeanX, -1);
       RVMLoadBoxFilter(Reader, MeanY, 1);
@@ -109507,7 +109587,8 @@ end;
 
 function BuildRVMFromSafeTensors(const FileName: string;
   FrameWidth, FrameHeight: integer; DownsampleRatio: double;
-  out Config: TRVMConfig; pTrainable: boolean = true): TNNet;
+  out Config: TRVMConfig; pTrainable: boolean = true;
+  const pRefiner: string = ''; pSegmentationPass: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
@@ -109515,6 +109596,8 @@ begin
   try
     Config := InferRVMConfigFromTensors(Reader, FrameWidth, FrameHeight,
       DownsampleRatio);
+    if pRefiner <> '' then Config.Refiner := pRefiner;
+    Config.SegmentationPass := pSegmentationPass;
     Result := BuildRVM(Reader, Config, pTrainable);
   finally
     Reader.Free;
@@ -109581,6 +109664,11 @@ begin
     FStateInputs[StatePos].MarkOutputWrittenOnRAM();
   end;
   FNet.GetOutput(Matte);
+end;
+
+function TRVMMatting.IsSegmentation(): boolean;
+begin
+  Result := FNet.GetLastLayer().Output.Depth = 1;
 end;
 
 function TRVMMatting.HiddenState(Level: integer): TNNetVolume;

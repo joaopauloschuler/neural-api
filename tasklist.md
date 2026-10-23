@@ -383,9 +383,17 @@ rather than acted on.
   - [ ] `TNNetBoxFilter` OpenCL forward reuses `cai_pool2d` (O(r^2) taps per
         output). If a fast_guided_filter refiner with a large radius is wired,
         add a separable two-pass (row then column running-sum) kernel.
-  - [ ] fast_guided_filter refiner (TNNetBoxFilter) and segmentation_pass
-        (project_seg) are not wired; the importer rejects a checkpoint
-        without `refiner.box_filter.weight` when the ratio is < 1.
+  - [X] fast_guided_filter refiner and segmentation_pass: `TRVMConfig.Refiner`
+        (auto: fast_guided_filter when `refiner.box_filter.weight` is absent,
+        since that refiner has no weights; overridable) and
+        `TRVMConfig.SegmentationPass` (project_seg logits at the low-res size,
+        no refiner); VideoMatting `--refiner`, `--segmentation`. Pico parity
+        (generator `--refiner fast_guided_filter`): FGF 1.6e-5 / 4.4e-5
+        (MobileNetV3 / ResNet-50; float32 torch is 0.7e-5 / 1.3e-5 off its own
+        float64 run, cov/(var+eps) is ill conditioned), seg 8.9e-8 / 4.1e-8.
+  - [ ] Real-checkpoint check of `--segmentation` and `--refiner
+        fast_guided_filter` with `rvm_mobilenetv3.pth` against the official
+        model (`tools/rvm_tiny_fixture.py --real` only runs the DGF matte).
 
 - [ ] Hunyuan-DiT bilingual text-to-image importer
       (`BuildHunyuanDiTFromSafeTensors[Ex]`, Tencent `Hunyuan-DiT`). A distinct

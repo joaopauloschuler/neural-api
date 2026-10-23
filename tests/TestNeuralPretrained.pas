@@ -196,9 +196,9 @@ type
       pRoundTrip: boolean; out Config: TDDColorConfig): double;
     function RVMSequenceMaxDiff(const Base, Prefix: string;
       FrameWidth, FrameHeight: integer; Ratio: double; Frames: integer;
-      out Config: TRVMConfig): double;
-    procedure RunRVMOpenCLParity(const Base: string; FrameWidth,
-      FrameHeight: integer);
+      out Config: TRVMConfig; pSegmentation: boolean = false): double;
+    procedure RunRVMOpenCLParity(const Base, Prefix: string; FrameWidth,
+      FrameHeight, Frames: integer);
     // Case Tag of <Base>_io.safetensors through BuildRetinaFaceFromSafeTensors.
     procedure RetinaFaceParity(const Base, Tag: string;
       out Config: TRetinaFaceConfig; out FaceCount: integer;
@@ -1521,6 +1521,12 @@ type
     procedure TestRVMResNet50Parity;
     procedure TestRVMResNet50NoRefinerParity;
     procedure TestRVMResNet50OpenCLParity;
+    procedure TestRVMFastGuidedFilterParity;
+    procedure TestRVMSegmentationParity;
+    procedure TestRVMResNet50FastGuidedFilterParity;
+    procedure TestRVMResNet50SegmentationParity;
+    procedure TestRVMFastGuidedFilterOpenCLParity;
+    procedure TestRVMRefinerSelection;
     procedure TestRetinaFaceMobileNetParity;
     procedure TestRetinaFaceMobileNetOddSizeParity;
     procedure TestRetinaFaceResNet50Parity;
@@ -54924,11 +54930,12 @@ end;
 {$ENDIF}
 
 // Builds the pico RVM <Base>.pth for one <Base>_io.safetensors sequence and
-// returns the max |diff| of the RGBA matte and the r1..r4 states over Frames.
+// returns the max |diff| of the RGBA matte (or seg logits) and r1..r4 over Frames.
 function TTestNeuralPretrained.RVMSequenceMaxDiff(const Base, Prefix: string;
   FrameWidth, FrameHeight: integer; Ratio: double; Frames: integer;
-  out Config: TRVMConfig): double;
+  out Config: TRVMConfig; pSegmentation: boolean): double;
 var
+  Reader: TNNetSafeTensorsReader;
   Matting: TRVMMatting;
   IO: TNNetSafeTensorsReader;
   Frame, Matte, Expected, Fgr, Pha, State: TNNetVolume;
@@ -54936,9 +54943,14 @@ var
   Tag: string;
 begin
   Result := 0;
-  Matting := TRVMMatting.Create(BuildRVMFromSafeTensors(
-    FixturePath(Base + '.pth'), FrameWidth, FrameHeight, Ratio,
-    Config, {pTrainable=}false));
+  Reader := CreatePretrainedTensorReader(FixturePath(Base + '.pth'));
+  try
+    Config := InferRVMConfigFromTensors(Reader, FrameWidth, FrameHeight, Ratio);
+    Config.SegmentationPass := pSegmentation;
+    Matting := TRVMMatting.Create(BuildRVM(Reader, Config, {pTrainable=}false));
+  finally
+    Reader.Free;
+  end;
   IO := TNNetSafeTensorsReader.Create(FixturePath(Base + '_io.safetensors'));
   Frame := TNNetVolume.Create;
   Matte := TNNetVolume.Create;
@@ -54951,17 +54963,25 @@ begin
     begin
       Tag := IntToStr(FramePos);
       LoadDDColorTorchImage(IO, Prefix + '_src' + Tag, Frame);
-      LoadDDColorTorchImage(IO, Prefix + '_fgr' + Tag, Fgr);
-      LoadDDColorTorchImage(IO, Prefix + '_pha' + Tag, Pha);
-      Expected.ReSize(Fgr.SizeX, Fgr.SizeY, 4);
-      for Y := 0 to Fgr.SizeY - 1 do
-        for X := 0 to Fgr.SizeX - 1 do
-        begin
-          for Channel := 0 to 2 do
-            Expected[X, Y, Channel] := Fgr[X, Y, Channel];
-          Expected[X, Y, 3] := Pha[X, Y, 0];
-        end;
+      if pSegmentation then
+        LoadDDColorTorchImage(IO, Prefix + '_seg' + Tag, Expected)
+      else
+      begin
+        LoadDDColorTorchImage(IO, Prefix + '_fgr' + Tag, Fgr);
+        LoadDDColorTorchImage(IO, Prefix + '_pha' + Tag, Pha);
+        Expected.ReSize(Fgr.SizeX, Fgr.SizeY, 4);
+        for Y := 0 to Fgr.SizeY - 1 do
+          for X := 0 to Fgr.SizeX - 1 do
+          begin
+            for Channel := 0 to 2 do
+              Expected[X, Y, Channel] := Fgr[X, Y, Channel];
+            Expected[X, Y, 3] := Pha[X, Y, 0];
+          end;
+      end;
       Matting.Step(Frame, Matte);
+      AssertEquals('output width', Expected.SizeX, Matte.SizeX);
+      AssertEquals('output height', Expected.SizeY, Matte.SizeY);
+      AssertEquals('output depth', Expected.Depth, Matte.Depth);
       Result := Max(Result, MaxAbsVolumeDiff(Matte, Expected));
       for Level := 1 to 4 do
       begin
@@ -55064,9 +55084,9 @@ begin
 end;
 
 // The pico net <Base>.pth under EnableOpenCL, then also ForceOpenCL, against the
-// host net frame by frame over the 3-frame DGF sequence (state carried on both).
-procedure TTestNeuralPretrained.RunRVMOpenCLParity(const Base: string;
-  FrameWidth, FrameHeight: integer);
+// host net frame by frame over the Prefix sequence (state carried on both).
+procedure TTestNeuralPretrained.RunRVMOpenCLParity(const Base, Prefix: string;
+  FrameWidth, FrameHeight, Frames: integer);
 {$IFDEF OpenCL}
 var
   Config: TRVMConfig;
@@ -55100,9 +55120,9 @@ begin
       OnOpenCL.Net.ForceOpenCL(Forced);
       OnHost.ResetState();
       OnOpenCL.ResetState();
-      for FramePos := 0 to 2 do
+      for FramePos := 0 to Frames - 1 do
       begin
-        LoadDDColorTorchImage(IO, 'dgf_src' + IntToStr(FramePos), Frame);
+        LoadDDColorTorchImage(IO, Prefix + '_src' + IntToStr(FramePos), Frame);
         OnHost.Step(Frame, MatteCPU);
         OnOpenCL.Step(Frame, MatteCL);
         FrameDiff := MaxAbsVolumeDiff(MatteCL, MatteCPU);
@@ -55136,7 +55156,7 @@ end;
 
 procedure TTestNeuralPretrained.TestRVMOpenCLParity;
 begin
-  RunRVMOpenCLParity('tiny_rvm_mobilenetv3', 44, 36);
+  RunRVMOpenCLParity('tiny_rvm_mobilenetv3', 'dgf', 44, 36, 3);
 end;
 
 // tiny_rvm_resnet50.*: model.py with the real ResNet50Encoder over a pico
@@ -55180,7 +55200,132 @@ end;
 
 procedure TTestNeuralPretrained.TestRVMResNet50OpenCLParity;
 begin
-  RunRVMOpenCLParity('tiny_rvm_resnet50', 80, 64);
+  RunRVMOpenCLParity('tiny_rvm_resnet50', 'dgf', 80, 64, 3);
+end;
+
+// tiny_rvm_mobilenetv3_fgf.*: model.py with refiner='fast_guided_filter' (no
+// refiner weights, auto-detected); 2 frames of 44x36 at ratio 0.5.
+procedure TTestNeuralPretrained.TestRVMFastGuidedFilterParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_mobilenetv3_fgf', 'fgf', 44, 36, 0.5,
+    2, Config);
+  WriteLn('  RVM pico (FGF, 2 frames) max|diff| = ', MaxDiff:0:9);
+  AssertEquals('refiner', csRVMFastGuidedFilter, Config.Refiner);
+  AssertEquals('no DGF hidden width', 0, Config.RefinerHidden);
+  AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+// segmentation_pass=True on the same pico: (22, 18, 1) project_seg logits.
+procedure TTestNeuralPretrained.TestRVMSegmentationParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_mobilenetv3_fgf', 'seg', 44, 36, 0.5,
+    2, Config, {pSegmentation=}true);
+  WriteLn('  RVM pico (segmentation, 2 frames) max|diff| = ', MaxDiff:0:9);
+  AssertTrue('seg + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+procedure TTestNeuralPretrained.TestRVMResNet50FastGuidedFilterParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_resnet50_fgf', 'fgf', 80, 64, 0.5,
+    2, Config);
+  WriteLn('  RVM ResNet-50 pico (FGF, 2 frames) max|diff| = ', MaxDiff:0:9);
+  AssertEquals('refiner', csRVMFastGuidedFilter, Config.Refiner);
+  AssertTrue('matte + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+procedure TTestNeuralPretrained.TestRVMResNet50SegmentationParity;
+var
+  Config: TRVMConfig;
+  MaxDiff: double;
+begin
+  MaxDiff := RVMSequenceMaxDiff('tiny_rvm_resnet50_fgf', 'seg', 80, 64, 0.5,
+    2, Config, {pSegmentation=}true);
+  WriteLn('  RVM ResNet-50 pico (segmentation, 2 frames) max|diff| = ',
+    MaxDiff:0:9);
+  AssertTrue('seg + states max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
+procedure TTestNeuralPretrained.TestRVMFastGuidedFilterOpenCLParity;
+begin
+  RunRVMOpenCLParity('tiny_rvm_mobilenetv3_fgf', 'fgf', 44, 36, 2);
+end;
+
+// Refiner detection, the explicit override and the deep_guided_filter guard.
+procedure TTestNeuralPretrained.TestRVMRefinerSelection;
+var
+  Reader: TNNetSafeTensorsReader;
+  Config: TRVMConfig;
+  NN: TNNet;
+  Matting: TRVMMatting;
+  Frame, Matte: TNNetVolume;
+  Raised: boolean;
+begin
+  Reader := CreatePretrainedTensorReader(FixturePath('tiny_rvm_mobilenetv3.pth'));
+  Frame := TNNetVolume.Create(44, 36, 3);
+  Matte := TNNetVolume.Create;
+  try
+    Config := InferRVMConfigFromTensors(Reader, 44, 36, 0.5);
+    AssertEquals('DGF checkpoint', csRVMDeepGuidedFilter, Config.Refiner);
+    AssertFalse('no segmentation by default', Config.SegmentationPass);
+    Frame.FillForDebug();
+    Frame.Mul(0.5);
+    Frame.Add(0.25);
+    // The weight-free FGF runs on a DGF checkpoint too.
+    Config.Refiner := csRVMFastGuidedFilter;
+    Matting := TRVMMatting.Create(BuildRVM(Reader, Config, false));
+    try
+      Matting.Step(Frame, Matte);
+      AssertFalse('FGF net is not a segmentation net', Matting.IsSegmentation());
+      AssertEquals('FGF matte width', 44, Matte.SizeX);
+      AssertEquals('FGF matte depth', 4, Matte.Depth);
+    finally
+      Matting.Free;
+    end;
+    Config.SegmentationPass := true;
+    Matting := TRVMMatting.Create(BuildRVM(Reader, Config, false));
+    try
+      Matting.Step(Frame, Matte);
+      AssertTrue('segmentation net', Matting.IsSegmentation());
+      AssertEquals('seg width', 22, Matte.SizeX);
+      AssertEquals('seg height', 18, Matte.SizeY);
+    finally
+      Matting.Free;
+    end;
+  finally
+    Matte.Free;
+    Frame.Free;
+    Reader.Free;
+  end;
+  Reader := CreatePretrainedTensorReader(
+    FixturePath('tiny_rvm_mobilenetv3_fgf.pth'));
+  try
+    Config := InferRVMConfigFromTensors(Reader, 44, 36, 0.5);
+    Config.Refiner := csRVMDeepGuidedFilter;
+    Raised := false;
+    NN := nil;
+    try
+      NN := BuildRVM(Reader, Config, false);
+    except
+      on E: Exception do Raised := true;
+    end;
+    NN.Free;
+    AssertTrue('deep_guided_filter without refiner weights must fail', Raised);
+  finally
+    Reader.Free;
+  end;
 end;
 
 // Largest |field diff| between Faces and the oracle rows Dets [K, 15]

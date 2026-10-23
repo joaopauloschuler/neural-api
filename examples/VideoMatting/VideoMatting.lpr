@@ -16,7 +16,9 @@ RVM is recurrent: four ConvGRU states carry what the net saw in the previous
 frames, so the frames must be consecutive frames of one clip. For each frame
 the program writes <name>_rgba.png (foreground RGB + alpha) and
 <name>_green.png (the foreground over a green screen), and optionally all the
-green-screen frames as one animated GIF.
+green-screen frames as one animated GIF. With --segmentation it writes only
+<name>_seg.png (16-bit grayscale), the sigmoid of RVM's segmentation output at
+the downsampled size.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -45,6 +47,8 @@ type
     ModelFile, InputDir, OutputDir, GifFile: string;
     Ratio: double; // 0 = pick from the frame size
     Fps: integer;
+    Refiner: string; // '' = from the checkpoint
+    Segmentation: boolean;
     UseOpenCL: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
@@ -63,6 +67,10 @@ begin
   WriteLn('  --gif FILE           also write the green-screen frames as an ',
     'animated GIF');
   WriteLn('  --fps N              GIF frame rate (default 25)');
+  WriteLn('  --refiner NAME       deep_guided_filter or fast_guided_filter ',
+    '(default: deep if the checkpoint has its weights, else fast)');
+  WriteLn('  --segmentation       write <frame>_seg.png (segmentation pass, ',
+    'downsampled size) instead of the matte');
   WriteLn('  --gpu                run the net on OpenCL (needs a build with ',
     '-dOpenCL)');
   WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
@@ -89,6 +97,8 @@ begin
   Opt.GifFile := '';
   Opt.Ratio := 0;
   Opt.Fps := 25;
+  Opt.Refiner := '';
+  Opt.Segmentation := false;
   Opt.UseOpenCL := false;
   Opt.OpenCLPlatform := 0;
   Opt.OpenCLDevice := 0;
@@ -103,6 +113,8 @@ begin
     else if Arg = '--gif' then Opt.GifFile := NextArg()
     else if Arg = '--ratio' then Opt.Ratio := StrToFloat(NextArg())
     else if Arg = '--fps' then Opt.Fps := StrToInt(NextArg())
+    else if Arg = '--refiner' then Opt.Refiner := NextArg()
+    else if Arg = '--segmentation' then Opt.Segmentation := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
@@ -122,6 +134,10 @@ begin
     raise Exception.Create('--ratio must be in (0, 1]');
   if Opt.Fps < 1 then
     raise Exception.Create('--fps must be positive');
+  if (Opt.Refiner <> '') and (Opt.Refiner <> csRVMDeepGuidedFilter) and
+     (Opt.Refiner <> csRVMFastGuidedFilter) then
+    raise Exception.Create('--refiner must be ' + csRVMDeepGuidedFilter +
+      ' or ' + csRVMFastGuidedFilter);
 end;
 
 // The RVM README "portrait" column: 1 up to 512x512, 0.375 at 1280x720, 0.25
@@ -226,6 +242,13 @@ begin
   end;
 end;
 
+// Seg logits (w, h, 1) -> the foreground probability in [0, 1].
+procedure ComposeSegmentation(Seg, Mask: TNNetVolume);
+begin
+  Mask.ReSize(Seg);
+  TNNetVolume.Sigmoid(Mask.DataPtr, Seg.DataPtr, Seg.Size);
+end;
+
 // Mattes every frame of Opt.InputDir into Opt.OutputDir.
 procedure MatteFolder(const Opt: TVideoMattingOptions);
 var
@@ -257,7 +280,8 @@ var
       Ratio := DefaultRatio(NetWidth, NetHeight);
     StartTime := Now();
     Matting := TRVMMatting.Create(BuildRVMFromSafeTensors(Opt.ModelFile,
-      NetWidth, NetHeight, Ratio, Config, {pTrainable=}false));
+      NetWidth, NetHeight, Ratio, Config, {pTrainable=}false, Opt.Refiner,
+      Opt.Segmentation));
     WriteLn(RVMConfigToString(Config));
     WriteLn(Format('  built in %.1f s', [(Now() - StartTime) * 86400.0]));
     {$IFDEF OpenCL}
@@ -330,9 +354,20 @@ begin
       Matting.Step(Frame, Matte);
       FrameSeconds := (Now() - StartTime) * 86400.0;
       TotalSeconds := TotalSeconds + FrameSeconds;
-      ComposeOutputs(Matte, RGBA, Green);
       Stem := IncludeTrailingPathDelimiter(Opt.OutputDir) +
         ChangeFileExt(Frames[FramePos], '');
+      if Opt.Segmentation then
+      begin
+        ComposeSegmentation(Matte, Green);
+        if not SaveGray16PNGFromVolume(Green, Stem + '_seg.png') then
+          raise Exception.Create('could not save ' + Stem + '_seg.png');
+        WriteLn(Format('  %s %dx%d ratio %.4g: %.2f s, seg %dx%d, mean ' +
+          'probability %.3f', [Frames[FramePos], Image.SizeX, Image.SizeY,
+          Ratio, FrameSeconds, Green.SizeX, Green.SizeY,
+          Green.GetAvg()]));
+        continue;
+      end;
+      ComposeOutputs(Matte, RGBA, Green);
       if not SaveImageFromVolumeIntoFile(RGBA, Stem + '_rgba.png') then
         raise Exception.Create('could not save ' + Stem + '_rgba.png');
       if not SaveImageFromVolumeIntoFile(Green, Stem + '_green.png') then
@@ -441,6 +476,14 @@ begin
   Opt.GifFile := 'rvm_smoke.gif';
   // Below 1 so the smoke also runs the Deep Guided Filter refiner.
   Opt.Ratio := 0.5;
+  MatteFolder(Opt);
+  WriteLn('Fast Guided Filter refiner, then the segmentation pass:');
+  Opt.Refiner := csRVMFastGuidedFilter;
+  Opt.OutputDir := 'rvm_smoke_out_fgf';
+  Opt.GifFile := '';
+  MatteFolder(Opt);
+  Opt.Segmentation := true;
+  Opt.OutputDir := 'rvm_smoke_out_seg';
   MatteFolder(Opt);
 end;
 
