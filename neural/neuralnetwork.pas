@@ -5094,7 +5094,8 @@ type
     // ComputeFlashPacked's additive score bias table (grow-only).
     FBufScoreBias: cl_mem;
     FCapScoreBias: csize_t;
-    // ComputeFlashPacked's per-query-head sink logits (grow-only).
+    // The per-query-head sink logits of ComputeFlashPacked and ComputeStep
+    // (grow-only), re-uploaded only when the caller says they changed.
     FBufSinkLogits: cl_mem;
     FCapSinkLogits: csize_t;
     // cai_sdpa_qk_l2norm_packed and its [Qn|Kn|V] result (grow-only).
@@ -5205,11 +5206,13 @@ type
     procedure AppendStep(bufX: cl_mem; Int8KV: boolean; KVHeads, TokenCnt, Dk,
       CacheMax, CacheSlot, QW, KW, XStride: integer; out bufK, bufV: cl_mem);
     // Split-row decode (pass 1 + merge) of Q's rows (query heads read from bufQ
-    // at Q.Depth per row) over the cache of the named format, into Y.
+    // at Q.Depth per row) over the cache of the named format, into Y; the
+    // merge adds the sinks (SinkLogitsArgs) once.
     procedure RunSplitDecode(Q, Y: TNNetVolume; bufQ: cl_mem; Int8KV: boolean;
       QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-      bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean);
+      bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean;
+      bufSinks: cl_mem; HasSinks: integer);
     // The three score constants as single-precision args FirstArg.. of k.
     procedure SetScoreArgs(k: cl_kernel; FirstArg: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
@@ -5280,12 +5283,14 @@ type
       CacheMax: integer; Int8KV, FlashOnly: boolean): TFusedSDPAOpenCLPath;
     // Appends X's [Q|K|V] rows at CacheSlot.. then attends on Path: row t ends at
     // CacheSlot+t+1 (flash: RowKeyEnds / non-causal); pExternalSrc borrows X.
+    // pSinkLogits: QHeads sink logits, uploaded when Changed; nil = none.
     procedure ComputeStep(X, Y: TNNetVolume; Int8KV: boolean;
       Path: TFusedSDPAOpenCLPath; QHeads, KVHeads, GroupSize, Dk, CacheMax,
       CacheSlot, QW, KW, Window: integer; Causal: boolean;
       const RowKeyEnds: array of integer; RowKeyEndsVersion: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
+      pSinkLogits: TNNetVolume = nil; pSinkLogitsChanged: boolean = true);
     // ComputeStep's append, then the identity score matrix: Y's row t, head h
     // is X's row t V slice of KV group h div GroupSize (one cai_gather_copy).
     procedure ComputeStepIdentityScores(X, Y: TNNetVolume; Int8KV: boolean;
@@ -5464,10 +5469,17 @@ type
   /// NO segment masking, prefix-LM, bidirectional window or tiled forward.
   /// OpenCL (TNNetFusedSDPACL) runs the cached forward only. Training
   /// backward IS implemented (per-head mirror of the single-head backward).
+  ///
+  /// Optional per-query-head sinks (gpt-oss, see TNNetGptOssSinkAttention):
+  /// head h's learned logit s_h joins its softmax denominator only, so
+  /// w[j] = exp(score[j]) / (exp(s_h) + sum_k exp(score[k])). The QHeads
+  /// logits are the weights of ONE neuron: they save, load and train as
+  /// weights (the backward yields d(loss)/d(s_h) too).
   /// Serialization: FStruct[5] = QHeads, FStruct[6] = KVHeads on top of the
   /// inherited [0]=HeadDim, [1]=causal, [2]=window, FFloatSt[0]=soft-cap;
-  /// FStruct[7] = CachedForwardNonCausal. SkipAttentionScores is a runtime
-  /// switch, not saved.
+  /// FStruct[7] = option bits, 1 = CachedForwardNonCausal, 2 = sinks (files
+  /// saved before the sinks load as 0 or 1: no sinks). SkipAttentionScores is
+  /// a runtime switch, not saved.
   // Coded by Claude (AI).
   TNNetFusedSDPA = class(TNNetScaledDotProductAttention)
   private
@@ -5478,6 +5490,8 @@ type
     // True: every token row of a cached forward attends the whole cache,
     // including the rows that forward appended (no causal order among them).
     FCachedForwardNonCausal: boolean;
+    // True: FNeurons[0] holds one sink logit per query head (see the class note).
+    FHasSinks: boolean;
     // Empty, or one key end per token row of a cached forward (see
     // SetRowKeyEnds); it replaces the causal / non-causal key range.
     FRowKeyEnds: TNeuralIntegerArray;
@@ -5496,6 +5510,8 @@ type
     // its own slot, or the whole cache when FCachedForwardNonCausal.
     procedure ComputeCachedRows(h1, h2: integer);
     procedure SetCachedForwardNonCausal(pValue: boolean);
+    // Writes the option bits of FStruct[7] from the flags they encode.
+    procedure StoreOptionBits();
     // Raises unless the row key ends (if any) fit this forward: cached path,
     // no eviction, one end per token row. Runs before any worker starts.
     procedure CheckRowKeyEnds();
@@ -5534,6 +5550,8 @@ type
     function OutputDepthRequired(): integer; override;
     function AttnHeadCount(): integer; override;
     function CacheKVHeads(): integer; override;
+    // The QHeads sink logits when HasSinks, else nil.
+    function SinkLogits(): TNNetVolume; override;
     // Chunk axis: query heads. ComputeRange computes heads
     // [StartRange..FinRange]; the cache append happens ONCE beforehand in
     // PrepareChunkedForward. Coded by Claude (AI).
@@ -5542,11 +5560,16 @@ type
     constructor Create(pQHeads, pKVHeads, pHeadDim: integer;
       pCausalMask: boolean = false; pWindow: integer = 0;
       pScoreSoftCap: TNeuralFloat = 0;
-      pCachedForwardNonCausal: boolean = false); reintroduce; overload;
+      pCachedForwardNonCausal: boolean = false;
+      pHasSinks: boolean = false); reintroduce; overload;
+    // With sinks, adds the sink neuron (logits 0) the first time a source is set.
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure BeginIncrementalDecode(pMaxContext: integer;
       pInt8KV: boolean = false); override;
+    // Copies Logits (QHeads values, query head order) into the sink logits.
+    procedure SetSinkLogits(Logits: TNNetVolume);
     // Appends K.SizeX token rows of externally computed keys and values (each
     // (Rows,1,KVHeads*HeadDim), already position-encoded) at slot CacheLength.
     procedure AppendCacheRowsFrom(K, V: TNNetVolume);
@@ -5577,6 +5600,7 @@ type
     // (mask mode none) over an FP32 cache. Eviction must be off.
     property CachedForwardNonCausal: boolean read FCachedForwardNonCausal
       write SetCachedForwardNonCausal;
+    property HasSinks: boolean read FHasSinks;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -37840,7 +37864,7 @@ end;
 
 constructor TNNetFusedSDPA.Create(pQHeads, pKVHeads, pHeadDim: integer;
   pCausalMask: boolean; pWindow: integer; pScoreSoftCap: TNeuralFloat;
-  pCachedForwardNonCausal: boolean);
+  pCachedForwardNonCausal: boolean; pHasSinks: boolean);
 begin
   // The inherited constructor sets FDk = pHeadDim, FInvSqrtDk, the mask /
   // soft-cap machinery and FStruct[0..4] / FFloatSt[0] exactly as the
@@ -37867,13 +37891,51 @@ begin
   FStruct[6] := FKVHeads;
   FChunkPrecomputed := false;
   FCacheBaseLen := 0;
+  FHasSinks := pHasSinks;
   SetCachedForwardNonCausal(pCachedForwardNonCausal);
 end;
 
 procedure TNNetFusedSDPA.SetCachedForwardNonCausal(pValue: boolean);
 begin
   FCachedForwardNonCausal := pValue;
-  if pValue then FStruct[7] := 1 else FStruct[7] := 0;
+  StoreOptionBits();
+end;
+
+procedure TNNetFusedSDPA.StoreOptionBits();
+begin
+  FStruct[7] := Ord(FCachedForwardNonCausal) + 2 * Ord(FHasSinks);
+end;
+
+procedure TNNetFusedSDPA.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // A later SetPrevLayer keeps the neuron, so loaded or trained logits survive.
+  if FHasSinks and (FNeurons.Count < 1) then
+  begin
+    AddMissingNeurons(1);
+    SetNumWeightsForAllNeurons(FQHeads, 1, 1);
+    FNeurons[0].FWeights.Fill(0);
+    AfterWeightUpdate();
+  end;
+end;
+
+function TNNetFusedSDPA.SinkLogits(): TNNetVolume;
+begin
+  if FHasSinks then Result := FNeurons[0].FWeights
+  else Result := nil;
+end;
+
+procedure TNNetFusedSDPA.SetSinkLogits(Logits: TNNetVolume);
+begin
+  if (not FHasSinks) or (FNeurons.Count < 1) or (Logits.Size <> FQHeads) then
+  begin
+    FErrorProc('TNNetFusedSDPA.SetSinkLogits needs a layer built with sinks ' +
+      'and connected, and ' + IntToStr(FQHeads) + ' logits. Got ' +
+      IntToStr(Logits.Size) + '.');
+    exit;
+  end;
+  FNeurons[0].FWeights.CopyNoChecks(Logits);
+  AfterWeightUpdate();
 end;
 
 procedure TNNetFusedSDPA.SetRowKeyEnds(const pRowKeyEnds: array of integer);
@@ -37939,9 +38001,9 @@ var
   QOfs, KOfs, VOfs: integer;
   AttnRow, AttnBandBase, HRowBase: integer;
   RowStride, posK, posV: integer;
-  Score, MaxScore, SumExp, A: TNeuralFloat;
-  Prev: TNNetVolume;
-  HasSoftCap: boolean;
+  Score, MaxScore, SumExp, A, SinkLogit, MaxScoreSeed: TNeuralFloat;
+  Prev, Sinks: TNNetVolume;
+  HasSoftCap, HasSink: boolean;
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   Prev := FPrevLayer.FOutput;
@@ -37949,12 +38011,22 @@ begin
   SeqLenM1 := SeqLen - 1;
   RowStride := Prev.GetRawPos(1, 0);
   HasSoftCap := FScoreSoftCap > 0;   // layer state, invariant per key (#20)
+  Sinks := SinkLogits();
+  HasSink := Assigned(Sinks);
+  SinkLogit := 0;
+  MaxScoreSeed := -1e30;
   for h := h1 to h2 do
   begin
     g := h div FGroupSize;
     QOfs := h * FDk;
     KOfs := FQW + g * FDk;
     VOfs := FQW + FKW + g * FDk;
+    // A sink logit seeds the running max and joins the normalizer once per row.
+    if HasSink then
+    begin
+      SinkLogit := Sinks.FData[h];
+      MaxScoreSeed := SinkLogit;
+    end;
     // Head h's attention map starts at Y-row h*SeqLen - invariant across i.
     HRowBase := h * SeqLen;
     for i := 0 to SeqLenM1 do
@@ -37977,7 +38049,7 @@ begin
         QueryPtr := Prev.GetRawPtr(i, 0, QOfs);
         posK := KOfs + jLo * RowStride;   // j=jLo K offset (#12)
         AttnBandBase := AttnRow + jLo;
-        MaxScore := -1e30;
+        MaxScore := MaxScoreSeed;
         for j := jLo to jHi do
         begin
           Score := TNNetVolume.DotProduct(
@@ -38000,6 +38072,7 @@ begin
         AttnRowPtr := FAttn.GetRawPtr(AttnBandBase);
         SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr,
           MaxScore, BandLen);
+        if HasSink then SumExp := SumExp + NeuralExp(SinkLogit - MaxScore);
         if SumExp > 0 then
           TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
       end;
@@ -38224,14 +38297,18 @@ var
   LiveLenM1, DkM1: integer;
   ScoreBase, ScaleIdx, CodeBase, hFDk, pos: integer;
   ScaleSeed, CodeSeed: integer;
-  QuantInt8, HasSoftCap: boolean;
-  Score, MaxScore, SumExp, InvSumExp: TNeuralFloat;
-  Prev: TNNetVolume;
+  QuantInt8, HasSoftCap, HasSink: boolean;
+  Score, MaxScore, SumExp, InvSumExp, SinkLogit, MaxScoreSeed: TNeuralFloat;
+  Prev, Sinks: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
   KCodesPtr, VCodesPtr: TNeuralInt8ArrPtr;
   KScalePtr, VScalePtr: TNeuralFloatArrPtr;
 begin
   Prev := FPrevLayer.FOutput;
+  Sinks := SinkLogits();
+  HasSink := Assigned(Sinks);
+  SinkLogit := 0;
+  MaxScoreSeed := -1e30;
   // Cache bases hoisted above the head loop (#11); the containers are
   // preallocated at MaxContext and never resized during a decode step.
   KCodesPtr := FKCacheQ.DataPtr;
@@ -38255,7 +38332,13 @@ begin
     hFDk := h * FDk;                      // head's depth offset (#4)
     QueryPtr := Prev.GetRawPtr(p, 0, hFDk);
     ScoreBase := h * FCacheMax;
-    MaxScore := -1e30;
+    // A sink logit seeds the running max and joins the normalizer once.
+    if HasSink then
+    begin
+      SinkLogit := Sinks.FData[h];
+      MaxScoreSeed := SinkLogit;
+    end;
+    MaxScore := MaxScoreSeed;
     // Head-major planes: head g's rows are CONTIGUOUS, so the running
     // offsets advance by FDk / 1 and the key stream prefetches like the
     // per-head caches did (the whole point of the plane layout).
@@ -38297,6 +38380,7 @@ begin
       TNeuralFloatArrPtr(@FCacheScores[pos]),
       TNeuralFloatArrPtr(@FCacheScores[pos]), MaxScore,
       LiveLenM1 - jStart + 1);
+    if HasSink then SumExp := SumExp + NeuralExp(SinkLogit - MaxScore);
     OutPtr := FOutput.GetRawPtr(p, 0, hFDk);
     FillChar(OutPtr^, FDk * csNeuralFloatSize, 0);
     if SumExp > 0 then
@@ -38717,6 +38801,7 @@ procedure TNNetFusedSDPA.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
   TokenCnt: integer;
+  Sinks: TNNetVolume;
 begin
   SourceBuffer := SourceBufferOnOpenCL();
   EnsureCacheOnOpenCL();
@@ -38732,12 +38817,18 @@ begin
       {CacheSlot=}FCacheLen, FQW, FKW, SourceBuffer,
       {pKeepResultOnOpenCL=}true)
   else
+  begin
+    // The sink buffer stays resident; a weight update marks it stale.
+    Sinks := SinkLogits();
     FFusedSDPACL.ComputeStep(FPrevLayer.FOutput, FOutput, FKVQuantInt8,
       OpenCLPathFor(TokenCnt), FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
       {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
       {Causal=}not FCachedForwardNonCausal, FRowKeyEnds, FRowKeyEndsVersion,
       FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
-      SourceBuffer, {pKeepResultOnOpenCL=}true);
+      SourceBuffer, {pKeepResultOnOpenCL=}true, Sinks,
+      {pSinkLogitsChanged=}FAfterWeightUpdateHasBeenCalled);
+    if Assigned(Sinks) then FAfterWeightUpdateHasBeenCalled := false;
+  end;
   Inc(FCacheLen, TokenCnt);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
@@ -38841,9 +38932,9 @@ var
   QOfs, KOfs, VOfs: integer;
   AttnRow, AttnRowStride, RowStride, posV, posK: integer;
   dOutPtr, qPtr, dQPtr: pointer;
-  Prev, PrevErr: TNNetVolume;
-  HasSoftCap: boolean;
-  SumDAttnAttn, A, dS, TanhVal: TNeuralFloat;
+  Prev, PrevErr, SinkDelta: TNNetVolume;
+  HasSoftCap, HasSink: boolean;
+  SumDAttnAttn, A, dS, TanhVal, SinkGrad, SinkWeight: TNeuralFloat;
 begin
   if FSkipAttentionScores then
     raise Exception.Create('TNNetFusedSDPA.Backpropagate: SkipAttentionScores ' +
@@ -38867,6 +38958,9 @@ begin
     // Elements between consecutive attention rows: FAttn is (SeqLen, rows, 1).
     AttnRowStride := FAttn.GetRawPos(0, 1);
     HasSoftCap := FScoreSoftCap > 0;                      // loop-invariant (#20)
+    HasSink := FHasSinks;
+    SinkDelta := nil;
+    if HasSink then SinkDelta := FNeurons[0].FDelta;
     g := 0;
     gHeadCnt := 0;
     // Head h's attention map starts at Y-row h*SeqLen, so the row offset
@@ -38877,6 +38971,7 @@ begin
       QOfs := h * FDk;
       KOfs := FQW + g * FDk;
       VOfs := FQW + FKW + g * FDk;
+      SinkGrad := 0;
       for i := 0 to SeqLenM1 do
       begin
         dOutPtr := FOutputError.GetRawPtr(i, 0, QOfs);   // i-only, hoisted (#11)
@@ -38905,6 +39000,14 @@ begin
         for j := 0 to SeqLenM1 do
           FdScoreBuf[j] := FAttn.FData[AttnRow + j] *
             (FdAttnBuf[j] - SumDAttnAttn);
+        // The sink column has dAttn = 0, so d(loss)/d(s_h) gains
+        // w_sink * (0 - SumDAttnAttn), w_sink = 1 - the row's real-key mass.
+        if HasSink then
+        begin
+          SinkWeight := 1 - TNNetVolume.Sum(@FAttn.FData[AttnRow], SeqLen);
+          if SinkWeight > 0 then
+            SinkGrad := SinkGrad - SinkWeight * SumDAttnAttn;
+        end;
         // dQ[i] += invSqrtDk * dScore[j] * K[j];  dK[j] += ... * Q[i].
         qPtr := Prev.GetRawPtr(i, 0, QOfs);              // i-only, hoisted (#11)
         dQPtr := PrevErr.GetRawPtr(i, 0, QOfs);          // i-only, hoisted (#11)
@@ -38928,6 +39031,9 @@ begin
         end;
         Inc(AttnRow, AttnRowStride);      // next query's attention row
       end;
+      // The layer convention: delta += -LR * gradient.
+      if HasSink then
+        SinkDelta.FData[h] := SinkDelta.FData[h] - FLearningRate * SinkGrad;
       // Next head's KV group: g = h div FGroupSize, carried (#6).
       Inc(gHeadCnt);
       if gHeadCnt = FGroupSize then
@@ -38935,6 +39041,11 @@ begin
         gHeadCnt := 0;
         Inc(g);
       end;
+    end;
+    if HasSink and (not FBatchUpdate) then
+    begin
+      FNeurons[0].UpdateWeights(FInertia);
+      AfterWeightUpdate();
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -44169,7 +44280,8 @@ end;
 procedure TNNetFusedSDPACL.RunSplitDecode(Q, Y: TNNetVolume; bufQ: cl_mem;
   Int8KV: boolean; QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
   Window: integer; InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-  bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean);
+  bufK, bufV: cl_mem; pKeepResultOnOpenCL: boolean; bufSinks: cl_mem;
+  HasSinks: integer);
 var
   bufPartials, bufY: cl_mem;
   kSplit: cl_kernel;
@@ -44213,7 +44325,7 @@ begin
   FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
     KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
   RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride,
-    {bufSinks=}bufQ, {HasSinks=}0);
+    bufSinks, HasSinks);
   FLastPath := sdpaPathDecodeSplit;
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
@@ -44223,22 +44335,26 @@ procedure TNNetFusedSDPACL.ComputeStep(X, Y: TNNetVolume; Int8KV: boolean;
   CacheSlot, QW, KW, Window: integer; Causal: boolean;
   const RowKeyEnds: array of integer; RowKeyEndsVersion: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
-  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false;
+  pSinkLogits: TNNetVolume = nil; pSinkLogitsChanged: boolean = true);
 var
-  bufX, bufK, bufV: cl_mem;
+  bufX, bufK, bufV, bufSinks: cl_mem;
+  HasSinks: integer;
 begin
   bufX := StepSourceBuffer(X, pExternalSrc);
+  SinkLogitsArgs(pSinkLogits, pSinkLogitsChanged, QHeads, bufX, bufSinks,
+    HasSinks);
   AppendStep(bufX, Int8KV, KVHeads, X.SizeX, Dk, CacheMax, CacheSlot, QW, KW,
     X.Depth, bufK, bufV);
   if Path = sdpaPathFlash then
     RunFlash(X, Y, bufX, Int8KV, QHeads, KVHeads, GroupSize, Dk, CacheMax,
       CacheSlot, Window, Causal, RowKeyEnds, RowKeyEndsVersion, InvSqrtDk,
       ScoreSoftCap, InvScoreSoftCap, bufK, bufV, pKeepResultOnOpenCL,
-      {bufSinks=}bufX, {HasSinks=}0)
+      bufSinks, HasSinks)
   else
     RunSplitDecode(X, Y, bufX, Int8KV, QHeads, KVHeads, GroupSize, Dk,
       CacheMax, CacheSlot, Window, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap,
-      bufK, bufV, pKeepResultOnOpenCL);
+      bufK, bufV, pKeepResultOnOpenCL, bufSinks, HasSinks);
 end;
 
 procedure TNNetFusedSDPACL.EnsureIdentityPlan(TokenCnt, XStride, QHeads,
@@ -44786,7 +44902,7 @@ begin
     RunSplitDecode(Pair, Pair, bufQ, Int8KV, {QHeads=}2, {KVHeads=}1,
       {GroupSize=}2, Dk, CacheMax, CacheSlot, {Window=}0, InvSqrtHalfDk,
       {ScoreSoftCap=}0, {InvScoreSoftCap=}0, bufK, bufV,
-      {pKeepResultOnOpenCL=}true);
+      {pKeepResultOnOpenCL=}true, {bufSinks=}bufX, {HasSinks=}0);
   bufPair := FResultBuf;
   bufOut := FKernel.EnsureOutputBuffer(FBufDiffY, FCapDiffY, Y);
   clSetKernelArg(FDiffCombineKernel, 0, csLongintSize, @TokenCnt);
@@ -142549,7 +142665,7 @@ begin
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc);
-      'TNNetFusedSDPA' : Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0], St[7] = 1);
+      'TNNetFusedSDPA' : Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0], (St[7] and 1) <> 0, (St[7] and 2) <> 0);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetGridSample' :           Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1);
@@ -143004,7 +143120,7 @@ begin
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc) else
-      if S[0] = 'TNNetFusedSDPA' then Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0], St[7] = 1) else
+      if S[0] = 'TNNetFusedSDPA' then Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0], (St[7] and 1) <> 0, (St[7] and 2) <> 0) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetGridSample' then Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1) else

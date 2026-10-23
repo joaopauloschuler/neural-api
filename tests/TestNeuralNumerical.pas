@@ -78,7 +78,8 @@ type
     function CheckFusedSDPASplitCase(const What: string; QHeads, KVHeads, Dk,
       StepCnt, StepTokens, Window: integer; Int8KV: boolean;
       SoftCap, Tolerance: TNeuralFloat; const Override: TFusedSDPASplitOverride;
-      ExpectedGpuForwards: integer): TFusedSDPASplitLaunch;
+      ExpectedGpuForwards: integer;
+      HasSinks: boolean = false): TFusedSDPASplitLaunch;
     // Shared check for the reparameterised convs: one per-sample step moves the
     // raw weights exactly as a batch-mode step flushed by UpdateWeights.
     procedure CheckReparamConvTrainsWithoutBatchUpdate(pSpectral: boolean);
@@ -596,6 +597,12 @@ type
     procedure FusedSDPAFlashInt8OpenCLParity;
     // Flash over heads wider than 256 in output column chunks.
     procedure FusedSDPAFlashColumnChunksOpenCLParity;
+    // Per-query-head sinks on the resident cached step vs the CPU, FP32 and
+    // int8 KV: the split-row decode with one and several chunks (the merge adds
+    // each sink once) and a sink change mid-session; flash with one and
+    // several key splits.
+    procedure FusedSDPASinkSplitDecodeOpenCLParity;
+    procedure FusedSDPASinkFlashOpenCLParity;
     // TNNetScaledDotProductAttention on cai_sdpa_flash vs the CPU, with the
     // residency of the attention, the concat and the out-projection.
     procedure ScaledDotProductAttentionFlashOpenCLParity;
@@ -1896,6 +1903,10 @@ type
     // The KV-cache forward (one and three rows per step, FP32 and int8, full
     // and sliding window) against the full forward. Coded by Claude (AI).
     procedure TestGptOssSinkAttentionCachedDecodeParity;
+    // TNNetFusedSDPA with per-query-head sinks: central differences of the
+    // input and the sink logits, and the cached step against the full forward.
+    procedure TestFusedSDPASinkGradientCheck;
+    procedure TestFusedSDPASinkCachedDecodeParity;
     // The KV-cache forward of TNNetSinkAttention / TNNetDifferentialAttention
     // against the full forward (widths 1 and 3, FP32 and int8). Coded by Claude (AI).
     procedure TestSinkAttentionCachedDecodeParity;
@@ -16890,6 +16901,186 @@ var
   Int8KV: boolean;
 begin
   RandSeed := 20261021;
+  for Int8KV := false to true do
+  begin
+    RunCase(8, 0, 1, 0.5, Int8KV);
+    RunCase(8, 4, 1, 0.5, Int8KV);
+    RunCase(10, 4, 3, -1.0, Int8KV);
+    // A sink far above every score takes most of the softmax mass.
+    RunCase(16, 0, 3, 6.0, Int8KV);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFusedSDPASinkGradientCheck;
+// Central differences of the input gradient and of every per-head sink-logit
+// gradient of a causal, windowed GQA TNNetFusedSDPA (4 query heads over 2 KV
+// heads, HeadDim 4, SeqLen 4) with non-zero sinks.
+const
+  SeqLen = 4; QHeads = 4; KVHeads = 2; Dk = 4;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired, Logits: TNNetVolume;
+  Attn: TNNetFusedSDPA;
+  SinkWeights: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, h: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, (QHeads + 2 * KVHeads) * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, (QHeads + 2 * KVHeads) * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, QHeads * Dk);
+  Logits := TNNetVolume.Create(QHeads, 1, 1);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, (QHeads + 2 * KVHeads) * Dk, 1));
+    Attn := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, {pCausalMask=}true,
+      {pWindow=}3, 0, false, {pHasSinks=}true);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for h := 0 to QHeads - 1 do Logits.FData[h] := 0.4 - 0.35 * h;
+    Attn.SetSinkLogits(Logits);
+    SinkWeights := Attn.Neurons[0].Weights;
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      Attn.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('FusedSDPA sink input gradient at ' + IntToStr(i) + ' num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // The sink-logit gradient: analytical = -Neuron.Delta (delta = -LR*grad).
+    for h := 0 to QHeads - 1 do
+    begin
+      SinkWeights.Raw[h] := SinkWeights.Raw[h] + epsilon;
+      lossPlus := ComputeLoss(Input);
+      SinkWeights.Raw[h] := SinkWeights.Raw[h] - 2 * epsilon;
+      lossMinus := ComputeLoss(Input);
+      SinkWeights.Raw[h] := SinkWeights.Raw[h] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      Attn.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -Attn.Neurons[0].Delta.Raw[h];
+      AssertTrue('FusedSDPA sink-logit gradient head ' + IntToStr(h) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      AssertTrue('FusedSDPA sink-logit gradient head ' + IntToStr(h) +
+        ' is not vacuous', Abs(numericalGrad) > 1e-3);
+    end;
+  finally
+    Logits.Free;
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFusedSDPASinkCachedDecodeParity;
+// The cached forward of a sink-enabled TNNetFusedSDPA (one and three rows per
+// step, FP32 and int8, full and sliding window) against its full forward.
+const
+  SeqLen = 12; QHeads = 4; KVHeads = 2;
+  // Per-row int8 K/V scales on O(1) Gaussian rows.
+  cInt8Tolerance = 3e-2;
+
+  procedure RunCase(Dk, Window, StepWidth: integer; SinkBase: TNeuralFloat;
+    Int8KV: boolean);
+  var
+    NNFull, NNStep: TNNet;
+    FullAttn, StepAttn: TNNetFusedSDPA;
+    Input, StepIn, Logits: TNNetVolume;
+    InDepth, OutDepth, Row, StepRow, h, d: integer;
+    Diff, MaxDiff: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('Dk=%d W=%d width=%d sink=%.2f int8=%s',
+      [Dk, Window, StepWidth, SinkBase, BoolToStr(Int8KV, true)]);
+    InDepth := (QHeads + 2 * KVHeads) * Dk;
+    OutDepth := QHeads * Dk;
+    NNFull := TNNet.Create();
+    NNStep := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+    StepIn := TNNetVolume.Create(StepWidth, 1, InDepth);
+    Logits := TNNetVolume.Create(QHeads, 1, 1);
+    try
+      NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth));
+      FullAttn := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, true, Window, 0,
+        false, {pHasSinks=}true);
+      NNFull.AddLayer(FullAttn);
+      NNStep.AddLayer(TNNetInput.Create(StepWidth, 1, InDepth));
+      StepAttn := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, true, Window, 0,
+        false, {pHasSinks=}true);
+      NNStep.AddLayer(StepAttn);
+      for h := 0 to QHeads - 1 do Logits.FData[h] := SinkBase - 0.5 * h;
+      FullAttn.SetSinkLogits(Logits);
+      StepAttn.SetSinkLogits(Logits);
+      Input.RandomizeGaussian(1.0);
+      NNFull.Compute(Input);
+      StepAttn.BeginIncrementalDecode(SeqLen, Int8KV);
+      MaxDiff := 0;
+      Row := 0;
+      while Row < SeqLen do
+      begin
+        for StepRow := 0 to StepWidth - 1 do
+          Move(Input.FData[(Row + StepRow) * InDepth],
+            StepIn.FData[StepRow * InDepth], InDepth * SizeOf(TNeuralFloat));
+        NNStep.Compute(StepIn);
+        for StepRow := 0 to StepWidth - 1 do
+          for d := 0 to OutDepth - 1 do
+          begin
+            Diff := Abs(FullAttn.Output.FData[(Row + StepRow) * OutDepth + d] -
+              StepAttn.Output.FData[StepRow * OutDepth + d]);
+            if IsNan(Diff) or (Diff > MaxDiff) then MaxDiff := Diff;
+          end;
+        Inc(Row, StepWidth);
+      end;
+      if Int8KV then
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < cInt8Tolerance)
+      else
+        AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff),
+          MaxDiff < 1e-5);
+    finally
+      Logits.Free;
+      StepIn.Free;
+      Input.Free;
+      NNStep.Free;
+      NNFull.Free;
+    end;
+  end;
+
+var
+  Int8KV: boolean;
+begin
+  RandSeed := 20261023;
   for Int8KV := false to true do
   begin
     RunCase(8, 0, 1, 0.5, Int8KV);
@@ -86630,14 +86821,17 @@ end;
 // cache snapshot after that step on the OpenCL side and restores it before the
 // next. Int8KV picks the int8 KV cache, and with it the int8 snapshot API.
 // Override sets the helper's split sizing; Launch reports the last step's.
+// HasSinks gives both layers the same random per-head sinks, redrawn after
+// step StepCnt div 2 so the OpenCL copy has to follow a weight change.
 function RunFusedSDPADecodeParityEx(QHeads, KVHeads, Dk, StepCnt, StepTokens,
   Window, CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean;
   SoftCap: TNeuralFloat; const Override: TFusedSDPASplitOverride;
-  out GpuForwards: integer; out Launch: TFusedSDPASplitLaunch): TNeuralFloat;
+  out GpuForwards: integer; out Launch: TFusedSDPASplitLaunch;
+  HasSinks: boolean = false): TNeuralFloat;
 {$IFDEF OpenCL}
 var
   NNCpu, NNGpu: TNNet;
-  StepIn, SnapK, SnapV: TNNetVolume;
+  StepIn, SnapK, SnapV, Logits: TNNetVolume;
   SnapKQ, SnapVQ: TNNetVolumeQuant8;
   LCpu, LGpu: TNNetFusedSDPA;
   Mixer: TNNetLayer;
@@ -86645,6 +86839,16 @@ var
   DeviceId: cl_device_id;
   InDepth, OutDepth, T, D, Row, SnapLen, SnapSinks, SnapWindow: integer;
   Diff: TNeuralFloat;
+
+  procedure DrawSinks();
+  var
+    h: integer;
+  begin
+    for h := 0 to QHeads - 1 do Logits.FData[h] := 3 * (Random - 0.3);
+    LCpu.SetSinkLogits(Logits);
+    LGpu.SetSinkLogits(Logits);
+  end;
+
 begin
   Result := 0;
   GpuForwards := 0;
@@ -86659,23 +86863,28 @@ begin
   SnapV := TNNetVolume.Create();
   SnapKQ := TNNetVolumeQuant8.Create();
   SnapVQ := TNNetVolumeQuant8.Create();
+  Logits := TNNetVolume.Create(QHeads, 1, 1);
   try
     NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
-    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap,
+      false, HasSinks);
     NNCpu.AddLayer(LCpu);
     NNCpu.AddLayer(TNNetSiLU.Create());
     NNCpu.SetTrainable(False, False);
 
     NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
-    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap,
+      false, HasSinks);
     Mixer := NNGpu.AddLayer(LGpu);
     NNGpu.AddLayer(TNNetSiLU.Create());
     NNGpu.SetTrainable(False, False);
+    if HasSinks then DrawSinks();
 
     LCpu.BeginIncrementalDecode(StepCnt * StepTokens, Int8KV);
     LGpu.BeginIncrementalDecode(StepCnt * StepTokens, Int8KV);
     for T := 0 to StepCnt - 1 do
     begin
+      if HasSinks and (T = StepCnt div 2) then DrawSinks();
       // The CPU network warms the OpenCL network's cache too: both run the same
       // rows, so arming OpenCL late leaves a cache the host built.
       if T = CpuWarmupSteps then
@@ -86734,6 +86943,7 @@ begin
     LGpu.EndIncrementalDecode();
     LCpu.EndIncrementalDecode();
   finally
+    Logits.Free;
     SnapVQ.Free; SnapKQ.Free;
     SnapV.Free; SnapK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
   end;
@@ -87206,11 +87416,11 @@ procedure RunFusedSDPAFlashCase(PlatformId: cl_platform_id;
   StepTokens, Window: integer; SoftCap, InputAmplitude, KeyRamp: TNeuralFloat;
   Causal: boolean; ForcedSplits, UsableLocalMemBytes: integer;
   HostSource, ResidentPrefix, Int8KV: boolean;
-  ExpectedPath: TFusedSDPAOpenCLPath);
+  ExpectedPath: TFusedSDPAOpenCLPath; HasSinks: boolean = false);
 var
   NNCpu, NNGpu: TNNet;
   LCpu, LGpu: TNNetFusedSDPA;
-  StepIn, PrefixK, PrefixV: TNNetVolume;
+  StepIn, PrefixK, PrefixV, Logits: TNNetVolume;
   KVRows: TNNetKVRowsOnOpenCL;
   InDepth, KW, Pass, Pos, SnapLen, SnapSinks, SnapWindow: integer;
   MaxPrefixPos, MaxStepInPos, MaxOutputPos: integer;
@@ -87247,6 +87457,7 @@ var
         else KeyHi := PrefixLen + StepTokens;
         if Window > 0 then KeyLo := Max(0, KeyHi - Window) else KeyLo := 0;
         MaxScore := -1e300;
+        if HasSinks then MaxScore := Logits.FData[H];
         for J := KeyLo to KeyHi - 1 do
         begin
           Score := 0;
@@ -87259,6 +87470,7 @@ var
           MaxScore := Max(MaxScore, Score);
         end;
         SumExp := 0;
+        if HasSinks then SumExp := Exp(Logits.FData[H] - MaxScore);
         for D := 0 to Dk - 1 do Acc[D] := 0;
         for J := KeyLo to KeyHi - 1 do
         begin
@@ -87274,11 +87486,11 @@ var
 
 begin
   What := Format('%s Hq=%d Hkv=%d Dk=%d L=%d T=%d W=%d cap=%.1f ' +
-    'splits=%d mem=%d host=%s resident=%s int8kv=%s', [
+    'splits=%d mem=%d host=%s resident=%s int8kv=%s sinks=%s', [
     BoolToStr(Causal, 'causal', 'non-causal'), QHeads, KVHeads, Dk, PrefixLen,
     StepTokens, Window, SoftCap, ForcedSplits, UsableLocalMemBytes,
     BoolToStr(HostSource, true), BoolToStr(ResidentPrefix, true),
-    BoolToStr(Int8KV, true)]);
+    BoolToStr(Int8KV, true), BoolToStr(HasSinks, true)]);
   InDepth := (QHeads + 2 * KVHeads) * Dk;
   KW := KVHeads * Dk;
   KVRows.Buffer := nil;
@@ -87292,10 +87504,11 @@ begin
   SnapK := TNNetVolumeQuant8.Create();
   SnapV := TNNetVolumeQuant8.Create();
   Reference := TNNetVolume.Create();
+  Logits := TNNetVolume.Create(QHeads, 1, 1);
   try
     NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
     LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window, SoftCap,
-      {pCachedForwardNonCausal=}not Causal);
+      {pCachedForwardNonCausal=}not Causal, HasSinks);
     LCpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
     NNCpu.AddLayer(LCpu);
     NNCpu.SetTrainable(False, False);
@@ -87303,10 +87516,16 @@ begin
     // TNNetIdentity computes on the host, so the attention uploads its input.
     if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
     LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, Causal, Window, SoftCap,
-      {pCachedForwardNonCausal=}not Causal);
+      {pCachedForwardNonCausal=}not Causal, HasSinks);
     LGpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
     NNGpu.AddLayer(LGpu);
     NNGpu.SetTrainable(False, False);
+    if HasSinks then
+    begin
+      for Pos := 0 to QHeads - 1 do Logits.FData[Pos] := 3 * (Random - 0.3);
+      LCpu.SetSinkLogits(Logits);
+      LGpu.SetSinkLogits(Logits);
+    end;
     NNGpu.EnableOpenCL(PlatformId, DeviceId);
     LGpu.FusedSDPACL.ForcedFlashSplits := ForcedSplits;
     if UsableLocalMemBytes > 0 then
@@ -87407,6 +87626,7 @@ begin
         int64(LGpu.FusedSDPACL.LastScratchBytes));
   finally
     if Assigned(KVRows.Buffer) then clReleaseMemObject(KVRows.Buffer);
+    Logits.Free;
     Reference.Free; SnapV.Free; SnapK.Free;
     PrefixV.Free; PrefixK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
   end;
@@ -88192,6 +88412,92 @@ begin
   // An NVIDIA-sized budget (48 KB less the reserve) holds the Dk 1152 tiles.
   RunFusedSDPAFlashCase(PlatformId, DeviceId, 1, 1, 1152, 0, 33, 0, 0, 3, 0,
     {Causal=}False, 0, 48 * 1024 - 1024, False, True, False, sdpaPathFlash);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASinkSplitDecodeOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+  Int8KV: boolean;
+  Tolerance: TNeuralFloat;
+  CaseSuffix: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261023;
+  for Int8KV := false to true do
+  begin
+    // See FusedSDPAInt8DecodeResidentOpenCLParity for the int8 tolerance.
+    if Int8KV then Tolerance := 1e-3 else Tolerance := 1e-4;
+    CaseSuffix := ' int8=' + BoolToStr(Int8KV, true);
+    CheckFusedSDPASplitCase('sink split GQA' + CaseSuffix, 4, 2, 3, 9, 1, 0,
+      Int8KV, 0, Tolerance, FusedSDPASplitOverride(0, 0, 0), 9, true);
+    // Four rows per chunk over a 20-row cache: the merge adds each sink once.
+    Launch := CheckFusedSDPASplitCase('sink split chunks' + CaseSuffix, 4, 2, 5,
+      20, 1, 0, Int8KV, 0, Tolerance, FusedSDPASplitOverride(0, 4, 0), 20,
+      true);
+    AssertTrue('sink split chunks' + CaseSuffix + ': several chunks',
+      Launch.Splits >= 3);
+    CheckFusedSDPASplitCase('sink split window + cap' + CaseSuffix, 6, 3, 8, 12,
+      1, 5, Int8KV, 5.0, Tolerance, FusedSDPASplitOverride(0, 0, 0), 12, true);
+    // A prefill window of 4 rows on the split-row decode, groups of 1.
+    CheckFusedSDPASplitCase('sink split 4-row steps' + CaseSuffix, 3, 3, 4, 5, 4,
+      0, Int8KV, 0, Tolerance, FusedSDPASplitOverride(0, 0, 0), 5, true);
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASinkFlashOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure RunCase(Causal, Int8KV: boolean; QHeads, KVHeads, Dk, PrefixLen,
+    StepTokens, Window, ForcedSplits: integer);
+  begin
+    RunFusedSDPAFlashCase(PlatformId, DeviceId, QHeads, KVHeads, Dk,
+      PrefixLen, StepTokens, Window, {SoftCap=}0, {InputAmplitude=}3,
+      {KeyRamp=}0, Causal, ForcedSplits, {UsableLocalMemBytes=}0,
+      {HostSource=}False, {ResidentPrefix=}not Int8KV, Int8KV, sdpaPathFlash,
+      {HasSinks=}True);
+  end;
+
+var
+  Int8KV: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261024;
+  for Int8KV := false to true do
+  begin
+    // One key split (the flash epilogue adds the sink), then forced splits
+    // (the merge adds it), a window with mostly empty splits, GQA groups of
+    // 4 and 1, and the non-causal mask.
+    RunCase(True, Int8KV, 4, 1, 64, 7, 16, 0, 1);
+    RunCase(True, Int8KV, 4, 1, 64, 7, 16, 0, 3);
+    RunCase(True, Int8KV, 4, 2, 32, 300, 16, 20, 7);
+    RunCase(True, Int8KV, 2, 2, 128, 40, 32, 0, 0);
+    RunCase(False, Int8KV, 2, 2, 64, 7, 20, 0, 0);
+    RunCase(False, Int8KV, 2, 1, 64, 30, 20, 0, 4);
+  end;
 end;
 {$ELSE}
 begin
@@ -89328,14 +89634,14 @@ end;
 function TTestNeuralNumerical.CheckFusedSDPASplitCase(const What: string;
   QHeads, KVHeads, Dk, StepCnt, StepTokens, Window: integer; Int8KV: boolean;
   SoftCap, Tolerance: TNeuralFloat; const Override: TFusedSDPASplitOverride;
-  ExpectedGpuForwards: integer): TFusedSDPASplitLaunch;
+  ExpectedGpuForwards: integer; HasSinks: boolean): TFusedSDPASplitLaunch;
 var
   MaxDiff: TNeuralFloat;
   GpuForwards: integer;
 begin
   MaxDiff := RunFusedSDPADecodeParityEx(QHeads, KVHeads, Dk, StepCnt,
     StepTokens, Window, {CpuWarmupSteps=}0, {CaptureAt=}-1, Int8KV, SoftCap,
-    Override, GpuForwards, Result);
+    Override, GpuForwards, Result, HasSinks);
   WriteLn('  FusedSDPA OpenCL ', What, ': max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards, ' splits=', Result.Splits,
     ' chunk rows=', Result.ChunkRows, ' scratch bytes=', Result.ScratchBytes,

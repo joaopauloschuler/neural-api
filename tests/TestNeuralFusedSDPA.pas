@@ -25,6 +25,12 @@ type
       Causal: boolean): TNNet;
     function BuildFusedNet(SeqLen, Hq, Hkv, HeadDim, Window: integer;
       Causal: boolean): TNNet;
+    // The sink twins: per-head TNNetGptOssSinkAttention heads, and one fused
+    // layer with sinks; head h's sink logit is SinkLogitOf(h) in both.
+    function BuildPerHeadSinkNet(SeqLen, Hq, Hkv, HeadDim,
+      Window: integer): TNNet;
+    function BuildFusedSinkNet(SeqLen, Hq, Hkv, HeadDim,
+      Window: integer): TNNet;
     procedure FillPacked(V: TNNetVolume; Seed: integer);
     procedure AssertOutputsEqual(const Msg: string; A, B: TNNet;
       Tolerance: TNeuralFloat);
@@ -47,6 +53,10 @@ type
     procedure TestSharedCacheStorage;     // stacked layers, one K/V storage
     procedure TestCachedRowKeyEnds;       // per-row key ends vs a dense mask
     procedure TestSkipAttentionScores;    // identity scores: each row's own V
+    procedure TestSinkPrefillParity;      // sinks vs per-head gpt-oss sink heads
+    procedure TestSinkDecodeParity;       // sinks, FP32 / int8 cached decode
+    procedure TestSinkBackwardParity;     // sinks: input and sink-logit grads
+    procedure TestSinkSaveLoad;           // sink flag and logits round trip
   end;
 
 implementation
@@ -1037,6 +1047,245 @@ begin
     NextInput.Free;
     PrefixK.Free;
     PrefixV.Free;
+  end;
+end;
+
+// Distinct per-head sink logits, both above and below the typical score.
+function SinkLogitOf(h: integer): TNeuralFloat;
+begin
+  Result := 1.1 - 0.7 * h;
+end;
+
+function TTestNeuralFusedSDPA.BuildPerHeadSinkNet(SeqLen, Hq, Hkv, HeadDim,
+  Window: integer): TNNet;
+var
+  NN: TNNet;
+  Src, QSlice, KSlice, VSlice, Pack: TNNetLayer;
+  Head: TNNetGptOssSinkAttention;
+  Heads: array of TNNetLayer;
+  h, g, GroupSize, QW, KW: integer;
+begin
+  NN := TNNet.Create();
+  GroupSize := Hq div Hkv;
+  QW := Hq * HeadDim;
+  KW := Hkv * HeadDim;
+  Src := NN.AddLayer(TNNetInput.Create(SeqLen, 1, QW + 2 * KW, 1));
+  SetLength(Heads, Hq);
+  for h := 0 to Hq - 1 do
+  begin
+    g := h div GroupSize;
+    QSlice := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(h * HeadDim, HeadDim), Src);
+    KSlice := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(QW + g * HeadDim, HeadDim), Src);
+    VSlice := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(QW + KW + g * HeadDim, HeadDim), Src);
+    Pack := NN.AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    Head := TNNetGptOssSinkAttention.Create(HeadDim, {pCausalMask=}true,
+      Window);
+    NN.AddLayerAfter(Head, Pack);
+    Head.SetSinkLogit(SinkLogitOf(h));
+    Heads[h] := Head;
+  end;
+  NN.AddLayer(TNNetDeepConcat.Create(Heads));
+  Result := NN;
+end;
+
+function TTestNeuralFusedSDPA.BuildFusedSinkNet(SeqLen, Hq, Hkv, HeadDim,
+  Window: integer): TNNet;
+var
+  NN: TNNet;
+  Layer: TNNetFusedSDPA;
+  Logits: TNNetVolume;
+  h: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(SeqLen, 1, (Hq + 2 * Hkv) * HeadDim, 1));
+  Layer := TNNetFusedSDPA.Create(Hq, Hkv, HeadDim, {pCausalMask=}true, Window,
+    0, false, {pHasSinks=}true);
+  NN.AddLayer(Layer);
+  Logits := TNNetVolume.Create(Hq, 1, 1);
+  try
+    for h := 0 to Hq - 1 do Logits.FData[h] := SinkLogitOf(h);
+    Layer.SetSinkLogits(Logits);
+  finally
+    Logits.Free;
+  end;
+  Result := NN;
+end;
+
+procedure TTestNeuralFusedSDPA.TestSinkPrefillParity;
+const
+  Windows: array[0..1] of integer = (0, 3);
+var
+  PerHead, Fused: TNNet;
+  Input: TNNetVolume;
+  Window: integer;
+  Parallel: boolean;
+begin
+  // GQA 4 query heads over 2 KV heads, full and sliding-window, serial and
+  // head-chunked.
+  Input := TNNetVolume.Create(7, 1, (4 + 4) * 4);
+  try
+    FillPacked(Input, 19);
+    for Window in Windows do
+    begin
+      for Parallel := false to true do
+      begin
+        PerHead := BuildPerHeadSinkNet(7, 4, 2, 4, Window);
+        Fused := BuildFusedSinkNet(7, 4, 2, 4, Window);
+        try
+          PerHead.Compute(Input);
+          Fused.Compute(Input, 0, Parallel);
+          AssertOutputsEqual('sink prefill window ' + IntToStr(Window) +
+            ' parallel=' + BoolToStr(Parallel, true), PerHead, Fused, 1e-6);
+        finally
+          Fused.Free;
+          PerHead.Free;
+        end;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralFusedSDPA.TestSinkDecodeParity;
+var
+  PerHead, Fused: TNNet;
+  Tok: TNNetVolume;
+  Step: integer;
+  Int8KV, Parallel: boolean;
+  Tolerance: TNeuralFloat;
+begin
+  // Single-token cached steps past a window of 3, over both cache formats:
+  // the per-head heads run the base cached decode with their sink.
+  Tok := TNNetVolume.Create(1, 1, (4 + 4) * 4);
+  try
+    for Int8KV := false to true do
+      for Parallel := false to true do
+      begin
+        PerHead := BuildPerHeadSinkNet(1, 4, 2, 4, 3);
+        Fused := BuildFusedSinkNet(1, 4, 2, 4, 3);
+        try
+          BeginDecodeAll(PerHead, 16, Int8KV);
+          BeginDecodeAll(Fused, 16, Int8KV);
+          if Int8KV then Tolerance := 1e-5 else Tolerance := 1e-6;
+          for Step := 0 to 9 do
+          begin
+            FillPacked(Tok, 800 + Step);
+            PerHead.Compute(Tok);
+            Fused.Compute(Tok, 0, Parallel);
+            AssertOutputsEqual('sink decode step ' + IntToStr(Step) +
+              ' int8=' + BoolToStr(Int8KV, true) + ' parallel=' +
+              BoolToStr(Parallel, true), PerHead, Fused, Tolerance);
+          end;
+        finally
+          Fused.Free;
+          PerHead.Free;
+        end;
+      end;
+  finally
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralFusedSDPA.TestSinkBackwardParity;
+var
+  PerHead, Fused: TNNet;
+  Input, Tgt: TNNetVolume;
+  FusedLayer: TNNetFusedSDPA;
+  i, h, HeadCnt: integer;
+begin
+  PerHead := BuildPerHeadSinkNet(5, 4, 2, 4, 0);
+  Fused := BuildFusedSinkNet(5, 4, 2, 4, 0);
+  Input := TNNetVolume.Create(5, 1, (4 + 4) * 4);
+  Tgt := TNNetVolume.Create(5, 1, 4 * 4);
+  try
+    PerHead.SetLearningRate(1.0, 0.0);
+    Fused.SetLearningRate(1.0, 0.0);
+    PerHead.SetBatchUpdate(true);
+    Fused.SetBatchUpdate(true);
+    FillPacked(Input, 13);
+    FillPacked(Tgt, 210);
+    PerHead.Compute(Input);
+    Fused.Compute(Input);
+    AssertOutputsEqual('sink backward-test forward', PerHead, Fused, 1e-6);
+    PerHead.Backpropagate(Tgt);
+    Fused.Backpropagate(Tgt);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('sink packed-input gradient at ' + IntToStr(i),
+        PerHead.Layers[0].OutputError.FData[i],
+        Fused.Layers[0].OutputError.FData[i], 2e-5);
+    FusedLayer := TNNetFusedSDPA(Fused.Layers[1]);
+    HeadCnt := 0;
+    for i := 0 to PerHead.CountLayers() - 1 do
+      if PerHead.Layers[i] is TNNetGptOssSinkAttention then
+      begin
+        h := HeadCnt;
+        AssertEquals('sink-logit delta of head ' + IntToStr(h),
+          PerHead.Layers[i].Neurons[0].Delta.FData[0],
+          FusedLayer.Neurons[0].Delta.FData[h], 2e-5);
+        Inc(HeadCnt);
+      end;
+    AssertEquals('per-head sink heads compared', 4, HeadCnt);
+    AssertTrue('the sink gradient is not vacuous',
+      Abs(FusedLayer.Neurons[0].Delta.FData[0]) > 1e-4);
+  finally
+    Tgt.Free;
+    Input.Free;
+    Fused.Free;
+    PerHead.Free;
+  end;
+end;
+
+procedure TTestNeuralFusedSDPA.TestSinkSaveLoad;
+var
+  NN, Reloaded, OldFile, Plain: TNNet;
+  Layer: TNNetFusedSDPA;
+  Input: TNNetVolume;
+  Saved: string;
+  h: integer;
+begin
+  NN := BuildFusedSinkNet(4, 4, 2, 4, 2);
+  Reloaded := TNNet.Create();
+  OldFile := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, (4 + 4) * 4);
+  try
+    Saved := NN.SaveToString();
+    Reloaded.LoadFromString(Saved);
+    AssertEquals('save->load->save', Saved, Reloaded.SaveToString());
+    Layer := TNNetFusedSDPA(Reloaded.Layers[1]);
+    AssertTrue('sinks reload', Layer.HasSinks);
+    AssertFalse('the sink bit is not the non-causal bit',
+      Layer.CachedForwardNonCausal);
+    for h := 0 to 3 do
+      AssertEquals('sink logit ' + IntToStr(h), SinkLogitOf(h),
+        Layer.Neurons[0].Weights.FData[h], 1e-6);
+    FillPacked(Input, 5);
+    NN.Compute(Input);
+    Reloaded.Compute(Input);
+    AssertOutputsEqual('reloaded sink forward', NN, Reloaded, 0);
+    // The layout of a file written before the sinks: option bits = 1, the
+    // non-causal flag alone.
+    Plain := TNNet.Create();
+    try
+      Plain.AddLayer(TNNetInput.Create(4, 1, (2 + 2) * 4));
+      Plain.AddLayer(TNNetFusedSDPA.Create(2, 1, 4, false, 0, 0, true));
+      OldFile.LoadFromString(Plain.SaveToString());
+    finally
+      Plain.Free;
+    end;
+    AssertTrue('the non-causal bit still loads',
+      TNNetFusedSDPA(OldFile.Layers[1]).CachedForwardNonCausal);
+    AssertFalse('a file without the sink bit loads without sinks',
+      TNNetFusedSDPA(OldFile.Layers[1]).HasSinks);
+    AssertEquals('no sink neuron', 0, OldFile.Layers[1].Neurons.Count);
+  finally
+    Input.Free;
+    OldFile.Free;
+    Reloaded.Free;
+    NN.Free;
   end;
 end;
 
