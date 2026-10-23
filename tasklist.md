@@ -1094,11 +1094,9 @@ rather than acted on.
       baseline (what the oracle pins). OPEN: (a) ship/import the OFFICIAL
       richzhang/PerceptualSimilarity lin{0..4}.model 1x1-conv weights + parity vs
       the reference calibrated LPIPS (needs the `lpips` weights, unobtainable
-      offline here). [X] (b) DONE: TNNetPerceptualLoss (neuralpretrained.pas) is
-      a TNeuralFit.OutputErrorFn hook (new general hook in neuralfit.pas, backed by
-      TNNet.BackpropagateFromOutputError) wired into SuperResolutionTrain as
-      --perceptual-vgg FILE [--perceptual-weight W] (TestOutputErrorFnDrivesTheStep,
-      TestPerceptualLossTrainingHook). OPEN from (b): (b1) a real-VGG SR training
+      offline here). (b) TNNetPerceptualLoss (a TNeuralFit.OutputErrorFn hook)
+      is wired into SuperResolutionTrain as --perceptual-vgg FILE
+      [--perceptual-weight W]. OPEN from (b): (b1) a real-VGG SR training
       run (CIFAR-10 + timm/vgg16.tv_in1k safetensors) to pick a default
       --perceptual-weight and check the timm key layout loads; (b2) calibrated
       unit-normalized (LPIPS-style) perceptual gradient; (b3) per-thread VGG
