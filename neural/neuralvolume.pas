@@ -560,6 +560,9 @@ type
       // Register-blocked PtrC[b * CStride + a] := A row a . B row b (+ PtrBias[a] unless nil)
       // for a < NumAs, b < NumBs; A from PackDotProductRows, B rows BStride floats apart.
       class procedure DotProductsPacked(PtrC: TNeuralFloatArrPtr; CStride: integer; PtrPackedA: TNeuralFloatArrPtr; NumAs: integer; PtrB: TNeuralFloatArrPtr; BStride, NumBs, VectorSize: integer; PtrBias: TNeuralFloatArrPtr); static;
+      // PtrC[r] += (NumRows rows RowStride floats apart, row r) . PtrB for r < NumRows:
+      // a GEMV that shares each PtrB load across four rows.
+      class procedure AddDotProductRows(PtrC, PtrRows: TNeuralFloatArrPtr; RowStride, NumRows: integer; PtrB: TNeuralFloatArrPtr; VectorSize: integer); static;
       // Fused int8-weight x float32-input dot product: returns the RAW code
       // sum (sum of code_i * b_i) with NO scale applied - the caller multiplies
       // by the per-row quantization scale once, so the kernel never touches a
@@ -2276,6 +2279,90 @@ begin
     'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
   ];
 end;
+{$ENDIF}
+
+{$IFDEF AVX64}
+{$IFDEF AVX2}
+// PtrC[0..3] += row r . PtrB for the four rows; each 8-float load of PtrB feeds
+// four FMAs. BodyElements is a positive multiple of 8.
+procedure AVXAddDotProductRows4(PtrC, PtrRow0, PtrRow1, PtrRow2, PtrRow3,
+  PtrB: pointer; BodyElements: int64);
+var
+  LocalC, LocalRow0, LocalRow1, LocalRow2, LocalRow3, LocalB: pointer;
+  LocalBodyElements: int64;
+begin
+  LocalC := PtrC;
+  LocalRow0 := PtrRow0;
+  LocalRow1 := PtrRow1;
+  LocalRow2 := PtrRow2;
+  LocalRow3 := PtrRow3;
+  LocalB := PtrB;
+  LocalBodyElements := BodyElements;
+  asm
+  mov r8, LocalRow0
+  mov r9, LocalRow1
+  mov r10, LocalRow2
+  mov r11, LocalRow3
+  mov rdx, LocalB
+  mov rcx, LocalBodyElements
+  xor rsi, rsi
+  vxorps ymm0, ymm0, ymm0
+  vxorps ymm1, ymm1, ymm1
+  vxorps ymm2, ymm2, ymm2
+  vxorps ymm3, ymm3, ymm3
+  vxorps ymm4, ymm4, ymm4
+  vxorps ymm5, ymm5, ymm5
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
+  shr rcx, 4
+  jz @Tail8
+@Loop16:
+  vmovups ymm8, [rdx+rsi]
+  vmovups ymm9, [rdx+rsi+32]
+  vfmadd231ps ymm0, ymm8, [r8+rsi]
+  vfmadd231ps ymm1, ymm8, [r9+rsi]
+  vfmadd231ps ymm2, ymm8, [r10+rsi]
+  vfmadd231ps ymm3, ymm8, [r11+rsi]
+  vfmadd231ps ymm4, ymm9, [r8+rsi+32]
+  vfmadd231ps ymm5, ymm9, [r9+rsi+32]
+  vfmadd231ps ymm6, ymm9, [r10+rsi+32]
+  vfmadd231ps ymm7, ymm9, [r11+rsi+32]
+  add rsi, 64
+  dec rcx
+  jnz @Loop16
+@Tail8:
+  mov rcx, LocalBodyElements
+  test rcx, 8
+  jz @Reduce
+  vmovups ymm8, [rdx+rsi]
+  vfmadd231ps ymm0, ymm8, [r8+rsi]
+  vfmadd231ps ymm1, ymm8, [r9+rsi]
+  vfmadd231ps ymm2, ymm8, [r10+rsi]
+  vfmadd231ps ymm3, ymm8, [r11+rsi]
+@Reduce:
+  vaddps ymm0, ymm0, ymm4
+  vaddps ymm1, ymm1, ymm5
+  vaddps ymm2, ymm2, ymm6
+  vaddps ymm3, ymm3, ymm7
+  // Per 128-bit lane: (r0, r1, r2, r3) partial sums, then fold the two lanes.
+  vhaddps ymm0, ymm0, ymm1
+  vhaddps ymm2, ymm2, ymm3
+  vhaddps ymm0, ymm0, ymm2
+  vextractf128 xmm1, ymm0, 1
+  vaddps xmm0, xmm0, xmm1
+  mov rax, LocalC
+  vmovups xmm1, [rax]
+  vaddps xmm0, xmm0, xmm1
+  vmovups [rax], xmm0
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'RSI', 'R8', 'R9', 'R10', 'R11',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9'
+  ];
+end;
+{$ENDIF}
 {$ENDIF}
 
 {$IFDEF AVX64}
@@ -15008,6 +15095,63 @@ begin
       end;
     end;
     TileStart := TileEnd;
+  end;
+end;
+
+class procedure TNNetVolume.AddDotProductRows(PtrC, PtrRows: TNeuralFloatArrPtr;
+  RowStride, NumRows: integer; PtrB: TNeuralFloatArrPtr; VectorSize: integer);
+var
+  RowPos, FirstTailRowPos, MaxRowPos, RowOfs: integer;
+  {$IFDEF AVX2}{$IFDEF AVX64}
+  QuadPos, MaxQuadPos, BodyElements, ElementPos, MaxElementPos: integer;
+  Row0, Row1, Row2, Row3: TNeuralFloatArrPtr;
+  BValue, Sum0, Sum1, Sum2, Sum3: TNeuralFloat;
+  {$ENDIF}{$ENDIF}
+begin
+  if (NumRows <= 0) or (VectorSize <= 0) then exit;
+  FirstTailRowPos := 0;
+  RowOfs := 0;
+  {$IFDEF AVX2}{$IFDEF AVX64}
+  BodyElements := VectorSize and (not 7);
+  if BodyElements > 0 then
+  begin
+    MaxQuadPos := (NumRows shr 2) - 1;
+    MaxElementPos := VectorSize - 1;
+    for QuadPos := 0 to MaxQuadPos do
+    begin
+      Row0 := @PtrRows^[RowOfs];
+      Row1 := @PtrRows^[RowOfs + RowStride];
+      Row2 := @PtrRows^[RowOfs + 2 * RowStride];
+      Row3 := @PtrRows^[RowOfs + 3 * RowStride];
+      AVXAddDotProductRows4(@PtrC^[FirstTailRowPos], Row0, Row1, Row2, Row3,
+        PtrB, BodyElements);
+      if BodyElements < VectorSize then
+      begin
+        Sum0 := 0; Sum1 := 0; Sum2 := 0; Sum3 := 0;
+        for ElementPos := BodyElements to MaxElementPos do
+        begin
+          BValue := PtrB^[ElementPos];
+          Sum0 := Sum0 + Row0^[ElementPos] * BValue;
+          Sum1 := Sum1 + Row1^[ElementPos] * BValue;
+          Sum2 := Sum2 + Row2^[ElementPos] * BValue;
+          Sum3 := Sum3 + Row3^[ElementPos] * BValue;
+        end;
+        PtrC^[FirstTailRowPos] := PtrC^[FirstTailRowPos] + Sum0;
+        PtrC^[FirstTailRowPos + 1] := PtrC^[FirstTailRowPos + 1] + Sum1;
+        PtrC^[FirstTailRowPos + 2] := PtrC^[FirstTailRowPos + 2] + Sum2;
+        PtrC^[FirstTailRowPos + 3] := PtrC^[FirstTailRowPos + 3] + Sum3;
+      end;
+      Inc(FirstTailRowPos, 4);
+      Inc(RowOfs, 4 * RowStride);
+    end;
+  end;
+  {$ENDIF}{$ENDIF}
+  MaxRowPos := NumRows - 1;
+  for RowPos := FirstTailRowPos to MaxRowPos do
+  begin
+    PtrC^[RowPos] := PtrC^[RowPos] +
+      DotProduct(@PtrRows^[RowOfs], PtrB, VectorSize);
+    Inc(RowOfs, RowStride);
   end;
 end;
 

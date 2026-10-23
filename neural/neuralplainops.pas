@@ -1297,7 +1297,7 @@ var
   StepPos, MaxStepPos, Position: integer;
   Gates, HiddenState: TNNetVolume;
   GatesPtr, InputGatePtr, ForgetGatePtr, CellGatePtr, OutputGatePtr: TNeuralFloatArrPtr;
-  HiddenPtr, CellPtr: TNeuralFloatArrPtr;
+  HiddenPtr, CellPtr, RecurrentPtr: TNeuralFloatArrPtr;
   IsBackward: boolean;
 begin
   Weights := FJobLSTM[Direction];
@@ -1315,6 +1315,7 @@ begin
   OutputGatePtr := Gates.GetRawPtr(3 * Hidden);
   HiddenPtr := HiddenState.DataPtr;
   CellPtr := FCell[Direction].DataPtr;
+  RecurrentPtr := Weights.RecurrentRows.DataPtr;
   HiddenState.Fill(0);
   FCell[Direction].Fill(0);
   MaxStepPos := FJobPositionCount - 1;
@@ -1322,10 +1323,10 @@ begin
   begin
     if IsBackward then Position := MaxStepPos - StepPos else Position := StepPos;
     // Gates read the h of the previous step; h is rewritten only below.
-    Gates.DotProducts(GateCount, 0, 0, Hidden, Weights.RecurrentRows,
-      HiddenState);
-    TNNetVolume.Add(GatesPtr,
-      FProjection[Direction].GetRawPtr(Position * GateCount), GateCount);
+    Move(FProjection[Direction].FData[Position * GateCount], GatesPtr^[0],
+      GateCount * csNeuralFloatSize);
+    TNNetVolume.AddDotProductRows(GatesPtr, RecurrentPtr, Hidden, GateCount,
+      HiddenPtr, Hidden);
     TNNetVolume.Sigmoid(InputGatePtr, InputGatePtr, 2 * Hidden);
     TNNetVolume.Tanh(CellGatePtr, CellGatePtr, Hidden);
     TNNetVolume.Sigmoid(OutputGatePtr, OutputGatePtr, Hidden);
