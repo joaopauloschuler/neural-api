@@ -2125,11 +2125,10 @@ rather than acted on.
 
 - [ ] SuperPoint + LightGlue follow-ups (`BuildSuperPointFromSafeTensors[Ex]`,
       `BuildLightGlueFromSafeTensors[Ex]`, `TSuperPointKeypoints`,
-      `TLightGlueMatcher` and examples/KeypointMatching are done):
-      - [ ] LightGlue follow-ups: adaptive depth (early exit on
-            `depth_confidence` with the token_confidence heads, not loaded
-            now) and point pruning (`width_confidence`); a real-checkpoint run
-            of ETH-CVG/lightglue_superpoint on a real image pair, with a
+      `TLightGlueMatcher` with early exit and point pruning, and
+      examples/KeypointMatching are done):
+      - [ ] LightGlue follow-ups: a real-checkpoint run of
+            ETH-CVG/lightglue_superpoint on a real image pair, with a
             transformers comparison (with and without early exit/pruning) and
             the measured time; threading the attention (one head per pool
             thread) and an OpenCL path; a TNNet coordinate-rotary layer if a

@@ -7,9 +7,12 @@ with the pico SuperPoint of make_pico_superpoint_fixture.py as its keypoint
 detector (its weights are copied in from tests/fixtures/tiny_superpoint.safetensors)
 and a randomly initialized matcher. The reference is the real transformers
 forward in float64 with the adaptive depth and the point pruning disabled
-(depth_confidence = width_confidence = -1 on the module), which is what the
-Pascal v1 matcher runs. The written config keeps the checkpoint defaults
-(0.95 / 0.99) so the config reader is exercised on real values.
+(depth_confidence = width_confidence = -1 on the module). The written config
+keeps the checkpoint defaults (0.95 / 0.99) so the config reader is exercised
+on real values. A second oracle ("adaptive" in the io json) reruns the same
+image pairs with per-variant depth / width confidences that trigger point
+pruning (and, on tiny_lightglue, an early stop): the token confidence heads are
+scaled and shifted so their sigmoid straddles the layer thresholds.
 
 Two variants:
   tiny_lightglue    descriptor_dim 16 > SuperPoint's 8 (input_projection),
@@ -48,7 +51,8 @@ sp_config["border_removal_distance"] = 2
 sp_weights = load_file(os.path.join(fixtures, "tiny_superpoint.safetensors"))
 
 
-def build(name, descriptor_dim, heads, kv_heads, layers, filter_threshold, seed):
+def build(name, descriptor_dim, heads, kv_heads, layers, filter_threshold, seed,
+          confidence_scale, confidence_biases):
     torch.manual_seed(seed)
     np.random.seed(seed)
     cfg = LightGlueConfig(
@@ -93,6 +97,10 @@ def build(name, descriptor_dim, heads, kv_heads, layers, filter_threshold, seed)
                 torch.nn.init.normal_(p, mean=0.0, std=0.02)
                 if "matchability.bias" in pname:
                     p.add_(2.0)  # most points matchable, as when trained
+        # After the seeded init, so every other tensor keeps its values.
+        for layer, head in enumerate(model.token_confidence):
+            head.token.weight.mul_(confidence_scale)
+            head.token.bias.add_(confidence_biases[layer])
         sd = model.keypoint_detector.state_dict()
         for key in sd:
             sd[key].copy_(torch.from_numpy(sp_weights[key]))
@@ -128,13 +136,87 @@ def run(model, image0, image1, dtype):
     return result
 
 
+def run_adaptive(model, image0, image1, dtype, depth, width):
+    """transformers forward with early stop + pruning; returns the matches,
+    the stop layer, per-layer token counts and the kept rows' descriptors."""
+    m = model.to(dtype)
+    m.depth_confidence = depth
+    m.width_confidence = width
+    stops = []
+    captured = {}
+
+    def hook(layer):
+        def fn(_module, args):
+            stops.append(layer)
+            captured["descriptors"] = args[0].detach().clone()
+        return fn
+
+    handles = [head.register_forward_pre_hook(hook(layer))
+               for layer, head in enumerate(m.match_assignment_layers)]
+    original_remap = m._do_final_keypoint_pruning
+
+    def remap(indices, matches, scores, num_keypoints):
+        captured["remap"] = (indices.clone(), matches.clone(), scores.clone())
+        return original_remap(indices, matches, scores, num_keypoints)
+
+    m._do_final_keypoint_pruning = remap
+    pv = np.stack([image0, image1])[None, :, None]
+    pv = torch.from_numpy(np.repeat(pv, 3, axis=2)).to(dtype)
+    with torch.no_grad():
+        out = m(pv)
+    del m._do_final_keypoint_pruning
+    for handle in handles:
+        handle.remove()
+    m.depth_confidence = -1
+    m.width_confidence = -1
+    assert len(stops) == 1, stops
+    stop = stops[0]
+    counts = [int(out.mask[0, i].sum()) for i in range(2)]
+    prune = out.prune[0].numpy()
+    result = {"stop_layer": stop}
+    # prune[i] = 1 + the number of pruning passes keypoint i survived.
+    result["layer_counts"] = [[int((prune[side, :counts[side]] >= layer + 1).sum())
+                               for side in range(2)] for layer in range(stop + 1)]
+    kept = [[int(i) for i in np.nonzero(prune[side, :counts[side]] == stop + 1)[0]]
+            for side in range(2)]
+    # The remap of the kept rows' matches back to keypoint indices, without
+    # transformers' quirk: the shorter side's -1 padding indices also write
+    # (match -1, score 0) into the last keypoint slot.
+    indices, matches, scores = (t.reshape(2, -1) for t in captured["remap"])
+    torch_matches = out.matches.reshape(2, -1)
+    torch_scores = out.matching_scores.reshape(2, -1)
+    result["transformers_clobbered"] = []
+    for side in range(2):
+        n = counts[side]
+        assert [int(i) for i in indices[side] if i >= 0] == kept[side]
+        side_matches = [-1] * n
+        side_scores = [0.0] * n
+        for row, index in enumerate(kept[side]):
+            partner = int(matches[side, row])
+            if partner >= 0:
+                side_matches[index] = kept[1 - side][partner]
+            side_scores[index] = float(scores[side, row])
+        for index in range(n):
+            if (side_matches[index] != int(torch_matches[side, index]) or
+                    abs(side_scores[index] - float(torch_scores[side, index])) > 1e-12):
+                assert index == max(counts) - 1, (side, index)
+                result["transformers_clobbered"].append([side, index])
+        result["kept%d" % side] = kept[side]
+        result["descriptors%d" % side] = (
+            captured["descriptors"][side, :len(kept[side])].double().numpy()
+            .reshape(-1).tolist())
+        result["matches%d" % side] = side_matches
+        result["scores%d" % side] = side_scores
+    return result
+
+
 def smooth_noise(rng):
     img = rng.random((HEIGHT // 4, WIDTH // 4))
     img = np.kron(img, np.ones((4, 4)))
     return img
 
 
-def write_variant(name, cfg, model, cases):
+def write_variant(name, cfg, model, cases, adaptive):
     tensors = {k: v.detach().cpu().numpy().astype(np.float32)
                for k, v in model.float().state_dict().items()}
     save_file(tensors, os.path.join(fixtures, name + ".safetensors"))
@@ -148,11 +230,12 @@ def write_variant(name, cfg, model, cases):
     with open(os.path.join(fixtures, name + "_config.json"), "w") as f:
         json.dump(out_cfg, f, indent=2)
     with open(os.path.join(fixtures, name + "_io.json"), "w") as f:
-        json.dump({"width": WIDTH, "height": HEIGHT, "cases": cases}, f)
+        json.dump({"width": WIDTH, "height": HEIGHT, "cases": cases,
+                   "adaptive": adaptive}, f)
     print("wrote", name, "tensors:", len(tensors))
 
 
-def make_cases(model, rng):
+def make_cases(model, rng, depth, width):
     base = smooth_noise(rng)
     pairs = [
         # The same scene shifted by 8 pixels plus noise: the counts differ.
@@ -161,7 +244,14 @@ def make_cases(model, rng):
         (smooth_noise(rng), smooth_noise(rng)),
     ]
     cases = []
+    adaptive_cases = []
     for image0, image1 in pairs:
+        ref = run_adaptive(model, image0, image1, torch.float64, depth, width)
+        check = run_adaptive(model, image0, image1, torch.float32, depth, width)
+        for key in ["stop_layer", "layer_counts", "kept0", "kept1",
+                    "matches0", "matches1"]:
+            assert ref[key] == check[key], key
+        adaptive_cases.append(ref)
         ref = run(model, image0, image1, torch.float64)
         check = run(model, image0, image1, torch.float32)
         for key in ["keypoints0", "keypoints1", "matches0", "matches1"]:
@@ -180,13 +270,26 @@ def make_cases(model, rng):
     print("  mutual scores:", [sorted(round(s, 4) for s in c["scores0"] if s > 0) for c in cases])
     assert any(a != b for a, b in counts), counts
     assert all(v > 0 for v in valid), valid
-    return cases
+    print("  adaptive stop layer per case:", [c["stop_layer"] for c in adaptive_cases])
+    print("  adaptive tokens per layer per case:", [c["layer_counts"] for c in adaptive_cases])
+    print("  transformers' clobbered slots per case:",
+          [c["transformers_clobbered"] for c in adaptive_cases])
+    print("  adaptive valid matches per case:",
+          [sum(1 for m in c["matches0"] if m >= 0) for c in adaptive_cases])
+    assert all(c["layer_counts"][-1] != c["layer_counts"][0] for c in adaptive_cases)
+    adaptive = {"depth_confidence": depth, "width_confidence": width,
+                "cases": adaptive_cases}
+    return cases, adaptive
 
 
-cfg, model = build("tiny_lightglue", 16, 2, 2, 3, 0.05, 2026)
-cases = make_cases(model.double(), np.random.default_rng(7))
-write_variant("tiny_lightglue", cfg, model, cases)
+# Prunes at layer 0, then stops early at layer 1 of 3.
+cfg, model = build("tiny_lightglue", 16, 2, 2, 3, 0.05, 2026, 4.0, [2.2, 4.0])
+cases, adaptive = make_cases(model.double(), np.random.default_rng(7), 0.8, 0.11)
+assert all(c["stop_layer"] == 1 for c in adaptive["cases"])
+write_variant("tiny_lightglue", cfg, model, cases, adaptive)
 
-cfg, model = build("tiny_lightglue_gqa", 8, 2, 1, 2, 0.05, 2027)
-cases = make_cases(model.double(), np.random.default_rng(8))
-write_variant("tiny_lightglue_gqa", cfg, model, cases)
+# Prunes at layer 0 and runs to the last layer: no early stop.
+cfg, model = build("tiny_lightglue_gqa", 8, 2, 1, 2, 0.05, 2027, 4.0, [2.2])
+cases, adaptive = make_cases(model.double(), np.random.default_rng(8), 0.95, 0.145)
+assert all(c["stop_layer"] == 1 for c in adaptive["cases"])
+write_variant("tiny_lightglue_gqa", cfg, model, cases, adaptive)

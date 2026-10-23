@@ -15790,7 +15790,9 @@ type
 // followed by MLP(concat[x, attention]) + residual. The match head is a
 // similarity + matchability double log-softmax with a mutual nearest-neighbour
 // check above filter_threshold. Host-side on TNNetPlainOps (the keypoint
-// counts change per pair); every layer runs: no early exit, no point pruning.
+// counts change per pair). With the per-layer token confidence heads, the
+// depth_confidence early exit and width_confidence point pruning of
+// transformers run too.
 // ---------------------------------------------------------------------------
 type
   TLightGlueConfig = record
@@ -15798,8 +15800,8 @@ type
     NumHiddenLayers: integer;        // 9
     NumAttentionHeads: integer;      // 4
     NumKeyValueHeads: integer;       // = NumAttentionHeads when absent
-    DepthConfidence: TNeuralFloat;   // 0.95, early exit (not run)
-    WidthConfidence: TNeuralFloat;   // 0.99, point pruning (not run)
+    DepthConfidence: TNeuralFloat;   // 0.95, early exit; <= 0 disables
+    WidthConfidence: TNeuralFloat;   // 0.99, point pruning; <= 0 disables
     FilterThreshold: TNeuralFloat;   // 0.1
     AttentionBias: boolean;          // true
     HiddenAct: string;               // 'gelu' (erf)
@@ -15829,17 +15831,22 @@ type
     FInputProjection: TNNetPlainConvWeights; // nil = identity
     FPositionProjector: TNNetVolume;         // [HeadDim/2][2]
     FBlocks: array of TLightGlueBlockWeights; // 2 per layer: self, cross
-    FFinalProjection, FMatchability: TNNetPlainConvWeights;
+    // Per layer; the early exit matches with the head of the layer it stops at.
+    FFinalProjections, FMatchabilities: array of TNNetPlainConvWeights;
+    FTokenConfidences: array of TNNetPlainConvWeights; // layers 0..L-2
+    FHasConfidenceHeads: boolean;
     FHeadDim, FKeyValueDim, FQKVWidth: integer;
     // Scratch reused across calls; token rows are image A's then image B's.
     FInput, FHidden, FQKV, FAttention, FProjected, FConcat: TNNetVolume;
     FMLPHidden, FMLPOut, FGeluScratch, FAngles, FCos, FSin: TNNetVolume;
     FKeyRows, FValueRowsT, FPackedKeys, FPackedValues, FScores: TNNetVolume;
-    FMatchDescriptors, FMatchLogits, FPackedMatch: TNNetVolume;
+    FMatchDescriptors, FMatchLogits, FPackedMatch, FConfidenceLogits: TNNetVolume;
     FSimilarity, FSimilarityT, FExpScratch: TNNetVolume;
     FRowLogSumExp, FColumnLogSumExp, FLogSigmoid: TNeuralFloatDynArr;
     FColumnBest: TNeuralFloatDynArr;
-    FCount0, FCount1: integer;
+    FCount0, FCount1, FKeptCount0, FKeptCount1, FStopLayer: integer;
+    // Original keypoint index of each FHidden row still in the layers.
+    FKeptIndices0, FKeptIndices1: TNeuralIntegerArray;
     FMatches0, FMatches1, FColumnArgMax: TNeuralIntegerArray;
     FMatchScores0, FMatchScores1: TNeuralFloatDynArr;
     procedure FreeWeights();
@@ -15851,7 +15858,19 @@ type
     // In place on FMLPHidden: per-token LayerNorm (eps 1e-5), then erf GELU.
     procedure LayerNormGelu(const Block: TLightGlueBlockWeights);
     procedure RunBlock(const Block: TLightGlueBlockWeights; IsCross: boolean);
-    procedure AssignMatches();
+    // True when the share of confident tokens after LayerPos exceeds
+    // depth_confidence; fills FConfidenceLogits.
+    function IsConfidentToStop(LayerPos: integer;
+      ConfidenceLogitThreshold: TNeuralFloat): boolean;
+    // Drops the rows (FHidden, FCos, FSin, kept indices) that are confident and
+    // not matchable; UseConfidences = false keeps on matchability alone.
+    procedure PruneKeypoints(LayerPos: integer; UseConfidences: boolean;
+      ConfidenceLogitThreshold: TNeuralFloat);
+    // Matches the kept rows with the match head of LayerPos.
+    procedure AssignMatches(LayerPos: integer);
+    // Moves kept-row matches to original keypoint indices; pruned ones get -1.
+    procedure MapKeptMatches();
+    procedure ClearMatches();
     function GetMatch0(Index: integer): integer;
     function GetMatch1(Index: integer): integer;
     function GetMatchScore0(Index: integer): TNeuralFloat;
@@ -15860,7 +15879,8 @@ type
     // pThreaded = false runs the per-token linears on the calling thread.
     constructor Create(const pConfig: TLightGlueConfig; pThreaded: boolean = true);
     destructor Destroy(); override;
-    // Loads every matcher tensor except token_confidence (early exit only).
+    // Loads every matcher tensor; without all token_confidence and per-layer
+    // match heads, every layer runs on every keypoint.
     procedure LoadWeights(Reader: TNNetSafeTensorsReader);
     // Matches the keypoints of two ImageWidth x ImageHeight images (the
     // SuperPoint net input size): Matches0[i] is the B index of A's i or -1.
@@ -15870,13 +15890,28 @@ type
     // Score a mutual match must exceed; read by the next Match.
     property FilterThreshold: TNeuralFloat read FConfig.FilterThreshold
       write FConfig.FilterThreshold;
+    // Early exit / point pruning, read by the next Match; <= 0 disables.
+    property DepthConfidence: TNeuralFloat read FConfig.DepthConfidence
+      write FConfig.DepthConfidence;
+    property WidthConfidence: TNeuralFloat read FConfig.WidthConfidence
+      write FConfig.WidthConfidence;
+    property HasConfidenceHeads: boolean read FHasConfidenceHeads;
     property Count0: integer read FCount0;
     property Count1: integer read FCount1;
+    // Last layer the Match ran (-1 when a side had no keypoint).
+    property StopLayer: integer read FStopLayer;
+    // Keypoints still in the layers when Match stopped, rows of Descriptors;
+    // KeptIndices0[0..KeptCount0-1] are their keypoint indices, ascending.
+    property KeptCount0: integer read FKeptCount0;
+    property KeptCount1: integer read FKeptCount1;
+    property KeptIndices0: TNeuralIntegerArray read FKeptIndices0;
+    property KeptIndices1: TNeuralIntegerArray read FKeptIndices1;
     property Matches0[Index: integer]: integer read GetMatch0;
     property Matches1[Index: integer]: integer read GetMatch1;
     property MatchScores0[Index: integer]: TNeuralFloat read GetMatchScore0;
     property MatchScores1[Index: integer]: TNeuralFloat read GetMatchScore1;
-    // (Count0 + Count1, 1, DescriptorDim) after the last layer, A rows first.
+    // (KeptCount0 + KeptCount1, 1, DescriptorDim) after the last layer run,
+    // A rows first.
     property Descriptors: TNNetVolume read FHidden;
   end;
 
@@ -96403,7 +96438,7 @@ begin
     ', filter_threshold=' + FloatToStr(Config.FilterThreshold) +
     ', depth_confidence=' + FloatToStr(Config.DepthConfidence) +
     ', width_confidence=' + FloatToStr(Config.WidthConfidence) +
-    ' (early exit and pruning not run); keypoint detector: ' +
+    '; keypoint detector: ' +
     SuperPointConfigToString(Config.KeypointDetector);
 end;
 
@@ -96501,8 +96536,18 @@ begin
     FBlocks[BlockPos].NormGain := TNNetVolume.Create();
     FBlocks[BlockPos].NormBias := TNNetVolume.Create();
   end;
-  FFinalProjection := TNNetPlainConvWeights.Create();
-  FMatchability := TNNetPlainConvWeights.Create();
+  SetLength(FFinalProjections, FConfig.NumHiddenLayers);
+  SetLength(FMatchabilities, FConfig.NumHiddenLayers);
+  SetLength(FTokenConfidences, FConfig.NumHiddenLayers - 1);
+  MaxBlockPos := FConfig.NumHiddenLayers - 1;
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    FFinalProjections[BlockPos] := TNNetPlainConvWeights.Create();
+    FMatchabilities[BlockPos] := TNNetPlainConvWeights.Create();
+  end;
+  MaxBlockPos := High(FTokenConfidences);
+  for BlockPos := 0 to MaxBlockPos do
+    FTokenConfidences[BlockPos] := TNNetPlainConvWeights.Create();
   FInput := TNNetVolume.Create();
   FHidden := TNNetVolume.Create();
   FQKV := TNNetVolume.Create();
@@ -96523,6 +96568,7 @@ begin
   FMatchDescriptors := TNNetVolume.Create();
   FMatchLogits := TNNetVolume.Create();
   FPackedMatch := TNNetVolume.Create();
+  FConfidenceLogits := TNNetVolume.Create();
   FSimilarity := TNNetVolume.Create();
   FSimilarityT := TNNetVolume.Create();
   FExpScratch := TNNetVolume.Create();
@@ -96543,10 +96589,19 @@ begin
     FBlocks[BlockPos].NormBias.Free;
   end;
   SetLength(FBlocks, 0);
+  MaxBlockPos := High(FFinalProjections);
+  for BlockPos := 0 to MaxBlockPos do
+  begin
+    FFinalProjections[BlockPos].Free;
+    FMatchabilities[BlockPos].Free;
+  end;
+  MaxBlockPos := High(FTokenConfidences);
+  for BlockPos := 0 to MaxBlockPos do FTokenConfidences[BlockPos].Free;
+  SetLength(FFinalProjections, 0);
+  SetLength(FMatchabilities, 0);
+  SetLength(FTokenConfidences, 0);
   FInputProjection.Free;
   FPositionProjector.Free;
-  FFinalProjection.Free;
-  FMatchability.Free;
 end;
 
 destructor TLightGlueMatcher.Destroy();
@@ -96573,6 +96628,7 @@ begin
   FMatchDescriptors.Free;
   FMatchLogits.Free;
   FPackedMatch.Free;
+  FConfidenceLogits.Free;
   FSimilarity.Free;
   FSimilarityT.Free;
   FExpScratch.Free;
@@ -96641,13 +96697,30 @@ begin
     QKVBias.Free;
     QKVWeight.Free;
   end;
-  LayerPrefix := 'match_assignment_layers.' +
-    IntToStr(FConfig.NumHiddenLayers - 1) + '.';
-  // transformers divides the projected descriptors by descriptor_dim^(1/4).
-  LoadLightGlueLinear(Reader, LayerPrefix + 'final_projection',
-    FFinalProjection, Dim, Dim, true, 1 / Sqrt(Sqrt(Dim)));
-  LoadLightGlueLinear(Reader, LayerPrefix + 'matchability', FMatchability,
-    Dim, 1, true);
+  // The last match head is required; the earlier ones and the token
+  // confidence heads only drive the early exit and the pruning.
+  MaxLayerPos := FConfig.NumHiddenLayers - 2;
+  FHasConfidenceHeads := true;
+  for LayerPos := 0 to MaxLayerPos do
+    FHasConfidenceHeads := FHasConfidenceHeads and
+      Reader.HasTensor('match_assignment_layers.' + IntToStr(LayerPos) +
+        '.matchability.weight') and
+      Reader.HasTensor('token_confidence.' + IntToStr(LayerPos) +
+        '.token.weight');
+  MaxLayerPos := FConfig.NumHiddenLayers - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    if FHasConfidenceHeads or (LayerPos = MaxLayerPos) then
+    begin
+      LayerPrefix := 'match_assignment_layers.' + IntToStr(LayerPos) + '.';
+      // transformers divides the projected descriptors by descriptor_dim^(1/4).
+      LoadLightGlueLinear(Reader, LayerPrefix + 'final_projection',
+        FFinalProjections[LayerPos], Dim, Dim, true, 1 / Sqrt(Sqrt(Dim)));
+      LoadLightGlueLinear(Reader, LayerPrefix + 'matchability',
+        FMatchabilities[LayerPos], Dim, 1, true);
+      if LayerPos < MaxLayerPos then
+        LoadLightGlueLinear(Reader, 'token_confidence.' + IntToStr(LayerPos) +
+          '.token', FTokenConfidences[LayerPos], Dim, 1, true);
+    end;
 end;
 
 function TLightGlueMatcher.GetMatch0(Index: integer): integer;
@@ -96811,14 +96884,14 @@ begin
   if IsCross then
   begin
     // Both directions read the same self-attended rows.
-    Attend(0, FCount0, FCount0, FCount1);
-    Attend(FCount0, FCount1, 0, FCount0);
+    Attend(0, FKeptCount0, FKeptCount0, FKeptCount1);
+    Attend(FKeptCount0, FKeptCount1, 0, FKeptCount0);
   end
   else
   begin
     ApplyRotary(TokenCount);
-    Attend(0, FCount0, 0, FCount0);
-    Attend(FCount0, FCount1, FCount0, FCount1);
+    Attend(0, FKeptCount0, 0, FKeptCount0);
+    Attend(FKeptCount0, FKeptCount1, FKeptCount0, FKeptCount1);
   end;
   FOps.PointwiseConv(FAttention, FProjected, Block.Output);
   FOps.ConcatChannels([FHidden, FProjected], FConcat);
@@ -96828,7 +96901,133 @@ begin
   FHidden.Add(FMLPOut);
 end;
 
-procedure TLightGlueMatcher.AssignMatches();
+function TLightGlueMatcher.IsConfidentToStop(LayerPos: integer;
+  ConfidenceLogitThreshold: TNeuralFloat): boolean;
+var
+  TokenPos, MaxTokenPos, UnconfidentCount: integer;
+begin
+  FOps.PointwiseConv(FHidden, FConfidenceLogits, FTokenConfidences[LayerPos]);
+  MaxTokenPos := FConfidenceLogits.Size - 1;
+  UnconfidentCount := 0;
+  for TokenPos := 0 to MaxTokenPos do
+    if FConfidenceLogits.FData[TokenPos] < ConfidenceLogitThreshold then
+      Inc(UnconfidentCount);
+  // As transformers: pruned keypoints count as confident.
+  Result := 1 - UnconfidentCount / (FCount0 + FCount1) >
+    FConfig.DepthConfidence;
+end;
+
+procedure TLightGlueMatcher.PruneKeypoints(LayerPos: integer;
+  UseConfidences: boolean; ConfidenceLogitThreshold: TNeuralFloat);
+var
+  Dim, HalfHeadDim, SourceToken, SourceRow, DestRow: integer;
+  SourceAngle, DestAngle: integer;
+  MatchabilityLogitThreshold: TNeuralFloat;
+
+  // Compacts the Count rows of one image starting at the read cursor.
+  function KeepRows(Count: integer; Indices: TNeuralIntegerArray): integer;
+  var
+    SidePos, MaxSidePos: integer;
+  begin
+    Result := 0;
+    MaxSidePos := Count - 1;
+    for SidePos := 0 to MaxSidePos do
+    begin
+      if (FMatchLogits.FData[SourceToken] > MatchabilityLogitThreshold) or
+         (UseConfidences and (FConfidenceLogits.FData[SourceToken] <=
+           ConfidenceLogitThreshold)) then
+      begin
+        if DestRow <> SourceRow then
+        begin
+          Move(FHidden.FData[SourceRow], FHidden.FData[DestRow],
+            Dim * csNeuralFloatSize);
+          Move(FCos.FData[SourceAngle], FCos.FData[DestAngle],
+            HalfHeadDim * csNeuralFloatSize);
+          Move(FSin.FData[SourceAngle], FSin.FData[DestAngle],
+            HalfHeadDim * csNeuralFloatSize);
+        end;
+        Indices[Result] := Indices[SidePos];
+        Inc(Result);
+        Inc(DestRow, Dim);
+        Inc(DestAngle, HalfHeadDim);
+      end;
+      Inc(SourceToken);
+      Inc(SourceRow, Dim);
+      Inc(SourceAngle, HalfHeadDim);
+    end;
+  end;
+
+begin
+  Dim := FConfig.DescriptorDim;
+  HalfHeadDim := FHeadDim div 2;
+  FOps.PointwiseConv(FHidden, FMatchLogits, FMatchabilities[LayerPos]);
+  // sigmoid(z) > 1 - width_confidence, compared on the logit.
+  if FConfig.WidthConfidence >= 1 then MatchabilityLogitThreshold := -MaxSingle
+  else MatchabilityLogitThreshold :=
+    Ln((1 - FConfig.WidthConfidence) / FConfig.WidthConfidence);
+  SourceToken := 0;
+  SourceRow := 0;
+  DestRow := 0;
+  SourceAngle := 0;
+  DestAngle := 0;
+  FKeptCount0 := KeepRows(FKeptCount0, FKeptIndices0);
+  FKeptCount1 := KeepRows(FKeptCount1, FKeptIndices1);
+  FHidden.ReSize(FKeptCount0 + FKeptCount1, 1, Dim);
+end;
+
+procedure TLightGlueMatcher.MapKeptMatches();
+
+  // Backwards, so each kept slot is read before a larger index overwrites it.
+  procedure MapSide(Count, KeptCount: integer;
+    const Indices, PartnerIndices: TNeuralIntegerArray;
+    var Matches: TNeuralIntegerArray; var Scores: TNeuralFloatDynArr);
+  var
+    KeptPos, MaxKeptPos, TargetPos, Partner: integer;
+  begin
+    TargetPos := Count - 1;
+    MaxKeptPos := KeptCount - 1;
+    for KeptPos := MaxKeptPos downto 0 do
+    begin
+      while TargetPos > Indices[KeptPos] do
+      begin
+        Matches[TargetPos] := -1;
+        Scores[TargetPos] := 0;
+        Dec(TargetPos);
+      end;
+      Partner := Matches[KeptPos];
+      if Partner >= 0 then Partner := PartnerIndices[Partner];
+      Matches[TargetPos] := Partner;
+      Scores[TargetPos] := Scores[KeptPos];
+      Dec(TargetPos);
+    end;
+    while TargetPos >= 0 do
+    begin
+      Matches[TargetPos] := -1;
+      Scores[TargetPos] := 0;
+      Dec(TargetPos);
+    end;
+  end;
+
+begin
+  MapSide(FCount0, FKeptCount0, FKeptIndices0, FKeptIndices1, FMatches0,
+    FMatchScores0);
+  MapSide(FCount1, FKeptCount1, FKeptIndices1, FKeptIndices0, FMatches1,
+    FMatchScores1);
+end;
+
+procedure TLightGlueMatcher.ClearMatches();
+var
+  PointPos, MaxPointPos: integer;
+begin
+  if FCount0 > 0 then FillChar(FMatchScores0[0], FCount0 * csNeuralFloatSize, 0);
+  if FCount1 > 0 then FillChar(FMatchScores1[0], FCount1 * csNeuralFloatSize, 0);
+  MaxPointPos := FCount0 - 1;
+  for PointPos := 0 to MaxPointPos do FMatches0[PointPos] := -1;
+  MaxPointPos := FCount1 - 1;
+  for PointPos := 0 to MaxPointPos do FMatches1[PointPos] := -1;
+end;
+
+procedure TLightGlueMatcher.AssignMatches(LayerPos: integer);
 var
   Dim, RowCount, ColumnCount, TokenPos, MaxTokenPos, RowPos, MaxRowPos: integer;
   ColumnPos, MaxColumnPos, BestPos, PartnerPos, SimilarityPos: integer;
@@ -96837,10 +97036,10 @@ var
   IsMutual: boolean;
 begin
   Dim := FConfig.DescriptorDim;
-  RowCount := FCount0;
-  ColumnCount := FCount1;
-  FOps.PointwiseConv(FHidden, FMatchDescriptors, FFinalProjection);
-  FOps.PointwiseConv(FHidden, FMatchLogits, FMatchability);
+  RowCount := FKeptCount0;
+  ColumnCount := FKeptCount1;
+  FOps.PointwiseConv(FHidden, FMatchDescriptors, FFinalProjections[LayerPos]);
+  FOps.PointwiseConv(FHidden, FMatchLogits, FMatchabilities[LayerPos]);
   MaxTokenPos := RowCount + ColumnCount - 1;
   for TokenPos := 0 to MaxTokenPos do
   begin
@@ -96936,18 +97135,25 @@ var
   MaxTokenPos, PairPos, MaxPairPos, AngleBase, LayerPos, MaxLayerPos: integer;
   PixelX, PixelY: integer;
   ShiftX, ShiftY, InvScale, NormX, NormY: TNeuralFloat;
+  ConfidenceLogitThreshold, ConfidenceThreshold: TNeuralFloat;
+  DoEarlyStop, DoPruning: boolean;
 begin
   FCount0 := KeypointsA.Count;
   FCount1 := KeypointsB.Count;
+  FKeptCount0 := FCount0;
+  FKeptCount1 := FCount1;
+  FStopLayer := -1;
   TokenCount := FCount0 + FCount1;
   if Length(FMatches0) < FCount0 then
   begin
+    SetLength(FKeptIndices0, FCount0);
     SetLength(FMatches0, FCount0);
     SetLength(FMatchScores0, FCount0);
     SetLength(FRowLogSumExp, FCount0);
   end;
   if Length(FMatches1) < FCount1 then
   begin
+    SetLength(FKeptIndices1, FCount1);
     SetLength(FMatches1, FCount1);
     SetLength(FMatchScores1, FCount1);
     SetLength(FColumnLogSumExp, FCount1);
@@ -96959,15 +97165,14 @@ begin
   if (FCount0 = 0) or (FCount1 = 0) then
   begin
     // transformers returns no match when either image has no keypoint.
-    if FCount0 > 0 then FillChar(FMatchScores0[0], FCount0 * csNeuralFloatSize, 0);
-    if FCount1 > 0 then FillChar(FMatchScores1[0], FCount1 * csNeuralFloatSize, 0);
-    MaxTokenPos := FCount0 - 1;
-    for TokenPos := 0 to MaxTokenPos do FMatches0[TokenPos] := -1;
-    MaxTokenPos := FCount1 - 1;
-    for TokenPos := 0 to MaxTokenPos do FMatches1[TokenPos] := -1;
+    ClearMatches();
     FHidden.ReSize(TokenCount, 1, Dim);
     exit;
   end;
+  MaxTokenPos := FCount0 - 1;
+  for TokenPos := 0 to MaxTokenPos do FKeptIndices0[TokenPos] := TokenPos;
+  MaxTokenPos := FCount1 - 1;
+  for TokenPos := 0 to MaxTokenPos do FKeptIndices1[TokenPos] := TokenPos;
   DetectorDim := FConfig.KeypointDetector.DescriptorDecoderDim;
   if (KeypointsA.Descriptors.Depth <> DetectorDim) or
      (KeypointsB.Descriptors.Depth <> DetectorDim) then
@@ -97031,13 +97236,40 @@ begin
   end;
   TNNetVolume.SinCos(FSin.DataPtr, FCos.DataPtr, FAngles.DataPtr,
     TokenCount * HalfHeadDim);
+  // Early stop without pruning, or the reverse, crash in transformers; both
+  // follow the original LightGlue (pruning then ignores the confidences).
+  DoEarlyStop := FHasConfidenceHeads and (FConfig.DepthConfidence > 0);
+  DoPruning := FHasConfidenceHeads and (FConfig.WidthConfidence > 0);
+  ConfidenceLogitThreshold := 0;
   MaxLayerPos := FConfig.NumHiddenLayers - 1;
   for LayerPos := 0 to MaxLayerPos do
   begin
     RunBlock(FBlocks[2 * LayerPos], false);
     RunBlock(FBlocks[2 * LayerPos + 1], true);
+    FStopLayer := LayerPos;
+    if LayerPos = MaxLayerPos then break;
+    if DoEarlyStop then
+    begin
+      // sigmoid(confidence) < 0.8 + 0.1 exp(-4 layer / layers), on the logit.
+      ConfidenceThreshold := 0.8 + 0.1 * NeuralExp(-4 * LayerPos /
+        FConfig.NumHiddenLayers);
+      ConfidenceLogitThreshold :=
+        Ln(ConfidenceThreshold / (1 - ConfidenceThreshold));
+      if IsConfidentToStop(LayerPos, ConfidenceLogitThreshold) then break;
+    end;
+    if DoPruning then
+    begin
+      PruneKeypoints(LayerPos, DoEarlyStop, ConfidenceLogitThreshold);
+      // Nothing left to attend to on one side: no match.
+      if (FKeptCount0 = 0) or (FKeptCount1 = 0) then
+      begin
+        ClearMatches();
+        exit;
+      end;
+    end;
   end;
-  AssignMatches();
+  AssignMatches(FStopLayer);
+  if (FKeptCount0 < FCount0) or (FKeptCount1 < FCount1) then MapKeptMatches();
 end;
 
 function BuildLightGlue(Reader: TNNetSafeTensorsReader;

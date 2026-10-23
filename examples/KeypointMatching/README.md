@@ -29,6 +29,8 @@ lazbuild -B KeypointMatching.lpi
 | `--max-keypoints N` | keypoints kept per image, highest score first; `-1` keeps all (default: the config) |
 | `--keypoint-threshold X` | SuperPoint score threshold (default: the config, 0.005) |
 | `--filter-threshold X` | LightGlue match score threshold (default: the config, 0.1) |
+| `--depth-confidence X` | early exit: stop after a layer when more than this share of the keypoints is confident. `<= 0` runs every layer (default: the config, 0.95) |
+| `--width-confidence X` | point pruning: drop a confident keypoint whose matchability is at most `1 - X`. `<= 0` keeps every keypoint (default: the config, 0.99) |
 
 ## What runs
 
@@ -47,6 +49,13 @@ lazbuild -B KeypointMatching.lpi
    residual. The match head scores every pair with a double log-softmax over
    the similarity plus a matchability sigmoid. It keeps a pair when each point
    is the other's best match and the score is above `filter_threshold`.
+   After each layer but the last, a per-layer token confidence head scores
+   every keypoint, as in transformers. When the share of confident keypoints
+   is above `depth_confidence`, the matcher stops and matches with that
+   layer's match head. Otherwise it drops each keypoint that is confident but
+   whose matchability is at most `1 - width_confidence`. The confidence
+   threshold is `0.8 + 0.1 exp(-4 layer / layers)`. Pruned keypoints get no
+   match. The output line reports the stop layer and the kept keypoints.
 4. The keypoints are mapped back to each original image size and drawn.
 
 `TLightGlueMatcher` does its math on the host with `TNNetPlainOps` (threaded
@@ -56,10 +65,11 @@ image pair.
 
 ## Limitations
 
-- v1 runs all 9 layers on every keypoint. LightGlue's adaptive depth (early
-  exit, `depth_confidence`) and point pruning (`width_confidence`) are not
-  implemented, so on a real checkpoint the matches are those of transformers
-  with both disabled. That is the most accurate setting, not the fastest one.
+- transformers only runs the early exit and the pruning together; with
+  only one of them on, it fails. Here, early exit alone matches without
+  pruning, and pruning alone uses only the matchability (as the original
+  LightGlue code does). `--depth-confidence 0 --width-confidence 0` gives
+  the all-layers matches, the most accurate setting.
 - No OpenCL path.
 - The real checkpoints have not been run yet.
 
@@ -77,7 +87,11 @@ projection from 8 to 16 channels) and `TestLightGlueGQAParity` (an identity
 projection with 2 query heads over 1 key/value head). Both compare against the
 transformers 5.17 `LightGlueForKeypointMatching` float64 forward, with early
 exit and pruning disabled: keypoints and match indices exact, final descriptors
-and match scores `< 1e-4`. Also `TestLightGlueConfigFromJSONFile` and
+and match scores `< 1e-4`. `TestLightGlueEarlyExitParity` (pruning at layer
+0, early exit at layer 1 of 3) and `TestLightGlueGQAPruningParity` (pruning
+at layer 0, no early exit) compare the same pairs with both on: stop layer,
+kept keypoints, their descriptors, matches and scores. Also
+`TestLightGluePruningWithoutEarlyExit`, `TestLightGlueConfigFromJSONFile` and
 `TestLightGlueNoKeypoints`. The fixtures are written by
 `tools/make_pico_lightglue_fixture.py`.
 

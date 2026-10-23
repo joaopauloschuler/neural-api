@@ -146,8 +146,8 @@ type
     procedure CheckTinyVaeDecoderParity(const FixtureName: string;
       ExpectedLatentChannels: integer);
     // SuperPoint from the LightGlue checkpoint, then TLightGlueMatcher, against
-    // tests/fixtures/<FixtureName>_io.json (make_pico_lightglue_fixture.py).
-    procedure CheckLightGlueParity(const FixtureName: string);
+    // tests/fixtures/<FixtureName>_io.json; Adaptive: its early-exit oracle.
+    procedure CheckLightGlueParity(const FixtureName: string; Adaptive: boolean);
     // Loads the fixture's "latent" (shaped by Config) and "image" tensors.
     procedure LoadTinyVaeDecoderIO(const FixtureName: string;
       const Config: TTinyVaeDecoderConfig; Latent, Image: TNNetVolume);
@@ -1528,6 +1528,12 @@ type
     procedure TestLightGlueParity;
     // Identity input projection and 2 query heads over 1 key/value head.
     procedure TestLightGlueGQAParity;
+    // Pruning at layer 0, then the early exit at layer 1 of 3.
+    procedure TestLightGlueEarlyExitParity;
+    // Pruning at layer 0, no early exit.
+    procedure TestLightGlueGQAPruningParity;
+    // Only the matchability prunes; matches still map to keypoint indices.
+    procedure TestLightGluePruningWithoutEarlyExit;
     procedure TestLightGlueNoKeypoints;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
@@ -54414,7 +54420,8 @@ begin
   AssertEquals('detector input width', 64, Config.KeypointDetector.InputWidth);
 end;
 
-procedure TTestNeuralPretrained.CheckLightGlueParity(const FixtureName: string);
+procedure TTestNeuralPretrained.CheckLightGlueParity(const FixtureName: string;
+  Adaptive: boolean);
 var
   Config: TLightGlueConfig;
   Detector: TNNet;
@@ -54423,10 +54430,11 @@ var
   Images: array[0..1] of TNNetVolume;
   RefRoot: TJSONData;
   RefJson: TStringList;
-  Cases, Arr: TJSONArray;
-  CaseObj: TJSONObject;
+  Cases, ExpectedCases, Arr, LayerCounts: TJSONArray;
+  CaseObj, ExpectedObj, AdaptiveObj: TJSONObject;
   Width, Height, CasePos, MaxCasePos, Side, ElemPos, MaxElemPos: integer;
-  PointPos, MaxPointPos, DescriptorBase: integer;
+  PointPos, MaxPointPos, DescriptorBase, KeptCount: integer;
+  KeptIndices: TNeuralIntegerArray;
   MaxDiff, ScoreDiff: double;
   Context: string;
 begin
@@ -54450,11 +54458,23 @@ begin
     Config.KeypointDetector.InputHeight := Height;
     Detector := BuildLightGlueKeypointDetectorFromSafeTensors(
       FixturePath(FixtureName + '.safetensors'), Config, {pTrainable=}false);
+    AssertTrue(FixtureName + ' confidence heads', Matcher.HasConfidenceHeads);
     Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    ExpectedCases := Cases;
+    Matcher.DepthConfidence := -1;
+    Matcher.WidthConfidence := -1;
+    if Adaptive then
+    begin
+      AdaptiveObj := TJSONObject(TJSONObject(RefRoot).Find('adaptive'));
+      Matcher.DepthConfidence := AdaptiveObj.Get('depth_confidence', 0.0);
+      Matcher.WidthConfidence := AdaptiveObj.Get('width_confidence', 0.0);
+      ExpectedCases := TJSONArray(AdaptiveObj.Find('cases'));
+    end;
     MaxCasePos := Cases.Count - 1;
     for CasePos := 0 to MaxCasePos do
     begin
       CaseObj := TJSONObject(Cases.Items[CasePos]);
+      ExpectedObj := TJSONObject(ExpectedCases.Items[CasePos]);
       for Side := 0 to 1 do
       begin
         Images[Side].ReSize(Width, Height, 1);
@@ -54478,15 +54498,47 @@ begin
         end;
       end;
       Matcher.Match(Keypoints[0], Keypoints[1], Width, Height);
+      Context := FixtureName + ' case ' + IntToStr(CasePos);
+      if Adaptive then
+        AssertEquals(Context + ' stop layer',
+          ExpectedObj.Get('stop_layer', -1), Matcher.StopLayer)
+      else
+        AssertEquals(Context + ' stop layer', Config.NumHiddenLayers - 1,
+          Matcher.StopLayer);
       for Side := 0 to 1 do
       begin
         Context := FixtureName + ' case ' + IntToStr(CasePos) + ' side ' +
           IntToStr(Side);
-        Arr := TJSONArray(CaseObj.Find('descriptors' + IntToStr(Side)));
+        if Side = 0 then
+        begin
+          KeptCount := Matcher.KeptCount0;
+          KeptIndices := Matcher.KeptIndices0;
+        end
+        else
+        begin
+          KeptCount := Matcher.KeptCount1;
+          KeptIndices := Matcher.KeptIndices1;
+        end;
+        if Adaptive then
+        begin
+          LayerCounts := TJSONArray(ExpectedObj.Find('layer_counts'));
+          AssertEquals(Context + ' kept count', TJSONArray(LayerCounts.Items[
+            LayerCounts.Count - 1]).Items[Side].AsInteger, KeptCount);
+          Arr := TJSONArray(ExpectedObj.Find('kept' + IntToStr(Side)));
+          AssertEquals(Context + ' kept indices', Arr.Count, KeptCount);
+          MaxPointPos := KeptCount - 1;
+          for PointPos := 0 to MaxPointPos do
+            AssertEquals(Context + ' kept ' + IntToStr(PointPos),
+              Arr.Items[PointPos].AsInteger, KeptIndices[PointPos]);
+        end
+        else
+          AssertEquals(Context + ' kept count', Keypoints[Side].Count,
+            KeptCount);
+        Arr := TJSONArray(ExpectedObj.Find('descriptors' + IntToStr(Side)));
         if Side = 0 then DescriptorBase := 0
-        else DescriptorBase := Matcher.Count0 * Config.DescriptorDim;
+        else DescriptorBase := Matcher.KeptCount0 * Config.DescriptorDim;
         AssertEquals(Context + ' descriptor count', Arr.Count,
-          Keypoints[Side].Count * Config.DescriptorDim);
+          KeptCount * Config.DescriptorDim);
         MaxDiff := 0;
         MaxElemPos := Arr.Count - 1;
         for ElemPos := 0 to MaxElemPos do
@@ -54494,7 +54546,7 @@ begin
             Matcher.Descriptors.FData[DescriptorBase + ElemPos]));
         AssertTrue(Context + ' descriptors max |diff| = ' + FloatToStr(MaxDiff),
           MaxDiff < 1e-4);
-        Arr := TJSONArray(CaseObj.Find('matches' + IntToStr(Side)));
+        Arr := TJSONArray(ExpectedObj.Find('matches' + IntToStr(Side)));
         MaxPointPos := Keypoints[Side].Count - 1;
         ScoreDiff := 0;
         for PointPos := 0 to MaxPointPos do
@@ -54504,14 +54556,14 @@ begin
             AssertEquals(Context + ' match ' + IntToStr(PointPos),
               Arr.Items[PointPos].AsInteger, Matcher.Matches0[PointPos]);
             ScoreDiff := Max(ScoreDiff, Abs(Matcher.MatchScores0[PointPos] -
-              TJSONArray(CaseObj.Find('scores0')).Items[PointPos].AsFloat));
+              TJSONArray(ExpectedObj.Find('scores0')).Items[PointPos].AsFloat));
           end
           else
           begin
             AssertEquals(Context + ' match ' + IntToStr(PointPos),
               Arr.Items[PointPos].AsInteger, Matcher.Matches1[PointPos]);
             ScoreDiff := Max(ScoreDiff, Abs(Matcher.MatchScores1[PointPos] -
-              TJSONArray(CaseObj.Find('scores1')).Items[PointPos].AsFloat));
+              TJSONArray(ExpectedObj.Find('scores1')).Items[PointPos].AsFloat));
           end;
         end;
         AssertTrue(Context + ' scores max |diff| = ' + FloatToStr(ScoreDiff),
@@ -54532,12 +54584,90 @@ end;
 
 procedure TTestNeuralPretrained.TestLightGlueParity;
 begin
-  CheckLightGlueParity('tiny_lightglue');
+  CheckLightGlueParity('tiny_lightglue', {Adaptive=}false);
 end;
 
 procedure TTestNeuralPretrained.TestLightGlueGQAParity;
 begin
-  CheckLightGlueParity('tiny_lightglue_gqa');
+  CheckLightGlueParity('tiny_lightglue_gqa', {Adaptive=}false);
+end;
+
+procedure TTestNeuralPretrained.TestLightGlueEarlyExitParity;
+begin
+  CheckLightGlueParity('tiny_lightglue', {Adaptive=}true);
+end;
+
+procedure TTestNeuralPretrained.TestLightGlueGQAPruningParity;
+begin
+  CheckLightGlueParity('tiny_lightglue_gqa', {Adaptive=}true);
+end;
+
+// No transformers oracle (it needs both settings on): checks the remap of
+// the kept rows and that pruned keypoints stay unmatched.
+procedure TTestNeuralPretrained.TestLightGluePruningWithoutEarlyExit;
+var
+  Config: TLightGlueConfig;
+  Detector: TNNet;
+  Matcher: TLightGlueMatcher;
+  Found: TSuperPointKeypoints;
+  Image: TNNetVolume;
+  PointPos, MaxPointPos, KeptPos, Partner, MatchCount: integer;
+  IsKept: boolean;
+begin
+  Matcher := BuildLightGlueFromSafeTensors(
+    FixturePath('tiny_lightglue.safetensors'), Config, {pThreaded=}false,
+    FixturePath('tiny_lightglue_config.json'));
+  Config.KeypointDetector.InputWidth := 64;
+  Config.KeypointDetector.InputHeight := 48;
+  Detector := BuildLightGlueKeypointDetectorFromSafeTensors(
+    FixturePath('tiny_lightglue.safetensors'), Config, {pTrainable=}false);
+  Found := TSuperPointKeypoints.Create();
+  Image := TNNetVolume.Create(64, 48, 1);
+  try
+    MaxPointPos := Image.Size - 1;
+    for PointPos := 0 to MaxPointPos do
+      Image.FData[PointPos] := Frac(Abs(Sin(PointPos * 12.9898)) * 43758.5453);
+    Found.Detect(Detector, Image, Config.KeypointDetector);
+    Matcher.DepthConfidence := -1;
+    Matcher.WidthConfidence := 0.11;
+    Matcher.FilterThreshold := 0;
+    Matcher.Match(Found, Found, 64, 48);
+    AssertEquals('all layers run', Config.NumHiddenLayers - 1,
+      Matcher.StopLayer);
+    AssertTrue('some pruned: ' + IntToStr(Matcher.KeptCount0) + ' of ' +
+      IntToStr(Matcher.Count0), Matcher.KeptCount0 < Matcher.Count0);
+    AssertTrue('some kept', Matcher.KeptCount0 > 0);
+    MatchCount := 0;
+    KeptPos := 0;
+    MaxPointPos := Matcher.Count0 - 1;
+    for PointPos := 0 to MaxPointPos do
+    begin
+      IsKept := (KeptPos < Matcher.KeptCount0) and
+        (Matcher.KeptIndices0[KeptPos] = PointPos);
+      if IsKept then Inc(KeptPos);
+      Partner := Matcher.Matches0[PointPos];
+      if not IsKept then
+      begin
+        AssertEquals('pruned unmatched ' + IntToStr(PointPos), -1, Partner);
+        AssertEquals('pruned zero score', 0, Matcher.MatchScores0[PointPos], 0);
+      end
+      else if Partner >= 0 then
+      begin
+        Inc(MatchCount);
+        AssertEquals('mutual ' + IntToStr(PointPos), PointPos,
+          Matcher.Matches1[Partner]);
+        AssertEquals('same score', Matcher.MatchScores0[PointPos],
+          Matcher.MatchScores1[Partner], 0);
+      end;
+    end;
+    AssertEquals('every kept index visited', Matcher.KeptCount0, KeptPos);
+    AssertTrue('some matches', MatchCount > 0);
+  finally
+    Image.Free;
+    Found.Free;
+    Detector.Free;
+    Matcher.Free;
+  end;
 end;
 
 // An image without keypoints matches nothing on either side.

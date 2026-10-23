@@ -44,6 +44,8 @@ type
     OutputFile: string;
     Width, Height, MaxKeypoints: integer;
     KeypointThreshold, FilterThreshold: TNeuralFloat;
+    DepthConfidence, WidthConfidence: TNeuralFloat;
+    HasDepthConfidence, HasWidthConfidence: boolean;
   end;
 
 procedure PrintUsage();
@@ -65,6 +67,10 @@ begin
     '(default: config)');
   WriteLn('  --keypoint-threshold X   SuperPoint score threshold (default: config)');
   WriteLn('  --filter-threshold X     LightGlue match threshold (default: config)');
+  WriteLn('  --depth-confidence X     early exit, <= 0 runs every layer ',
+    '(default: config)');
+  WriteLn('  --width-confidence X     point pruning, <= 0 keeps every point ',
+    '(default: config)');
 end;
 
 function ParseOptions(out Opt: TMatchOptions): boolean;
@@ -93,6 +99,10 @@ begin
   Opt.MaxKeypoints := -2;  // -2 = keep the config value
   Opt.KeypointThreshold := -1;
   Opt.FilterThreshold := -1;
+  Opt.DepthConfidence := 0;
+  Opt.WidthConfidence := 0;
+  Opt.HasDepthConfidence := false;
+  Opt.HasWidthConfidence := false;
   Result := true;
   ArgPos := 1;
   while ArgPos <= ParamCount do
@@ -112,6 +122,16 @@ begin
       Opt.KeypointThreshold := StrToFloat(NextArg())
     else if Arg = '--filter-threshold' then
       Opt.FilterThreshold := StrToFloat(NextArg())
+    else if Arg = '--depth-confidence' then
+    begin
+      Opt.DepthConfidence := StrToFloat(NextArg());
+      Opt.HasDepthConfidence := true;
+    end
+    else if Arg = '--width-confidence' then
+    begin
+      Opt.WidthConfidence := StrToFloat(NextArg());
+      Opt.HasWidthConfidence := true;
+    end
     else if (Arg = '--help') or (Arg = '-h') then
     begin
       PrintUsage();
@@ -284,6 +304,10 @@ begin
     if Opt.FilterThreshold >= 0 then
       Config.FilterThreshold := Opt.FilterThreshold;
     Matcher.FilterThreshold := Config.FilterThreshold;
+    if Opt.HasDepthConfidence then Config.DepthConfidence := Opt.DepthConfidence;
+    if Opt.HasWidthConfidence then Config.WidthConfidence := Opt.WidthConfidence;
+    Matcher.DepthConfidence := Config.DepthConfidence;
+    Matcher.WidthConfidence := Config.WidthConfidence;
     Config.KeypointDetector.InputWidth := Opt.Width;
     Config.KeypointDetector.InputHeight := Opt.Height;
     if Opt.SuperPointFile <> '' then
@@ -319,9 +343,12 @@ begin
         Inc(MatchCount);
         ScoreSum := ScoreSum + Matcher.MatchScores0[PointPos];
       end;
-    WriteLn(Format('  LightGlue: %.2f s, %d matches (mean score %.3f)',
+    WriteLn(Format('  LightGlue: %.2f s, %d matches (mean score %.3f); ' +
+      'stopped after layer %d of %d, %d + %d of %d + %d keypoints kept',
       [(Now() - StartTime) * 86400.0, MatchCount,
-       ScoreSum / Max(MatchCount, 1)]));
+       ScoreSum / Max(MatchCount, 1), Matcher.StopLayer + 1,
+       Config.NumHiddenLayers, Matcher.KeptCount0, Matcher.KeptCount1,
+       Matcher.Count0, Matcher.Count1]));
     SaveMatchImage(Opt.OutputFile, Images, Keypoints, Matcher, Opt.Width,
       Opt.Height);
     WriteLn('  wrote ', Opt.OutputFile);
