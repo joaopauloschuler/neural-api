@@ -2195,6 +2195,38 @@ rather than acted on.
             offline weights with the `window_len` / `step` overlap of the
             reference `CoTrackerOnlinePredictor`; a real-checkpoint run on a
             real clip from the user's GPU box.
+- [ ] Whole-photo multi-person pose + OpenPose control image for ControlNet.
+      Today `BuildViTPoseFromSafeTensors` + `DecodeViTPoseKeypoints` take ONE
+      pre-cropped person and return integer heatmap-grid peaks, and
+      examples/ControlNetCanny can make its own control image only for Canny
+      (`--photo` + `CannyEdges`). Nothing turns a photo into the pose image that
+      `lllyasviel/sd-controlnet-openpose` / `control_v11p_sd15_openpose` expect.
+      Steps, each ending green with a commit:
+      - [ ] Top-down ViTPose like transformers `VitPoseImageProcessor`: person
+            box (xywh) -> center/scale with the 1.25 padding and the 3:4
+            aspect fix, affine warp of the crop to the model input size
+            (bilinear, reuse the existing resize/affine sampling code), then
+            `post_process_pose_estimation`: the inverse affine back to image
+            pixels plus the quarter-pixel heatmap refinement (and optional
+            flip test). Pico parity vs transformers in the ~/x venv on
+            `tests/fixtures/tiny_vitpose*` with one non-square box.
+      - [ ] Multi-person driver: YOLO (`BuildYolo` + `DecodeYoloDetections`,
+            class 0 = person, score threshold) feeds the boxes, one ViTPose
+            pass per box; a plain `TPoseKeypoints` result per person.
+      - [ ] OpenPose renderer as controlnet_aux `draw_bodypose`: COCO-17 ->
+            OpenPose-18 mapping (neck = mid-shoulder, only when both
+            shoulders pass the score threshold), the 17 limb pairs with their
+            fixed colors as ellipse polygons at 0.6 alpha (stickwidth 4) and
+            the 18 colored joint dots on black, at the photo size. Pixel
+            test against controlnet_aux output for one fixed keypoint set
+            (oracle values committed, no Python at run time).
+      - [ ] examples/ControlNetCanny: `--pose-photo FILE --yolo FILE --vitpose
+            FILE [--pose-out FILE]` builds the control image the same way
+            `--photo` builds edges, so a ControlNet openpose checkpoint runs
+            from a plain photo; README section + an examples/PoseEstimation
+            README note that it now handles whole photos. Real run (yolov8n
+            + usyd-community/vitpose-base-simple + sd-controlnet-openpose) on
+            the user's GPU box before the README calls it supported.
 
 ## OpenCL forward coverage — layers still on the host
 
@@ -2704,14 +2736,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       the gradient fix: DenseNet helper, VisualGAN, SuperResolution. The
       fix increases backward magnitude by `PoolSize` (=2 in practice), so
       existing learning rates may be off by 2x.
-- [ ] Loss-layer gradient-check helper — parameterized helper that takes
-      (LossLayer, BatchSize, Shape) and runs a single central-difference
-      check.
-- [ ] Backward-pass sign-correlation test — for every layer that overrides
-      Backpropagate, perturb input by ±ε, assert gradient direction agrees
-      with loss-difference direction >90% of the time across a small grid.
-- [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
-      `[grad] [serialize]` block, written by a small script.
 
 ## Vision / generative & accelerator batch 2026-06-27b
 
