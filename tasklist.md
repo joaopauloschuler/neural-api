@@ -125,10 +125,6 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
-- [X] examples/YoloDetect has no `.lpi`, so `lazbuild -B` cannot build it (it
-      compiles with plain `fpc -Fu<lazutils> -Funeural`). Add an `.lpi` like the
-      sibling examples (e.g. examples/FastSAM/FastSAM.lpi).
-
 - [ ] OpenCL test suite under 2 minutes (user goal and authorization
       2026-10-05; today ~600 s on PoCL). Diagnosis (single-test runs): idle
       scheduler workers spin hot against PoCL (one VAE test: OpenCL + parallel
@@ -276,19 +272,15 @@ rather than acted on.
 
 - [ ] FastSAM follow-ups (ultralytics FastSAM-s / FastSAM-x on the YOLOv8-seg
       importer: segment head, `ComputeYoloMasks` / `DecodeYoloSegmentation`
-      with retina masks and `MaxDetections`, box/point prompts and
-      examples/FastSAM are done; pico parity `TestYoloSegParity`,
-      `TestFastSAMPromptSelection`, `TestYoloSegOpenCLParity`):
+      with retina masks and `MaxDetections`, box/point prompts, native
+      retina masks at the original image size (`ComputeYoloMasksNative`), the
+      CLIP text prompt (`FastSAMSelectByText`) and examples/FastSAM are done;
+      pico parity `TestYoloSegParity`, `TestFastSAMPromptSelection`,
+      `TestYoloSegNativeMasks`, `TestFastSAMTextSelection`,
+      `TestYoloSegOpenCLParity`):
       - [ ] Real-checkpoint run: FastSAM-s.pt / FastSAM-x.pt converted to
             safetensors on the user's box (config rows in
             examples/FastSAM/README.md); check masks against ultralytics.
-      - [X] Native retina-mask path at the ORIGINAL image size
-            (`ScaleYoloBoxesToImage`, `ComputeYoloMasksNative`,
-            `DecodeYoloSegmentationNative`; examples/FastSAM default;
-            `TestYoloSegNativeMasks`).
-      - [X] CLIP text prompt (`FastSAMSelectByText`, ultralytics
-            FastSAMPredictor rules; examples/FastSAM `--text --clip`;
-            `TestFastSAMTextSelection` on the pico CLIP).
       - [ ] Real run of `--text` with openai/clip-vit-base-patch32 (real
             tokenizer.json + towers) against ultralytics' selection.
 
@@ -376,10 +368,6 @@ rather than acted on.
       arXiv:2305.15272; `BuildViTMatteFromSafeTensors[Ex]`, `ViTMatteEstimateAlpha`,
       `TrimapFromMask` and examples/ImageMatting are done; pico parity
       `TestViTMatteParity` plus OpenCL parity):
-  - [X] TNNetSAMVisionAttention's class comment says Backpropagate passes
-        dL/dInput through the chain; it passes a zero gradient. Fix the comment
-        or implement the backward. Done: the real backward (input, qkv, proj and
-        rel-pos gradients), covered by TestSAMVisionAttentionGradientCheck.
   - [ ] Real hustvl/vitmatte-small-composition-1k run on the GPU box (`--gpu`,
         also CPU) compared with the transformers output before README calls
         it supported.
@@ -782,13 +770,8 @@ rather than acted on.
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close; and `gligen-1-4-inpainting-text-box` with
       `--gligen-inpaint-image` (only the boxes change).
-- [X] GLIGEN: skip the fuser branch once its gates close (it now still runs and
-      adds zeros for the last `(1 - beta) * steps` steps).
 - [ ] GLIGEN text-image variant (`gligen-1-4-generation-text-image-box`:
       `linears_text` / `linears_image`, CLIP image embeddings as grounding).
-- [X] GLIGEN inpainting (`gligen-1-4-inpainting-text-box`: 9-channel UNet
-      input with the box-masked image latents, diffusers
-      `gligen_inpaint_image`).
 - [ ] CogVLM / CogVLM2 vision-language importer (`BuildCogVLMFromSafeTensors[Ex]`,
       model_type "cogvlm"/"cogvlm2"). Architecturally distinct from the
       shared-trunk VLMs already imported (LLaVA / Florence2 / Blip2):
@@ -830,12 +813,9 @@ rather than acted on.
       window/shifted-window attention + 3x3 conv residual + pixel-shuffle upsample
       tail, reusing the landed Swin attention blocks, NO new leaf layers; pico parity
       TestSwinIRParity / TestSwinIRConfigFromJSONFile < 1e-4 vs a float64 numpy
-      oracle; examples/SwinIRRestore 2x SR smoke):
-  - [X] All three non-lightweight tails parity-pinned: `pixelshuffle` x2
-        (TestSwinIRParity, key auto-detect), `nearest+conv` x4
-        (TestSwinIRNearestConvParity) and the upscale-1 denoise tail
-        `x + conv_last(feat)` (TestSwinIRDenoiseParity); config field
-        `upsampler`, or auto-detect from conv_up1 / conv_before_upsample keys.
+      oracle; examples/SwinIRRestore 2x SR smoke; the `nearest+conv` x4 and
+      upscale-1 denoise tails are pinned by TestSwinIRNearestConvParity and
+      TestSwinIRDenoiseParity):
   - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
         not obtainable offline). The `pixelshuffle` tail needs the PixelShuffle
         channel-order fix under "Bugs" first; the `nearest+conv` real-world
