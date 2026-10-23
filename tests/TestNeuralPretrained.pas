@@ -1275,6 +1275,7 @@ type
     procedure TestYoloSegParity;
     procedure TestFastSAMPromptSelection;
     procedure TestYoloSegOpenCLParity;
+    procedure TestYoloSegNativeMasks;
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
     procedure TestOwlViTDetectionDecode;
@@ -56340,6 +56341,137 @@ begin
   finally
     Dest.Free;
     Masks.Free;
+  end;
+end;
+
+// ultralytics scale_boxes and process_mask_native at the original image size
+// against a hand-computed F.interpolate oracle, plus the square-image identity
+// with the net-input retina path on the pico fixture.
+procedure TTestNeuralPretrained.TestYoloSegNativeMasks;
+const
+  ImageW = 6;
+  ImageH = 3;
+var
+  Config, PicoConfig: TYoloConfig;
+  Head, Proto, Masks, RetinaMasks, Img: TNNetVolume;
+  Dets, NativeDets: TYoloDetectionArray;
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  X, Y, DetPos, X0, X1, Y0, Y1, ValuePos, Mismatches: integer;
+  SrcX, SrcY, LambdaX, LambdaY, Expected, MaxDiff: double;
+  Coef: array[0..1] of TNeuralFloat;
+
+  // sigmoid(Coef * logit) of the unpadded prototype rows 1..2 (top = 1).
+  function ContentProb(DetIdx, CX, CY: integer): double;
+  begin
+    Result := 1 / (1 + Exp(-Coef[DetIdx] * Proto[CX, CY + 1, 0]));
+  end;
+
+begin
+  // ScaleYoloBoxesToImage: 16 px net, 6x3 image -> gain 16/6, pad (0, 4).
+  SetLength(Dets, 2);
+  Dets[0].X1 := 8; Dets[0].Y1 := 4; Dets[0].X2 := 20; Dets[0].Y2 := 4 + 16 / 3;
+  Dets[1].X1 := -2; Dets[1].Y1 := 1; Dets[1].X2 := 8; Dets[1].Y2 := 12;
+  ScaleYoloBoxesToImage(Dets, 16, ImageW, ImageH);
+  AssertEquals('x1', 3, Dets[0].X1, 1e-5);
+  AssertEquals('y1', 0, Dets[0].Y1, 1e-5);
+  AssertEquals('x2 clipped', ImageW, Dets[0].X2, 1e-5);
+  AssertEquals('y2', 2, Dets[0].Y2, 1e-5);
+  AssertEquals('x1 clipped', 0, Dets[1].X1, 1e-5);
+  AssertEquals('y1 clipped', 0, Dets[1].Y1, 1e-5);
+  AssertEquals('y2 clipped', ImageH, Dets[1].Y2, 1e-5);
+  // ComputeYoloMasksNative: RegMax 1, 1 class, 1 mask; 4x4 Proto for a 16 px
+  // net, so the 6x3 image fills rows 1..2 of the prototype map.
+  FillChar(Config, SizeOf(Config), 0);
+  Config.RegMax := 1; Config.NumClasses := 1; Config.NumMasks := 1;
+  Config.ImageSize := 16;
+  Coef[0] := 1; Coef[1] := -2;
+  Head := TNNetVolume.Create(2, 1, 6);
+  Proto := TNNetVolume.Create(4, 4, 1);
+  Masks := TNNetVolume.Create;
+  RetinaMasks := TNNetVolume.Create;
+  Img := TNNetVolume.Create;
+  NN := nil;
+  IO := nil;
+  try
+    Head[0, 0, 5] := Coef[0];
+    Head[1, 0, 5] := Coef[1];
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        Proto[X, Y, 0] := (X - 1.5) * 1.3 + (Y - 2) * 0.7 + 0.2 * X * Y;
+    Dets[0].CellIndex := 0;
+    Dets[0].X1 := 1; Dets[0].Y1 := 0; Dets[0].X2 := 5.5; Dets[0].Y2 := 2;
+    Dets[1].CellIndex := 1;
+    Dets[1].X1 := 0; Dets[1].Y1 := 0.5; Dets[1].X2 := 6; Dets[1].Y2 := 3;
+    ComputeYoloMasksNative(Head, Proto, Config, Dets, Masks, ImageW, ImageH,
+      {Binarize=}false);
+    AssertEquals('mask width', ImageW, Masks.SizeX);
+    AssertEquals('mask height', ImageH, Masks.SizeY);
+    AssertEquals('mask count', 2, Masks.Depth);
+    MaxDiff := 0;
+    for DetPos := 0 to 1 do
+      for Y := 0 to ImageH - 1 do
+        for X := 0 to ImageW - 1 do
+        begin
+          // F.interpolate bilinear, align_corners=False, 4x2 -> 6x3.
+          SrcX := Max(0, (X + 0.5) * 4 / ImageW - 0.5);
+          SrcY := Max(0, (Y + 0.5) * 2 / ImageH - 0.5);
+          X0 := Trunc(SrcX); X1 := Min(X0 + 1, 3); LambdaX := SrcX - X0;
+          Y0 := Trunc(SrcY); Y1 := Min(Y0 + 1, 1); LambdaY := SrcY - Y0;
+          Expected :=
+            (1 - LambdaY) * ((1 - LambdaX) * ContentProb(DetPos, X0, Y0) +
+              LambdaX * ContentProb(DetPos, X1, Y0)) +
+            LambdaY * ((1 - LambdaX) * ContentProb(DetPos, X0, Y1) +
+              LambdaX * ContentProb(DetPos, X1, Y1));
+          if (X < Dets[DetPos].X1) or (X >= Dets[DetPos].X2) or
+             (Y < Dets[DetPos].Y1) or (Y >= Dets[DetPos].Y2) then Expected := 0;
+          MaxDiff := Max(MaxDiff, Abs(Masks[X, Y, DetPos] - Expected));
+        end;
+    WriteLn('  YOLO-seg native mask vs hand oracle max|diff| = ', MaxDiff:0:9);
+    AssertTrue('native soft mask max |diff| ' + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    // Square image of the net size: no padding, so it equals the retina path.
+    IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_yolo_seg_io.safetensors'));
+    NN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo_seg.safetensors'),
+      PicoConfig, {pTrainable=}false, FixturePath('tiny_yolo_seg_config.json'));
+    LoadDDColorTorchImage(IO, 'input', Img);
+    NN.Compute(Img);
+    Dets := DecodeYoloSegmentation(NN, PicoConfig, RetinaMasks, 0.5, 0.5,
+      {IsFastSAM=}true, {RetinaMasks=}true);
+    NativeDets := DecodeYoloSegmentationNative(NN, PicoConfig, Masks,
+      PicoConfig.ImageSize, PicoConfig.ImageSize, 0.5, 0.5, {IsFastSAM=}true);
+    AssertTrue('pico has detections', Length(Dets) > 0);
+    AssertEquals('native detection count', Length(Dets), Length(NativeDets));
+    AssertEquals('native mask size', RetinaMasks.Size, Masks.Size);
+    Mismatches := 0;
+    for ValuePos := 0 to Masks.Size - 1 do
+      if Masks.FData[ValuePos] <> RetinaMasks.FData[ValuePos] then Inc(Mismatches);
+    AssertEquals('native vs retina mask pixels', 0, Mismatches);
+    // Non-square image: masks at the image size, zero outside each image box.
+    NativeDets := DecodeYoloSegmentationNative(NN, PicoConfig, Masks, 150, 75,
+      0.5, 0.5, {IsFastSAM=}true);
+    AssertEquals('wide mask width', 150, Masks.SizeX);
+    AssertEquals('wide mask height', 75, Masks.SizeY);
+    Mismatches := 0;
+    for DetPos := 0 to High(NativeDets) do
+    begin
+      AssertTrue('box inside the image', (NativeDets[DetPos].X1 >= 0) and
+        (NativeDets[DetPos].X2 <= 150) and (NativeDets[DetPos].Y1 >= 0) and
+        (NativeDets[DetPos].Y2 <= 75));
+      for Y := 0 to 74 do
+        for X := 0 to 149 do
+          if ((X < NativeDets[DetPos].X1) or (X >= NativeDets[DetPos].X2) or
+             (Y < NativeDets[DetPos].Y1) or (Y >= NativeDets[DetPos].Y2)) and
+             (Masks[X, Y, DetPos] <> 0) then Inc(Mismatches);
+    end;
+    AssertEquals('pixels set outside their box', 0, Mismatches);
+  finally
+    IO.Free;
+    NN.Free;
+    Img.Free;
+    RetinaMasks.Free;
+    Masks.Free;
+    Proto.Free;
+    Head.Free;
   end;
 end;
 

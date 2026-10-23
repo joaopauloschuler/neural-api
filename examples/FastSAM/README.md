@@ -12,7 +12,9 @@ image encoder, so it runs at interactive speed on a CPU.
 **Status: coded, not yet tested on a real checkpoint.** The importer is
 parity-tested against a float64 reference of the ultralytics modules on a
 random pico net (`TestYoloSegParity`: raw head and prototype map < 1e-4, boxes,
-soft masks < 1e-4 and binary masks identical for both mask modes), the prompt logic against FastSAM's
+soft masks < 1e-4 and binary masks identical for both mask modes), the
+image-size retina masks against a hand-computed `F.interpolate` oracle
+(`TestYoloSegNativeMasks`), the prompt logic against FastSAM's
 `prompt.py` rules (`TestFastSAMPromptSelection`), and the OpenCL forward
 against the CPU forward (`TestYoloSegOpenCLParity`). The CLIP text prompt is
 not implemented.
@@ -32,27 +34,25 @@ not implemented.
    `max_det`, default 300); for a `fastsam` config it then applies FastSAM's
    box step (`FastSAMAdjustBoxes`: sides within 20 px of the border snap to
    it, a box with IoU > 0.9 against the whole image becomes the whole image).
-   `ComputeYoloMasks` then builds each mask as sigmoid of coefficients .
-   prototypes, bilinear upsample to the net input, > 0.5, with the box crop in
-   one of two places:
-   - retina masks (default, FastSAM's `retina_masks=True`; ultralytics 8.0
-     `process_mask_native`): upsample first, then crop to the box in pixels.
-   - `--no-retina` (ultralytics 8.0 `process_mask`): crop to the box at
-     prototype resolution, then upsample, so the box edge of each mask
-     follows the stride-4 prototype grid.
-
-   Ultralytics runs `process_mask_native` at the original image size: it
-   removes the letterbox padding from the prototype map, upsamples straight to
-   the image and crops with the image-space boxes. This program runs it at the
-   net input size and then maps the binary masks to the image (step 5), so the
-   mask is resampled twice; the crop is still at pixel precision of the net
-   input.
+   Each mask is sigmoid of coefficients . prototypes, bilinear upsample,
+   > 0.5, with the box crop in one of two places:
+   - retina masks (default, FastSAM's `retina_masks=True`; ultralytics
+     `process_mask_native`, `DecodeYoloSegmentationNative`): the boxes are
+     mapped to image pixels (`ScaleYoloBoxesToImage`, ultralytics
+     `scale_boxes`), and `ComputeYoloMasksNative` removes the letterbox
+     padding from the prototype-scale masks, upsamples them straight to the
+     ORIGINAL image size and crops them to the image-pixel boxes.
+   - `--no-retina` (ultralytics `process_mask`, `ComputeYoloMasks`): crop to
+     the box at prototype resolution, then upsample to the net input, so the
+     box edge of each mask follows the stride-4 prototype grid; step 5 maps
+     these masks to the image.
 4. A `--box` prompt keeps the mask with the highest IoU against the box
    (`FastSAMSelectByBox`). `--point` prompts walk the masks from largest to
    smallest: a mask under a label-1 point is added, a mask under a label-0
    point is removed (`FastSAMSelectByPoint`).
-5. The program crops the letterbox padding off the masks, resizes them to the
-   image and writes a PNG with each mask blended in a palette colour.
+5. With `--no-retina` the program crops the letterbox padding off the masks
+   and resizes them to the image. It writes a PNG with each mask blended in a
+   palette colour.
 
 ## Run
 

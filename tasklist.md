@@ -282,9 +282,10 @@ rather than acted on.
       - [ ] Real-checkpoint run: FastSAM-s.pt / FastSAM-x.pt converted to
             safetensors on the user's box (config rows in
             examples/FastSAM/README.md); check masks against ultralytics.
-      - [ ] Native retina-mask path at the ORIGINAL image size (unpad the
-            prototype map, upsample to the image); today's retina path works
-            at the net input size.
+      - [X] Native retina-mask path at the ORIGINAL image size
+            (`ScaleYoloBoxesToImage`, `ComputeYoloMasksNative`,
+            `DecodeYoloSegmentationNative`; examples/FastSAM default;
+            `TestYoloSegNativeMasks`).
       - [ ] CLIP text prompt (`text_prompt`: crop each mask's box, CLIP
             image/text similarity, argmax).
 

@@ -15,7 +15,9 @@ Two modes:
     drawn; with a box or points only the selected mask is drawn.
 
 The image is letterboxed to the net input (ultralytics LetterBox: keep the
-aspect ratio, pad with gray 114), and the masks are mapped back to the image.
+aspect ratio, pad with gray 114). Retina masks (the default) are computed at
+the image size (DecodeYoloSegmentationNative); --no-retina masks are computed
+at the net input size and then mapped back to the image.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -66,8 +68,9 @@ begin
   WriteLn('  --output PNG         mask overlay (default fastsam.png)');
   WriteLn('  --conf X             score threshold (default 0.4, FastSAM)');
   WriteLn('  --iou X              NMS IoU threshold (default 0.9, FastSAM)');
-  WriteLn('  --no-retina          crop masks at prototype scale (process_mask)');
-  WriteLn('                       instead of FastSAM''s retina_masks default');
+  WriteLn('  --no-retina          masks at the net input size, cropped at prototype');
+  WriteLn('                       scale (process_mask), instead of FastSAM''s');
+  WriteLn('                       retina_masks default (masks at the image size)');
   WriteLn('  --box X1,Y1,X2,Y2    box prompt in image pixels');
   WriteLn('  --point X,Y,LABEL    point prompt in image pixels, LABEL 1 = keep,');
   WriteLn('                       0 = remove; repeat for several points');
@@ -251,14 +254,21 @@ begin
   end;
 end;
 
+// Maps a pixel coordinate of the image into the letterboxed net input.
+function ImageToNet(Coordinate: integer; Scale: TNeuralFloat; Offset: integer): integer;
+begin
+  Result := Round(Coordinate * Scale) + Offset;
+end;
+
 // Runs the net on Image, applies the prompts of Opt and writes the overlay.
+// Retina masks live at the image size; --no-retina masks at the net input size.
 procedure SegmentImage(NN: TNNet; const Config: TYoloConfig; Image: TNNetVolume;
   const Opt: TFastSAMOptions);
 var
   NetInput, Masks, Selected, ImageMasks: TNNetVolume;
   Dets: TYoloDetectionArray;
   Box: TLetterbox;
-  NetPointX, NetPointY: array of integer;
+  PromptX, PromptY: array of integer;
   PointPos, MaxPointPos, MaskIdx: integer;
   StartTime: TDateTime;
 begin
@@ -270,17 +280,31 @@ begin
     LetterboxImage(Image, NetInput, Config.ImageSize, Box);
     StartTime := Now();
     NN.Compute(NetInput);
-    Dets := DecodeYoloSegmentation(NN, Config, Masks, Opt.ScoreThreshold,
-      Opt.IoUThreshold, {IsFastSAM=}Config.ModelType = 'fastsam', Opt.RetinaMasks);
+    if Opt.RetinaMasks then
+      Dets := DecodeYoloSegmentationNative(NN, Config, Masks, Image.SizeX,
+        Image.SizeY, Opt.ScoreThreshold, Opt.IoUThreshold,
+        {IsFastSAM=}Config.ModelType = 'fastsam')
+    else
+      Dets := DecodeYoloSegmentation(NN, Config, Masks, Opt.ScoreThreshold,
+        Opt.IoUThreshold, {IsFastSAM=}Config.ModelType = 'fastsam',
+        {RetinaMasks=}false);
     WriteLn(Format('  %dx%d image -> %d mask(s) in %.2f s', [Image.SizeX,
       Image.SizeY, Length(Dets), (Now() - StartTime) * 86400.0]));
+    // Prompt coordinates are image pixels; --no-retina masks need net pixels.
+    SetLength(PromptX, 2);
+    SetLength(PromptY, 2);
     if Opt.HasBox then
     begin
-      MaskIdx := FastSAMSelectByBox(Masks,
-        Round(Opt.Box[0] * Box.Scale) + Box.Left,
-        Round(Opt.Box[1] * Box.Scale) + Box.Top,
-        Round(Opt.Box[2] * Box.Scale) + Box.Left,
-        Round(Opt.Box[3] * Box.Scale) + Box.Top);
+      PromptX[0] := Opt.Box[0]; PromptY[0] := Opt.Box[1];
+      PromptX[1] := Opt.Box[2]; PromptY[1] := Opt.Box[3];
+      if not Opt.RetinaMasks then
+        for PointPos := 0 to 1 do
+        begin
+          PromptX[PointPos] := ImageToNet(PromptX[PointPos], Box.Scale, Box.Left);
+          PromptY[PointPos] := ImageToNet(PromptY[PointPos], Box.Scale, Box.Top);
+        end;
+      MaskIdx := FastSAMSelectByBox(Masks, PromptX[0], PromptY[0], PromptX[1],
+        PromptY[1]);
       WriteLn(Format('  box prompt (%d,%d,%d,%d) selects mask %d',
         [Opt.Box[0], Opt.Box[1], Opt.Box[2], Opt.Box[3], MaskIdx]));
       Selected.ReSize(Masks.SizeX, Masks.SizeY, 1);
@@ -291,19 +315,26 @@ begin
     else if Length(Opt.PointX) > 0 then
     begin
       MaxPointPos := High(Opt.PointX);
-      SetLength(NetPointX, MaxPointPos + 1);
-      SetLength(NetPointY, MaxPointPos + 1);
+      SetLength(PromptX, MaxPointPos + 1);
+      SetLength(PromptY, MaxPointPos + 1);
       for PointPos := 0 to MaxPointPos do
       begin
-        NetPointX[PointPos] := Round(Opt.PointX[PointPos] * Box.Scale) + Box.Left;
-        NetPointY[PointPos] := Round(Opt.PointY[PointPos] * Box.Scale) + Box.Top;
+        PromptX[PointPos] := Opt.PointX[PointPos];
+        PromptY[PointPos] := Opt.PointY[PointPos];
+        if not Opt.RetinaMasks then
+        begin
+          PromptX[PointPos] := ImageToNet(PromptX[PointPos], Box.Scale, Box.Left);
+          PromptY[PointPos] := ImageToNet(PromptY[PointPos], Box.Scale, Box.Top);
+        end;
       end;
-      FastSAMSelectByPoint(Masks, NetPointX, NetPointY, Opt.PointLabels, Selected);
-      WriteLn(Format('  %d point prompt(s) select %d net-input pixels',
+      FastSAMSelectByPoint(Masks, PromptX, PromptY, Opt.PointLabels, Selected);
+      WriteLn(Format('  %d point prompt(s) select %d mask pixels',
         [MaxPointPos + 1, Round(Selected.GetSum())]));
       Masks.Copy(Selected);
     end;
-    if Masks.Depth > 0 then
+    if Opt.RetinaMasks then
+      ImageMasks.Copy(Masks)
+    else if Masks.Depth > 0 then
       MasksToImage(Masks, ImageMasks, Box, Image.SizeX, Image.SizeY)
     else
       ImageMasks.ReSize(Image.SizeX, Image.SizeY, 0);
