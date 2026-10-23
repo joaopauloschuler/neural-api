@@ -11582,6 +11582,10 @@ procedure ViTMattePreprocess(Image, Trimap, NetInput: TNNetVolume;
 // cropped. NN must be built for the padded size of Image.
 procedure ViTMatteEstimateAlpha(NN: TNNet; Image, Trimap, Alpha: TNNetVolume);
 
+// Mask (W, H, 1) 0..255 thresholded at 128 -> Trimap (W, H, 1): 255 where the
+// mask survives an UnknownBand-px erosion, 128 within UnknownBand px of an edge, else 0.
+procedure TrimapFromMask(Mask, Trimap: TNNetVolume; UnknownBand: integer);
+
 // ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
 // feature backbone and the prerequisite for LPIPS + neural style transfer).
@@ -88415,6 +88419,55 @@ begin
       Image.SizeY);
   finally
     NetInput.Free;
+  end;
+end;
+
+procedure TrimapFromMask(Mask, Trimap: TNNetVolume; UnknownBand: integer);
+var
+  BoxNet: TNNet;
+  ForegroundAndOnes, Filtered: TNNetVolume;
+  PixelPos, MaxPixelPos: integer;
+  Coverage, CoverageEps: TNeuralFloat;
+begin
+  if (Mask.Depth <> 1) or (UnknownBand < 0) then
+    ImportError(csViTMatteImporter + ': TrimapFromMask needs a one-channel ' +
+      'mask and UnknownBand >= 0.');
+  // Channel 0 = foreground (0/1), channel 1 = ones: the ratio of their box
+  // means is the foreground share of the window's in-image pixels, so the
+  // image border neither erodes nor dilates the mask.
+  ForegroundAndOnes := TNNetVolume.Create(Mask.SizeX, Mask.SizeY, 2);
+  BoxNet := TNNet.Create();
+  try
+    MaxPixelPos := Mask.SizeX * Mask.SizeY - 1;
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      if Mask.FData[PixelPos] >= 128 then
+        ForegroundAndOnes.FData[2 * PixelPos] := 1
+      else
+        ForegroundAndOnes.FData[2 * PixelPos] := 0;
+      ForegroundAndOnes.FData[2 * PixelPos + 1] := 1;
+    end;
+    BoxNet.AddLayer(TNNetInput.Create(Mask.SizeX, Mask.SizeY, 2));
+    BoxNet.AddLayer(TNNetBoxFilter.Create(UnknownBand));
+    BoxNet.Compute(ForegroundAndOnes);
+    Filtered := BoxNet.GetLastLayer().Output;
+    // Half of one pixel's share of a full (2N+1)^2 window, the smallest share.
+    CoverageEps := 0.5 / Sqr(2 * UnknownBand + 1);
+    Trimap.ReSize(Mask.SizeX, Mask.SizeY, 1);
+    for PixelPos := 0 to MaxPixelPos do
+    begin
+      Coverage := Filtered.FData[2 * PixelPos] /
+        Filtered.FData[2 * PixelPos + 1];
+      if Coverage > 1 - CoverageEps then
+        Trimap.FData[PixelPos] := 255
+      else if Coverage > CoverageEps then
+        Trimap.FData[PixelPos] := 128
+      else
+        Trimap.FData[PixelPos] := 0;
+    end;
+  finally
+    BoxNet.Free;
+    ForegroundAndOnes.Free;
   end;
 end;
 

@@ -1579,6 +1579,9 @@ type
     procedure TestViTMatteParity;
     // The tiny fixture with EnableOpenCL against the host net, every layer.
     procedure TestViTMatteOpenCLParity;
+    // TrimapFromMask on a bar touching the top/bottom border: band, core,
+    // background, no erosion at the image border, UnknownBand 0 = binary.
+    procedure TestTrimapFromMask;
     // Pico RetinaFace + tiny CodeFormer through RestoreFacesInImage: each restored
     // face equals CodeFormerRestoreFace on its crop; IsCodeFormerCheckpoint.
     procedure TestRestoreFacesInImageCodeFormer;
@@ -57320,6 +57323,42 @@ begin
     PixelValues.Free;
     Trimap.Free;
     Image.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestTrimapFromMask;
+var
+  Mask, Trimap: TNNetVolume;
+  X, Y: integer;
+begin
+  Mask := TNNetVolume.Create(20, 12, 1);
+  Trimap := TNNetVolume.Create;
+  try
+    for Y := 0 to 11 do
+      for X := 0 to 19 do
+        if (X >= 5) and (X <= 14) then Mask[X, Y, 0] := 200
+        else Mask[X, Y, 0] := 50;
+    TrimapFromMask(Mask, Trimap, 2);
+    AssertEquals('width', 20, Trimap.SizeX);
+    AssertEquals('height', 12, Trimap.SizeY);
+    AssertEquals('depth', 1, Trimap.Depth);
+    for Y := 0 to 11 do
+      for X := 0 to 19 do
+        if (X >= 7) and (X <= 12) then
+          AssertEquals('core ' + IntToStr(X) + ',' + IntToStr(Y), 255,
+            Trimap[X, Y, 0], 0)
+        else if (X >= 3) and (X <= 16) then
+          AssertEquals('band ' + IntToStr(X) + ',' + IntToStr(Y), 128,
+            Trimap[X, Y, 0], 0)
+        else
+          AssertEquals('background ' + IntToStr(X) + ',' + IntToStr(Y), 0,
+            Trimap[X, Y, 0], 0);
+    TrimapFromMask(Mask, Trimap, 0);
+    AssertEquals('band 0 foreground', 255, Trimap[5, 6, 0], 0);
+    AssertEquals('band 0 background', 0, Trimap[4, 6, 0], 0);
+  finally
+    Trimap.Free;
+    Mask.Free;
   end;
 end;
 

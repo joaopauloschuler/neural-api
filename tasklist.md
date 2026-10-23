@@ -393,11 +393,14 @@ rather than acted on.
   - [ ] TNNetSAMVisionAttention's class comment says Backpropagate passes
         dL/dInput through the chain; it passes a zero gradient. Fix the comment
         or implement the backward.
-  - [ ] examples/ImageMatting (`--image`, `--trimap FILE`, or `--auto-trimap`:
+  - [X] examples/ImageMatting (`--image`, `--trimap FILE`, or `--auto-trimap`:
         build the trimap from a BiRefNet mask by eroding and dilating it with
         the existing `TNNetBoxFilter` layer + a threshold, band width `--unknown-band N`).
         Writes the alpha PNG and an RGBA cut-out. Add a README.md, plus a row
         in examples/README.md.
+        Done: the erode/dilate is `TrimapFromMask` (box mean of the mask over
+        the box mean of ones, so the image border does not erode), tested by
+        `TestTrimapFromMask`; pico smoke covers --trimap and --auto-trimap.
   - [ ] Real hustvl/vitmatte-small-composition-1k run on the GPU box (`--gpu`,
         also CPU) compared with the transformers output before README calls
         it supported.

@@ -122,6 +122,7 @@ __pycache__/
 examples/ColorizePhoto/*.png
 examples/FaceRestoration/*.png
 examples/BackgroundRemoval/*.png
+examples/ImageMatting/*.png
 examples/VideoMatting/*.gif
 examples/VideoMatting/rvm_smoke_frames/
 examples/VideoMatting/rvm_smoke_out/
