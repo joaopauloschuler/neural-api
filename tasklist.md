@@ -838,6 +838,43 @@ rather than acted on.
               GPU box: swap, refine and reweight from a seed and from an
               inverted photo; LocalBlend (the reference's mask that limits
               the edit to the edited words' region) is not ported.
+- [ ] IC-Light relighting on the SD 1.5 pipeline (lllyasviel/IC-Light,
+      Zhang et al. ICLR 2025, `gradio_demo.py` / `gradio_demo_bg.py`): relight
+      a cut-out subject from a text prompt ("sunset over the sea, warm rim
+      light") and an optional light direction or background photo. The pieces
+      exist: `TStableDiffusionImageConditioner.PredictWithExtraChannels` (the
+      InstructPix2Pix / inpainting latent concat), `TStableDiffusionImg2Img`,
+      Karras sigmas and `BiRefNetRemoveBackground` (examples/BackgroundRemoval).
+      Steps, each ending green with a commit:
+      - (a) Load: the reference widens the base UNet `conv_in` from 4 to 8
+            input channels (fc) or 12 (fbc), zero weights for the new channels,
+            then loads `base + offset` for EVERY tensor from
+            `iclight_sd15_fc.safetensors` / `iclight_sd15_fbc.safetensors`
+            (diffusers UNet keys; base `stablediffusionapi/realistic-vision-v51`
+            or any SD 1.5). Add this as an offset-merge option of the SD UNet
+            loader, not a copied loader.
+      - (b) `TStableDiffusionICLight` conditioner (subclass of
+            `TStableDiffusionImageConditioner`): foreground composited on gray
+            127 with the matte alpha, VAE-encoded with the latent-dist MODE
+            times the scaling factor, concatenated in depth at every step (fc:
+            foreground; fbc: foreground | background latents). Light direction
+            left/right/top/bottom = a 255->0 gradient image used as the
+            img2img init at strength 0.9 (steps / strength rounded), none = txt2img.
+      - (c) The reference's highres pass: decode, resize by 1.5 to multiples
+            of 64, re-encode, img2img at strength 0.5 with the same concat.
+      - (d) Sampler: the reference runs DPMSolverMultistep `sde-dpmsolver++`
+            with Karras sigmas; `TNNetSamplerMethod` has only the
+            deterministic `smDPMSolverPP2M`. Add the SDE variant as an
+            algorithm option of the existing DPM++ 2M step (diffusers
+            `algorithm_type`), not a separate scheduler.
+      - (e) Pico-fixture parity vs diffusers + the reference hook in the ~/x
+            venv (offset merge, 8-channel UNet input, one denoise step),
+            then `--relight` / `--light left|right|top|bottom` /
+            `--relight-background FILE` in examples/StableDiffusion and its
+            README. The reference mattes with `briaai/RMBG-1.4` (IS-Net, not
+            ported); state in the README that BiRefNet / RMBG-2.0 is used
+            instead, or accept a user-supplied RGBA cut-out.
+      - (f) Real run on the user's GPU box (fc and fbc, `--int8` too).
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close; and `gligen-1-4-inpainting-text-box` with
