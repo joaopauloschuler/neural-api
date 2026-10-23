@@ -676,8 +676,20 @@ rather than acted on.
               `--panorama-wrap`) and a 512 -> 1024 / 2048 `--tile-upscale`
               with lllyasviel/control_v11f1e_sd15_tile (quality, time, peak
               memory); README outputs.
-        - [ ] Tiled VAE encode: img2img encodes the whole canvas at once,
-              which bounds `--tile-upscale` by the encoder's memory.
+        - [ ] Tiled VAE encode follow-ups (`TiledVaeEncode` on the
+              `TiledNetCompute` planner; `EncodeVaeImage` tiles under
+              `VaeTileSize`, so img2img, `--tile-upscale` and every SD
+              conditioner that encodes an image use it):
+          - [ ] Qwen-Image-2.1: `TQwenImage21VaeEncoder.Encode` still encodes
+                the whole image (the net is rebuilt per image size and runs
+                `Compute(..., FParallel)`); tile it with the pipeline's
+                `VaeTileSize` / `VaeTileStride` (diffusers'
+                AutoencoderKLQwenImage `tiled_encode`, stride-based, not
+                `TiledNetCompute`'s overlap factor), parallel tile compute.
+          - [ ] Marigold (`MarigoldPredict`) encodes the whole image too.
+          - [ ] Measure tiled-vs-whole encode error on a real SD 1.5 VAE (the
+                pico encoder is untrained: about 0.24 x max latent away from
+                seams on a periodic image, about 2 x on an aperiodic one).
         - [ ] Refused with windows today: DeepCache over several windows (one
               cache set per window), GLIGEN (boxes in image coordinates mapped
               per window), Prompt-to-Prompt, DDIM / null-text inversion.

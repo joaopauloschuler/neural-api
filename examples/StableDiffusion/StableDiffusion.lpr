@@ -85,10 +85,11 @@ on overlapping --width x --height windows (default the checkpoint size) of a
 WxH canvas every --panorama-stride pixels (default 64, diffusers' 8 latent
 cells), averages the predictions where windows overlap and steps the whole
 canvas once; --panorama-wrap wraps the windows in X for a 360-degree panorama.
---vae-tile N decodes in N-pixel tiles (diffusers enable_vae_tiling).
+--vae-tile N decodes and encodes in N-pixel tiles (diffusers
+enable_vae_tiling).
 --tile-upscale N --init-image PNG upscales the image N times: PIL bicubic to N
 times its size, then image-to-image at a low --strength (default 0.35) over
---panorama windows every half window, decoded with --vae-tile; --controlnet DIR
+--panorama windows every half window, encoded and decoded with --vae-tile; --controlnet DIR
 (a ControlNet folder such as lllyasviel/control_v11f1e_sd15_tile) takes the
 upscaled image as its hint, each window its own crop of it. --controlnet DIR
 --control-image PNG adds a ControlNet to any other run.
@@ -543,17 +544,17 @@ begin
   WriteLn('  --panorama-wrap   wrap the windows past the right edge to the left ',
     'edge (360-degree');
   WriteLn('                    panorama, diffusers circular_padding)');
-  WriteLn('  --vae-tile N      VAE-decode images larger than N pixels in ',
-    'overlapping N x N tiles');
-  WriteLn('                    (diffusers enable_vae_tiling; default 0 = one ',
-    'decode)');
+  WriteLn('  --vae-tile N      VAE-decode and -encode images larger than N ',
+    'pixels in overlapping');
+  WriteLn('                    N x N tiles (diffusers enable_vae_tiling; ',
+    'default 0 = one pass)');
   WriteLn('  --tile-upscale N  upscale --init-image N times (PIL bicubic), then ',
     'image-to-image');
   WriteLn('                    over --width x --height windows every half ',
     'window (--panorama-stride)');
-  WriteLn('                    at --strength (default 0.35), VAE-decoded in ',
-    'window-size tiles');
-  WriteLn('                    (--vae-tile)');
+  WriteLn('                    at --strength (default 0.35), VAE-encoded and ',
+    '-decoded in');
+  WriteLn('                    window-size tiles (--vae-tile)');
   WriteLn('  --controlnet DIR  a diffusers ControlNet folder; under ',
     '--tile-upscale (e.g.');
   WriteLn('                    lllyasviel/control_v11f1e_sd15_tile) its hint is ',

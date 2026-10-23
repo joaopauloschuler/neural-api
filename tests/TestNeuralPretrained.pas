@@ -1353,6 +1353,7 @@ type
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestTiledVaeDecodeParity;
+    procedure TestTiledVaeEncodeParity;
     procedure TestTinyVaeDecoderConfigFromJSONFile;
     procedure TestTinyVaeDecoder4ChParity;
     procedure TestTinyVaeDecoder16ChParity;
@@ -1502,8 +1503,8 @@ type
     // alone with its crop as the hint (mean in the overlap); img2img plus a
     // ControlNet whose hint is the image runs over the windows.
     procedure TestStableDiffusionPanoramaHintCrop;
-    // VaeTileSize: a tile covering the image is the plain decode; a smaller one
-    // runs TiledVaeDecode at the image size.
+    // VaeTileSize: a tile covering the image is the plain decode / encode; a
+    // smaller one runs TiledVaeDecode / TiledVaeEncode at the image size.
     procedure TestStableDiffusionVaeTiling;
     procedure TestStableDiffusionPAGLayerNames;
     // PerturbedGuidance with PerturbedScale 0 (or < 0) bit-identical to none.
@@ -45796,6 +45797,125 @@ begin
   end;
 end;
 
+// Tiled VAE encode. A purely local 2x-downscale net (2x2 stride-2 conv) tiled
+// over a 40x40 image equals its whole-image forward (the planner and the
+// latent-space blend are exact). On the pico encoder (2x per latent cell): one
+// tile over the image is the plain encode bit for bit; a 3x3-tile encode (tile
+// 8 cells, overlap 2, image 20 cells) is finite and (20, 20, 4). Its GroupNorm
+// statistics, MID self-attention and zero-padded tile borders are per tile, so
+// with the untrained pico weights the tiled latent is only loosely close to
+// the whole encode even on a 4-pixel-periodic image (whose per-tile statistics
+// match the whole image's): about 0.24 x max|latent| in the cells only the
+// first tile covers, about 2 x on an aperiodic image. Tiling is an
+// approximation there too, as in diffusers.
+procedure TTestNeuralPretrained.TestTiledVaeEncodeParity;
+const
+  cTile = 8;       // latent cells per tile
+  cWhole = 20;     // latent cells of the multi-tile image
+  cOverlap = 0.25;
+var
+  CfgTile, CfgWhole: TVaeDecoderConfig;
+  TileNet, WholeNet: TNNet;
+  ImgTile, ImgWhole, Tiled, Whole: TNNetVolume;
+  ValuePos, x, y, d: integer;
+  Diff, MaxDiff, MaxRef: TNeuralFloat;
+begin
+  TileNet := TNNet.Create;
+  WholeNet := TNNet.Create;
+  ImgWhole := TNNetVolume.Create(40, 40, 3);
+  Whole := TNNetVolume.Create;
+  Tiled := nil;
+  try
+    TileNet.AddLayer(TNNetInput.Create(16, 16, 3));
+    TileNet.AddLayer(TNNetConvolutionLinear.Create(5, 2, 0, 2, 0));
+    WholeNet.AddLayer(TNNetInput.Create(40, 40, 3));
+    WholeNet.AddLayer(TNNetConvolutionLinear.Create(5, 2, 0, 2, 0));
+    WholeNet.CopyWeights(TileNet);
+    ImgWhole.RandomizeGaussian();
+    WholeNet.Compute(ImgWhole);
+    Tiled := TiledVaeEncode(TileNet, ImgWhole, 8, cOverlap);
+    AssertEquals('local net: tiled width', 20, Tiled.SizeX);
+    AssertEquals('local net: tiled = whole', 0,
+      MaxAbsVolumeDiff(WholeNet.GetLastLayer().Output, Tiled), 1e-5);
+  finally
+    Tiled.Free;
+    Whole.Free;
+    ImgWhole.Free;
+    WholeNet.Free;
+    TileNet.Free;
+  end;
+  CfgTile := ReadVaeEncoderConfigFromJSONFile(
+    FixturePath('tiny_vae_encoder_config.json'));
+  CfgTile.LatentGrid := cTile;
+  CfgTile.LatentGridY := cTile;
+  CfgWhole := CfgTile;
+  CfgWhole.LatentGrid := cWhole;
+  CfgWhole.LatentGridY := cWhole;
+  TileNet := BuildVaeEncoderFromSafeTensorsEx(
+    FixturePath('tiny_vae_encoder.safetensors'), CfgTile, {pTrainable=}false);
+  WholeNet := BuildVaeEncoderFromSafeTensorsEx(
+    FixturePath('tiny_vae_encoder.safetensors'), CfgWhole, {pTrainable=}false);
+  ImgTile := TNNetVolume.Create;
+  ImgWhole := TNNetVolume.Create;
+  Whole := TNNetVolume.Create;
+  Tiled := nil;
+  try
+    ImgTile.ReSize(TileNet.GetFirstLayer().Output);
+    for ValuePos := 0 to ImgTile.Size - 1 do
+      ImgTile.FData[ValuePos] := Sin(ValuePos * 0.37) * 0.8;
+    TileNet.Compute(ImgTile);
+    Whole.Copy(TileNet.GetLastLayer().Output);
+    Tiled := TiledVaeEncode(TileNet, ImgTile, cTile, cOverlap);
+    AssertEquals('one tile = plain encode', 0, MaxAbsVolumeDiff(Whole, Tiled),
+      0);
+    Tiled.Free;
+    Tiled := nil;
+    try
+      Tiled := TiledVaeEncode(TileNet, ImgTile, cTile + 1, cOverlap);
+      Fail('a tile off the encoder latent grid must be refused');
+    except
+      on EPretrainedImportError do ;
+    end;
+
+    ImgWhole.ReSize(WholeNet.GetFirstLayer().Output);
+    for y := 0 to ImgWhole.SizeY - 1 do
+      for x := 0 to ImgWhole.SizeX - 1 do
+        for d := 0 to ImgWhole.Depth - 1 do
+          ImgWhole[x, y, d] := 0.8 * Sin(1.7 * (x mod 4) + 0.9 * (y mod 4) +
+            1.3 * d);
+    WholeNet.Compute(ImgWhole);
+    Whole.Copy(WholeNet.GetLastLayer().Output);
+    Tiled := TiledVaeEncode(TileNet, ImgWhole, cTile, cOverlap);
+    AssertEquals('tiled width', cWhole, Tiled.SizeX);
+    AssertEquals('tiled height', cWhole, Tiled.SizeY);
+    AssertEquals('tiled channels', CfgTile.LatentChannels, Tiled.Depth);
+    for ValuePos := 0 to Tiled.Size - 1 do
+      AssertFalse('finite latent', IsNan(Tiled.FData[ValuePos]) or
+        IsInfinite(Tiled.FData[ValuePos]));
+    // Cells 0..3 of each axis: only the first tile reaches them (the second
+    // starts at cell 6 and blends cells 6..7).
+    MaxDiff := 0;
+    MaxRef := 0;
+    for y := 0 to 3 do
+      for x := 0 to 3 do
+        for d := 0 to Tiled.Depth - 1 do
+        begin
+          Diff := Abs(Tiled[x, y, d] - Whole[x, y, d]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          if Abs(Whole[x, y, d]) > MaxRef then MaxRef := Abs(Whole[x, y, d]);
+        end;
+    AssertTrue('away from seams max|diff| ' + FloatToStr(MaxDiff) +
+      ' <= 0.4 * max|latent| ' + FloatToStr(MaxRef), MaxDiff <= 0.4 * MaxRef);
+  finally
+    Tiled.Free;
+    Whole.Free;
+    ImgWhole.Free;
+    ImgTile.Free;
+    WholeNet.Free;
+    TileNet.Free;
+  end;
+end;
+
 // Stable Diffusion VAE ENCODER parity test (diffusers AutoencoderKL encoder),
 // the mirror of TestVaeDecoderParity. tests/fixtures/tiny_vae_encoder.* is a
 // pico randomly-initialized encoder (block_out_channels [8,16],
@@ -49414,14 +49534,65 @@ end;
 procedure TTestNeuralPretrained.TestStableDiffusionVaeTiling;
 var
   Pipeline: TStableDiffusionPipeline;
-  Latents, Plain, Tiled: TNNetVolume;
-  ValuePos: integer;
+  Latents, Plain, Tiled, VaeImage, Noise, ZeroNoise: TNNetVolume;
+  ValuePos, x, y, d: integer;
 begin
   Pipeline := CreateSD15Pipeline();
   Latents := TNNetVolume.Create;
   Plain := TNNetVolume.Create;
   Tiled := TNNetVolume.Create;
+  VaeImage := TNNetVolume.Create;
+  Noise := TNNetVolume.Create;
+  ZeroNoise := TNNetVolume.Create;
   try
+    // Encode: a tile over the image is the plain encode, mean and sample.
+    VaeImage.ReSize(24, 16, 3);
+    for y := 0 to 15 do
+      for x := 0 to 23 do
+        for d := 0 to 2 do
+          VaeImage[x, y, d] := 0.8 * Sin(0.3 * x + 0.2 * y + 1.1 * d);
+    Pipeline.VaeTileSize := 0;
+    Pipeline.EncodeVaeImage(VaeImage, Plain);
+    Noise.ReSize(Plain);
+    for ValuePos := 0 to Noise.Size - 1 do
+      Noise.FData[ValuePos] := Cos(ValuePos * 0.7);
+    ZeroNoise.ReSize(Plain);
+    ZeroNoise.Fill(0);
+    Pipeline.VaeTileSize := 32;
+    Pipeline.EncodeVaeImage(VaeImage, Tiled);
+    AssertEquals('encode: a tile over the image = plain', 0,
+      MaxAbsVolumeDiff(Plain, Tiled), 0);
+    Pipeline.VaeTileSize := 0;
+    Pipeline.EncodeVaeImage(VaeImage, Plain, Noise);
+    Pipeline.VaeTileSize := 32;
+    Pipeline.EncodeVaeImage(VaeImage, Tiled, Noise);
+    AssertEquals('sampled encode: a tile over the image = plain', 0,
+      MaxAbsVolumeDiff(Plain, Tiled), 0);
+    // Tiled encode (8-pixel tiles): latent shape, finite, the zero-noise
+    // sample is the mean, and the unscaled mean is the mean / scaling_factor.
+    Pipeline.VaeTileSize := 8;
+    Pipeline.EncodeVaeImage(VaeImage, Tiled);
+    AssertEquals('tiled encode width', 12, Tiled.SizeX);
+    AssertEquals('tiled encode height', 8, Tiled.SizeY);
+    AssertEquals('tiled encode channels', 4, Tiled.Depth);
+    for ValuePos := 0 to Tiled.Size - 1 do
+      AssertFalse('finite tiled latent', IsNan(Tiled.FData[ValuePos]) or
+        IsInfinite(Tiled.FData[ValuePos]));
+    Pipeline.EncodeVaeImage(VaeImage, Plain, ZeroNoise);
+    AssertEquals('tiled: zero-noise sample = mean', 0,
+      MaxAbsVolumeDiff(Plain, Tiled), 0);
+    Pipeline.EncodeVaeImage(VaeImage, Plain, nil, {ApplyScalingFactor=}false);
+    // One factor (scaling_factor) maps the unscaled mean onto the latents.
+    x := 0;
+    for ValuePos := 1 to Plain.Size - 1 do
+      if Abs(Plain.FData[ValuePos]) > Abs(Plain.FData[x]) then x := ValuePos;
+    Plain.Mul(Tiled.FData[x] / Plain.FData[x]);
+    AssertEquals('tiled: unscaled mean * scaling_factor', 0,
+      MaxAbsVolumeDiff(Plain, Tiled), 1e-5);
+    Pipeline.EncodeVaeImage(VaeImage, Plain, Noise);
+    AssertTrue('tiled: the sample moves off the mean',
+      MaxAbsVolumeDiff(Plain, Tiled) > 1e-4);
+    Pipeline.VaeTileSize := 0;
     Pipeline.MakeInitialLatents(16, 16, 5, Latents);
     Pipeline.DecodeLatents(Latents, 16, 16, Plain);
     Pipeline.VaeTileSize := 32;
@@ -49429,6 +49600,12 @@ begin
     AssertEquals('a tile over the image = plain', 0,
       MaxAbsVolumeDiff(Plain, Tiled), 0);
     Pipeline.MakeInitialLatents(24, 16, 5, Latents);
+    Pipeline.VaeTileSize := 0;
+    Pipeline.DecodeLatents(Latents, 24, 16, Plain);
+    Pipeline.VaeTileSize := 32;
+    Pipeline.DecodeLatents(Latents, 24, 16, Tiled);
+    AssertEquals('a tile over a non-square image = plain', 0,
+      MaxAbsVolumeDiff(Plain, Tiled), 0);
     Pipeline.VaeTileSize := 8;
     Pipeline.DecodeLatents(Latents, 24, 16, Tiled);
     AssertEquals('tiled width', 24, Tiled.SizeX);
@@ -49445,6 +49622,9 @@ begin
       on EPretrainedImportError do ;
     end;
   finally
+    ZeroNoise.Free;
+    Noise.Free;
+    VaeImage.Free;
     Tiled.Free;
     Plain.Free;
     Latents.Free;

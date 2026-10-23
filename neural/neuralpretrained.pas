@@ -11879,9 +11879,13 @@ function BuildTinyVaeDecoderFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // Runs Net (its TNNetInput is the tile) over Source in tiles stepping by tile -
-// 2*Pad - Overlap, dropping Pad on interior sides and feathering Overlap seams.
+// 2*Pad - Overlap, dropping Pad on interior sides and feathering Overlap seams;
+// returns OutputLayer's (nil: the last layer's) tiled output. The net scales by
+// one integer factor, up or down; tiles, Overlap and Pad are counted in cells
+// of the coarser grid (input pixels when upscaling, output pixels when
+// downscaling), so every tile starts on a whole output pixel.
 function TiledNetCompute(Net: TNNet; Source: TNNetVolume;
-  Overlap, Pad: integer): TNNetVolume;
+  Overlap, Pad: integer; OutputLayer: TNNetLayer = nil): TNNetVolume;
 
 // Net input side for an ImageSide image: the image padded to SizeMultiple when
 // Tile <= 0 or it fits one tile, else Tile + 2*TilePad, each rounded up.
@@ -11915,6 +11919,28 @@ function PaddedTiledNetCompute(NN: TNNet; Image: TNNetVolume;
 // a freshly-allocated (W*scale, H*scale, OutChannels) image; caller owns it.
 function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
   TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat): TNNetVolume;
+
+// Tiled VAE encode (diffusers AutoencoderKL._tiled_encode), the mirror of
+// TiledVaeDecode on the same tile planner (TiledNetCompute): Image is encoded
+// in overlapping square tiles by an Encoder built at the TILE size and the
+// tiles are blended in LATENT space, so encoder memory is bounded by the tile.
+//   Encoder           : a VAE encoder whose OutputLayer (nil: last layer) is a
+//                       TileLatentMinSize-wide latent of its fixed input tile.
+//   Image             : (W, H, C) image, W and H multiples of the encoder's
+//                       downscale and at least one tile.
+//   TileLatentMinSize : latent tile edge (diffusers tile_latent_min_size, 64).
+//   TileOverlapFactor : diffusers tile_overlap_factor (0.25).
+// diffusers blends the quant_conv MOMENTS and builds one DiagonalGaussian-
+// Distribution over the blended result, so its mean and sample are taken
+// after the blend; pass the moments layer as OutputLayer to do the same
+// (TStableDiffusionPipeline.EncodeVaeImage does). Differences from diffusers:
+// edge tiles are clamped inside the image (the fixed-size net takes no partial
+// tile) instead of being encoded smaller, and the seam ramp is
+// (i + 1) / (overlap + 1) instead of i / overlap. Returns a (W / f, H / f,
+// OutputLayer depth) volume; caller owns it.
+function TiledVaeEncode(Encoder: TNNet; Image: TNNetVolume;
+  TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat;
+  OutputLayer: TNNetLayer = nil): TNNetVolume;
 
 // ---------------------------------------------------------------------------
 // STABLE DIFFUSION UNet IMPORT (diffusers UNet2DConditionModel - the text-
@@ -12726,6 +12752,9 @@ type
     // Latent grid of a Width x Height image; raises unless both sides are a
     // positive multiple of the VAE factor.
     procedure LatentGridFor(Width, Height: integer; out GridX, GridY: integer);
+    // The VaeTileSize tile in latent cells for a GridX x GridY latent, 0 when
+    // one VAE pass covers it; raises on a VaeTileSize off the VAE factor.
+    function VaeTileCellsFor(GridX, GridY: integer): integer;
     function UNetStepConfig(GridX, GridY, TextSeqLen: integer): TSDUNetConfig;
     // The kept net of that shape, or a new one (kept when ComponentsLoaded)
     // after starting its load phase; ReleaseComponent ends its use.
@@ -13084,10 +13113,11 @@ type
     // circular_padding, 360-degree panoramas).
     property PanoramaCircular: boolean read FPanoramaCircular
       write FPanoramaCircular;
-    // > 0: DecodeLatents of an image wider or taller than this many pixels
-    // runs TiledVaeDecode on square tiles of this side (clamped to the
-    // shorter image side; a multiple of VaeScaleFactor), overlap 0.25 as
-    // diffusers enable_vae_tiling. 0 (default): one decode.
+    // > 0: DecodeLatents / EncodeVaeImage of an image wider or taller than
+    // this many pixels run TiledVaeDecode / TiledVaeEncode on square tiles of
+    // this side (clamped to the shorter image side; a multiple of
+    // VaeScaleFactor), overlap 0.25 as diffusers enable_vae_tiling. 0
+    // (default): one decode / encode.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
   end;
 
@@ -76397,9 +76427,10 @@ begin
 end;
 
 function TiledNetCompute(Net: TNNet; Source: TNNetVolume;
-  Overlap, Pad: integer): TNNetVolume;
+  Overlap, Pad: integer; OutputLayer: TNNetLayer): TNNetVolume;
 var
-  TileW, TileH, OutTileW, OutTileH, Scale, StrideX, StrideY: integer;
+  TileW, TileH, OutTileW, OutTileH, StrideX, StrideY: integer;
+  InCell, OutCell, TileCellsW, TileCellsH: integer;  // pixels per tile cell
   OutChannels, OutOverlap, OutPad: integer;
   StartsX, StartsY: TNeuralIntegerArray;
   nx, nj, tx, ty, d: integer;
@@ -76411,42 +76442,57 @@ var
   FeatherCols, MaxFeatherColPos, RunLen, gxBase, gyBase: integer;
   TileRowFloats, ResultBase, TileOutBase: integer;
 begin
+  if OutputLayer = nil then OutputLayer := Net.GetLastLayer();
   TileW := Net.GetFirstLayer().Output.SizeX;
   TileH := Net.GetFirstLayer().Output.SizeY;
-  OutTileW := Net.GetLastLayer().Output.SizeX;
-  OutTileH := Net.GetLastLayer().Output.SizeY;
-  if (TileW <= 0) or (TileH <= 0) or (OutTileW mod TileW <> 0) or
-     ((OutTileW div TileW) * TileH <> OutTileH) then
+  OutTileW := OutputLayer.Output.SizeX;
+  OutTileH := OutputLayer.Output.SizeY;
+  // A cell is the coarser grid's pixel: InCell input and OutCell output pixels.
+  InCell := 1;
+  OutCell := 1;
+  if (TileW > 0) and (OutTileW > 0) then
+  begin
+    if OutTileW >= TileW then OutCell := OutTileW div TileW
+    else InCell := TileW div OutTileW;
+  end;
+  if (TileW <= 0) or (TileH <= 0) or (OutTileW * InCell <> TileW * OutCell) or
+     (OutTileH * InCell <> TileH * OutCell) or (TileH mod InCell <> 0) then
     ImportError('TiledNetCompute: cannot derive one integer input->output ' +
       'scale from the net (' + IntToStr(TileW) + 'x' + IntToStr(TileH) +
       ' -> ' + IntToStr(OutTileW) + 'x' + IntToStr(OutTileH) + ').');
-  Scale := OutTileW div TileW;
+  TileCellsW := TileW div InCell;
+  TileCellsH := TileH div InCell;
   if Source.Depth <> Net.GetFirstLayer().Output.Depth then
     ImportError('TiledNetCompute: source depth ' + IntToStr(Source.Depth) +
       ' <> net input depth ' + IntToStr(Net.GetFirstLayer().Output.Depth) + '.');
   if (Source.SizeX < TileW) or (Source.SizeY < TileH) then
     ImportError('TiledNetCompute: source smaller than one tile; use plain ' +
       'Compute.');
+  if (Source.SizeX mod InCell <> 0) or (Source.SizeY mod InCell <> 0) then
+    ImportError('TiledNetCompute: source ' + IntToStr(Source.SizeX) + 'x' +
+      IntToStr(Source.SizeY) + ' is not a multiple of the ' + IntToStr(InCell) +
+      'x downscale.');
   if (Overlap < 0) or (Pad < 0) then
     ImportError('TiledNetCompute: overlap and pad must be >= 0.');
-  StrideX := TileW - 2 * Pad - Overlap;
-  StrideY := TileH - 2 * Pad - Overlap;
+  StrideX := TileCellsW - 2 * Pad - Overlap;
+  StrideY := TileCellsH - 2 * Pad - Overlap;
   if ((Source.SizeX > TileW) and (StrideX < 1)) or
      ((Source.SizeY > TileH) and (StrideY < 1)) then
-    ImportError('TiledNetCompute: tile ' + IntToStr(TileW) + 'x' +
-      IntToStr(TileH) + ' leaves no stride after 2*pad (' + IntToStr(Pad) +
-      ') + overlap (' + IntToStr(Overlap) + ').');
+    ImportError('TiledNetCompute: tile ' + IntToStr(TileCellsW) + 'x' +
+      IntToStr(TileCellsH) + ' cells leaves no stride after 2*pad (' +
+      IntToStr(Pad) + ') + overlap (' + IntToStr(Overlap) + ').');
   if StrideX < 1 then StrideX := 1;
   if StrideY < 1 then StrideY := 1;
-  ComputeTileStarts(Source.SizeX, TileW, StrideX, StartsX);
-  ComputeTileStarts(Source.SizeY, TileH, StrideY, StartsY);
+  ComputeTileStarts(Source.SizeX div InCell, TileCellsW, StrideX, StartsX);
+  ComputeTileStarts(Source.SizeY div InCell, TileCellsH, StrideY, StartsY);
 
-  OutChannels := Net.GetLastLayer().Output.Depth;
-  OutOverlap := Overlap * Scale;
-  OutPad := Pad * Scale;
+  OutChannels := OutputLayer.Output.Depth;
+  OutOverlap := Overlap * OutCell;
+  OutPad := Pad * OutCell;
   invOv := 1.0 / (OutOverlap + 1);
   Result := TNNetVolume.Create;
-  Result.ReSize(Source.SizeX * Scale, Source.SizeY * Scale, OutChannels);
+  Result.ReSize((Source.SizeX div InCell) * OutCell,
+    (Source.SizeY div InCell) * OutCell, OutChannels);
   Result.Fill(0);
 
   Tile := TNNetVolume.Create;
@@ -76464,21 +76510,23 @@ begin
       if nj > 0 then KeepY0 := OutPad else KeepY0 := 0;
       if nj < MaxStartYPos then MaxKeptRowPos := OutTileH - OutPad - 1
       else MaxKeptRowPos := OutTileH - 1;
-      gyBase := StartsY[nj] * Scale;
+      gyBase := StartsY[nj] * OutCell;
       for nx := 0 to MaxStartXPos do
       begin
         // Each tile row is one contiguous run in both volumes.
         for ty := 0 to MaxTileYPos do
-          Move(Source.FData[Source.GetRawPos(StartsX[nx], StartsY[nj] + ty, 0)],
+          Move(Source.FData[Source.GetRawPos(StartsX[nx] * InCell,
+            StartsY[nj] * InCell + ty, 0)],
             Tile.FData[Tile.GetRawPos(0, ty, 0)],
             TileRowFloats * csNeuralFloatSize);
         Net.Compute(Tile);
-        TileOut := Net.GetLastLayer().Output;
+        OutputLayer.ForceOutputOnRAM();
+        TileOut := OutputLayer.Output;
 
         if nx > 0 then KeepX0 := OutPad else KeepX0 := 0;
         if nx < MaxStartXPos then KeepX1 := OutTileW - OutPad
         else KeepX1 := OutTileW;
-        gxBase := StartsX[nx] * Scale;
+        gxBase := StartsX[nx] * OutCell;
         // Feather the left OutOverlap kept columns into the tile to the left
         // and the top OutOverlap kept rows into the tile above (diffusers
         // blend_h / blend_v linear ramp); the rest of the kept span overwrites.
@@ -76531,6 +76579,16 @@ begin
   end;
 end;
 
+// diffusers int(tile_latent_min_size * tile_overlap_factor) blend rows, rounded
+// and kept below one tile so the tiles still advance.
+function VaeTileOverlapCells(TileLatentMinSize: integer;
+  TileOverlapFactor: TNeuralFloat): integer;
+begin
+  Result := Round(TileLatentMinSize * TileOverlapFactor);
+  if Result < 0 then Result := 0;
+  if Result > TileLatentMinSize - 1 then Result := TileLatentMinSize - 1;
+end;
+
 function TiledVaeDecode(Decoder: TNNet; Latent: TNNetVolume;
   TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat): TNNetVolume;
 var
@@ -76545,10 +76603,29 @@ begin
     ImportError('TiledVaeDecode: cannot derive integer latent->image scale.');
   if (Latent.SizeX < TileLatentMinSize) or (Latent.SizeY < TileLatentMinSize) then
     ImportError('TiledVaeDecode: latent smaller than one tile; use plain decode.');
-  Overlap := Round(TileLatentMinSize * TileOverlapFactor);
-  if Overlap < 0 then Overlap := 0;
-  if Overlap > TileLatentMinSize - 1 then Overlap := TileLatentMinSize - 1;
+  Overlap := VaeTileOverlapCells(TileLatentMinSize, TileOverlapFactor);
   Result := TiledNetCompute(Decoder, Latent, Overlap, {Pad=}0);
+end;
+
+function TiledVaeEncode(Encoder: TNNet; Image: TNNetVolume;
+  TileLatentMinSize: integer; TileOverlapFactor: TNeuralFloat;
+  OutputLayer: TNNetLayer): TNNetVolume;
+var
+  LatTileW, ImgTileW, Overlap: integer;
+begin
+  if OutputLayer = nil then OutputLayer := Encoder.GetLastLayer();
+  LatTileW := OutputLayer.Output.SizeX;
+  ImgTileW := Encoder.GetFirstLayer().Output.SizeX;
+  if LatTileW <> TileLatentMinSize then
+    ImportError('TiledVaeEncode: encoder latent tile (' + IntToStr(LatTileW) +
+      ') must equal TileLatentMinSize (' + IntToStr(TileLatentMinSize) + ').');
+  if (LatTileW <= 0) or (ImgTileW mod LatTileW <> 0) then
+    ImportError('TiledVaeEncode: cannot derive integer image->latent scale.');
+  if (Image.SizeX < ImgTileW) or
+     (Image.SizeY < Encoder.GetFirstLayer().Output.SizeY) then
+    ImportError('TiledVaeEncode: image smaller than one tile; use plain encode.');
+  Overlap := VaeTileOverlapCells(TileLatentMinSize, TileOverlapFactor);
+  Result := TiledNetCompute(Encoder, Image, Overlap, {Pad=}0, OutputLayer);
 end;
 
 // ===========================================================================
@@ -103114,28 +103191,61 @@ procedure TStableDiffusionPipeline.EncodeVaeImage(VaeImage,
   Latents: TNNetVolume; SampleNoise: TNNetVolume; ApplyScalingFactor: boolean);
 var
   Net: TNNet;
-  Moments, Mean: TNNetLayer;
-  GridX, GridY, LatentChannels, CellPos, MaxCellPos, ChannelPos,
-    MaxChannelPos, LatentPos, LogVarPos: integer;
+  MomentsLayer, Mean: TNNetLayer;
+  Moments, TiledMoments: TNNetVolume;
+  GridX, GridY, TileCells, LatentChannels, CellPos, MaxCellPos, ChannelPos,
+    MaxChannelPos, LatentPos, MomentPos: integer;
   LogVar, StdScale, LatentScale: TNeuralFloat;
 begin
   LatentGridFor(VaeImage.SizeX, VaeImage.SizeY, GridX, GridY);
-  Net := AcquireVaeEncoder(GridX, GridY);
+  TileCells := VaeTileCellsFor(GridX, GridY);
+  if TileCells > 0 then Net := AcquireVaeEncoder(TileCells, TileCells)
+  else Net := AcquireVaeEncoder(GridX, GridY);
+  TiledMoments := nil;
   try
-    Net.Compute(VaeImage);
-    if ApplyScalingFactor then
+    if ApplyScalingFactor then LatentScale := FVaeConfig.ScalingFactor
+    else LatentScale := 1;
+    // BuildVaeEncoder ends quant_conv (mean | logvar), mean split, scale.
+    MomentsLayer := Net.Layers[Net.GetLastLayerIdx() - 2];
+    LatentChannels := Net.GetLastLayer().Output.Depth;
+    if MomentsLayer.Output.Depth <> 2 * LatentChannels then
+      ImportError('TStableDiffusionPipeline.EncodeVaeImage: the VAE ' +
+        'encoder does not end in quant_conv, mean split and scale.');
+    if TileCells > 0 then
     begin
-      Net.GetOutput(Latents);
-      LatentScale := FVaeConfig.ScalingFactor;
+      // diffusers blends the moments and samples the blended distribution.
+      TiledMoments := TiledVaeEncode(Net, VaeImage, TileCells, 0.25,
+        MomentsLayer);
+      Moments := TiledMoments;
+      Latents.ReSize(Moments.SizeX, Moments.SizeY, LatentChannels);
+      MaxCellPos := Latents.SizeX * Latents.SizeY - 1;
+      MaxChannelPos := LatentChannels - 1;
+      LatentPos := 0;
+      for CellPos := 0 to MaxCellPos do
+      begin
+        MomentPos := 2 * LatentChannels * CellPos;
+        for ChannelPos := 0 to MaxChannelPos do
+        begin
+          Latents.FData[LatentPos] :=
+            Moments.FData[MomentPos + ChannelPos] * LatentScale;
+          Inc(LatentPos);
+        end;
+      end;
     end
     else
     begin
-      // The mean split, before the scaling_factor layer.
-      Mean := Net.Layers[Net.GetLastLayerIdx() - 1];
-      Mean.ForceOutputOnRAM();
-      Latents.ReSize(Mean.Output);
-      Latents.Copy(Mean.Output);
-      LatentScale := 1;
+      Net.Compute(VaeImage);
+      if ApplyScalingFactor then Net.GetOutput(Latents)
+      else
+      begin
+        // The mean split, before the scaling_factor layer.
+        Mean := Net.Layers[Net.GetLastLayerIdx() - 1];
+        Mean.ForceOutputOnRAM();
+        Latents.ReSize(Mean.Output);
+        Latents.Copy(Mean.Output);
+      end;
+      Moments := MomentsLayer.Output;
+      if Assigned(SampleNoise) then MomentsLayer.ForceOutputOnRAM();
     end;
     if Assigned(SampleNoise) then
     begin
@@ -103143,23 +103253,16 @@ begin
         ImportError('TStableDiffusionPipeline.EncodeVaeImage: sample noise ' +
           'of ' + IntToStr(SampleNoise.Size) + ' values for ' +
           IntToStr(Latents.Size) + ' latents.');
-      // BuildVaeEncoder ends quant_conv (mean | logvar), mean split, scale.
-      Moments := Net.Layers[Net.GetLastLayerIdx() - 2];
-      Moments.ForceOutputOnRAM();
-      LatentChannels := Latents.Depth;
-      if Moments.Output.Depth <> 2 * LatentChannels then
-        ImportError('TStableDiffusionPipeline.EncodeVaeImage: the VAE ' +
-          'encoder does not end in quant_conv, mean split and scale.');
       MaxCellPos := Latents.SizeX * Latents.SizeY - 1;
       MaxChannelPos := LatentChannels - 1;
       LatentPos := 0;
       for CellPos := 0 to MaxCellPos do
       begin
-        LogVarPos := 2 * LatentChannels * CellPos + LatentChannels;
+        MomentPos := 2 * LatentChannels * CellPos + LatentChannels;
         for ChannelPos := 0 to MaxChannelPos do
         begin
           // DiagonalGaussianDistribution: std = exp(0.5 * clamp(logvar, -30, 20)).
-          LogVar := Moments.Output.FData[LogVarPos + ChannelPos];
+          LogVar := Moments.FData[MomentPos + ChannelPos];
           if LogVar < -30 then LogVar := -30
           else if LogVar > 20 then LogVar := 20;
           StdScale := LatentScale * Exp(0.5 * LogVar);
@@ -103170,8 +103273,23 @@ begin
       end;
     end;
   finally
+    TiledMoments.Free;
     ReleaseComponent(Net);
   end;
+end;
+
+function TStableDiffusionPipeline.VaeTileCellsFor(GridX,
+  GridY: integer): integer;
+begin
+  if (FVaeTileSize < 0) or (FVaeTileSize mod VaeScaleFactor <> 0) then
+    ImportError('TStableDiffusionPipeline: VaeTileSize ' +
+      IntToStr(FVaeTileSize) + ' must be 0 or a positive multiple of ' +
+      IntToStr(VaeScaleFactor) + '.');
+  Result := FVaeTileSize div VaeScaleFactor;
+  // One tile covering the whole grid is the plain pass (diffusers tiles only
+  // a side above the tile); else the square tile fits the shorter side.
+  if (Result >= GridX) and (Result >= GridY) then Result := 0
+  else Result := Min(Result, Min(GridX, GridY));
 end;
 
 function TStableDiffusionPipeline.GetVaeScaleFactor(): integer;
@@ -104964,17 +105082,7 @@ var
   GridX, GridY, TileCells: integer;
 begin
   LatentGridFor(Width, Height, GridX, GridY);
-  if (FVaeTileSize < 0) or (FVaeTileSize mod VaeScaleFactor <> 0) then
-    ImportError('TStableDiffusionPipeline: VaeTileSize ' +
-      IntToStr(FVaeTileSize) + ' must be 0 or a positive multiple of ' +
-      IntToStr(VaeScaleFactor) + '.');
-  TileCells := 0;
-  if FVaeTileSize > 0 then
-  begin
-    TileCells := Min(FVaeTileSize div VaeScaleFactor, Min(GridX, GridY));
-    // One tile covering the whole grid is the plain decode.
-    if (TileCells >= GridX) and (TileCells >= GridY) then TileCells := 0;
-  end;
+  TileCells := VaeTileCellsFor(GridX, GridY);
   ClearPhaseStats([sdphLoadVae, sdphDecode]);
   if TileCells > 0 then Net := AcquireVaeDecoder(TileCells, TileCells)
   else Net := AcquireVaeDecoder(GridX, GridY);

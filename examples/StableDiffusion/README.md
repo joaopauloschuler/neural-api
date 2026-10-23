@@ -964,8 +964,17 @@ whole canvas once.
   (diffusers `circular_padding`), for 360-degree panoramas whose two ends
   meet.
 * `--vae-tile N` decodes the canvas in overlapping N x N tiles (diffusers
-  `enable_vae_tiling`, overlap 0.25, `TiledVaeDecode`), so the VAE memory is
-  that of one tile; without it the canvas is decoded at once.
+  `enable_vae_tiling`, overlap 0.25, `TiledVaeDecode`), and the image-to-image
+  `--init-image` is encoded the same way (`TiledVaeEncode`, the encoder built
+  at the tile size, the tiles blended in latent space), so the VAE memory is
+  that of one tile; without it the canvas is decoded and encoded at once.
+  Only an image wider or taller than N is tiled. As in diffusers, the
+  encoder's moments (mean and log-variance) are blended and the latent is
+  sampled once from the blended result; unlike diffusers, the last tile of a
+  row or column is moved back inside the image rather than encoded smaller,
+  and the seam ramp is (i + 1) / (overlap + 1) rather than i / overlap. A
+  tiled pass is an approximation of the whole-image pass (each tile has its
+  own GroupNorm statistics and mid-block attention).
 * `--init-image` runs image-to-image over the windows (the image is resized to
   the canvas). `--ip-adapter`, `--pag-scale`, `--sag-scale`, `--freeu`,
   `--lora` and every sampler combine with it. `--edit-prompt`,
@@ -1021,8 +1030,9 @@ recipe (as in A1111's Tiled Diffusion extension):
    overrides it; diffusers' panorama default of 64 pixels would make 625
    windows of 512x512 on a 2048x2048 canvas), so the UNet repaints the detail
    at the size it was trained on and the windows agree on the seams;
-3. the canvas is decoded with `TiledVaeDecode` in window-size tiles
-   (`--vae-tile` overrides it).
+3. the upscaled image is encoded with `TiledVaeEncode` and the result
+   decoded with `TiledVaeDecode`, both in window-size tiles (`--vae-tile`
+   overrides it), so neither VAE pass bounds the canvas size.
 
 `--controlnet DIR` with a tile ControlNet such as
 `lllyasviel/control_v11f1e_sd15_tile` (a normal diffusers ControlNet folder,
@@ -1191,12 +1201,12 @@ StableDiffusion [--model DIR] [options]
                     than a window side (default 64 = diffusers' 8 latent cells)
   --panorama-wrap   wrap the windows past the right edge to the left edge (360-degree
                     panorama, diffusers circular_padding)
-  --vae-tile N      VAE-decode images larger than N pixels in overlapping N x N tiles
-                    (diffusers enable_vae_tiling; default 0 = one decode)
+  --vae-tile N      VAE-decode and -encode images larger than N pixels in overlapping
+                    N x N tiles (diffusers enable_vae_tiling; default 0 = one pass)
   --tile-upscale N  upscale --init-image N times (PIL bicubic), then image-to-image
                     over --width x --height windows every half window (--panorama-stride)
-                    at --strength (default 0.35), VAE-decoded in window-size tiles
-                    (--vae-tile)
+                    at --strength (default 0.35), VAE-encoded and -decoded in
+                    window-size tiles (--vae-tile)
   --controlnet DIR  a diffusers ControlNet folder; under --tile-upscale (e.g.
                     lllyasviel/control_v11f1e_sd15_tile) its hint is the upscaled image,
                     each window seeing its own crop; else give --control-image
@@ -1267,8 +1277,10 @@ Stages of image 2 (wall time):
   pipeline lay out one chunk; lpw puts a single `<|endoftext|>` at the end of
   each chunk instead, so its pad rows differ there.
 * `--panorama` and `--vae-tile` are pico-tested against the plain pipeline
-  only (see the panorama section); the VAE encoder of image-to-image runs on
-  the whole canvas at once.
+  only (see the panorama section). On the untrained pico encoder a tiled
+  encode is only loosely close to the whole encode (about 0.24 x the largest
+  latent away from the seams on a periodic image); on a real checkpoint the
+  gap is unmeasured.
 * Every UNet pass recomputes the cross-attention K/V of the text states,
   which do not change across steps. This costs about 0.4% of a 512x512 SD 1.5
   pass, so the K/V are not cached.
