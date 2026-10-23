@@ -274,36 +274,17 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [ ] FastSAM real-time segment-anything importer (ultralytics FastSAM-s /
-      FastSAM-x = yolov8s-seg / yolov8x-seg, one class), built on the YOLOv8
-      importer as `"task": "segment"` / `model_type` `fastsam`.
-      - [X] Segment head in `BuildYolo`: per-stride `cv4` mask coefficients
-            appended to each head cell + the `Proto` branch (stride-4 map,
-            `GetYoloProtoLayer`); ultralytics key names; head widths derived
-            from the ultralytics rules so FastSAM-s / -x configs only need
-            widths/depths (`TestYoloSegConfigDefaults`).
-      - [X] `ComputeYoloMasks` / `DecodeYoloSegmentation` (ultralytics 8.0
-            `process_mask`, FastSAM's border-snap / full-box step
-            `FastSAMAdjustBoxes`), `FastSAMSelectByBox` / `FastSAMSelectByPoint`.
-      - [X] Pico fixture `tools/yolo_tiny_fixture.py --seg`: `TestYoloSegParity`
-            (head 8e-7, proto 4e-6, soft masks 1.4e-6, binary masks identical),
-            `TestFastSAMPromptSelection`, `TestYoloSegOpenCLParity`.
-      - [X] SPPF fix: torch pads its maxpool with -inf, `TNNetMaxPoolPortable`
-            with 0; `BuildYolo` now shifts the SPPF input by +0.5 and folds the
-            shift into cv2's bias (the detect fixture moved by 2e-3).
-      - [X] examples/FastSAM (segment everything, `--box`, `--point`, `--gpu`).
+- [ ] FastSAM follow-ups (ultralytics FastSAM-s / FastSAM-x on the YOLOv8-seg
+      importer: segment head, `ComputeYoloMasks` / `DecodeYoloSegmentation`
+      with retina masks and `MaxDetections`, box/point prompts and
+      examples/FastSAM are done; pico parity `TestYoloSegParity`,
+      `TestFastSAMPromptSelection`, `TestYoloSegOpenCLParity`):
       - [ ] Real-checkpoint run: FastSAM-s.pt / FastSAM-x.pt converted to
             safetensors on the user's box (config rows in
             examples/FastSAM/README.md); check masks against ultralytics.
-      - [X] Retina-mask path (`retina_masks=True`, FastSAM's CLI default):
-            `ComputeYoloMasks` / `DecodeYoloSegmentation` `RetinaMasks`
-            (8.0 `process_mask_native` at the net input size: upsample, then
-            crop in pixels; parity in `TestYoloSegParity`), default in
-            examples/FastSAM (`--no-retina`). Not done: the native path at the
-            ORIGINAL image size (unpad the prototype map, upsample to the image).
-      - [X] `max_det` cap: `MaxDetections` (default 300) on
-            `DecodeYoloDetections` / `DecodeYoloSegmentation`
-            (`TestYoloDetectionDecode`).
+      - [ ] Native retina-mask path at the ORIGINAL image size (unpad the
+            prototype map, upsample to the image); today's retina path works
+            at the net input size.
       - [ ] CLIP text prompt (`text_prompt`: crop each mask's box, CLIP
             image/text similarity, argmax).
 
@@ -387,46 +368,13 @@ rather than acted on.
       box (`--gpu`, also CPU) and compare the mask with the official
       `transformers` remote-code output before README calls it supported.
 
-- [ ] ViTMatte trimap-based image matting importer (Yao et al. 2023,
-      arXiv:2305.15272; transformers `VitMatteForImageMatting`, checkpoints
-      hustvl/vitmatte-small-composition-1k / -base-composition-1k). BiRefNet
-      gives a hard foreground mask and RVM targets video; ViTMatte turns an
-      RGB image plus a trimap (0 = background, 128 = unknown, 255 = foreground)
-      into a fine alpha matte (hair, fur, glass edges). Plan:
-  - [X] `BuildViTMatteFromSafeTensors[Ex]` + `TViTMatteConfig` (reads the
-        `backbone_config` sub-block). The VitDet backbone takes a 4-channel
-        input (RGB + trimap). REUSE the SAM ViTDet blocks behind
-        `BuildSAMVisionTower` (windowed + global decomposed-rel-pos attention)
-        instead of copying them. Add only what SAM does not have: the
-        residual bottleneck conv blocks at `residual_block_indices`, the
-        bicubic resize of the absolute position embedding from
-        `pretrain_image_size`, and rel-pos table interpolation for any input
-        size. The detail-capture head (ConvStream 3x3 stride-2 conv+BN+ReLU
-        stages, bilinear x2 fusion blocks, conv + sigmoid matting head) is
-        built from existing layers only.
-  - [X] `ViTMattePreprocess` (rescale 1/255, normalize mean/std 0.5, append
-        trimap/255, pad to a multiple of 32 as `VitMatteImageProcessor` does)
-        and a crop back to the input size afterwards.
-  - [X] Pico fixture (`tools/make_pico_vitmatte_fixture.py`, ~/x venv) and a
-        `TestViTMatteParity` logit test against transformers, plus OpenCL
-        parity on the same fixture.
-        Done: the SAM blocks are shared as `AddViTDetBlock`/`LoadViTDetBlock`
-        (rel-pos tables resized at load time), the net is built for one padded
-        size (`BuildViTMatteFromSafeTensors(..., ImageWidth, ImageHeight)`),
-        `ViTMatteEstimateAlpha` = preprocess + compute + crop. Pico 45x30 image
-        (padded 64x32): alpha max|diff| 1.8e-7, preprocess 5.9e-8, OpenCL
-        66/66 layers forced.
+- [ ] ViTMatte trimap-based image matting follow-ups (Yao et al. 2023,
+      arXiv:2305.15272; `BuildViTMatteFromSafeTensors[Ex]`, `ViTMatteEstimateAlpha`,
+      `TrimapFromMask` and examples/ImageMatting are done; pico parity
+      `TestViTMatteParity` plus OpenCL parity):
   - [ ] TNNetSAMVisionAttention's class comment says Backpropagate passes
         dL/dInput through the chain; it passes a zero gradient. Fix the comment
         or implement the backward.
-  - [X] examples/ImageMatting (`--image`, `--trimap FILE`, or `--auto-trimap`:
-        build the trimap from a BiRefNet mask by eroding and dilating it with
-        the existing `TNNetBoxFilter` layer + a threshold, band width `--unknown-band N`).
-        Writes the alpha PNG and an RGBA cut-out. Add a README.md, plus a row
-        in examples/README.md.
-        Done: the erode/dilate is `TrimapFromMask` (box mean of the mask over
-        the box mean of ones, so the image border does not erode), tested by
-        `TestTrimapFromMask`; pico smoke covers --trimap and --auto-trimap.
   - [ ] Real hustvl/vitmatte-small-composition-1k run on the GPU box (`--gpu`,
         also CPU) compared with the transformers output before README calls
         it supported.
@@ -825,10 +773,6 @@ rather than acted on.
             TestStableDiffusionSAG*: pico parity vs diffusers with reference
             numbers hardcoded from an ad hoc run; tools/make_pico_sd_pipeline_fixture.py
             has no SAG mode).
-- [X] GLIGEN box-grounded layout control for the SD 1.x pipeline
-      (`TStableDiffusionGLIGEN`, fusers in `BuildSDUNet(GLIGENReader)`,
-      examples/StableDiffusion `--gligen/--box/--gligen-beta`); pico parity vs
-      diffusers float64 (position_net, gated UNet, CFG + no-CFG pipeline).
 - [ ] GLIGEN on a real checkpoint (`masterful/gligen-1-4-generation-text-box`)
       on the user's GPU box: boxes land where asked, timing with the fusers on
       vs after the gates close.
@@ -2243,7 +2187,7 @@ rather than acted on.
 
 Forward pass only; device backward is limited to `TNNetFullConnect`,
 `TNNetPixelShuffle` and `TNNetBicubicUpsample` (convolution: see "Convolution
-training on OpenCL"). About 69 of the 529 `TNNet*` classes in `neuralnetwork.pas` (2026-10-22)
+training on OpenCL"). About 69 of the 528 `TNNet*` classes in `neuralnetwork.pas` (2026-10-22)
 declare a `ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
@@ -2369,10 +2313,9 @@ dev box proves parity; throughput numbers have to come from the GPU box.
           to RAM. Route: give `TNNetFusedSDPA` a per-query-head sink
           option (one neuron of QHeads weights, FStruct flag, the CPU prefill
           / cached-token / chunked-row paths and the backward), pass
-          `SinkLogits` to `TNNetFusedSDPACL.Compute` / `ComputeInt8` /
-          `ComputeFlash` / `ComputeFlashInt8` (the kernels already take it,
-          `cai_sdpa_flash_int8` included; only `ComputeFlashPacked` passes it
-          today), then build gpt-oss through `AddGQAAttentionFromSources`.
+          `SinkLogits` to `TNNetFusedSDPACL.ComputeStep` (the kernels already
+          take it, `cai_sdpa_flash_int8` included; only `ComputeFlashPacked`
+          passes it today), then build gpt-oss through `AddGQAAttentionFromSources`.
           Parity: the pico oracle, the streamed decode, and
           `FusedSDPA*OpenCLParity`-style split / int8 cases with sinks.
           A single-head alternative now exists: the resident cached step on
