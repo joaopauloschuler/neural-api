@@ -17958,9 +17958,9 @@ type
   /// TWO-DIMENSIONAL Fourier Neural Operator (FNO) SPECTRAL CONVOLUTION layer:
   /// the natural 2-D extension of TNNetSpectralConv1D. Over a (SizeX, SizeY,
   /// InDepth) image it performs, per channel:
-  ///   1. a 2-D real FFT (FFT along X for every row, then along Y for every
-  ///      column -- both use the shared TFFTPlan, so any SizeX/SizeY, NOT a
-  ///      hand-rolled second FFT);
+  ///   1. a 2-D real FFT: a real FFT along X for every row (TRealFFTPlan),
+  ///      then a complex FFT along Y (TFFTPlan) for the FModesX kept X bins
+  ///      only, so any SizeX/SizeY;
   ///   2. a spectral LOW-PASS truncation to the lowest FModesX x FModesY 2-D
   ///      frequency modes (high modes are zeroed, never learned -- exactly what
   ///      makes the operator resolution-invariant: the SAME learned weights apply
@@ -17969,7 +17969,8 @@ type
   ///      weight R[mx,my] (an InDepth x OutDepth complex matmul mixing real/imag
   ///      via the 2x2 complex-multiply block);
   ///   4. an inverse 2-D FFT (IFFT along Y then along X) back to the (SizeX,SizeY)
-  ///      domain; the real part is the output.
+  ///      domain; the real part is the output, taken as the real inverse FFT
+  ///      along X of the spectrum's Hermitian part.
   ///
   /// Weight layout: a single weight neuron holding
   ///   2 * FModesX * FModesY * InDepth * OutDepth reals (real then imag for each
@@ -17990,13 +17991,13 @@ type
     FModesY: integer;       // number of kept low-frequency modes along Y
     FSizeX: integer;        // input SizeX, any size >= 1
     FSizeY: integer;        // input SizeY, any size >= 1
-    FPlanX, FPlanY: TFFTPlan; // per-axis FFT plans, built in SetPrevLayer
+    FRealPlanX: TRealFFTPlan; // X-axis real FFT plan, built in SetPrevLayer
+    FPlanY: TFFTPlan;         // Y-axis complex FFT plan, built in SetPrevLayer
     FInDepth: integer;      // input Depth
-    // Scratch: forward 2-D spectrum of the input, [ci][x][y].
+    // Scratch: the FModesX kept X bins of the input's 2-D spectrum, [ci][kx][y].
     FXre, FXim: array of TSpectralConv2DMatrix;
-    FSreBuf, FSimBuf: TSpectralConv2DMatrix;     // ComputeCPU spectrum [FSizeX][FSizeY]
-    FGreBuf, FGimBuf: TSpectralConv2DMatrix;     // BackpropagateCPU FFT scratch [FSizeX][FSizeY]
-    FdXreBuf, FdXimBuf: array of TSpectralConv2DMatrix; // BackpropagateCPU input-spectrum grad [FInDepth][FModesX][FModesY]
+    FSreBuf, FSimBuf: TSpectralConv2DMatrix;     // ComputeCPU spectrum [FModesX][FSizeY]
+    FGreBuf, FGimBuf: TSpectralConv2DMatrix;     // BackpropagateCPU FFT scratch [FModesX][FSizeY]
     // AVX-contiguous mirrors of the spectral weights, rebuilt from the strided
     // interleaved W.FData (where the ci axis has stride FOutDepth*2 -- NOT
     // contiguous). Layout: index ((co*FModesX + mx)*FModesY + my)*FInDepth + ci
@@ -18007,18 +18008,26 @@ type
     FxrPlane, FximPlane: array of TNeuralFloat;
     // BackpropagateCPU contiguous input-spectrum gradient, FxrPlane's layout.
     FdXrePlane, FdXimPlane: array of TNeuralFloat;
-    // Persistent FFT2D X-axis scratch (length FSizeX). The Y axis needs none:
-    // the [x][y] layout makes Re[ix] the contiguous Y row, so FFTPlanExecute
-    // runs in place on it.
-    FFftRowRe, FFftRowIm: array of Double;
+    // X-axis scratch: one real grid row (FSizeX) and its bins (Max(FModesX,
+    // FSizeX div 2 + 1)). The Y axis needs none: the [kx][y] layout makes Re[kx]
+    // the contiguous Y row, so FFTPlanExecute runs in place on it.
+    FRealRow: array of Double;
+    FBinRe, FBinIm: array of Double;
     {$IFDEF OpenCL}
     FSpectralConvCL: TNNetSpectralConv2DCL;
     {$ENDIF}
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(mx, my, ci, co: integer): integer;
-    // 2-D FFT helpers on a [x][y] grid (in-place); one TFFTPlan per axis.
-    procedure FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
+    // Re/Im[kx][ky] := 2-D DFT of channel Channel of the real (FSizeX, FSizeY,
+    // Depth) grid Src, for kx < FModesX and every ky.
+    procedure RealToKeptSpectrum(Src: TNNetVolume; Channel, Depth: integer;
+      var Re, Im: TSpectralConv2DMatrix);
+    { Channel of Dst (FSizeX, FSizeY, Depth) := Scale * Re(inverse 2-D DFT) of the
+      spectrum Re/Im[kx][ky] (kx < FModesX, zero above), added when Accumulate.
+      Overwrites Re/Im. }
+    procedure KeptSpectrumToReal(var Re, Im: TSpectralConv2DMatrix; Dst: TNNetVolume;
+      Channel, Depth: integer; Scale: Double; Accumulate: boolean);
     procedure RebuildWeightPlanes();
     procedure FreeBackpropScratch();
     procedure SizeBackpropScratch();
@@ -99330,18 +99339,14 @@ procedure TNNetSpectralConv2D.FreeBackpropScratch();
 begin
   SetLength(FGreBuf, 0);
   SetLength(FGimBuf, 0);
-  SetLength(FdXreBuf, 0);
-  SetLength(FdXimBuf, 0);
   SetLength(FdXrePlane, 0);
   SetLength(FdXimPlane, 0);
 end;
 
 procedure TNNetSpectralConv2D.SizeBackpropScratch();
 begin
-  SetLength(FGreBuf, FSizeX, FSizeY);
-  SetLength(FGimBuf, FSizeX, FSizeY);
-  SetLength(FdXreBuf, FInDepth, FModesX, FModesY);
-  SetLength(FdXimBuf, FInDepth, FModesX, FModesY);
+  SetLength(FGreBuf, FModesX, FSizeY);
+  SetLength(FGimBuf, FModesX, FSizeY);
   SetLength(FdXrePlane, FModesX * FModesY * FInDepth);
   SetLength(FdXimPlane, FModesX * FModesY * FInDepth);
 end;
@@ -99373,36 +99378,71 @@ begin
   Result := (((mx * FModesY + my) * FInDepth + ci) * FOutDepth + co) * 2;
 end;
 
-// In-place 2-D FFT on a [x][y] grid: FFT along X (each row of fixed y) then along
-// Y (each column of fixed x). Inverse reverses nothing structurally (the FFT is
-// separable); FFTPlanExecute's Inverse flag already applies the 1/N per axis, so a
-// full inverse 2-D FFT divides by FSizeX*FSizeY overall.
-procedure TNNetSpectralConv2D.FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: boolean);
+// Real FFT along X per grid row, keeping the FModesX bins that the mode block
+// uses (bins above SizeX div 2 come from conjugate symmetry), then a complex
+// FFT along Y for each kept bin only.
+procedure TNNetSpectralConv2D.RealToKeptSpectrum(Src: TNNetVolume; Channel, Depth: integer;
+  var Re, Im: TSpectralConv2DMatrix);
 var
-  ix, iy: integer;
-  SizeXM1, SizeYM1: integer;
+  ix, iy, kx, MaxRowPos, MaxColPos, MaxBinPos, pos: integer;
 begin
-  SizeXM1 := FSizeX - 1;
-  SizeYM1 := FSizeY - 1;
-  // FFT along X for each y: the X axis is the outer index, so a gather into the
-  // persistent row scratch is required.
-  for iy := 0 to SizeYM1 do
+  MaxRowPos := FSizeY - 1;
+  MaxColPos := FSizeX - 1;
+  MaxBinPos := FModesX - 1;
+  pos := Channel;                  // #12: carries (iy*FSizeX + ix)*Depth + Channel
+  for iy := 0 to MaxRowPos do
   begin
-    for ix := 0 to SizeXM1 do
+    for ix := 0 to MaxColPos do
     begin
-      FFftRowRe[ix] := Re[ix][iy];
-      FFftRowIm[ix] := Im[ix][iy];
+      FRealRow[ix] := Src.FData[pos];
+      Inc(pos, Depth);
     end;
-    FFTPlanExecute(FPlanX, FFftRowRe, FFftRowIm, Inverse);
-    for ix := 0 to SizeXM1 do
+    RealFFTForwardBins(FRealPlanX, FRealRow, FBinRe, FBinIm, FModesX);
+    for kx := 0 to MaxBinPos do
     begin
-      Re[ix][iy] := FFftRowRe[ix];
-      Im[ix][iy] := FFftRowIm[ix];
+      Re[kx][iy] := FBinRe[kx];
+      Im[kx][iy] := FBinIm[kx];
     end;
   end;
-  // FFT along Y for each x: Re[ix]/Im[ix] already ARE the contiguous Y rows.
-  for ix := 0 to SizeXM1 do
-    FFTPlanExecute(FPlanY, Re[ix], Im[ix], Inverse);
+  for kx := 0 to MaxBinPos do
+    FFTPlanExecute(FPlanY, Re[kx], Im[kx], false);
+end;
+
+// Inverse Y FFT of each kept X bin, then per grid row the real inverse X FFT of
+// the bins' Hermitian part, which is Re of the full inverse. Both inverses
+// divide by their length, so the 2-D inverse carries 1/(FSizeX*FSizeY).
+procedure TNNetSpectralConv2D.KeptSpectrumToReal(var Re, Im: TSpectralConv2DMatrix;
+  Dst: TNNetVolume; Channel, Depth: integer; Scale: Double; Accumulate: boolean);
+var
+  ix, iy, kx, MaxRowPos, MaxColPos, MaxBinPos, pos: integer;
+begin
+  MaxRowPos := FSizeY - 1;
+  MaxColPos := FSizeX - 1;
+  MaxBinPos := FModesX - 1;
+  for kx := 0 to MaxBinPos do
+    FFTPlanExecute(FPlanY, Re[kx], Im[kx], true);
+  pos := Channel;                  // #12: carries (iy*FSizeX + ix)*Depth + Channel
+  for iy := 0 to MaxRowPos do
+  begin
+    for kx := 0 to MaxBinPos do
+    begin
+      FBinRe[kx] := Re[kx][iy];
+      FBinIm[kx] := Im[kx][iy];
+    end;
+    RealFFTInverseRealPart(FRealPlanX, FBinRe, FBinIm, FModesX, FRealRow);
+    if Accumulate then
+      for ix := 0 to MaxColPos do
+      begin
+        Dst.FData[pos] := Dst.FData[pos] + Scale * FRealRow[ix];
+        Inc(pos, Depth);
+      end
+    else
+      for ix := 0 to MaxColPos do
+      begin
+        Dst.FData[pos] := Scale * FRealRow[ix];
+        Inc(pos, Depth);
+      end;
+  end;
 end;
 
 procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -99434,19 +99474,20 @@ begin
   FNeurons[0].FBiasWeight := 0;
   BuildArrNeurons();
 
-  SetLength(FXre, FInDepth, FSizeX, FSizeY);
-  SetLength(FXim, FInDepth, FSizeX, FSizeY);
+  SetLength(FXre, FInDepth, FModesX, FSizeY);
+  SetLength(FXim, FInDepth, FModesX, FSizeY);
   // FSreBuf/FSimBuf are forward Compute scratch; the rest is backprop-only.
-  SetLength(FSreBuf, FSizeX, FSizeY);
-  SetLength(FSimBuf, FSizeX, FSizeY);
+  SetLength(FSreBuf, FModesX, FSizeY);
+  SetLength(FSimBuf, FModesX, FSizeY);
   // AVX-contiguous weight + input-spectrum planes (forward path).
   SetLength(FWrPlane, FOutDepth * FModesX * FModesY * FInDepth);
   SetLength(FWiPlane, FOutDepth * FModesX * FModesY * FInDepth);
   SetLength(FxrPlane, FModesX * FModesY * FInDepth);
   SetLength(FximPlane, FModesX * FModesY * FInDepth);
-  SetLength(FFftRowRe, FSizeX);
-  SetLength(FFftRowIm, FSizeX);
-  FFTPlanInit(FPlanX, FSizeX);
+  SetLength(FRealRow, FSizeX);
+  SetLength(FBinRe, Max(FModesX, FSizeX div 2 + 1));
+  SetLength(FBinIm, Max(FModesX, FSizeX div 2 + 1));
+  RealFFTPlanInit(FRealPlanX, FSizeX);
   FFTPlanInit(FPlanY, FSizeY);
   if FIsTrainable then SizeBackpropScratch();
 
@@ -99594,17 +99635,15 @@ end;
 
 procedure TNNetSpectralConv2D.ComputeCPU();
 var
-  ci, co, mx, my, ix, iy: integer;
-  InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
-  wBaseIdx, xBaseIdx, pos, InRowStride, OutRowStride, RowBytes, TailBytes: integer;
+  ci, co, mx, my, ix: integer;
+  InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
+  wBaseIdx, xBaseIdx, TailBytes: integer;
   PrevOut: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
-  SizeXM1 := FSizeX - 1;
-  SizeYM1 := FSizeY - 1;
   ModesXM1 := FModesX - 1;
   ModesYM1 := FModesY - 1;
   // Every sanctioned weight writer (SetPrevLayer, UpdateWeights, CopyWeights,
@@ -99615,22 +99654,9 @@ begin
   // additionally hand-edited (a finite-difference perturbation writes
   // Weights.FData straight), so it keeps refreshing per forward.
   if FIsTrainable then RebuildWeightPlanes();
-  // 1. 2-D FFT of every input channel.
-  InRowStride := FSizeX * FInDepth;       // #5: one grid row of the input
+  // 1. 2-D FFT of every input channel, kept X bins only.
   for ci := 0 to InDepthM1 do
-  begin
-    for ix := 0 to SizeXM1 do
-    begin
-      pos := ix * FInDepth + ci;          // #12: carries ((FSizeX*iy)+ix)*FInDepth+ci
-      for iy := 0 to SizeYM1 do
-      begin
-        FXre[ci][ix][iy] := PrevOut.FData[pos];
-        FXim[ci][ix][iy] := 0;
-        Inc(pos, InRowStride);
-      end;
-    end;
-    FFT2D(FXre[ci], FXim[ci], false);
-  end;
+    RealToKeptSpectrum(PrevOut, ci, FInDepth, FXre[ci], FXim[ci]);
   // Pack the kept-mode input spectra into contiguous (mx,my,ci) Single planes so
   // the InDepth contraction below is a vectorizable DotProduct.
   for mx := 0 to ModesXM1 do
@@ -99647,24 +99673,17 @@ begin
   // The InDepth complex contraction is the 4-multiply complex GEMM, each real
   // reduction an AVX DotProduct over the contiguous ci axis:
   //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
-  OutRowStride := FSizeX * FOutDepth;     // #5: one grid row of the output
-  RowBytes := FSizeY * csDoubleSize;      // #5: one FSreBuf row
   TailBytes := (FSizeY - FModesY) * csDoubleSize;
   for co := 0 to OutDepthM1 do
   begin
-    // Only the truncated part of the spectrum stays zero: the kept mode block
-    // [0..ModesX-1][0..ModesY-1] is overwritten below (#13: FillChar per row).
+    // Only the truncated Y tail of each kept X bin stays zero: the kept mode
+    // block [0..ModesX-1][0..ModesY-1] is overwritten below (#13: FillChar per row).
     if TailBytes > 0 then                 // #20: loop-invariant, tested once
       for ix := 0 to ModesXM1 do
       begin
         FillChar(FSreBuf[ix][FModesY], TailBytes, 0);
         FillChar(FSimBuf[ix][FModesY], TailBytes, 0);
       end;
-    for ix := FModesX to SizeXM1 do
-    begin
-      FillChar(FSreBuf[ix][0], RowBytes, 0);
-      FillChar(FSimBuf[ix][0], RowBytes, 0);
-    end;
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
       begin
@@ -99677,16 +99696,8 @@ begin
           TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
           TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
       end;
-    FFT2D(FSreBuf, FSimBuf, true);  // inverse 2-D FFT (includes 1/(FSizeX*FSizeY))
-    for ix := 0 to SizeXM1 do
-    begin
-      pos := ix * FOutDepth + co;         // #12: carries the output grid address
-      for iy := 0 to SizeYM1 do
-      begin
-        FOutput.FData[pos] := FSreBuf[ix][iy];  // real part
-        Inc(pos, OutRowStride);
-      end;
-    end;
+    // Real part of the inverse 2-D FFT (includes 1/(FSizeX*FSizeY)).
+    KeptSpectrumToReal(FSreBuf, FSimBuf, FOutput, co, FOutDepth, 1.0, false);
   end;
 end;
 
@@ -99709,21 +99720,19 @@ end;
 // Exact real adjoint of 2-D FFT -> complex matmul -> real 2-D IFFT.
 procedure TNNetSpectralConv2D.BackpropagateCPU();
 var
-  ci, co, mx, my, ix, iy, n: integer;
-  InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
+  ci, co, mx, my, ix: integer;
+  InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
   WDelta, LocalPrevError: TNNetVolume;
-  invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
+  invL, gyr, gyi, lrGyr, lrGyi: Double;
   xr, xi, wr, wi: TNeuralFloat;
-  b, L, wBaseIdx, xBaseIdx, wPos, xPos, planeSize, OutStride, pos: integer;
-  InRowStride, OutRowStride, RowBytes, TailBytes: integer;
+  b, L, wBaseIdx, xBaseIdx, wPos, xPos, planeSize, OutStride: integer;
+  TailBytes: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
   L := FSizeX * FSizeY;
   invL := 1.0 / L;
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
-  SizeXM1 := FSizeX - 1;
-  SizeYM1 := FSizeY - 1;
   ModesXM1 := FModesX - 1;
   ModesYM1 := FModesY - 1;
 
@@ -99732,25 +99741,12 @@ begin
   planeSize := FModesX * FModesY * FInDepth;
   FillChar(FdXrePlane[0], planeSize * csNeuralFloatSize, 0);   // #13
   FillChar(FdXimPlane[0], planeSize * csNeuralFloatSize, 0);
-  InRowStride := FSizeX * FInDepth;       // #5: one grid row of the input
-  OutRowStride := FSizeX * FOutDepth;     // #5: one grid row of the output
-  RowBytes := FSizeY * csDoubleSize;      // #5: one FGreBuf row
   TailBytes := (FSizeY - FModesY) * csDoubleSize;
   OutStride := FOutDepth * 2;             // #12: ci step in the interleaved layout
   for co := 0 to OutDepthM1 do
   begin
     // dL/dYhat[co][mx,my] = (1/L) * FFT2D(g[co])[mx,my].
-    for ix := 0 to SizeXM1 do
-    begin
-      pos := ix * FOutDepth + co;         // #12: carries the output grid address
-      for iy := 0 to SizeYM1 do
-      begin
-        FGreBuf[ix][iy] := FOutputError.FData[pos];
-        FGimBuf[ix][iy] := 0;
-        Inc(pos, OutRowStride);
-      end;
-    end;
-    FFT2D(FGreBuf, FGimBuf, false);
+    RealToKeptSpectrum(FOutputError, co, FOutDepth, FGreBuf, FGimBuf);
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
       begin
@@ -99791,20 +99787,6 @@ begin
       end;
   end;
 
-  // Scatter the contiguous (mx,my,ci) input-spectrum gradient back to the
-  // [ci][mx][my] scratch the per-channel IFFT2D below consumes.
-  for ci := 0 to InDepthM1 do
-  begin
-    xBaseIdx := ci;         // #12: carries (mx*FModesY+my)*FInDepth + ci
-    for mx := 0 to ModesXM1 do
-      for my := 0 to ModesYM1 do
-      begin
-        FdXreBuf[ci][mx][my] := FdXrePlane[xBaseIdx];
-        FdXimBuf[ci][mx][my] := FdXimPlane[xBaseIdx];
-        Inc(xBaseIdx, FInDepth);
-      end;
-  end;
-
   // Propagate the input-spectrum gradient back through the input 2-D FFT:
   //   dL/dx[ci] = L * Re( IFFT2D(dXhat[ci]) ).
   if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
@@ -99820,28 +99802,17 @@ begin
           FillChar(FGreBuf[ix][FModesY], TailBytes, 0);
           FillChar(FGimBuf[ix][FModesY], TailBytes, 0);
         end;
-      for ix := FModesX to SizeXM1 do
-      begin
-        FillChar(FGreBuf[ix][0], RowBytes, 0);
-        FillChar(FGimBuf[ix][0], RowBytes, 0);
-      end;
+      // Gather channel ci of the contiguous (mx,my,ci) gradient planes.
+      xBaseIdx := ci;         // #12: carries (mx*FModesY+my)*FInDepth + ci
       for mx := 0 to ModesXM1 do
         for my := 0 to ModesYM1 do
         begin
-          FGreBuf[mx][my] := FdXreBuf[ci][mx][my];
-          FGimBuf[mx][my] := FdXimBuf[ci][mx][my];
+          FGreBuf[mx][my] := FdXrePlane[xBaseIdx];
+          FGimBuf[mx][my] := FdXimPlane[xBaseIdx];
+          Inc(xBaseIdx, FInDepth);
         end;
-      FFT2D(FGreBuf, FGimBuf, true);  // IFFT2D (includes 1/L)
-      for ix := 0 to SizeXM1 do
-      begin
-        pos := ix * FInDepth + ci;      // #12/#4: one address, built once
-        for iy := 0 to SizeYM1 do
-        begin
-          contrib := L * FGreBuf[ix][iy];  // undo the IFFT's 1/L -> real adjoint
-          LocalPrevError.FData[pos] := LocalPrevError.FData[pos] + contrib;
-          Inc(pos, InRowStride);
-        end;
-      end;
+      // L * Re(IFFT2D) undoes the inverse's 1/L: the real adjoint.
+      KeptSpectrumToReal(FGreBuf, FGimBuf, LocalPrevError, ci, FInDepth, L, true);
     end;
   end;
 

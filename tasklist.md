@@ -2587,9 +2587,13 @@ cannot pay for its own transfer.
         the product and inverse on the half spectrum (kernel spectrum too).
       - `TNNetSpectralConv1D`: Modes may exceed SeqLen div 2 + 1, so the bins
         above Nyquist would have to be rebuilt by conjugate symmetry.
-      - `TNNetSpectralConv2D` / `TNNetFourierMix`: the first axis is real, but
-        the second-axis pass needs every first-axis bin (Hermitian rebuild or a
-        half-spectrum 2-D layout as in rfft2).
+      - `TNNetFourierMix`: the first axis is real, but the second-axis pass
+        needs every first-axis bin (Hermitian rebuild or a half-spectrum 2-D
+        layout as in rfft2).
+      - [x] `TNNetSpectralConv2D`: real row FFT along X keeping the ModesX bins
+        (`RealFFTForwardBins` rebuilds those above Nyquist), Y FFT on the kept
+        bins only; inverse via `RealFFTInverseRealPart`. CPU A/B ~2.1-2.8x
+        forward, ~2.4x forward+backward (64x64x16 m12, 60x60x8 m16).
 - [ ] Decision for the user: inference-time release of the convolution im2col
       matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
       convolution keeps it after the forward in both memory modes (the FP32

@@ -344,6 +344,7 @@ type
     // TNNetSpectralConv2D 2-D Fourier Neural Operator spectral conv layer
     procedure TestSpectralConv2DGradientCheck;
     procedure TestSpectralConv2DGradientCheckNonPow2;
+    procedure TestSpectralConv2DGradientCheckAboveNyquist;
     // Non-power-of-two (and one radix-2) SpectralConv1D/2D forward vs a naive DFT.
     procedure TestSpectralConvNonPow2MatchesNaiveDFT;
     procedure TestSpectralConv2DShapeAndTruncation;
@@ -66564,13 +66565,14 @@ begin
   WriteLn('  DWT1D reconstruction-oracle max-abs-error: ', maxErr:0:10);
 end;
 
-procedure SpectralConv2DGradCheck(ATestCase: TTestCase; SizeX, SizeY: integer);
+procedure SpectralConv2DGradCheck(ATestCase: TTestCase; SizeX, SizeY: integer;
+  ModesX: integer = 2; ModesY: integer = 3);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
   SC: TNNetSpectralConv2D;
   epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
-  i, InDepth, OutDepth, ModesX, ModesY, InSize, OutSize, WCount: integer;
+  i, InDepth, OutDepth, InSize, OutSize, WCount: integer;
 
   function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
   var
@@ -66592,7 +66594,7 @@ begin
   // keep finite-difference truncation small -- tolerance is NOT loosened to mask
   // a bug. (Shared RNG; reseed to avoid tripping ordering-sensitive checks.)
   RandSeed := 424242;
-  InDepth := 2; OutDepth := 2; ModesX := 2; ModesY := 3;
+  InDepth := 2; OutDepth := 2;
   InSize := SizeX * SizeY * InDepth;
   OutSize := SizeX * SizeY * OutDepth;
   NN := TNNet.Create();
@@ -66678,6 +66680,15 @@ begin
   // on X with Bluestein on Y.
   SpectralConv2DGradCheck(Self, 6, 5);
   SpectralConv2DGradCheck(Self, 4, 3);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DGradientCheckAboveNyquist;
+begin
+  // ModesX > SizeX div 2 + 1: the kept X bins above Nyquist come from conjugate
+  // symmetry of the real row FFT; odd and even SizeX, and SizeX = 1.
+  SpectralConv2DGradCheck(Self, 5, 3, 5, 2);
+  SpectralConv2DGradCheck(Self, 4, 4, 4, 4);
+  SpectralConv2DGradCheck(Self, 1, 4, 1, 3);
 end;
 
 // Naive forward of TNNetSpectralConv1D/2D: per-(kx,ky) direct DFT of the input,
@@ -66781,6 +66792,15 @@ begin
     6, 5, 2, 2, 3, 2, 'SpectralConv2D 6x5');
   SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(3, 2, 3),
     8, 7, 2, 3, 2, 3, 'SpectralConv2D 8x7');
+  // ModesX above SizeX div 2 + 1 (rebuilt by conjugate symmetry), odd and even.
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(2, 5, 4),
+    6, 5, 2, 2, 5, 4, 'SpectralConv2D 6x5 ModesX 5');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(2, 7, 2),
+    7, 4, 3, 2, 7, 2, 'SpectralConv2D 7x4 all X modes');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(2, 8, 3),
+    8, 3, 2, 2, 8, 3, 'SpectralConv2D 8x3 all X modes');
+  SpectralConvNaiveParityCheck(Self, TNNetSpectralConv2D.Create(2, 1, 2),
+    1, 5, 2, 2, 1, 2, 'SpectralConv2D 1x5');
 end;
 
 procedure TTestNeuralNumerical.TestSpectralConv2DShapeAndTruncation;

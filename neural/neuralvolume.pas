@@ -1887,6 +1887,17 @@ type
     divided by N as FFTPlanExecute; Im of DC and Nyquist ignored. X may alias In. }
   procedure RealFFTInverse(var Plan: TRealFFTPlan; const InRe, InIm: array of Double;
     var X: array of Double);
+  { OutRe/OutIm[0..NumBins-1] := bins 0..NumBins-1 (1 <= NumBins <= N) of the forward
+    DFT of real X[0..N-1]; bins above N div 2 are rebuilt as conj(bin N-k). Out needs
+    Max(NumBins, N div 2 + 1) entries and may alias X; no allocation. }
+  procedure RealFFTForwardBins(var Plan: TRealFFTPlan; const X: array of Double;
+    var OutRe, OutIm: array of Double; NumBins: integer);
+  { X[0..N-1] := Re(inverse DFT) of the spectrum that is In[k] for k < NumBins
+    (1 <= NumBins <= N) and 0 above, divided by N as FFTPlanExecute. Overwrites
+    In[0..N div 2] with that spectrum's Hermitian part; In needs Max(NumBins,
+    N div 2 + 1) entries and must not alias X. No allocation. }
+  procedure RealFFTInverseRealPart(var Plan: TRealFFTPlan; var InRe, InIm: array of Double;
+    NumBins: integer; var X: array of Double);
 
   { NeuralBoxIoU returns the Intersection-over-Union of two axis-aligned boxes
     given in corner (x1,y1,x2,y2) format (x2>=x1, y2>=y1; pixel or any
@@ -5873,6 +5884,59 @@ begin
     Inc(SampleCnt, 2);
   end;
 end;
+
+procedure RealFFTForwardBins(var Plan: TRealFFTPlan; const X: array of Double;
+  var OutRe, OutIm: array of Double; NumBins: integer);
+var
+  BinCnt, MaxBinPos, MirrorBin: integer;
+begin
+  RealFFTForward(Plan, X, OutRe, OutIm);
+  // A real signal's spectrum is Hermitian: X_k = conj X_{N-k}.
+  MaxBinPos := NumBins - 1;
+  MirrorBin := Plan.N - (Plan.N div 2 + 1);
+  for BinCnt := Plan.N div 2 + 1 to MaxBinPos do
+  begin
+    OutRe[BinCnt] := OutRe[MirrorBin];
+    OutIm[BinCnt] := -OutIm[MirrorBin];
+    Dec(MirrorBin);
+  end;
+end;
+
+procedure RealFFTInverseRealPart(var Plan: TRealFFTPlan; var InRe, InIm: array of Double;
+  NumBins: integer; var X: array of Double);
+var
+  HalfN, FirstMirrorBin, MaxLoneBinPos, BinCnt, MirrorBin, ZeroCnt: integer;
+begin
+  HalfN := Plan.N div 2;
+  // Re(IDFT(S)) = IDFT(H) with H_k = (S_k + conj S_{N-k}) / 2, so only H_0..H_{N/2}
+  // is built. Bins of the half at or above NumBins are zero in S.
+  ZeroCnt := HalfN + 1 - NumBins;
+  if ZeroCnt > 0 then
+  begin
+    FillChar(InRe[NumBins], ZeroCnt * csDoubleSize, 0);
+    FillChar(InIm[NumBins], ZeroCnt * csDoubleSize, 0);
+  end;
+  // S_{N-k} is nonzero only when N-k < NumBins. Bin 0 is its own mirror and only
+  // its real part is read by RealFFTInverse, so it stays as it is.
+  FirstMirrorBin := Plan.N - NumBins + 1;
+  MaxLoneBinPos := Min(FirstMirrorBin - 1, HalfN);
+  for BinCnt := 1 to MaxLoneBinPos do
+  begin
+    InRe[BinCnt] := 0.5 * InRe[BinCnt];
+    InIm[BinCnt] := 0.5 * InIm[BinCnt];
+  end;
+  // N-k > N div 2 for every k < N/2, so the mirror is never a bin already
+  // rewritten; the even-N Nyquist bin is its own mirror and is read first.
+  MirrorBin := NumBins - 1;
+  for BinCnt := FirstMirrorBin to HalfN do
+  begin
+    InRe[BinCnt] := 0.5 * (InRe[BinCnt] + InRe[MirrorBin]);
+    InIm[BinCnt] := 0.5 * (InIm[BinCnt] - InIm[MirrorBin]);
+    Dec(MirrorBin);
+  end;
+  RealFFTInverse(Plan, InRe, InIm, X);
+end;
+
 
 function NeuralBoxIoU(AX1, AY1, AX2, AY2,
   BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
