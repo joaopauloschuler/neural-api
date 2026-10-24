@@ -24,7 +24,7 @@ uses
   TestNeuralSWA, TestNeuralFusedSDPA, TestNeuralABFun, TestNeuralReduction,
   TestNeuralBytePrediction, TestNeuralG2P, TestNeuralPlainOps,
   TestNeuralDecision, TestNeuralAnyJev, TestNeuralDecisionHeads,
-  TestNeuralGaussianSplat{$IFDEF OpenCL}, neuralopencl{$ENDIF};
+  TestNeuralGaussianSplat, TestNeuralMesh{$IFDEF OpenCL}, neuralopencl{$ENDIF};
 
 type
   TMyTestRunner = class(TTestRunner)

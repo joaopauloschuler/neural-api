@@ -36,8 +36,8 @@ type
   end;
   TNNetPLYElementArray = array of TNNetPLYElement;
 
-  // Parses the header on Create; ReadRow then returns rows in file order. A
-  // list property is read and dropped: its column holds the list length.
+  // Parses the header on Create; ReadRow then returns rows in file order. ReadRow
+  // drops list items (the column holds the length); ReadFlatRow keeps them.
   TNNetPLYReader = class
   private
     FStream: TStream;
@@ -67,14 +67,17 @@ type
     procedure SkipToElement(ElementIndex: integer);
     // Reads the next row of CurrentElement; Row needs one slot per property.
     procedure ReadRow(var Row: array of TNeuralFloat);
+    // Reads the next row in the WriteRow flat layout (a list is its length, then its
+    // items); grows Row when short and returns the slot count.
+    function ReadFlatRow(var Row: TNeuralFloatDynArr): integer;
     property Format: TNNetPLYFormat read FFormat;
     property Elements: TNNetPLYElementArray read FElements;
     property Comments: TStringList read FComments;
     property CurrentElement: integer read FCurrentElement;
   end;
 
-  // Declare elements and scalar properties, call WriteHeader, then WriteRow
-  // Count times per element in declaration order; Destroy flushes.
+  // Declare elements and properties, call WriteHeader, then WriteRow Count times
+  // per element in declaration order; Destroy flushes.
   TNNetPLYWriter = class
   private
     FStream: TStream;
@@ -100,7 +103,10 @@ type
     procedure AddComment(const Comment: string);
     procedure AddElement(const ElementName: string; Count: integer);
     procedure AddProperty(const PropertyName: string; ValueType: TNNetPLYValueType);
+    procedure AddListProperty(const PropertyName: string;
+      CountType, ValueType: TNNetPLYValueType);
     procedure WriteHeader;
+    // Row is flat: one slot per scalar; a list takes its length, then its items.
     procedure WriteRow(const Row: array of TNeuralFloat);
     property Elements: TNNetPLYElementArray read FElements;
   end;
@@ -458,6 +464,45 @@ begin
   SkipFinishedElements;
 end;
 
+function TNNetPLYReader.ReadFlatRow(var Row: TNeuralFloatDynArr): integer;
+var
+  PropertyPos, MaxPropertyPos, ListLength, MaxListPos, ListPos: integer;
+
+  procedure EnsureSlots(SlotCount: integer);
+  begin
+    if Length(Row) < SlotCount then SetLength(Row, 2 * SlotCount);
+  end;
+
+begin
+  if FCurrentElement >= Length(FElements) then
+    raise EReadError.Create('PLY: no rows left');
+  MaxPropertyPos := High(FElements[FCurrentElement].Properties);
+  Result := 0;
+  for PropertyPos := 0 to MaxPropertyPos do
+    with FElements[FCurrentElement].Properties[PropertyPos] do
+    begin
+      if IsList then
+      begin
+        ListLength := Round(ReadValue(ListCountType));
+        EnsureSlots(Result + 1 + ListLength);
+        Row[Result] := ListLength;
+        Inc(Result);
+        MaxListPos := ListLength - 1;
+        for ListPos := 0 to MaxListPos do
+          Row[Result + ListPos] := ReadValue(ValueType);
+        Inc(Result, ListLength);
+      end
+      else
+      begin
+        EnsureSlots(Result + 1);
+        Row[Result] := ReadValue(ValueType);
+        Inc(Result);
+      end;
+    end;
+  Inc(FRowsReadInElement);
+  SkipFinishedElements;
+end;
+
 { TNNetPLYWriter }
 
 constructor TNNetPLYWriter.Create(const FileName: string; pFormat: TNNetPLYFormat);
@@ -548,6 +593,17 @@ begin
   FElements[ElementPos].Properties[PropertyPos].ListCountType := plyUInt8;
 end;
 
+procedure TNNetPLYWriter.AddListProperty(const PropertyName: string;
+  CountType, ValueType: TNNetPLYValueType);
+var
+  PropertyPos: integer;
+begin
+  AddProperty(PropertyName, ValueType);
+  PropertyPos := High(FElements[High(FElements)].Properties);
+  FElements[High(FElements)].Properties[PropertyPos].IsList := true;
+  FElements[High(FElements)].Properties[PropertyPos].ListCountType := CountType;
+end;
+
 procedure TNNetPLYWriter.WriteHeader;
 var
   CommentPos, MaxCommentPos, ElementPos, MaxElementPos, PropertyPos, MaxPropertyPos: integer;
@@ -564,9 +620,12 @@ begin
       IntToStr(FElements[ElementPos].Count) + #10);
     MaxPropertyPos := High(FElements[ElementPos].Properties);
     for PropertyPos := 0 to MaxPropertyPos do
-      WriteText('property ' +
-        PLYValueTypeNames[FElements[ElementPos].Properties[PropertyPos].ValueType] +
-        ' ' + FElements[ElementPos].Properties[PropertyPos].Name + #10);
+      with FElements[ElementPos].Properties[PropertyPos] do
+        if IsList then
+          WriteText('property list ' + PLYValueTypeNames[ListCountType] + ' ' +
+            PLYValueTypeNames[ValueType] + ' ' + Name + #10)
+        else
+          WriteText('property ' + PLYValueTypeNames[ValueType] + ' ' + Name + #10);
   end;
   WriteText('end_header'#10);
   FHeaderWritten := true;
@@ -608,19 +667,38 @@ end;
 
 procedure TNNetPLYWriter.WriteRow(const Row: array of TNeuralFloat);
 var
-  PropertyPos, MaxPropertyPos: integer;
+  PropertyPos, MaxPropertyPos, SlotPos, ListLength, MaxListPos, ListPos: integer;
+
+  procedure WriteSlot(ValueType: TNNetPLYValueType);
+  begin
+    if SlotPos > High(Row) then
+      raise ERangeError.Create('PLY: row shorter than its properties and lists');
+    if (FFormat = plyAscii) and (SlotPos > 0) then WriteText(' ');
+    WriteValue(Row[SlotPos], ValueType);
+    Inc(SlotPos);
+  end;
+
 begin
   if not FHeaderWritten then raise EWriteError.Create('PLY: WriteHeader not called');
   if FCurrentElement >= Length(FElements) then
     raise EWriteError.Create('PLY: every declared row is already written');
   MaxPropertyPos := High(FElements[FCurrentElement].Properties);
-  if Length(Row) <= MaxPropertyPos then
-    raise ERangeError.Create('PLY: row shorter than the property count');
+  SlotPos := 0;
   for PropertyPos := 0 to MaxPropertyPos do
-  begin
-    if (FFormat = plyAscii) and (PropertyPos > 0) then WriteText(' ');
-    WriteValue(Row[PropertyPos], FElements[FCurrentElement].Properties[PropertyPos].ValueType);
-  end;
+    with FElements[FCurrentElement].Properties[PropertyPos] do
+    begin
+      if IsList then
+      begin
+        if SlotPos > High(Row) then
+          raise ERangeError.Create('PLY: row shorter than its properties and lists');
+        ListLength := Round(Row[SlotPos]);
+        WriteSlot(ListCountType);
+        MaxListPos := ListLength - 1;
+        for ListPos := 0 to MaxListPos do WriteSlot(ValueType);
+      end
+      else
+        WriteSlot(ValueType);
+    end;
   if FFormat = plyAscii then WriteText(#10);
   Inc(FRowsWrittenInElement);
   while (FCurrentElement < Length(FElements)) and

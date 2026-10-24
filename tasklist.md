@@ -1923,6 +1923,14 @@ rather than acted on.
       a NEW Python oracle script in tools/, so ask the user before writing it.
       examples/ImageTo3D/README.md documents the download, flags
       (--mc-resolution, --threshold, --no-remove-bg, --gpu) and RAM needs.
+      Landed (mesh building blocks): neural/neuralmesh.pas with
+      `TNNetTriangleMesh` (indexed vertices, optional per-vertex colours,
+      SaveToPLY / LoadFromPLY / SaveToOBJ) and `MarchingCubes` (TNNetVolume or
+      strided pointer overload, Bourke tables, per-slice edge caches so
+      vertices are shared); `TNNetPLYWriter.AddListProperty` +
+      `TNNetPLYReader.ReadFlatRow` for face lists; tests/TestNeuralMesh.pas
+      (sphere, single cube, empty, random closed field, PLY/OBJ). Still open:
+      the importer, the triplane query layer, vertex colouring and the example.
 - [ ] 3D Gaussian Splatting viewer follow-ups (arXiv:2308.04079). Landed:
       neural/neuralply.pas (`TNNetPLYReader` / `TNNetPLYWriter`),
       neural/neuralgaussiansplat.pas (`TGaussianSplatScene`,
