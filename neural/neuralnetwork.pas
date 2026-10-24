@@ -6365,6 +6365,17 @@ type
     function BufferBytes(): int64; override;
   end;
 
+  /// OpenCL forward helper for TNNetTriplaneSample: cai_triplane_sample, one
+  // work-item per output float. Source A is the triplane, B the points.
+  TNNetTriplaneSampleCL = class(TNNetTwoSourceCL)
+  public
+    constructor Create(NN: TNNet);
+    // ResultBuffer (Points, 3*Channels) := the concatenated plane samples.
+    procedure Sample(BufPlanes, BufPoints: cl_mem; PointCount, PlaneWidth,
+      PlaneHeight, Channels: integer; InvRadius: TNeuralFloat;
+      AlignCorners, BorderPad: boolean);
+  end;
+
   /// OpenCL forward helper for TNNetConvGRUCell: the two elementwise steps around
   // its gate convolutions (cai_conv_gru_reset_input, cai_conv_gru_blend). Coded by Claude (AI).
   TNNetConvGRUCellCL = class(TNNetKernelCL)
@@ -7085,6 +7096,55 @@ type
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property GridSource: TNNetLayer read FGridLayer;
+  end;
+
+  /// Triplane query (TripoSR TriplaneNeRFRenderer.query_triplane, "concat"):
+  // each point p = (x, y, z) in [-Radius, Radius]^3 is scaled by 1/Radius and
+  // sampled with torch F.grid_sample(bilinear) on plane 0 at (x, y), plane 1 at
+  // (x, z) and plane 2 at (y, z) (first coordinate along width, second along
+  // height); the three Cp-vectors are concatenated plane-major.
+  //   PrevLayer   (triplane): (Wp, 3*Hp, Cp), plane k on rows [k*Hp, (k+1)*Hp).
+  //   PointsSource (points) : (SizeX, SizeY, 3); output (SizeX, SizeY, 3*Cp).
+  // Backward writes dL/d(triplane) and dL/d(points). The OpenCL forward
+  // (cai_triplane_sample) is inference only. FStruct: [0] pad, [1] align_corners;
+  // FFloatSt[0] = Radius. No trainable parameters. Coded by Claude (AI).
+  TNNetTriplaneSample = class(TNNetLayer)
+  private
+    FPointsLayer: TNNetLayer;
+    FPlaneWidth, FPlaneHeight, FChannels: integer;
+    FInvRadius: TNeuralFloat;
+    FAlignCorners, FBorderPad: boolean;
+    {$IFDEF OpenCL}
+    FTriplaneCL: TNNetTriplaneSampleCL;
+    // Binds (or uploads) both sources and leaves the output in OpenCL memory.
+    // The caller checks WillOpenCL first.
+    procedure ComputeOpenCL();
+    {$ENDIF}
+    // Pixel coordinate along an axis of Dim pixels for a point coordinate, and
+    // its derivative (0 where border padding clips it).
+    function CoordToPixel(Coord: TNeuralFloat; Dim: integer;
+      out dPixeldCoord: TNeuralFloat): TNeuralFloat;
+      {$IFDEF Release} inline; {$ENDIF}
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    // pRadius: half-width of the point box (TripoSR: 0.87).
+    constructor Create(PointsSource: TNNetLayer; pRadius: TNeuralFloat = 0.87;
+      pPad: TNNetGridSamplePad = gspZeros;
+      pAlignCorners: boolean = false); reintroduce; overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure AppendInputLayers(pList: TList); override;
+    {$IFDEF OpenCL}
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
+    property PointsSource: TNNetLayer read FPointsLayer;
   end;
 
   /// Multi-scale deformable attention (Zhu et al. 2021, "Deformable DETR",
@@ -26090,10 +26150,12 @@ type
 
   // OutPtr[0..D-1] := bilinear blend of Src's depth columns at source-pixel
   // (sx, sy); BorderPad clamps corners, else out-of-range corners add 0.
-  // SrcDepthOffset selects the first source channel of the D-long column.
+  // SrcDepthOffset selects the first source channel of the D-long column;
+  // SrcRowOffset is added to every source row (a W x H tile stacked along Y).
   procedure NeuralBilinearGatherColumn(Src: TNNetVolume;
     OutPtr: TNeuralFloatArrPtr; sx, sy: TNeuralFloat;
-    W, H, D: integer; BorderPad: boolean; SrcDepthOffset: integer = 0);
+    W, H, D: integer; BorderPad: boolean; SrcDepthOffset: integer = 0;
+    SrcRowOffset: integer = 0);
 
   // Marks the pK largest of pValues^[pBase + i*pStride] (+ pBias^[i]) in the
   // zeroed pKept; pTopIdx/pTopVal (>= pK entries) end sorted, largest first.
@@ -43975,6 +44037,43 @@ begin
     OpenCLMemBytes(FBufReference);
 end;
 
+{ TNNetTriplaneSampleCL }
+
+constructor TNNetTriplaneSampleCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_triplane_sample');
+end;
+
+procedure TNNetTriplaneSampleCL.Sample(BufPlanes, BufPoints: cl_mem;
+  PointCount, PlaneWidth, PlaneHeight, Channels: integer;
+  InvRadius: TNeuralFloat; AlignCorners, BorderPad: boolean);
+var
+  k: cl_kernel;
+  iPointCount, iPlaneWidth, iPlaneHeight, iChannels: longint;
+  iAlignCorners, iBorderPad: longint;
+  fInvRadius: single;
+begin
+  k := FKernel.Kernel;
+  iPointCount := PointCount;
+  iPlaneWidth := PlaneWidth;
+  iPlaneHeight := PlaneHeight;
+  iChannels := Channels;
+  iAlignCorners := Ord(AlignCorners);
+  iBorderPad := Ord(BorderPad);
+  fInvRadius := InvRadius;
+  clSetKernelArg(k, 0, csLongintSize, @iPointCount);
+  clSetKernelArg(k, 1, csLongintSize, @iPlaneWidth);
+  clSetKernelArg(k, 2, csLongintSize, @iPlaneHeight);
+  clSetKernelArg(k, 3, csLongintSize, @iChannels);
+  clSetKernelArg(k, 4, csNeuralFloatSize, @fInvRadius);
+  clSetKernelArg(k, 5, csLongintSize, @iAlignCorners);
+  clSetKernelArg(k, 6, csLongintSize, @iBorderPad);
+  clSetKernelArg(k, 7, csCLMemSize, @BufPlanes);
+  clSetKernelArg(k, 8, csCLMemSize, @BufPoints);
+  clSetKernelArg(k, 9, csCLMemSize, @FBufY);
+  FKernel.RunKernel(k, PointCount * 3 * Channels);
+end;
+
 { TNNetConvGRUCellCL }
 
 constructor TNNetConvGRUCellCL.Create(NN: TNNet);
@@ -46961,7 +47060,8 @@ end;
 // here removes the duplicated MulAdd blend.
 procedure NeuralBilinearGatherColumn(Src: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr; sx, sy: TNeuralFloat;
-  W, H, D: integer; BorderPad: boolean; SrcDepthOffset: integer);
+  W, H, D: integer; BorderPad: boolean; SrcDepthOffset: integer;
+  SrcRowOffset: integer);
 var
   x0, y0, x1, y1: integer;
   fx, fy, w00, w01, w10, w11: TNeuralFloat;
@@ -46983,10 +47083,10 @@ begin
     if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0, SrcDepthOffset), w00, D);
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, SrcDepthOffset), w10, D);
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, SrcDepthOffset), w01, D);
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, SrcDepthOffset), w11, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0 + SrcRowOffset, SrcDepthOffset), w00, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0 + SrcRowOffset, SrcDepthOffset), w10, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1 + SrcRowOffset, SrcDepthOffset), w01, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1 + SrcRowOffset, SrcDepthOffset), w11, D);
   end
   else
   begin
@@ -46995,11 +47095,28 @@ begin
     inX1 := (x1 >= 0) and (x1 < W);
     inY0 := (y0 >= 0) and (y0 < H);
     inY1 := (y1 >= 0) and (y1 < H);
-    if inX0 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0, SrcDepthOffset), w00, D);
-    if inX1 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, SrcDepthOffset), w10, D);
-    if inX0 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, SrcDepthOffset), w01, D);
-    if inX1 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, SrcDepthOffset), w11, D);
+    if inX0 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0 + SrcRowOffset, SrcDepthOffset), w00, D);
+    if inX1 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0 + SrcRowOffset, SrcDepthOffset), w10, D);
+    if inX0 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1 + SrcRowOffset, SrcDepthOffset), w01, D);
+    if inX1 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1 + SrcRowOffset, SrcDepthOffset), w11, D);
   end;
+end;
+
+// torch grid_sampler_unnormalize: normalized c in [-1, 1] -> pixel coordinate
+// along an axis of Dim pixels (align_corners maps to [0, Dim-1], else [-0.5, Dim-0.5]).
+function NeuralGridUnnormalize(c: TNeuralFloat; Dim: integer;
+  AlignCorners: boolean): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if AlignCorners
+    then Result := (c + 1) * 0.5 * (Dim - 1)
+    else Result := ((c + 1) * Dim - 1) * 0.5;
+end;
+
+// d(NeuralGridUnnormalize)/dc.
+function NeuralGridUnnormalizeGrad(Dim: integer;
+  AlignCorners: boolean): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+begin
+  if AlignCorners then Result := (Dim - 1) * 0.5 else Result := Dim * 0.5;
 end;
 
 { TNNetAffineGridSample }
@@ -47350,20 +47467,12 @@ end;
 
 function TNNetGridSample.Unnormalize(c: TNeuralFloat; Dim: integer): TNeuralFloat;
 begin
-  // torch GridSampler::grid_sampler_unnormalize.
-  if FStruct[2] = 1 then
-    // align_corners=True : map [-1,1] -> [0, Dim-1]
-    Result := (c + 1) * 0.5 * (Dim - 1)
-  else
-    // align_corners=False : map [-1,1] -> [-0.5, Dim-0.5], i.e. ((c+1)*Dim-1)/2
-    Result := ((c + 1) * Dim - 1) * 0.5;
+  Result := NeuralGridUnnormalize(c, Dim, FStruct[2] = 1);
 end;
 
 function TNNetGridSample.UnnormalizeGrad(Dim: integer): TNeuralFloat;
 begin
-  // d(pixel coord)/d(normalized coord).
-  if FStruct[2] = 1 then Result := (Dim - 1) * 0.5
-  else Result := Dim * 0.5;
+  Result := NeuralGridUnnormalizeGrad(Dim, FStruct[2] = 1);
 end;
 
 procedure TNNetGridSample.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -47685,6 +47794,301 @@ begin
     FGridLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
+
+{ TNNetTriplaneSample }
+
+const
+  // Point coordinate read along each plane's width and height (XY, XZ, YZ).
+  csTriplaneWidthAxis: array[0..2] of integer = (0, 0, 1);
+  csTriplaneHeightAxis: array[0..2] of integer = (1, 2, 2);
+
+constructor TNNetTriplaneSample.Create(PointsSource: TNNetLayer;
+  pRadius: TNeuralFloat; pPad: TNNetGridSamplePad; pAlignCorners: boolean);
+begin
+  inherited Create();
+  if PointsSource = nil then
+    FErrorProc('TNNetTriplaneSample requires a non-nil PointsSource.');
+  if not (pRadius > 0) then
+    FErrorProc('TNNetTriplaneSample requires Radius > 0, got ' +
+      FloatToStr(pRadius) + '.');
+  FStruct[0] := Ord(pPad);
+  if pAlignCorners then FStruct[1] := 1 else FStruct[1] := 0;
+  FFloatSt[0] := pRadius;
+  FInvRadius := 1 / pRadius;
+  FBorderPad := (pPad = gspBorder);
+  FAlignCorners := pAlignCorners;
+  FPointsLayer := PointsSource;
+  if FPointsLayer is TNNetInput then TNNetInput(FPointsLayer).EnableErrorCollection;
+  // The triplane branch is counted by AddLayer/AddLayerAfter; this is the points one.
+  FPointsLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetTriplaneSample.Destroy();
+begin
+  {$IFDEF OpenCL}
+  if Assigned(FTriplaneCL) then FreeAndNil(FTriplaneCL);
+  {$ENDIF}
+  inherited Destroy();
+end;
+
+function TNNetTriplaneSample.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FPointsLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+function TNNetTriplaneSample.CoordToPixel(Coord: TNeuralFloat; Dim: integer;
+  out dPixeldCoord: TNeuralFloat): TNeuralFloat;
+begin
+  Result := NeuralGridUnnormalize(Coord * FInvRadius, Dim, FAlignCorners);
+  dPixeldCoord := NeuralGridUnnormalizeGrad(Dim, FAlignCorners) * FInvRadius;
+  // padding_mode='border' clips the coordinate (torch clip_coordinates).
+  if FBorderPad then
+  begin
+    if Result < 0 then
+    begin
+      Result := 0;
+      dPixeldCoord := 0;
+    end
+    else if Result > Dim - 1 then
+    begin
+      Result := Dim - 1;
+      dPixeldCoord := 0;
+    end;
+  end;
+end;
+
+procedure TNNetTriplaneSample.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  Planes, Points: TNNetVolume;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  Planes := pPrevLayer.FOutput;
+  Points := FPointsLayer.FOutput;
+  if (Planes.SizeY < 3) or ((Planes.SizeY mod 3) <> 0) then
+    FErrorProc('TNNetTriplaneSample needs a (Wp, 3*Hp, Cp) triplane, got SizeY=' +
+      IntToStr(Planes.SizeY) + '.');
+  if Points.Depth <> 3 then
+    FErrorProc('TNNetTriplaneSample needs a points source of Depth=3 (x, y, z), ' +
+      'got Depth=' + IntToStr(Points.Depth) + '.');
+  FPlaneWidth := Planes.SizeX;
+  FPlaneHeight := Planes.SizeY div 3;
+  FChannels := Planes.Depth;
+  FOutput.ReSize(Points.SizeX, Points.SizeY, 3 * FChannels);
+  SetOutputErrorSize(FOutput);
+  {$IFDEF OpenCL}
+  FShouldOpenCL := (FOutput.Size >= cNeuralOpenCLMinWork);
+  {$ENDIF}
+end;
+
+procedure TNNetTriplaneSample.Compute();
+var
+  StartTime: double;
+  Planes, Points: TNNetVolume;
+  PointPos, MaxPointPos, Plane, PointBase, OutPos: integer;
+  sx, sy, dPixeldCoord: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL}
+  // Runs BEFORE any ForceOutputOnRAM because those downloads are what it avoids.
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  FPointsLayer.ForceOutputOnRAM();
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
+  Planes := FPrevLayer.FOutput;
+  Points := FPointsLayer.FOutput;
+  MaxPointPos := Points.SizeX * Points.SizeY - 1;
+  PointBase := 0;
+  OutPos := 0;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    for Plane := 0 to 2 do
+    begin
+      sx := CoordToPixel(Points.FData[PointBase + csTriplaneWidthAxis[Plane]],
+        FPlaneWidth, dPixeldCoord);
+      sy := CoordToPixel(Points.FData[PointBase + csTriplaneHeightAxis[Plane]],
+        FPlaneHeight, dPixeldCoord);
+      OutPtr := @FOutput.FData[OutPos];
+      // Every corner outside (also NaN): the zero-padded sample is zero.
+      if (sx > -1) and (sx < FPlaneWidth) and (sy > -1) and (sy < FPlaneHeight) then
+        NeuralBilinearGatherColumn(Planes, OutPtr, sx, sy, FPlaneWidth,
+          FPlaneHeight, FChannels, {BorderPad=}false, 0, Plane * FPlaneHeight)
+      else
+        FillDWord(OutPtr^, FChannels, 0);
+      Inc(OutPos, FChannels);
+    end;
+    Inc(PointBase, 3);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTriplaneSample.Backpropagate();
+var
+  StartTime: double;
+  Planes, PlanesErr, Points, PointsErr: TNNetVolume;
+  PointPos, MaxPointPos, Plane, PointBase, GradPos, RowOffset: integer;
+  x0, y0, x1, y1, p00, p10, p01, p11: integer;
+  sx, sy, dsxdCoord, dsydCoord, fx, fy: TNeuralFloat;
+  g00, g10, g01, g11, dLdsx, dLdsy: TNeuralFloat;
+  GradPtr: TNeuralFloatArrPtr;
+  InX0, InX1, InY0, InY1, HasPlanesErr, HasPointsErr: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Planes := FPrevLayer.FOutput;
+  PlanesErr := FPrevLayer.FOutputError;
+  Points := FPointsLayer.FOutput;
+  PointsErr := FPointsLayer.FOutputError;
+  HasPlanesErr := (PlanesErr.Size = Planes.Size);
+  HasPointsErr := (PointsErr.Size = Points.Size);
+  MaxPointPos := Points.SizeX * Points.SizeY - 1;
+  PointBase := 0;
+  GradPos := 0;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    for Plane := 0 to 2 do
+    begin
+      sx := CoordToPixel(Points.FData[PointBase + csTriplaneWidthAxis[Plane]],
+        FPlaneWidth, dsxdCoord);
+      sy := CoordToPixel(Points.FData[PointBase + csTriplaneHeightAxis[Plane]],
+        FPlaneHeight, dsydCoord);
+      if (sx > -1) and (sx < FPlaneWidth) and (sy > -1) and (sy < FPlaneHeight) then
+      begin
+        x0 := Floor(sx); y0 := Floor(sy);
+        x1 := x0 + 1;    y1 := y0 + 1;
+        fx := sx - x0;   fy := sy - y0;
+        InX0 := (x0 >= 0); InX1 := (x1 < FPlaneWidth);
+        InY0 := (y0 >= 0); InY1 := (y1 < FPlaneHeight);
+        RowOffset := Plane * FPlaneHeight;
+        p00 := Planes.GetRawPos(x0, y0 + RowOffset);
+        p10 := p00 + FChannels;
+        p01 := Planes.GetRawPos(x0, y1 + RowOffset);
+        p11 := p01 + FChannels;
+        GradPtr := @FOutputError.FData[GradPos];
+        if HasPlanesErr then
+        begin
+          if InX0 and InY0 then TNNetVolume.MulAdd(@PlanesErr.FData[p00], GradPtr, (1 - fx) * (1 - fy), FChannels);
+          if InX1 and InY0 then TNNetVolume.MulAdd(@PlanesErr.FData[p10], GradPtr, fx * (1 - fy), FChannels);
+          if InX0 and InY1 then TNNetVolume.MulAdd(@PlanesErr.FData[p01], GradPtr, (1 - fx) * fy, FChannels);
+          if InX1 and InY1 then TNNetVolume.MulAdd(@PlanesErr.FData[p11], GradPtr, fx * fy, FChannels);
+        end;
+        if HasPointsErr then
+        begin
+          if InX0 and InY0 then g00 := TNNetVolume.DotProduct(GradPtr, @Planes.FData[p00], FChannels) else g00 := 0;
+          if InX1 and InY0 then g10 := TNNetVolume.DotProduct(GradPtr, @Planes.FData[p10], FChannels) else g10 := 0;
+          if InX0 and InY1 then g01 := TNNetVolume.DotProduct(GradPtr, @Planes.FData[p01], FChannels) else g01 := 0;
+          if InX1 and InY1 then g11 := TNNetVolume.DotProduct(GradPtr, @Planes.FData[p11], FChannels) else g11 := 0;
+          dLdsx := (1 - fy) * (g10 - g00) + fy * (g11 - g01);
+          dLdsy := (1 - fx) * (g01 - g00) + fx * (g11 - g10);
+          PointsErr.FData[PointBase + csTriplaneWidthAxis[Plane]] :=
+            PointsErr.FData[PointBase + csTriplaneWidthAxis[Plane]] + dLdsx * dsxdCoord;
+          PointsErr.FData[PointBase + csTriplaneHeightAxis[Plane]] :=
+            PointsErr.FData[PointBase + csTriplaneHeightAxis[Plane]] + dLdsy * dsydCoord;
+        end;
+      end;
+      Inc(GradPos, FChannels);
+    end;
+    Inc(PointBase, 3);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if HasPointsErr then FPointsLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetTriplaneSample.AppendInputLayers(pList: TList);
+begin
+  inherited AppendInputLayers(pList);
+  if Assigned(FPointsLayer) then pList.Add(FPointsLayer);
+end;
+
+{$IFDEF OpenCL}
+function TNNetTriplaneSample.WillOpenCL(): boolean;
+begin
+  Result := false;
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FTriplaneCL)) then exit;
+  if not Assigned(FPrevLayer) then exit;
+  // A source may have been resized since SetPrevLayer, so the shapes the kernel
+  // indexes are checked here.
+  if (FPrevLayer.FOutput.Size <> FPlaneWidth * 3 * FPlaneHeight * FChannels) or
+     (FPointsLayer.FOutput.Size * FChannels <> FOutput.Size) or
+     (csize_t(FOutput.Size) * csNeuralFloatSize > FTriplaneCL.ResultBytes()) then exit;
+  Result := FForceOpenCL or FShouldOpenCL or
+    FPrevLayer.OutputBindableOnOpenCL() or FPointsLayer.OutputBindableOnOpenCL();
+end;
+
+procedure TNNetTriplaneSample.ComputeOpenCL();
+var
+  OutputKernel: TNeuralKernel;
+  UploadPlanes, UploadPoints, BufferPlanes, BufferPoints: cl_mem;
+begin
+  OutputKernel := FTriplaneCL.OutputKernel();
+  UploadPlanes := nil;
+  UploadPoints := nil;
+  if not FPrevLayer.OutputBindableOnOpenCL() then
+    UploadPlanes := FTriplaneCL.UploadBuffer(FPrevLayer.FOutput, {pIsB=}false);
+  if not FPointsLayer.OutputBindableOnOpenCL() then
+    UploadPoints := FTriplaneCL.UploadBuffer(FPointsLayer.FOutput, {pIsB=}true);
+  BufferPlanes := BindOrUploadOpenCLOperand(FPrevLayer, OutputKernel, UploadPlanes);
+  BufferPoints := BindOrUploadOpenCLOperand(FPointsLayer, OutputKernel, UploadPoints);
+  FTriplaneCL.Sample(BufferPlanes, BufferPoints, FPointsLayer.FOutput.Size div 3,
+    FPlaneWidth, FPlaneHeight, FChannels, FInvRadius, FAlignCorners, FBorderPad);
+  // No read back: the result stays in OpenCL memory until a host reader calls
+  // ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+procedure TNNetTriplaneSample.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if not Assigned(FNN) then exit;
+  if not Assigned(FTriplaneCL) then
+    FTriplaneCL := TNNetTriplaneSampleCL.Create(FNN)
+  else if FTriplaneCL.ResultBytes() < csize_t(FOutput.Size) * csNeuralFloatSize then
+    // Growing replaces the result buffer, and the output it held goes with it.
+    FOutputOnOpenCL := false;
+  FTriplaneCL.ReserveResult(FOutput);
+end;
+
+procedure TNNetTriplaneSample.DisableOpenCL();
+begin
+  // FTriplaneCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FTriplaneCL);
+end;
+
+function TNNetTriplaneSample.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTriplaneCL) then Result := FTriplaneCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTriplaneSample.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTriplaneCL) then Result := FTriplaneCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetTriplaneSample.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTriplaneCL) then
+    Result := Result + FTriplaneCL.BufferBytes();
+end;
+{$ENDIF}
 
 { TNNetMultiScaleDeformableAttention }
 
@@ -145288,7 +145692,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetGridSample') or (S[0] = 'TNNetMultiScaleDeformableAttention') or (S[0] = 'TNNetTopKGatherTokens') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetBackwardWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') or (S[0] = 'TNNetDeformableConv') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetGridSample') or (S[0] = 'TNNetTriplaneSample') or (S[0] = 'TNNetMultiScaleDeformableAttention') or (S[0] = 'TNNetTopKGatherTokens') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetBackwardWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') or (S[0] = 'TNNetDeformableConv') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -145442,6 +145846,7 @@ begin
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetGridSample' :           Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1);
+      'TNNetTriplaneSample' :       Result := TNNetTriplaneSample.Create(aL[0], Ft[0], TNNetGridSamplePad(St[0]), St[1] = 1);
       'TNNetMultiScaleDeformableAttention' : Result := TNNetMultiScaleDeformableAttention.Create(St[0], TNNetMultiScaleDeformableAttention.LevelPointsFromStruct(St, Ft), TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1], TNNetMultiScaleDeformableAttention.OffsetScaleFromStruct(Ft), TNNetMultiScaleDeformableAttention.DiscreteSamplingFromStruct(Ft));
       'TNNetTopKGatherTokens' :     Result := TNNetTopKGatherTokens.Create(St[0], aL[0]);
       'TNNetFlowWarp' :             Result := TNNetFlowWarp.Create(aL[0]);
@@ -145901,6 +146306,7 @@ begin
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetGridSample' then Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1) else
+      if S[0] = 'TNNetTriplaneSample' then Result := TNNetTriplaneSample.Create(aL[0], Ft[0], TNNetGridSamplePad(St[0]), St[1] = 1) else
       if S[0] = 'TNNetMultiScaleDeformableAttention' then Result := TNNetMultiScaleDeformableAttention.Create(St[0], TNNetMultiScaleDeformableAttention.LevelPointsFromStruct(St, Ft), TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1], TNNetMultiScaleDeformableAttention.OffsetScaleFromStruct(Ft), TNNetMultiScaleDeformableAttention.DiscreteSamplingFromStruct(Ft)) else
       if S[0] = 'TNNetTopKGatherTokens' then Result := TNNetTopKGatherTokens.Create(St[0], aL[0]) else
       if S[0] = 'TNNetFlowWarp' then Result := TNNetFlowWarp.Create(aL[0]) else

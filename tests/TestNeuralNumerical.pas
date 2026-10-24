@@ -705,6 +705,9 @@ type
     // TNNetMultiScaleDeformableAttention on OpenCL vs the CPU, box (cxcywh) and
     // point (xy) references, bilinear and discrete, two inputs, all sources bound.
     procedure TestMultiScaleDeformableAttentionOpenCLParity;
+    // TNNetTriplaneSample on OpenCL vs the CPU for both paddings and both
+    // align_corners values; triplane and points are bound, not downloaded.
+    procedure TestTriplaneSampleOpenCLParity;
     // TNNetTopKGatherTokens on OpenCL vs the CPU over two inputs with different
     // top-K tokens; the gathered features are bound, not downloaded.
     procedure TestTopKGatherTokensOpenCLParity;
@@ -2078,6 +2081,9 @@ type
     procedure TestGridSampleBorderGridGradientCheck;
     procedure TestGridSampleNearestForward;
     procedure TestGridSampleLoadFromString;
+    // TNNetTriplaneSample: finite-difference dL/d(triplane) and dL/d(points),
+    // zeros and border padding, with samples that straddle the plane edges.
+    procedure TestTriplaneSampleGradientCheck;
     // TNNetFlowWarp dense per-pixel (dx,dy) backward-warp sampler
     procedure TestFlowWarpFeatureGradientCheck;
     procedure TestFlowWarpFlowGradientCheck;
@@ -22380,6 +22386,110 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestTriplaneSampleGradientCheck;
+const
+  csRadius = 0.87;
+  csChannels = 3;
+  csPointCount = 5;
+  // Target pixel per point coordinate on the 4 x 4 planes: fractional (off the
+  // bilinear kinks), some past the plane edges (one corner padded or clipped).
+  csPointPixels: array[0..csPointCount - 1, 0..2] of TNeuralFloat = (
+    (0.4, 1.3, 2.6), (1.7, 0.55, 2.35), (-0.4, 2.2, 1.6), (3.4, 1.45, -0.3),
+    (2.75, 3.3, 0.65));
+var
+  NN: TNNet;
+  PlanesInput, PointsInput: TNNetLayer;
+  Planes, Points, Desired: TNNetVolume;
+  Sources: array[0..1] of TNNetVolume;
+  Pad: TNNetGridSamplePad;
+  SourcePos, Pos, MaxPos, PointPos, Axis, Checked: integer;
+  Epsilon, Saved, LossPlus, LossMinus, Numerical, Analytical, MaxError: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    OutputPos, MaxOutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    PointsInput.Output.Copy(Points);
+    NN.Compute(Planes);
+    Result := 0;
+    MaxOutputPos := NN.GetLastLayer.Output.Size - 1;
+    for OutputPos := 0 to MaxOutputPos do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  Epsilon := 0.001;
+  MaxError := 0;
+  Checked := 0;
+  Planes := TNNetVolume.Create(4, 12, csChannels);
+  Points := TNNetVolume.Create(csPointCount, 1, 3);
+  Desired := TNNetVolume.Create(csPointCount, 1, 3 * csChannels);
+  Sources[0] := Planes;
+  Sources[1] := Points;
+  try
+    MaxPos := Planes.Size - 1;
+    for Pos := 0 to MaxPos do Planes.Raw[Pos] := Sin(Pos * 0.53) * 0.9 + 0.1;
+    MaxPos := Desired.Size - 1;
+    for Pos := 0 to MaxPos do Desired.Raw[Pos] := Cos(Pos * 0.31);
+    // align_corners=False on 4 pixels: pixel t <- coord = Radius * ((2t + 1) / 4 - 1).
+    for PointPos := 0 to csPointCount - 1 do
+      for Axis := 0 to 2 do
+        Points.Store(PointPos, 0, Axis,
+          csRadius * ((2 * csPointPixels[PointPos, Axis] + 1) / 4 - 1));
+    for Pad := gspZeros to gspBorder do
+    begin
+      NN := TNNet.Create();
+      try
+        PlanesInput := NN.AddLayer(TNNetInput.Create(4, 12, csChannels, 1));
+        PointsInput := NN.AddLayerAfter(TNNetInput.Create(csPointCount, 1, 3, 1), 0);
+        NN.AddLayerAfter(TNNetTriplaneSample.Create(PointsInput, csRadius, Pad,
+          false), PlanesInput);
+        NN.SetLearningRate(1.0, 0.0);
+        NN.SetBatchUpdate(true);
+        for SourcePos := 0 to 1 do
+        begin
+          MaxPos := Sources[SourcePos].Size - 1;
+          for Pos := 0 to MaxPos do
+          begin
+            Saved := Sources[SourcePos].Raw[Pos];
+            Sources[SourcePos].Raw[Pos] := Saved + Epsilon;
+            LossPlus := ComputeLoss();
+            Sources[SourcePos].Raw[Pos] := Saved - Epsilon;
+            LossMinus := ComputeLoss();
+            Sources[SourcePos].Raw[Pos] := Saved;
+            Numerical := (LossPlus - LossMinus) / (2 * Epsilon);
+            ComputeLoss();
+            PlanesInput.OutputError.Fill(0);
+            PointsInput.OutputError.Fill(0);
+            NN.Backpropagate(Desired);
+            if SourcePos = 0
+              then Analytical := PlanesInput.OutputError.Raw[Pos]
+              else Analytical := PointsInput.OutputError.Raw[Pos];
+            MaxError := Max(MaxError, Abs(Numerical - Analytical));
+            AssertTrue('pad ' + IntToStr(Ord(Pad)) + ' source ' +
+              IntToStr(SourcePos) + ' element ' + IntToStr(Pos) + ' numerical ' +
+              FloatToStr(Numerical) + ' analytical ' + FloatToStr(Analytical),
+              Abs(Numerical - Analytical) < 0.01);
+            Inc(Checked);
+          end;
+        end;
+      finally
+        NN.Free;
+      end;
+    end;
+    WriteLn('  TestTriplaneSampleGradientCheck max gradient error: ',
+      FloatToStr(MaxError), ' over ', Checked, ' elements');
+  finally
+    Desired.Free;
+    Points.Free;
+    Planes.Free;
   end;
 end;
 
@@ -73911,6 +74021,120 @@ begin
           SentinelTotal, SentinelSurvivors);
         AssertTrue('deformable attention OpenCL vs CPU parity: max |diff| = ' +
           FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    for InputPos := 0 to 1 do
+    begin
+      OutCPU[InputPos].Free;
+      Inputs[InputPos].Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestTriplaneSampleOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csPlaneWidth = 7;
+  csPlaneHeight = 5;
+  csChannels = 6;
+  csInputDepth = 4;
+var
+  NN: TNNet;
+  Inputs: array[0..1] of TNNetVolume;
+  OutCPU: array[0..1] of TNNetVolume;
+  InputLayer, Planes, Points: TNNetLayer;
+  Triplane: TNNetTriplaneSample;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pad: TNNetGridSamplePad;
+  AlignCorners: boolean;
+  InputPos, Pos, MaxPos, SentinelSurvivors, SentinelTotal: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for InputPos := 0 to 1 do
+  begin
+    Inputs[InputPos] := TNNetVolume.Create(csPlaneWidth, 3 * csPlaneHeight,
+      csInputDepth);
+    OutCPU[InputPos] := TNNetVolume.Create();
+  end;
+  try
+    for Pad := gspZeros to gspBorder do
+    for AlignCorners := false to true do
+    begin
+      RandSeed := 20261024 + Ord(Pad) * 2 + Ord(AlignCorners);
+      NN := TNNet.Create();
+      try
+        InputLayer := NN.AddLayer(TNNetInput.Create(csPlaneWidth,
+          3 * csPlaneHeight, csInputDepth));
+        Planes := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(csChannels),
+          InputLayer);
+        // One point per input position; many land outside the 0.87 box.
+        Points := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(3), InputLayer);
+        Triplane := TNNetTriplaneSample.Create(Points, 0.87, Pad, AlignCorners);
+        NN.AddLayerAfter(Triplane, Planes);
+        NN.SetTrainable(False, False);
+        for InputPos := 0 to 1 do
+        begin
+          Inputs[InputPos].RandomizeGaussian();
+          NN.Compute(Inputs[InputPos]);
+          OutCPU[InputPos].Copy(NN.GetLastLayer.Output);
+        end;
+        AssertEquals('triplane sample ran on the CPU before EnableOpenCL', 0,
+          Triplane.ForwardGPUCnt);
+
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        NN.ForceOpenCL(True);
+        MaxDiff := 0;
+        try
+          NN.Compute(Inputs[1]);
+          // Parity cannot tell a bind from a download: the next forwards must
+          // leave the host copies of both sources untouched.
+          Planes.Output.Fill(csSentinel);
+          Points.Output.Fill(csSentinel);
+          for InputPos := 0 to 1 do
+          begin
+            NN.Compute(Inputs[InputPos]);
+            AssertEquals('output size match', OutCPU[InputPos].Size,
+              NN.GetLastLayer.Output.Size);
+            MaxPos := OutCPU[InputPos].Size - 1;
+            for Pos := 0 to MaxPos do
+              MaxDiff := Max(MaxDiff, Abs(OutCPU[InputPos].Raw[Pos] -
+                NN.GetLastLayer.Output.Raw[Pos]));
+          end;
+          SentinelSurvivors := 0;
+          SentinelTotal := Planes.Output.Size + Points.Output.Size;
+          MaxPos := Planes.Output.Size - 1;
+          for Pos := 0 to MaxPos do
+            if Planes.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          MaxPos := Points.Output.Size - 1;
+          for Pos := 0 to MaxPos do
+            if Points.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+        finally
+          NN.ForceOpenCL(False);
+        end;
+        WriteLn('  TriplaneSample OpenCL parity (pad ', Ord(Pad),
+          ', align_corners ', AlignCorners, '): max|diff|=', MaxDiff:0:9,
+          ' gpu forwards=', Triplane.ForwardGPUCnt,
+          ' source sentinels=', SentinelSurvivors, '/', SentinelTotal);
+        AssertTrue('triplane sample must reach OpenCL', Triplane.ForwardGPUCnt > 0);
+        AssertEquals('both sources must be read in OpenCL memory',
+          SentinelTotal, SentinelSurvivors);
+        AssertTrue('triplane sample OpenCL vs CPU parity: max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
       finally
         NN.Free;
       end;

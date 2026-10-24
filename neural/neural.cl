@@ -4817,6 +4817,78 @@ __kernel void cai_ms_deformable_attn
   for (int c = 0; c < ChannelCount; c++) Out[c] = acc[c];
 }
 
+// CAI triplane sample (TNNetTriplaneSample forward, TripoSR query_triplane):
+// FDst[(point*3 + plane)*FChannels + c] = torch grid_sample (bilinear) of channel
+// c of plane `plane` at the point's (x, y), (x, z) or (y, z) times FInvRadius.
+// FPlanes is (FWidth, 3*FHeight, FChannels), plane k on rows [k*FHeight,
+// (k+1)*FHeight); FPoints is (FPointCount, 3). FBorderPad != 0 clips the pixel
+// coordinate (padding_mode='border'), else zero padding. One work-item per
+// output float. Coded by Claude (AI).
+__kernel void cai_triplane_sample
+(
+  const int FPointCount,
+  const int FWidth,
+  const int FHeight,
+  const int FChannels,
+  const float FInvRadius,
+  const int FAlignCorners,
+  const int FBorderPad,
+  __global const float* FPlanes,
+  __global const float* FPoints,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  const int FeatureDepth = 3 * FChannels;
+  if (g_id >= FPointCount * FeatureDepth) return;
+  const int Point = g_id / FeatureDepth;
+  const int Feature = g_id - Point * FeatureDepth;
+  const int Plane = Feature / FChannels;
+  const int Channel = Feature - Plane * FChannels;
+  __global const float* P = FPoints + Point * 3;
+  const float u = P[(Plane == 2) ? 1 : 0] * FInvRadius;
+  const float v = P[(Plane == 0) ? 1 : 2] * FInvRadius;
+  float px, py;
+  if (FAlignCorners)
+  {
+    px = (u + 1.0f) * 0.5f * (float)(FWidth - 1);
+    py = (v + 1.0f) * 0.5f * (float)(FHeight - 1);
+  }
+  else
+  {
+    px = ((u + 1.0f) * (float)FWidth - 1.0f) * 0.5f;
+    py = ((v + 1.0f) * (float)FHeight - 1.0f) * 0.5f;
+  }
+  if (FBorderPad)
+  {
+    px = (px < 0.0f) ? 0.0f : ((px > (float)(FWidth - 1)) ? (float)(FWidth - 1) : px);
+    py = (py < 0.0f) ? 0.0f : ((py > (float)(FHeight - 1)) ? (float)(FHeight - 1) : py);
+  }
+  float acc = 0.0f;
+  // Every corner outside (also NaN): the sample is zero. Inside, the int
+  // conversions below are bounded.
+  if ((px > -1.0f) && (px < (float)FWidth) && (py > -1.0f) && (py < (float)FHeight))
+  {
+    const float x0f = floor(px);
+    const float y0f = floor(py);
+    const int x0 = (int)x0f;
+    const int y0 = (int)y0f;
+    const float fx = px - x0f;
+    const float fy = py - y0f;
+    const int InX0 = x0 >= 0;
+    const int InX1 = x0 + 1 < FWidth;
+    const int InY0 = y0 >= 0;
+    const int InY1 = y0 + 1 < FHeight;
+    const int Base = ((Plane * FHeight + y0) * FWidth + x0) * FChannels + Channel;
+    const int RowBelow = Base + FWidth * FChannels;
+    if (InX0 && InY0) acc += ((1.0f - fx) * (1.0f - fy)) * FPlanes[Base];
+    if (InX1 && InY0) acc += (fx * (1.0f - fy)) * FPlanes[Base + FChannels];
+    if (InX0 && InY1) acc += ((1.0f - fx) * fy) * FPlanes[RowBelow];
+    if (InX1 && InY1) acc += (fx * fy) * FPlanes[RowBelow + FChannels];
+  }
+  FDst[g_id] = acc;
+}
+
 // TNNetDeformableConv forward im2col: FPatch[(pos * FTapCount + tap) * FInDepth
 // + ci] = the zero-padded bilinear sample of input channel ci for tap
 // (fx, fy) of output position pos, shifted by its offset group's (dx, dy) and

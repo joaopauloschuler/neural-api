@@ -1929,8 +1929,19 @@ rather than acted on.
       strided pointer overload, Bourke tables, per-slice edge caches so
       vertices are shared); `TNNetPLYWriter.AddListProperty` +
       `TNNetPLYReader.ReadFlatRow` for face lists; tests/TestNeuralMesh.pas
-      (sphere, single cube, empty, random closed field, PLY/OBJ). Still open:
-      the importer, the triplane query layer, vertex colouring and the example.
+      (sphere, single cube, empty, random closed field, PLY/OBJ).
+      Landed (triplane query layer): `TNNetTriplaneSample(PointsSource,
+      Radius = 0.87, Pad, AlignCorners)`; triplane input (Wp, 3*Hp, Cp) with
+      plane k (XY, XZ, YZ) on rows [k*Hp, (k+1)*Hp), so the 3 x 32 x 32 tokens
+      reshape to (32, 96, 1024) and a 2x2 stride-2 transposed conv (kernel =
+      stride, planes do not mix) yields (64, 192, 40) - not yet checked against
+      TNNetDeconvolution's padding; points (SizeX, SizeY, 3) -> (SizeX, SizeY,
+      3*Cp), plane-major concat. CPU forward + backward (triplane and points),
+      OpenCL inference forward `cai_triplane_sample` (binds resident sources,
+      output stays resident). Tests: hand-derived bilinear cases, save/load,
+      gradient check, OpenCL parity (max |diff| 8.3e-7, not bit-identical).
+      Still open: the importer, vertex colouring and the example; chunk the
+      256^3 grid (N * 3 * Cp must stay below 2^31 per forward).
 - [ ] 3D Gaussian Splatting viewer follow-ups (arXiv:2308.04079). Landed:
       neural/neuralply.pas (`TNNetPLYReader` / `TNNetPLYWriter`),
       neural/neuralgaussiansplat.pas (`TGaussianSplatScene`,

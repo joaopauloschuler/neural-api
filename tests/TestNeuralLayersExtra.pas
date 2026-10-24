@@ -238,6 +238,11 @@ type
     procedure TestConvolutionRectangularDilationSaveLoad;
     // The dense-only TNNetConvolution backward routines refuse a dilated layer.
     procedure TestConvolutionDenseOnlyBackwardRefusesDilation;
+    // TNNetTriplaneSample: hand-derived bilinear samples (texel centre, between
+    // texels, outside the box, plane edges), plane/concat order, both paddings,
+    // align_corners, and the save/load round trip.
+    procedure TestTriplaneSampleHandCases;
+    procedure TestTriplaneSampleSaveLoad;
     // TNNetMultiScaleDeformableAttention: forward against a naive bilinear
     // reference (cxcywh and xy references), finite-difference gradients of
     // the offsets|logits, value and reference sources, and save/load.
@@ -10014,6 +10019,151 @@ begin
   if Mode = csDeformModeDiscrete then
     AssertTrue('some discrete samples are clamped to the map border',
       ClampedCount > 0);
+end;
+
+// Two-input net: Layers[0] the (4, 3*4, 2) triplane, Layers[1] PointCount points.
+procedure BuildTriplaneSampleNet(NN: TNNet; PointCount: integer;
+  Radius: TNeuralFloat; Pad: TNNetGridSamplePad; AlignCorners: boolean);
+var
+  PlanesInput, PointsInput: TNNetLayer;
+begin
+  PlanesInput := NN.AddLayer(TNNetInput.Create(4, 12, 2, 1));
+  PointsInput := NN.AddLayerAfter(TNNetInput.Create(PointCount, 1, 3, 1), 0);
+  NN.AddLayerAfter(TNNetTriplaneSample.Create(PointsInput, Radius, Pad,
+    AlignCorners), PlanesInput);
+end;
+
+// Texel (x, y) of plane k, channel c holds 100k + 10y + x + 0.5c, so an interior
+// bilinear sample at pixel (px, py) is 100k + 10py + px + 0.5c.
+procedure FillTriplaneRamp(Planes: TNNetVolume);
+var
+  Plane, PixelX, PixelY, Channel: integer;
+begin
+  for Plane := 0 to 2 do
+  for PixelY := 0 to 3 do
+  for PixelX := 0 to 3 do
+  for Channel := 0 to 1 do
+    Planes.Store(PixelX, Plane * 4 + PixelY, Channel,
+      100 * Plane + 10 * PixelY + PixelX + 0.5 * Channel);
+end;
+
+procedure TTestNeuralLayersExtra.TestTriplaneSampleHandCases;
+type
+  TTriplaneCase = record
+    x, y, z: TNeuralFloat;
+    // Per plane: the channel-0 value and the summed weight of in-bound corners
+    // (channel 1 adds 0.5 * that weight).
+    Value, WeightSum: array[0..2] of TNeuralFloat;
+  end;
+const
+  // Radius 0.5, align_corners=False: pixel = ((coord / 0.5 + 1) * 4 - 1) / 2.
+  csZeros: array[0..3] of TTriplaneCase = (
+    // Texel centres: plane 0 at pixel (1, 2), plane 1 (1, 2), plane 2 (2, 2).
+    (x: -0.125; y: 0.125; z: 0.125; Value: (21, 121, 222); WeightSum: (1, 1, 1)),
+    // Between texels: (1.5, 0.25), (1.5, 1.5), (0.25, 1.5).
+    (x: 0; y: -0.3125; z: 0; Value: (4, 116.5, 215.25); WeightSum: (1, 1, 1)),
+    // x outside the box (pixel 4.5): planes 0 and 1 read zero padding.
+    (x: 0.75; y: 0; z: 0; Value: (0, 0, 216.5); WeightSum: (0, 0, 1)),
+    // On the box faces x = +r, y = -r: pixels 3.5 and -0.5 keep half a texel.
+    (x: 0.5; y: -0.5; z: 0; Value: (0.75, 59, 107.5); WeightSum: (0.25, 0.5, 0.5)));
+  // padding_mode='border' clips the pixel coordinate to [0, 3].
+  csBorder: array[0..1] of TTriplaneCase = (
+    (x: 0.5; y: -0.5; z: 0; Value: (3, 118, 215); WeightSum: (1, 1, 1)),
+    (x: 0.75; y: 0; z: 0; Value: (18, 118, 216.5); WeightSum: (1, 1, 1)));
+  // align_corners=True: pixel = (coord / 0.5 + 1) / 2 * 3.
+  csAlign: array[0..1] of TTriplaneCase = (
+    (x: 0.5; y: -0.5; z: 0.5; Value: (3, 133, 230); WeightSum: (1, 1, 1)),
+    (x: -0.125; y: 0.125; z: 0.125; Value: (19.875, 119.875, 220.625);
+      WeightSum: (1, 1, 1)));
+
+  procedure CheckCases(const Cases: array of TTriplaneCase; Pad: TNNetGridSamplePad;
+    AlignCorners: boolean; const CaseName: string);
+  var
+    NN: TNNet;
+    Planes, Points, Output: TNNetVolume;
+    CasePos, MaxCasePos, Plane, Channel: integer;
+    Expected: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Planes := TNNetVolume.Create(4, 12, 2);
+    Points := TNNetVolume.Create(Length(Cases), 1, 3);
+    try
+      BuildTriplaneSampleNet(NN, Length(Cases), 0.5, Pad, AlignCorners);
+      FillTriplaneRamp(Planes);
+      MaxCasePos := High(Cases);
+      for CasePos := 0 to MaxCasePos do
+      begin
+        Points.Store(CasePos, 0, 0, Cases[CasePos].x);
+        Points.Store(CasePos, 0, 1, Cases[CasePos].y);
+        Points.Store(CasePos, 0, 2, Cases[CasePos].z);
+      end;
+      NN.Layers[1].Output.Copy(Points);
+      NN.Compute(Planes);
+      Output := NN.GetLastLayer.Output;
+      AssertEquals(CaseName + ' output SizeX', Length(Cases), Output.SizeX);
+      AssertEquals(CaseName + ' output SizeY', 1, Output.SizeY);
+      AssertEquals(CaseName + ' output Depth = 3 * Cp', 6, Output.Depth);
+      for CasePos := 0 to MaxCasePos do
+      for Plane := 0 to 2 do
+      for Channel := 0 to 1 do
+      begin
+        Expected := Cases[CasePos].Value[Plane] +
+          0.5 * Channel * Cases[CasePos].WeightSum[Plane];
+        AssertEquals(CaseName + ' point ' + IntToStr(CasePos) + ' plane ' +
+          IntToStr(Plane) + ' channel ' + IntToStr(Channel), Expected,
+          Output.Get(CasePos, 0, Plane * 2 + Channel), 1e-4);
+      end;
+    finally
+      Points.Free;
+      Planes.Free;
+      NN.Free;
+    end;
+  end;
+
+begin
+  CheckCases(csZeros, gspZeros, false, 'zeros');
+  CheckCases(csBorder, gspBorder, false, 'border');
+  CheckCases(csAlign, gspZeros, true, 'align_corners');
+end;
+
+procedure TTestNeuralLayersExtra.TestTriplaneSampleSaveLoad;
+const
+  csPointCount = 9;
+var
+  NN, Loaded: TNNet;
+  Planes, Points: TNNetVolume;
+  Saved: string;
+  Pos, MaxPos: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Planes := TNNetVolume.Create(4, 12, 2);
+  Points := TNNetVolume.Create(csPointCount, 1, 3);
+  try
+    RandSeed := 20261024;
+    BuildTriplaneSampleNet(NN, csPointCount, 0.87, gspBorder, true);
+    Planes.RandomizeGaussian();
+    Points.Randomize();
+    NN.Layers[1].Output.Copy(Points);
+    NN.Compute(Planes);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+    AssertTrue('loaded layer class', Loaded.GetLastLayer is TNNetTriplaneSample);
+    AssertTrue('points source reconnected',
+      TNNetTriplaneSample(Loaded.GetLastLayer).PointsSource = Loaded.Layers[1]);
+    Loaded.Layers[1].Output.Copy(Points);
+    Loaded.Compute(Planes);
+    MaxPos := NN.GetLastLayer.Output.Size - 1;
+    for Pos := 0 to MaxPos do
+      AssertEquals('output ' + IntToStr(Pos), NN.GetLastLayer.Output.Raw[Pos],
+        Loaded.GetLastLayer.Output.Raw[Pos], 1e-6);
+  finally
+    Points.Free;
+    Planes.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionForward;
