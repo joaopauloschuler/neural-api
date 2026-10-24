@@ -430,14 +430,6 @@ rather than acted on.
       parity < 1e-4 vs a float64 HF DINOv3ViTModel oracle, scalar + AVX2 green):
   - [ ] use_gated_mlp (gate/up/down_proj; silu/gelu gate) coded with pico parity
         TestDINOv3GatedMLPParity; no real vith16plus / 7B checkpoint run.
-  - [X] non-square / non-native input: TDINOv3Config.InputWidth/InputHeight
-        (multiples of patch_size, 0 = image_size) set the input and the RoPE
-        grid (TNNetVisionRoPE2D normalizes each axis by its own patch count, as
-        HF get_patches_center_coordinates; DINOv3 has no position table to
-        interpolate, and the RoPE shift/jitter/rescale are training-only).
-        Pico parity TestDINOv3NonSquareParity (12x12 weights at 8 x 20 H x W).
-        DINOv3-backed dense prediction still needs the BuildDPT register-token
-        item under Depth Anything V2 below.
 
 - [ ] Kandinsky 2.2 unCLIP text-to-image importer
       (`BuildKandinskyPriorFromSafeTensors[Ex]` + `BuildKandinskyDecoderFromSafeTensors[Ex]`,
@@ -936,65 +928,10 @@ rather than acted on.
           `TestMask2FormerSemanticDecodeReference` carry it); a fixture with varied
           output would make the real-forward check meaningful.
 - [ ] EoMT (Encoder-only Mask Transformer, Kerssies et al. CVPR 2025,
-      arXiv:2503.19108) universal-segmentation importer for transformers'
-      EomtForUniversalSegmentation (model_type "eomt",
+      arXiv:2503.19108) universal-segmentation importer follow-ups for
+      transformers' EomtForUniversalSegmentation (model_type "eomt",
       tue-mps/coco_panoptic_eomt_*_640, tue-mps/ade20k_semantic_eomt_*_512,
       tue-mps/coco_instance_eomt_*_640):
-  - [X] Model core in neural/neuralpretrained.pas: `TEoMTConfig`,
-        `ReadEoMTConfigFromJSONFile` (EomtConfig defaults for omitted fields,
-        num_labels from id2label), `EoMTMaskGridSize`,
-        `BuildEoMTFromSafeTensors[Ex]` and `SplitEoMTOutput`. One TNNet from
-        pixels: DINOv2-with-registers trunk (AddDINOv2EncoderBlock,
-        LoadDINOv2EncoderBlockWeightsNamed for the q/k/v/out_proj names; the
-        position table covers the patch rows only), the query tokens prepended
-        by a TNNetPadXY + TNNetLearnedPositionalEmbedding before the last
-        num_blocks blocks, class_predictor + 3-Linear mask head on the query
-        rows, num_upscale_blocks x (TNNetDeconvolutionLinear k2 s2 -> act ->
-        depthwise 3x3 -> TNNetTokenLayerNorm eps 1e-6) on the patch grid, and
-        the mask logits by TNNetDotProducts (the Mask2FormerMaskEinsum layout).
-        Output (NumQueries, 1, NumLabels + 1 + MaskGrid^2) = class | mask
-        logits; SplitEoMTOutput gives the (Q,1,NumLabels+1) / (Q,1,MaskGrid^2)
-        pair the DecodeMask2Former* routines take. The builder rejects a missing
-        or nonzero `attn_mask_probs` (masked attention is not ported).
-  - [X] Pico parity: tools/make_pico_eomt_fixture.py writes
-        tests/fixtures/tiny_eomt{,_swiglu}{.safetensors,_config.json,
-        _io.safetensors} (float64 transformers oracle; MLP and SwiGLU FFN).
-        TestEoMTParity < 1e-4 on class and mask logits (about 2e-6 measured),
-        TestEoMTConfigFromJSONFile, TestEoMTRejectsNonzeroAttnMaskProbs.
-  - [X] Preprocessing: `TEoMTProcessorConfig`,
-        `ReadEoMTProcessorConfigFromJSONFile`, `EoMTPreprocessImage` (port of
-        EomtImageProcessorPil, the PIL backend as SAM/DPT): PIL bilinear uint8
-        resize by `HFSizeWithAspectRatio` (neuralimageresize, transformers
-        get_size_with_aspect_ratio; longest_edge null = None), then the
-        do_split_image windows (`_split_image` starts) and/or do_pad, then
-        rescale + normalize by `CropAndNormalizeImage` (neuralimageresize, now
-        also behind neuraldatasets' CenterCropAndNormalizeImage; EoMT pads
-        before normalizing, so padded pixels are -mean/std). `TEoMTImageLayout`
-        carries the sizes and window starts to the post-processors.
-  - [X] Post-processing: `EoMTSemanticScores` / `DecodeEoMTSemantic` (no
-        unpad, as transformers; merge_image_patches for split windows),
-        `DecodeEoMTInstance` (no top-k, query order, threshold 0.8),
-        `DecodeEoMTPanoptic` (unpad + resize, sigmoid after the resize,
-        compute_segments with stuff_classes, -1 background, ids from 0). Shared
-        with the DecodeMask2Former* routines through the factored
-        Mask2FormerSemanticScores / Mask2FormerArgmaxLabels /
-        Mask2FormerPositiveMaskStats / Mask2FormerPaintSegments /
-        Mask2FormerKeepConfidentQueries / Mask2FormerAssignKeptPixels.
-  - [X] Processor parity: tools/make_pico_eomt_fixture.py also writes
-        tests/fixtures/tiny_eomt{,_swiglu}_{processor_io.safetensors,
-        preprocessor_config.json} (40x28 uint8 test image; tiny_eomt do_pad,
-        tiny_eomt_swiglu do_split_image on a landscape and a portrait image).
-        TestEoMTProcessorConfigFromJSONFile, TestEoMTPreprocessPadParity and
-        TestEoMTPreprocessSplitParity (pixel_values max |diff| 4.8e-7),
-        TestEoMTPostprocessPadParity and TestEoMTPostprocessSplitParity
-        (semantic scores 7.2e-7; semantic / instance / panoptic maps 0
-        mismatched pixels; segment ids, labels and scores).
-  - [X] examples/UniversalSegmentation `--model eomt --model-dir DIR --image
-        FILE`: preprocess, one forward per window, the post-processor for the
-        checkpoint's task (do_split_image or "semantic" in the folder name ->
-        semantic, "instance" -> instance, else panoptic; --task overrides),
-        same printout and segmentation.ppm. Smoke-run on pico folders built
-        from the fixtures (panoptic, instance, split semantic).
   - [ ] Real-checkpoint smoke on the user's box (no EoMT checkpoint was run;
         the importer assumes the transformers key names without a prefix, as
         EomtForUniversalSegmentation.save_pretrained writes them), e.g.
@@ -1006,12 +943,6 @@ rather than acted on.
         head over a DINOv3 trunk (RoPE 2-D, LayerScale); reuse the DINOv3
         builder pieces (AddMultiHeadVisionRoPE2DAttention) and the EoMT head
         code; needs a pico fixture like tiny_eomt.
-  - [X] Small reuse follow-up: `SAMPreprocessImage` now calls
-        `CropAndNormalizeImage(Work, Dst, 0, 0, ImageSize, ImageSize, Mean, Std,
-        PadBeforeNormalize=false)`: SamImageProcessor pads after normalize with
-        0, which is that routine's default padding, so the semantics match.
-        TestSAMProcessorEndToEndParity / TestSAMMaskInputParity /
-        TestSAMAutomaticMaskGenerationParity pass on cpu and avx2.
   - [ ] Fast-processor backend: the port matches EomtImageProcessorPil (PIL
         uint8 bilinear); transformers' default fast processor resizes with
         torchvision antialias. Measure the gap on a real photo first.
@@ -1558,15 +1489,6 @@ rather than acted on.
         (tensor resize); the port matches the PIL backend (uint8 PIL bilinear).
         Measure the pixel_values gap on a real photo; add a torchvision-mode
         resize only if it changes masks.
-  - [X] examples/SegmentAnything `--mask-input FILE`: `SAMMaskImageToInputLogits`
-        (neuralpretrained) converts a mask image at the photo's size to the
-        `(4*Grid, 4*Grid, 1)` MaskInput: PIL 'L', the SAMPreprocessImage
-        longest-side resize + black padding, PIL bilinear down to the low-res
-        size, 0..255 -> -10..+10 (`csSAMMaskInputLogit`, SAM 2's
-        `mask * 20 - 10`). With no point / box it is a mask-only prompt.
-        TestSAMMaskImageToInputLogits checks the geometry on a 40x20 photo;
-        pico smoke runs (point + mask + refine, mask-only multimask, box + mask,
-        wrong-size error) work.
   - [ ] `--mask-input` follow-ups: compare L = 10 against other scales (and a
         plain 0/1 map) on a real sam-vit-base checkpoint and photo, since the
         pico fixture's random weights say nothing about mask quality; maybe a
@@ -2403,16 +2325,6 @@ rather than acted on.
       stage; then a real 432x240 clip on the user's box, frames processed in
       chunks under the 2 GB agent cap.
 - [ ] `TNNetDeformableConv` external-offset mode follow-ups:
-      - [X] torchvision parity fixture: tools/deform_conv2d_tiny_fixture.py
-            writes tests/fixtures/deform_conv2d_tiny.safetensors (7243293e);
-            it now also covers dilation 2 and 2 weight groups.
-      - [X] OpenCL bilinear gather: the inference forward builds the patch
-            matrix with cai_deformable_im2col straight from the bound input,
-            offset and mask buffers (self-offset mode: the offset head runs as
-            an implicit conv first), feeds the existing GEMM and keeps its
-            output resident. Covered by TestDeformableConvOpenCLParity,
-            TestDeformableConvExternalOpenCLParity and
-            TestDeformableConvOpenCLResidency (sentinel check).
       - [ ] The trainable OpenCL forward still gathers on the CPU (the CPU
             backward reads FOffMap) and downloads its sources.
       - [ ] Not supported yet: OpenCL backward. Dilation > 1 and weight
