@@ -17052,6 +17052,41 @@ function DecodeRtDetrDetections(Output: TNNetVolume; NumLabels: integer;
   Threshold: TNeuralFloat = 0.5; MaxDetections: integer = 0): TDetrDetectionArray;
 
 // ---------------------------------------------------------------------------
+// HGNetV2 BACKBONE (transformers "hgnet_v2"; the D-FINE, RT-DETRv2 and DEIM
+// backbone): a stem with a 2x2-conv branch beside a max-pool branch, then
+// stages of HGNetV2BasicLayer (plain or light pointwise + depthwise convs whose
+// outputs are concatenated and aggregated by a squeeze and an excitation conv).
+// ---------------------------------------------------------------------------
+type
+  TNeuralBooleanArray = array of boolean;
+
+  THGNetV2Config = record
+    NumChannels: integer;
+    StemChannels: TNeuralIntegerArray;     // stem_channels [in, mid, out]
+    StemStrides: TNeuralIntegerArray;      // stem1, stem2a, stem2b, stem3, stem4
+    StageInChannels, StageMidChannels, StageOutChannels: TNeuralIntegerArray;
+    StageNumBlocks, StageNumLayers, StageKernelSizes: TNeuralIntegerArray;
+    StageDownsampleStrides: TNeuralIntegerArray;
+    StageDownsample, StageLightBlock: TNeuralBooleanArray;
+    UseLearnableAffineBlock: boolean;
+    Activation: string;                    // hidden_act
+    OutIndices: TNeuralIntegerArray;       // 0 = stem, i = stage i
+  end;
+
+// An HGNetV2Config object; missing fields take the transformers defaults.
+function ReadHGNetV2Config(Obj: TJSONObject): THGNetV2Config;
+
+// Reads "backbone_config" of a detector config.json, or the top level of a
+// "hgnet_v2" config.json.
+function ReadHGNetV2ConfigFromJSONFile(const FileName: string): THGNetV2Config;
+
+// Adds the backbone after Source and loads it from Prefix ('model.backbone.
+// model.' in D-FINE); Result[0] is the stem output and Result[i] stage i's.
+function BuildHGNetV2Backbone(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  const Prefix: string; const Config: THGNetV2Config; Source: TNNetLayer;
+  pTrainable: boolean = false): TNNetLayerRefArr;
+
+// ---------------------------------------------------------------------------
 // MASK2FORMER UNIVERSAL-SEGMENTATION IMPORT (HF "mask2former", e.g.
 // facebook/mask2former-swin-tiny-*-semantic) -- the repo's FIRST mask-
 // CLASSIFICATION set-prediction segmenter. STRUCTURALLY DISTINCT from the
@@ -76800,19 +76835,22 @@ begin
       pTrainable) );
 end;
 
+// torch F.pad(x, (0, 1, 0, 1)) after Source: TNNetPadXY pads every side, so
+// TNNetCrop drops the top/left pad again. Returns the crop.
+function AddBottomRightZeroPad(NN: TNNet; Source: TNNetLayer;
+  pTrainable: boolean): TNNetLayer;
+begin
+  NN.AddLayerAfter(VaeLayerTrainable(TNNetPadXY.Create(1, 1), pTrainable), Source);
+  Result := NN.AddLayer(VaeLayerTrainable(TNNetCrop.Create(1, 1,
+    Source.Output.SizeX + 1, Source.Output.SizeY + 1), pTrainable));
+end;
+
 // diffusers Downsample2D on the last layer: ZeroPad2d((0,1,0,1)) then a
-// stride-2 pad-0 3x3 conv. TNNetPadXY pads every side, so TNNetCrop drops the
-// top/left pad again. Returns the conv.
+// stride-2 pad-0 3x3 conv. Returns the conv.
 function AddVaeAsymmetricDownsample(NN: TNNet; OutCh: integer;
   pTrainable: boolean = true): TNNetLayer;
-var
-  InputW, InputH: integer;
 begin
-  InputW := NN.GetLastLayer().Output.SizeX;
-  InputH := NN.GetLastLayer().Output.SizeY;
-  NN.AddLayer( VaeLayerTrainable(TNNetPadXY.Create(1, 1), pTrainable) );
-  NN.AddLayer( VaeLayerTrainable(TNNetCrop.Create(1, 1, InputW + 1,
-    InputH + 1), pTrainable) );
+  AddBottomRightZeroPad(NN, NN.GetLastLayer(), pTrainable);
   Result := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionLinear.Create(
     OutCh, 3, {pad=}0, {stride=}2, {bias=}0), pTrainable) );
 end;
@@ -85339,6 +85377,27 @@ begin
   SetLength(Result, Arr.Count);
   MaxItemPos := Arr.Count - 1;
   for ItemPos := 0 to MaxItemPos do Result[ItemPos] := Arr.Items[ItemPos].AsInteger;
+end;
+
+// Boolean array field FieldName of Obj; Default when it is missing or not an array.
+function ReadJSONBoolArray(Obj: TJSONObject; const FieldName: string;
+  const Default: array of boolean): TNeuralBooleanArray;
+var
+  Arr: TJSONArray;
+  ItemPos, MaxItemPos: integer;
+begin
+  Result := nil;
+  if not (Obj.Find(FieldName) is TJSONArray) then
+  begin
+    SetLength(Result, Length(Default));
+    MaxItemPos := Length(Default) - 1;
+    for ItemPos := 0 to MaxItemPos do Result[ItemPos] := Default[ItemPos];
+    Exit;
+  end;
+  Arr := TJSONArray(Obj.Find(FieldName));
+  SetLength(Result, Arr.Count);
+  MaxItemPos := Arr.Count - 1;
+  for ItemPos := 0 to MaxItemPos do Result[ItemPos] := Arr.Items[ItemPos].AsBoolean;
 end;
 
 function ReadNAFNetConfigFromJSONFile(
@@ -95988,13 +96047,32 @@ end;
 // ===========================================================================
 // RT-DETR importer
 // ===========================================================================
+// A transformers backbone config's out_indices, else its out_features
+// ("stem" = 0, "stageN" = N), else Default.
+function ReadBackboneOutIndices(Backbone: TJSONObject;
+  const Default: array of integer): TNeuralIntegerArray;
+var
+  OutFeatures: TJSONArray;
+  FeaturePos, MaxFeaturePos: integer;
+begin
+  if (Backbone.Find('out_indices') is TJSONArray) or
+     not (Backbone.Find('out_features') is TJSONArray) then
+    Exit(ReadJSONIntArray(Backbone, 'out_indices', Default));
+  OutFeatures := TJSONArray(Backbone.Find('out_features'));
+  Result := nil;
+  SetLength(Result, OutFeatures.Count);
+  MaxFeaturePos := OutFeatures.Count - 1;
+  for FeaturePos := 0 to MaxFeaturePos do
+    Result[FeaturePos] := StrToIntDef(
+      StringReplace(OutFeatures.Strings[FeaturePos], 'stage', '', []), 0);
+end;
+
 function ReadRtDetrConfigFromJSONFile(const FileName: string;
   ImageWidth: integer; ImageHeight: integer): TRtDetrConfig;
 var
   JsonText: TStringList;
   Root, Field: TJSONData;
   Obj, Backbone, Labels: TJSONObject;
-  OutFeatures: TJSONArray;
   FeaturePos, MaxFeaturePos, LabelId: integer;
 
   function FloatField(O: TJSONObject; const FieldName: string;
@@ -96055,21 +96133,7 @@ begin
       Result.DownsampleInBottleneck :=
         Backbone.Get('downsample_in_bottleneck', false);
       Result.NumChannels := Backbone.Get('num_channels', 3);
-      if Backbone.Find('out_indices') is TJSONArray then
-        Result.BackboneOutIndices := ReadJSONIntArray(Backbone, 'out_indices',
-          [2, 3, 4])
-      else if Backbone.Find('out_features') is TJSONArray then
-      begin
-        OutFeatures := TJSONArray(Backbone.Find('out_features'));
-        SetLength(Result.BackboneOutIndices, OutFeatures.Count);
-        MaxFeaturePos := OutFeatures.Count - 1;
-        for FeaturePos := 0 to MaxFeaturePos do
-          Result.BackboneOutIndices[FeaturePos] := StrToIntDef(
-            StringReplace(OutFeatures.Strings[FeaturePos], 'stage', '', []), 0);
-      end
-      else
-        Result.BackboneOutIndices := ReadJSONIntArray(Backbone, 'out_indices',
-          [2, 3, 4]);
+      Result.BackboneOutIndices := ReadBackboneOutIndices(Backbone, [2, 3, 4]);
     finally
       if Backbone <> Field then Backbone.Free;
     end;
@@ -96803,6 +96867,261 @@ begin
     Inc(DetectionCount);
   end;
   SetLength(Result, DetectionCount);
+end;
+
+// The integer array FieldName of Obj (Default when missing); a nested
+// per-axis entry such as [2, 1] is rejected.
+function ReadHGNetV2Strides(Obj: TJSONObject; const FieldName: string;
+  const Default: array of integer): TNeuralIntegerArray;
+var
+  Field: TJSONData;
+  ItemPos, MaxItemPos: integer;
+begin
+  Field := Obj.Find(FieldName);
+  if Field is TJSONArray then
+  begin
+    MaxItemPos := Field.Count - 1;
+    for ItemPos := 0 to MaxItemPos do
+      if not (Field.Items[ItemPos] is TJSONIntegerNumber) then
+        ImportError('HGNetV2 import: ' + FieldName + ' must list one integer ' +
+          'stride per entry, got ' + Field.AsJSON + '.');
+  end;
+  Result := ReadJSONIntArray(Obj, FieldName, Default);
+end;
+
+function ReadHGNetV2Config(Obj: TJSONObject): THGNetV2Config;
+var
+  StageCount: integer;
+begin
+  if Obj.Get('model_type', 'hgnet_v2') <> 'hgnet_v2' then
+    ImportError('HGNetV2 import: backbone model_type "' +
+      Obj.Get('model_type', '') + '" is not "hgnet_v2".');
+  Result.NumChannels := Obj.Get('num_channels', 3);
+  Result.Activation := Obj.Get('hidden_act', 'relu');
+  Result.StemChannels := ReadJSONIntArray(Obj, 'stem_channels', [3, 32, 48]);
+  Result.StemStrides := ReadHGNetV2Strides(Obj, 'stem_strides', [2, 1, 1, 2, 1]);
+  Result.StageInChannels := ReadJSONIntArray(Obj, 'stage_in_channels',
+    [48, 128, 512, 1024]);
+  Result.StageMidChannels := ReadJSONIntArray(Obj, 'stage_mid_channels',
+    [48, 96, 192, 384]);
+  Result.StageOutChannels := ReadJSONIntArray(Obj, 'stage_out_channels',
+    [128, 512, 1024, 2048]);
+  Result.StageNumBlocks := ReadJSONIntArray(Obj, 'stage_num_blocks', [1, 1, 3, 1]);
+  Result.StageNumLayers := ReadJSONIntArray(Obj, 'stage_numb_of_layers',
+    [6, 6, 6, 6]);
+  Result.StageKernelSizes := ReadJSONIntArray(Obj, 'stage_kernel_size',
+    [3, 3, 5, 5]);
+  Result.StageDownsampleStrides := ReadHGNetV2Strides(Obj,
+    'stage_downsample_strides', [2, 2, 2, 2]);
+  Result.StageDownsample := ReadJSONBoolArray(Obj, 'stage_downsample',
+    [false, true, true, true]);
+  Result.StageLightBlock := ReadJSONBoolArray(Obj, 'stage_light_block',
+    [false, false, true, true]);
+  Result.UseLearnableAffineBlock := ReadJSONBoolOrDefault(Obj,
+    'use_learnable_affine_block', false);
+  StageCount := Length(Result.StageInChannels);
+  Result.OutIndices := ReadBackboneOutIndices(Obj, [StageCount]);
+  if (Length(Result.StemChannels) <> 3) or (Length(Result.StemStrides) <> 5) then
+    ImportError('HGNetV2 import: stem_channels needs 3 entries and ' +
+      'stem_strides 5.');
+  if (StageCount < 1) or
+     (Length(Result.StageMidChannels) <> StageCount) or
+     (Length(Result.StageOutChannels) <> StageCount) or
+     (Length(Result.StageNumBlocks) <> StageCount) or
+     (Length(Result.StageNumLayers) <> StageCount) or
+     (Length(Result.StageKernelSizes) <> StageCount) or
+     (Length(Result.StageDownsampleStrides) <> StageCount) or
+     (Length(Result.StageDownsample) <> StageCount) or
+     (Length(Result.StageLightBlock) <> StageCount) then
+    ImportError('HGNetV2 import: the stage_* lists must have the same length.');
+end;
+
+function ReadHGNetV2ConfigFromJSONFile(const FileName: string): THGNetV2Config;
+var
+  Obj: TJSONObject;
+begin
+  Obj := LoadImportJSONObject(FileName, 'HGNetV2');
+  try
+    if Obj.Find('backbone_config') is TJSONObject then
+      Result := ReadHGNetV2Config(TJSONObject(Obj.Find('backbone_config')))
+    else
+      Result := ReadHGNetV2Config(Obj);
+  finally
+    Obj.Free;
+  end;
+end;
+
+function BuildHGNetV2Backbone(NN: TNNet; Reader: TNNetSafeTensorsReader;
+  const Prefix: string; const Config: THGNetV2Config; Source: TNNetLayer;
+  pTrainable: boolean): TNNetLayerRefArr;
+const
+  csFrozenBatchNormEps = 0.00001;
+var
+  Previous, Padded, Branch, Pooled, Identity: TNNetLayer;
+  Aggregated: array of TNNetLayer;
+  StemIn, StemMid, StemOut, Stage, MaxStage: integer;
+  BlockPos, MaxBlockPos, LayerPos, MaxLayerPos: integer;
+  BlockIn, LayerIn, MidWidth, OutWidth, KernelSize: integer;
+  StagePrefix, BlockPrefix, LayerPrefix: string;
+
+  // HGNetV2LearnableAffineBlock (scalar scale * x + bias) as a
+  // TNNetPolynomialActivation with a zero square term.
+  function AddLearnableAffine(AffineSource: TNNetLayer;
+    const AffinePrefix: string): TNNetLayer;
+
+    function LoadScalar(const TensorName: string): TNeuralFloat;
+    var
+      Scalar: TNNetVolume;
+    begin
+      if not Reader.HasTensor(TensorName) then
+        ImportError('HGNetV2 import: missing tensor "' + TensorName + '".');
+      Scalar := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(TensorName, Scalar);
+        if Scalar.Size <> 1 then
+          ImportError('HGNetV2 import: "' + TensorName + '" must hold one ' +
+            'value, got ' + Reader.ShapeAsString(TensorName));
+        Result := Scalar.FData[0];
+      finally
+        Scalar.Free;
+      end;
+    end;
+
+  begin
+    Result := NN.AddLayerAfter(TNNetPolynomialActivation.Create()
+      .SetTrainable(pTrainable), AffineSource);
+    EnsureWritableImportWeights(Result);
+    Result.FArrNeurons[0].Weights.Fill(0);
+    Result.FArrNeurons[1].Weights.Fill(LoadScalar(AffinePrefix + '.scale'));
+    Result.FArrNeurons[2].Weights.Fill(LoadScalar(AffinePrefix + '.bias'));
+    Result.FlushWeightCache();
+  end;
+
+  // HGNetV2ConvLayer: conv with the frozen BatchNorm folded in, then the
+  // activation ActivationName ('' = none) and, with it, the affine block.
+  function AddConvLayer(ConvSource: TNNetLayer; OutCh, InCh, pKernelSize,
+    Stride: integer; Depthwise: boolean; const ActivationName,
+    ConvPrefix: string): TNNetLayer;
+  var
+    Shift: TNNetVolume;
+  begin
+    if Depthwise then
+    begin
+      Result := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1, pKernelSize,
+        (pKernelSize - 1) div 2, Stride).SetTrainable(pTrainable), ConvSource);
+      LoadMobileNetDepthwiseFoldBN(Reader, Result, ConvPrefix +
+        '.convolution.weight', ConvPrefix + '.normalization', OutCh,
+        pKernelSize, csFrozenBatchNormEps, Shift);
+      Result := NN.AddLayerAfter(TNNetChannelBias.Create()
+        .SetTrainable(pTrainable), Result);
+      LoadChannelBiasFromShift(Result, Shift);
+    end
+    else
+    begin
+      Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(OutCh,
+        pKernelSize, (pKernelSize - 1) div 2, Stride, 0)
+        .SetTrainable(pTrainable), ConvSource);
+      LoadResNetConvFoldBN(Reader, Result, ConvPrefix + '.convolution.weight',
+        ConvPrefix + '.normalization', OutCh, InCh, pKernelSize,
+        csFrozenBatchNormEps);
+    end;
+    if ActivationName <> '' then
+    begin
+      Result := NN.AddLayerAfter(RtDetrActivationLayer(ActivationName)
+        .SetTrainable(pTrainable), Result);
+      if Config.UseLearnableAffineBlock then
+        Result := AddLearnableAffine(Result, ConvPrefix + '.lab');
+    end;
+  end;
+
+begin
+  MaxStage := High(Config.StageInChannels);
+  Result := nil;
+  SetLength(Result, MaxStage + 2);
+  // ---- HGNetV2Embeddings ----
+  StemIn := Config.StemChannels[0];
+  StemMid := Config.StemChannels[1];
+  StemOut := Config.StemChannels[2];
+  if Source.Output.Depth <> StemIn then
+    ImportError('HGNetV2 import: the source has ' +
+      IntToStr(Source.Output.Depth) + ' channels, stem_channels[0] is ' +
+      IntToStr(StemIn) + '.');
+  Previous := AddConvLayer(Source, StemMid, StemIn, 3, Config.StemStrides[0],
+    false, Config.Activation, Prefix + 'embedder.stem1');
+  Padded := AddBottomRightZeroPad(NN, Previous, pTrainable);
+  Branch := AddConvLayer(Padded, StemMid div 2, StemMid, 2,
+    Config.StemStrides[1], false, Config.Activation, Prefix + 'embedder.stem2a');
+  Branch := AddBottomRightZeroPad(NN, Branch, pTrainable);
+  Branch := AddConvLayer(Branch, StemMid, StemMid div 2, 2,
+    Config.StemStrides[2], false, Config.Activation, Prefix + 'embedder.stem2b');
+  Pooled := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(2, 1, 0)
+    .SetTrainable(pTrainable), Padded);
+  if (Pooled.Output.SizeX <> Branch.Output.SizeX) or
+     (Pooled.Output.SizeY <> Branch.Output.SizeY) then
+    ImportError('HGNetV2 import: stem_strides[1] and stem_strides[2] must be 1.');
+  Previous := NN.AddLayer(TNNetDeepConcat.Create([Pooled, Branch])
+    .SetTrainable(pTrainable));
+  Previous := AddConvLayer(Previous, StemMid, 2 * StemMid, 3,
+    Config.StemStrides[3], false, Config.Activation, Prefix + 'embedder.stem3');
+  Previous := AddConvLayer(Previous, StemOut, StemMid, 1, Config.StemStrides[4],
+    false, Config.Activation, Prefix + 'embedder.stem4');
+  Result[0] := Previous;
+  // ---- HGNetV2Stage: optional depthwise downsample, HGNetV2BasicLayer blocks ----
+  for Stage := 0 to MaxStage do
+  begin
+    if Previous.Output.Depth <> Config.StageInChannels[Stage] then
+      ImportError('HGNetV2 import: stage ' + IntToStr(Stage) + ' expects ' +
+        IntToStr(Config.StageInChannels[Stage]) + ' input channels, got ' +
+        IntToStr(Previous.Output.Depth) + '.');
+    StagePrefix := Prefix + 'encoder.stages.' + IntToStr(Stage) + '.';
+    MidWidth := Config.StageMidChannels[Stage];
+    OutWidth := Config.StageOutChannels[Stage];
+    KernelSize := Config.StageKernelSizes[Stage];
+    if Config.StageDownsample[Stage] then
+      Previous := AddConvLayer(Previous, Config.StageInChannels[Stage],
+        Config.StageInChannels[Stage], 3, Config.StageDownsampleStrides[Stage],
+        true, '', StagePrefix + 'downsample');
+    MaxBlockPos := Config.StageNumBlocks[Stage] - 1;
+    MaxLayerPos := Config.StageNumLayers[Stage] - 1;
+    SetLength(Aggregated, MaxLayerPos + 2);
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      BlockPrefix := StagePrefix + 'blocks.' + IntToStr(BlockPos) + '.';
+      BlockIn := Previous.Output.Depth;
+      Identity := Previous;
+      Aggregated[0] := Previous;
+      LayerIn := BlockIn;
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        LayerPrefix := BlockPrefix + 'layers.' + IntToStr(LayerPos);
+        // The block convs take the HGNetV2ConvLayer default activation (relu),
+        // not hidden_act.
+        if Config.StageLightBlock[Stage] then
+        begin
+          Previous := AddConvLayer(Previous, MidWidth, LayerIn, 1, 1, false, '',
+            LayerPrefix + '.conv1');
+          Previous := AddConvLayer(Previous, MidWidth, MidWidth, KernelSize, 1,
+            true, 'relu', LayerPrefix + '.conv2');
+        end
+        else
+          Previous := AddConvLayer(Previous, MidWidth, LayerIn, KernelSize, 1,
+            false, 'relu', LayerPrefix);
+        Aggregated[LayerPos + 1] := Previous;
+        LayerIn := MidWidth;
+      end;
+      Previous := NN.AddLayer(TNNetDeepConcat.Create(Aggregated)
+        .SetTrainable(pTrainable));
+      Previous := AddConvLayer(Previous, OutWidth div 2,
+        BlockIn + (MaxLayerPos + 1) * MidWidth, 1, 1, false, 'relu',
+        BlockPrefix + 'aggregation.0');
+      Previous := AddConvLayer(Previous, OutWidth, OutWidth div 2, 1, 1, false,
+        'relu', BlockPrefix + 'aggregation.1');
+      if BlockPos > 0 then
+        Previous := NN.AddLayer(TNNetSum.Create([Previous, Identity])
+          .SetTrainable(pTrainable));
+    end;
+    Result[Stage + 1] := Previous;
+  end;
 end;
 
 // ===========================================================================

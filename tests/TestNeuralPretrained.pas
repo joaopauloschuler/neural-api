@@ -1680,6 +1680,12 @@ type
     // top-K gather on OpenCL, parity with the oracle, residency counts printed.
     procedure TestRtDetrOpenCL;
     procedure TestRtDetrRejectsInputSize;
+    // HGNetV2 (the D-FINE backbone): config reading and the stem + stage
+    // outputs against transformers, without (tiny_dfine) and with
+    // (tiny_dfine_perlevel) the learnable affine blocks; also forced OpenCL.
+    procedure TestHGNetV2ConfigFromJSONFile;
+    procedure TestHGNetV2Parity;
+    procedure TestHGNetV2OpenCL;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -59278,6 +59284,125 @@ begin
     NN.Free;
   end;
   AssertTrue('80 x 64 must be rejected', Raised);
+end;
+
+procedure TTestNeuralPretrained.TestHGNetV2ConfigFromJSONFile;
+var
+  Config: THGNetV2Config;
+begin
+  Config := ReadHGNetV2ConfigFromJSONFile(FixturePath('tiny_dfine_config.json'));
+  AssertEquals('stem channels', 3, Length(Config.StemChannels));
+  AssertEquals('stem out', 8, Config.StemChannels[2]);
+  AssertEquals('stem strides', 5, Length(Config.StemStrides));
+  AssertEquals('stem1 stride', 2, Config.StemStrides[0]);
+  AssertEquals('stages', 4, Length(Config.StageInChannels));
+  AssertEquals('stage 3 out', 48, Config.StageOutChannels[3]);
+  AssertEquals('stage 2 blocks', 2, Config.StageNumBlocks[2]);
+  AssertEquals('stage 2 kernel', 5, Config.StageKernelSizes[2]);
+  AssertFalse('stage 0 downsample', Config.StageDownsample[0]);
+  AssertTrue('stage 1 downsample', Config.StageDownsample[1]);
+  AssertFalse('stage 1 light', Config.StageLightBlock[1]);
+  AssertTrue('stage 2 light', Config.StageLightBlock[2]);
+  AssertFalse('no affine block', Config.UseLearnableAffineBlock);
+  AssertEquals('activation', 'relu', Config.Activation);
+  AssertEquals('out indices', 3, Length(Config.OutIndices));
+  AssertEquals('first out index', 2, Config.OutIndices[0]);
+  Config := ReadHGNetV2ConfigFromJSONFile(
+    FixturePath('tiny_dfine_perlevel_config.json'));
+  AssertTrue('affine block', Config.UseLearnableAffineBlock);
+  AssertEquals('stage 1 layers', 3, Config.StageNumLayers[1]);
+end;
+
+// Stem and every stage output of the pico fixture Name against the oracle's
+// backbone_hidden_<i> (channels-last).
+procedure RunHGNetV2Parity(ATest: TTestNeuralPretrained; const Name: string;
+  OnOpenCL: boolean);
+var
+  Config: THGNetV2Config;
+  NN: TNNet;
+  Reader, IO: TNNetSafeTensorsReader;
+  Image, Expected, Actual: TNNetVolume;
+  StageOutputs: TNNetLayerRefArr;
+  StagePos, MaxStagePos, ElementPos, MaxElementPos: integer;
+  MaxDiff: double;
+  TensorName: string;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+begin
+  Config := ReadHGNetV2ConfigFromJSONFile(ATest.FixturePath(Name + '_config.json'));
+  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
+  Reader := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '.safetensors'));
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NN := TNNet.Create();
+  try
+    IO.LoadTensorFlat('image', Expected);
+    Image.ReSize(IO.DimSize('image', 1), IO.DimSize('image', 0), 3);
+    Image.CopyNoChecks(Expected);
+    NN.AddLayer(TNNetInput.Create(Image.SizeX, Image.SizeY, 3).SetTrainable(false));
+    StageOutputs := BuildHGNetV2Backbone(NN, Reader, 'model.backbone.model.',
+      Config, NN.GetLastLayer());
+    ATest.AssertEquals(Name + ' stage outputs', 5, Length(StageOutputs));
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      if not ATest.AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+      begin
+        ATest.AssertTrue('no OpenCL device: SKIP', true);
+        exit;
+      end;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(true);
+    end;
+    {$ENDIF}
+    NN.Compute(Image);
+    MaxStagePos := High(StageOutputs);
+    for StagePos := 0 to MaxStagePos do
+    begin
+      TensorName := 'backbone_hidden_' + IntToStr(StagePos);
+      StageOutputs[StagePos].ForceOutputOnRAM();
+      Actual := StageOutputs[StagePos].Output;
+      IO.LoadTensorFlat(TensorName, Expected);
+      ATest.AssertEquals(Name + ' ' + TensorName + ' height',
+        IO.DimSize(TensorName, 0), Actual.SizeY);
+      ATest.AssertEquals(Name + ' ' + TensorName + ' width',
+        IO.DimSize(TensorName, 1), Actual.SizeX);
+      ATest.AssertEquals(Name + ' ' + TensorName + ' channels',
+        IO.DimSize(TensorName, 2), Actual.Depth);
+      MaxDiff := 0;
+      MaxElementPos := Actual.Size - 1;
+      for ElementPos := 0 to MaxElementPos do
+        MaxDiff := Max(MaxDiff, Abs(Expected.FData[ElementPos] -
+          Actual.FData[ElementPos]));
+      WriteLn('  ', Name, ' ', TensorName, ' max |diff| ', FloatToStr(MaxDiff));
+      ATest.AssertTrue(Name + ' ' + TensorName + ' max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    end;
+  finally
+    NN.Free;
+    Expected.Free;
+    Image.Free;
+    Reader.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestHGNetV2Parity;
+begin
+  RunHGNetV2Parity(Self, 'tiny_dfine', {OnOpenCL=}false);
+  RunHGNetV2Parity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestHGNetV2OpenCL;
+begin
+  {$IFDEF OpenCL}
+  RunHGNetV2Parity(Self, 'tiny_dfine', {OnOpenCL=}true);
+  RunHGNetV2Parity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;

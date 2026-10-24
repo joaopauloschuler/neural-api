@@ -1985,10 +1985,14 @@ rather than acted on.
       selection (TNNetTopKGatherTokens), TNNetInverseSigmoid,
       TNNetMultiScaleDeformableAttention and the no-NMS post-process
       (DecodeRtDetrDetections). Share the code; do not copy it. New code:
-        - HGNetV2 backbone (transformers hgnet_v2: stem, HGNetV2BasicLayer
-          with light depthwise convs and aggregation, LearnableAffineBlock as
-          a scalar scale + bias). Build it as its own routine so that RT-DETRv2
-          and DEIM checkpoints can reuse it later.
+        - [x] HGNetV2 backbone: DONE, BuildHGNetV2Backbone +
+          ReadHGNetV2Config[FromJSONFile] (LearnableAffineBlock = a
+          TNNetPolynomialActivation with a zero square term). Stem and stage
+          parity < 1e-6 on both pico fixtures, CPU and OpenCL. Pico fixtures
+          tiny_dfine / tiny_dfine_perlevel from tools/make_pico_dfine_fixture.py
+          also hold the encoder outputs, enc_topk, logits, boxes and
+          post-process. transformers 5.17 crashes when eval_idx is not the last
+          layer, so the perlevel oracle runs with the decoder cut after eval_idx.
         - Neck blocks DFineRepNCSPELAN4 (RepVgg + CSP) and DFineSCDown
           (pointwise + strided depthwise) in place of the RT-DETR CCFM convs.
         - [x] Deformable attention with one point count per level
