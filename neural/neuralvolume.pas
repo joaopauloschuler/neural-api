@@ -466,12 +466,19 @@ type
       // Makes FData the same dynamic array as Original.FData, so a write through
       // either volume reaches both. Sizes must match unless pAdoptShape is set.
       procedure ShareDataWith(Original: TNNetVolume; pAdoptShape: boolean = false);
+      // Makes FData Original's storage, which holds at least Size elements: this
+      // volume uses its first Size elements (every method reads Size, not Length(FData)).
+      procedure ShareDataPrefixWith(Original: TNNetVolume);
+      // Gives this volume fresh zeroed storage of Max(Capacity, Size) elements;
+      // a volume of at most that size may then ShareDataPrefixWith it.
+      procedure AllocateData(Capacity: integer);
       // Gives this volume its own copy of FData when another volume shares it,
       // or zeroed storage after ReleaseData.
       procedure UnshareData();
       // Frees FData but keeps the shape: until ShareDataWith or UnshareData the
       // volume holds no elements.
       procedure ReleaseData();
+      // FData holds at least Size elements.
       function HasData(): boolean;
       // SqrElements is a caller-owned scratch volume shaped like Original; it
       // is resized here only when the shape changes, so nothing is allocated
@@ -8711,9 +8718,9 @@ var
 begin
   FTokenizer.Text := '';
   NumericFormat := GetDefaultNumericFormat;
-  if Length(Volume.FData) > 0 then
+  if Volume.FSize > 0 then
   begin
-    vHigh := High(Volume.FData);
+    vHigh := Volume.FSize - 1;
     if vHigh > 0 then
     begin
       for I := 0 to vHigh do
@@ -9539,7 +9546,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := (random(a) - b) / c;
 end;
@@ -9549,7 +9556,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := RandomGaussianValue() * pMul;
 end;
@@ -9559,7 +9566,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] += RandomGaussianValue() * pMul;
@@ -9615,7 +9622,7 @@ begin
     raise Exception.Create('Sizes don''t match at Add: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] += Original.FData[I];
@@ -9629,7 +9636,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] += Value;
@@ -9973,7 +9980,7 @@ begin
     raise Exception.Create('Sizes don''t match at Sub: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] -= Original.FData[I];
@@ -9987,7 +9994,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] -= Value;
@@ -10007,7 +10014,7 @@ begin
     raise Exception.Create('Sizes don''t match at Diff: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxSingle := FData[I] - Original.FData[I];
@@ -10025,7 +10032,7 @@ begin
   NewX := Original.FSize div NewDepth;
   Resize(NewX,1,NewDepth);
 
-  vHigh := High(FData);
+  vHigh := FSize - 1;
 
   posX := 0;
   posD := 0;
@@ -10069,7 +10076,7 @@ begin
   NewDepth3 := NewDepth2 + NewDepth;
   NewDepth4 := NewDepth3 + NewDepth;
 
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   vHighM4 := vHigh - 4;
 
   posX := 0;
@@ -10160,7 +10167,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := Min(FData[I], Value);
 end;
@@ -10170,7 +10177,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := Max(FData[I], Value);
 end;
@@ -10185,7 +10192,7 @@ begin
     raise Exception.Create('Sizes don''t match at Mul: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] *= Original.FData[I];
@@ -10228,7 +10235,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] *= Value;
@@ -10271,7 +10278,7 @@ var
 begin
   if Value <> 1 then
   begin
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     for I := 0 to vHigh do
       FData[I] := pcr_powf(FData[I],Value);
   end;
@@ -10282,7 +10289,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     if FData[I] <> 0 then FData[I] := (1/FData[I]);
@@ -10294,7 +10301,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := pcr_sqrtf(FData[I]);
 end;
@@ -10516,7 +10523,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] /= Original.FData[I];
@@ -10530,7 +10537,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] /= Value;
@@ -10544,7 +10551,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := NeuronForceMinRange(FData[I], Value);
 end;
@@ -10563,7 +10570,7 @@ begin
   end;
   // A non-positive bound sits outside the kernel's contract - it early-exits
   // there - so the scalar clamp keeps handling it.
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := NeuronForceRange(FData[I], Value);
 end;
@@ -10611,7 +10618,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     if FData[I] < 0 then FData[I] := -FData[I];
 end;
@@ -10627,7 +10634,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := c;
 end;
@@ -10673,7 +10680,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := I/100;
 end;
@@ -11400,7 +11407,7 @@ begin
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
   Result := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxDiff := FData[I] - Original.FData[I];
@@ -11417,7 +11424,7 @@ begin
   if Original.Size <> Self.Size then
     raise Exception.Create('Sizes don''t match at DebugDiff: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxDiff := FData[I] - Original.FData[I];
@@ -11436,9 +11443,9 @@ var
   vHigh: integer;
 begin
   if Size <> Original.FSize then Resize(Original);
-  if Length(Original.FData) > 0 then
+  if Original.FSize > 0 then
   begin
-    vHigh := High(Original.FData);
+    vHigh := Original.FSize - 1;
     FData[0] := Original.FData[0];
     for I := 1 to vHigh do
       FData[I] := FData[I-1] + Original.FData[I];
@@ -11457,7 +11464,7 @@ begin
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
   Result := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxDiff := FData[I] - Original.FData[I];
@@ -11537,11 +11544,11 @@ var
   vHigh: integer;
   v: T;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0];
     FLastPos := 0;
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -11567,9 +11574,9 @@ var
   vHigh: integer;
 begin
   Result := 0;
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     for I := 0 to vHigh do
     begin
       if FData[I] <> 0 then Inc(Result);
@@ -11583,7 +11590,7 @@ var
   vHigh: integer;
   auxSingle: single;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     auxSingle := FData[0];
     FLastPos := 0;
@@ -11594,7 +11601,7 @@ begin
     // ForceMaxAbs / NormalizeMax / int8 quantization / backprop overflow
     // protection - that all expect a true non-negative magnitude).
     Result := auxSingle;
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -11621,11 +11628,11 @@ var
   vHigh: integer;
   v: T;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0];
     FLastPos := 0;
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -11683,10 +11690,10 @@ var
   I: integer;
   vHigh: integer;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0];
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     // Eight accumulations per iteration into the one left-associated chain, so
     // the summation order - and therefore the result - is exactly the
     // element-at-a-time loop's, at a fraction of the loop overhead. This is the
@@ -11718,7 +11725,7 @@ begin
   // Abs clears the sign bit; the sign test it replaces was a data-dependent
   // branch taken once per element.
   Result := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     Result := Result + Abs(FData[I]);
 end;
@@ -11728,10 +11735,10 @@ var
   I: integer;
   vHigh: integer;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0] * FData[0];
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -12002,7 +12009,7 @@ var
   vHigh: integer;
   Value: TNeuralFloat;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     Value := FData[I];
@@ -12196,7 +12203,7 @@ end;
 
 procedure TVolume.SetClass(pClass: integer; value: T);
 begin
-  if (pClass >= 0) and (pClass <= High(FData)) then
+  if (pClass >= 0) and (pClass <= FSize - 1) then
   begin
     Fill(-value);
     FData[pClass] := value;
@@ -12209,7 +12216,7 @@ end;
 
 procedure TVolume.SetClass(pClass: integer; TrueValue, FalseValue: T);
 begin
-  if (pClass >= 0) and (pClass <= High(FData)) then
+  if (pClass >= 0) and (pClass <= FSize - 1) then
   begin
     Fill(FalseValue);
     FData[pClass] := TrueValue;
@@ -12244,7 +12251,7 @@ var
   vMax: T;
   v: T;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   if (vHigh>0) then
   begin
     Result := 0;
@@ -12301,7 +12308,7 @@ var
   MinValue, MaxValue, ShiftedMin: T;
 begin
   TotalSum := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
 
   if vHigh >= 0 then
   begin
@@ -13874,7 +13881,7 @@ begin
   begin
     if FSize > 1 then
     begin
-      VMax := High(FData);
+      VMax := FSize - 1;
       VMin := Low(FData) + Positions;
       if ( (VMin <= VMax) and (VMin > 0) ) then
       begin
@@ -13893,7 +13900,7 @@ begin
     if FSize > 1 then
       // memmove semantics handle the overlapping copy toward lower indices.
       Move(FData[1], FData[0], (FSize - 1) * csNeuralFloatSize);
-    FData[High(FData)] := 0;
+    FData[FSize - 1] := 0;
   end;
 end;
 
@@ -13903,7 +13910,7 @@ var
   vHigh: integer;
   AuxData: Single;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   Write('(',SizeX,',',SizeY,',',Depth,') - ');
   for I := 0 to vHigh do
   begin
@@ -14073,7 +14080,7 @@ begin
   S.Add( IntToStr(FSizeY) );
   S.Add( IntToStr(FDepth) );
 
-  Hi := High(FData);
+  Hi := FSize - 1;
   Lo := Low(FData);
   for I := Lo to Hi do
   begin
@@ -14158,8 +14165,26 @@ begin
   FDataPtr := Original.FDataPtr;
 end;
 
-// SetLength copies a dynamic array referenced more than once and leaves one
-// referenced only here in place.
+procedure TNNetVolume.ShareDataPrefixWith(Original: TNNetVolume);
+begin
+  if Length(Original.FData) < FSize then
+    raise Exception.Create('TNNetVolume.ShareDataPrefixWith: ' +
+      IntToStr(Length(Original.FData)) + ' elements cannot hold ' +
+      IntToStr(FSize) + '.');
+  FData := Original.FData;
+  FDataPtr := Original.FDataPtr;
+end;
+
+procedure TNNetVolume.AllocateData(Capacity: integer);
+begin
+  FData := nil;
+  SetLength(FData, Max(Capacity, FSize));
+  if Length(FData) > 0 then FDataPtr := Addr(FData[0])
+  else FDataPtr := nil;
+end;
+
+// SetLength copies a dynamic array referenced more than once (only its first
+// Size elements) and trims one referenced only here in place.
 procedure TNNetVolume.UnshareData();
 begin
   SetLength(FData, FSize);
@@ -14175,7 +14200,7 @@ end;
 
 function TNNetVolume.HasData(): boolean;
 begin
-  Result := Length(FData) = FSize;
+  Result := Length(FData) >= FSize;
 end;
 
 function TNNetVolume.GetMemSize(): integer;
@@ -21039,7 +21064,7 @@ begin
     else
     begin
       Result := 0;
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += FData[I] * Original.FData[I];
     end;
@@ -21055,7 +21080,7 @@ begin
     else
     begin
       Result := 0;
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += FData[I];
     end;
@@ -21127,7 +21152,7 @@ begin
     then Result := AVXDistanceSqr(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += Sqr(Original.FData[I]-FData[I]);
     end;
@@ -21159,7 +21184,7 @@ begin
     then Result := AVXSumDiff(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += Abs(Original.FData[I]-FData[I]);
     end;
@@ -21190,7 +21215,7 @@ begin
     then AVXMul(FDataPtr, Value, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         FData[I] *= Value;
     end;
@@ -21341,7 +21366,7 @@ begin
     then AVXAdd(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         FData[I] += Original.FData[I];
     end;
@@ -21377,7 +21402,7 @@ begin
     then AVXSub(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         FData[I] -= Original.FData[I];
     end;

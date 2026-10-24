@@ -1668,17 +1668,34 @@ rather than acted on.
         zq branches so their storage is reused. Left: exact-size slots keep the
         256-channel and 128-channel full-resolution phases in separate storage
         (growable host slots would cut ~1/3 more); no in-place layers.
-  - [ ] VAE follow-up: let a smaller host output reuse a larger free slot in
-        the ShareHostOutputsByLiveness plan (today slots match by exact size),
-        so the 256-channel and 128-channel full-resolution phases share
-        storage; estimated ~1/3 less activation RAM per latent cell (~6 GB for
-        a 30x45 tile). Needs a TNNetVolume that can view a prefix of a larger
-        buffer; check every consumer of shared outputs reads only Size elements.
+  - [X] VAE follow-up: let a smaller host output reuse a larger free slot in
+        the ShareHostOutputsByLiveness plan. The host plan now uses the
+        best-fit/grow planner the OpenCL plan already had: a slot's first user
+        allocates the slot's largest size (TNNetVolume.AllocateData) and later
+        users view its prefix (TNNetVolume.ShareDataPrefixWith); every TVolume
+        method now bounds its loops by Size, not Length(FData). Measured on
+        random CogVideoX-2b-shape weights (2x2-latent batch nets, NonWeightBytes
+        after one forward, MiB per latent cell): first-batch net 27.47 MB ->
+        15.42 MB (6.55 -> 3.68 MiB per cell, -44%), cached-pad net 24.65 MB ->
+        14.22 MB (5.88 -> 3.39 MiB per cell, -42%); output unchanged. Other
+        sharing users on their pico fixtures: RT-DETR 1.68 -> 1.61 MB (-4.5%),
+        RT-DETR R50 1.54 -> 1.44 MB (-6.2%), EfficientLoFTR 34.03 -> 33.18 MB
+        (-2.5%), parity unchanged. Tests: TestVolumeSharePrefixView,
+        TestShareHostOutputsGrowingSlots.
+  - [ ] VAE follow-up: re-measure the whole-tile peak RSS per latent cell with
+        the grown slots (the 6.7 MB figure predates them; scaling by the net
+        bytes gives ~3.8 MB, i.e. ~5.5 GB for a 30x45 tile) - part of the real
+        THUDM run below.
+  - [ ] Host output sharing follow-up: in-place layers (an elementwise layer
+        writing into its only reader's dead source) and finding which layers
+        hold the remaining unshared host bytes of RT-DETR / EfficientLoFTR
+        (best-fit slots saved only 2-6% there).
   - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (TCogVideoXVaeDecoder.Create
         on the downloaded vae folder, a 2-3 latent-frame low-res slice against
         diffusers decode); check the encoder tensors are ignored and no decoder
-        tensor is left over. RAM estimate: 0.47 GB FP32 weights + ~6.7 MB per
-        latent cell, so ~9 GB for one 30x45 tile with EnableTiling and ~36 GB
+        tensor is left over. RAM estimate: 0.47 GB FP32 weights + ~3.8 MB per
+        latent cell (scaled from the net bytes, RSS not re-measured), so
+        ~5.5 GB for one 30x45 tile with EnableTiling and ~21 GB
         for the untiled 60x90 latent; a low-res slice (e.g. 8x8 latent) fits
         in ~1 GB.
   - [ ] VAE follow-up: OpenCL / speed. TNNetConvolution3D's CPU forward is one

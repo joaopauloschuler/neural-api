@@ -914,6 +914,9 @@ type
     // ShareHostOutputsByLiveness on the CPU: identical to unshared, serial and
     // parallel; fewer host bytes; suffix forwards refused; trainable nets unshared.
     procedure TestShareHostOutputsByLiveness;
+    // ShareHostOutputsByLiveness with outputs of several sizes: a slot grows to
+    // its largest user, smaller outputs view its prefix; identical to unshared.
+    procedure TestShareHostOutputsGrowingSlots;
     // ShareHostOutputsByLiveness on OpenCL with host-computed layers and a host
     // reader in the pass: identical to unshared; off with per-layer queues.
     procedure TestOpenCLShareHostOutputsByLiveness;
@@ -82133,6 +82136,135 @@ begin
   finally
     Input.Free;
     NetTrainable.Free;
+    NetOn.Free;
+    NetOff.Free;
+  end;
+end;
+
+// Channel counts of BuildGrowingSlotTestNet's chain: two slots alternate;
+// each starts at 4 channels and grows to 32; 16 sits between 32s.
+const
+  cGrowingSlotChannels: array[1..9] of integer = (4, 4, 32, 8, 32, 8, 16, 32, 32);
+
+function BuildGrowingSlotTestNet(): TNNet;
+var
+  LayerCnt, NeuronCnt, WeightCnt, ChainPos: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(6, 5, 8));
+  for ChainPos := Low(cGrowingSlotChannels) to High(cGrowingSlotChannels) do
+    Result.AddLayer(TNNetConvolutionLinear.Create(
+      cGrowingSlotChannels[ChainPos], 3, 1, 1, 0));
+  Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1, 0));
+  Result.SetTrainable(false, {pLowMemory=}false);
+  for LayerCnt := 0 to Result.GetLastLayerIdx() do
+  begin
+    for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.02 + 0.05 * Sin(LayerCnt * 1.7 + NeuronCnt * 0.9 + WeightCnt * 0.23);
+      Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+        0.1 * Cos(LayerCnt + NeuronCnt * 0.17);
+    end;
+    Result.Layers[LayerCnt].FlushWeightCache();
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestShareHostOutputsGrowingSlots;
+const
+  CellCount = 30;
+  SlotBytes = 32 * CellCount * csNeuralFloatSize;
+var
+  NetOff, NetOn: TNNet;
+  Input: TNNetVolume;
+  PassPos, ElementPos, MaxElementPos, ChainPos: integer;
+  UnsharedBytes, BytesOff, BytesOn: int64;
+  SlotStorage: array[0..1] of Pointer;
+
+  procedure CheckPass(const pWhen: string; pParallel: boolean);
+  var
+    LayerPos: integer;
+  begin
+    NetOff.Compute(Input, 0, pParallel);
+    NetOn.Compute(Input, 0, pParallel);
+    // The last user of each slot and the output keep their values.
+    for LayerPos := 8 to 10 do
+    begin
+      AssertEquals(pWhen + ': layer ' + IntToStr(LayerPos), 0,
+        MaxAbsDiffOfVolumes(NetOn.Layers[LayerPos].Output,
+        NetOff.Layers[LayerPos].Output), 0);
+      AssertEquals(pWhen + ': SaveToString of layer ' + IntToStr(LayerPos),
+        NetOff.Layers[LayerPos].Output.SaveToString(),
+        NetOn.Layers[LayerPos].Output.SaveToString());
+      AssertEquals(pWhen + ': GetSum of layer ' + IntToStr(LayerPos),
+        NetOff.Layers[LayerPos].Output.GetSum(),
+        NetOn.Layers[LayerPos].Output.GetSum(), 0);
+    end;
+  end;
+
+begin
+  NetOff := BuildGrowingSlotTestNet();
+  NetOn := BuildGrowingSlotTestNet();
+  Input := TNNetVolume.Create(6, 5, 8);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.6 * Sin(ElementPos * 0.051) - 0.1;
+    NetOn.ShareHostOutputsByLiveness := true;
+    for PassPos := 0 to 3 do
+      CheckPass('pass ' + IntToStr(PassPos), PassPos >= 2);
+    // Odd chain layers take slot 0, even ones slot 1.
+    SlotStorage[0] := Pointer(NetOn.Layers[1].Output.FData);
+    SlotStorage[1] := Pointer(NetOn.Layers[2].Output.FData);
+    AssertTrue('two slots', SlotStorage[0] <> SlotStorage[1]);
+    UnsharedBytes := 0;
+    for ChainPos := Low(cGrowingSlotChannels) to High(cGrowingSlotChannels) do
+    begin
+      AssertTrue('layer ' + IntToStr(ChainPos) + ' in its slot',
+        Pointer(NetOn.Layers[ChainPos].Output.FData) = SlotStorage[1 - ChainPos mod 2]);
+      AssertEquals('layer ' + IntToStr(ChainPos) + ' views the grown slot',
+        32 * CellCount, Length(NetOn.Layers[ChainPos].Output.FData));
+      AssertEquals('layer ' + IntToStr(ChainPos) + ' Size',
+        cGrowingSlotChannels[ChainPos] * CellCount,
+        NetOn.Layers[ChainPos].Output.Size);
+      UnsharedBytes := UnsharedBytes +
+        int64(NetOn.Layers[ChainPos].Output.Size) * csNeuralFloatSize;
+    end;
+    BytesOff := NetOff.NonWeightBytes();
+    BytesOn := NetOn.NonWeightBytes();
+    WriteLn('  ShareHostOutputs growing slots: ',
+      NetOn.HostSharedOutputLayerCount(), ' layers share ',
+      NetOn.HostSharedOutputBytes(), ' B in place of ',
+      NetOn.HostSharedOutputPrivateBytes(), ' B; net host bytes ', BytesOff,
+      ' -> ', BytesOn);
+    AssertEquals('every chain layer but the two holders shares', 7,
+      NetOn.HostSharedOutputLayerCount());
+    AssertEquals('two 32-channel slots', 2 * SlotBytes,
+      NetOn.HostSharedOutputBytes());
+    AssertEquals('the outputs on their own', UnsharedBytes,
+      NetOn.HostSharedOutputPrivateBytes());
+    AssertEquals('host bytes saved', UnsharedBytes - 2 * SlotBytes,
+      BytesOff - BytesOn);
+    // Freed between uses (the last layer's own output too), planned and
+    // allocated again by the next forward.
+    NetOn.ReleaseHostOutputs();
+    AssertEquals('released', BytesOn - 2 * SlotBytes -
+      int64(NetOn.GetLastLayer().Output.Size) * csNeuralFloatSize,
+      NetOn.NonWeightBytes());
+    CheckPass('after ReleaseHostOutputs', false);
+    AssertEquals('replanned', BytesOn, NetOn.NonWeightBytes());
+    // Off: every layer gets its own storage of its own size.
+    NetOn.ShareHostOutputsByLiveness := false;
+    AssertEquals('off: host bytes as unshared', BytesOff, NetOn.NonWeightBytes());
+    for ChainPos := Low(cGrowingSlotChannels) to High(cGrowingSlotChannels) do
+      AssertEquals('off: layer ' + IntToStr(ChainPos) + ' storage',
+        NetOn.Layers[ChainPos].Output.Size,
+        Length(NetOn.Layers[ChainPos].Output.FData));
+    CheckPass('off', true);
+  finally
+    Input.Free;
     NetOn.Free;
     NetOff.Free;
   end;

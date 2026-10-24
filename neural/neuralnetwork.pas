@@ -21019,10 +21019,10 @@ type
       procedure SetShareHostOutputsByLiveness(Value: boolean);
       // TNNetLayer.OutputPinned changed: the sharing plans are stale.
       procedure OutputPinChanged(pPinned: boolean);
-      // HostSharedOutputLayerCount, HostSharedOutputBytes and
-      // HostSharedOutputPrivateBytes in one pass.
+      // The Host*SharedOutput* counts in one pass; HeldBytes: the storage the
+      // sharing layers' FOutput volumes reference, counted once per layer.
       procedure CountHostSharedOutputs(out LayerCount: integer;
-        out SharedBytes, PrivateBytes: int64);
+        out SharedBytes, PrivateBytes, HeldBytes: int64);
       procedure SetLayerProfiling(Value: boolean);
       // Starts the borrowing build pairing at the owner's first layer.
       procedure SetBuildWeightOwner(Value: TNNet);
@@ -23062,7 +23062,7 @@ type
       function HostSharedOutputBytes(): int64;
       function HostSharedOutputPrivateBytes(): int64;
       // Inference-only nets (not with per-layer OpenCL queues): from the next
-      // forward, equal-size dead outputs share host storage; see PlanOutputSlotsByLiveness.
+      // forward, an output reuses a dead output's storage of at least its size.
       property ShareHostOutputsByLiveness: boolean
         read FShareHostOutputsByLiveness write SetShareHostOutputsByLiveness;
       // With ShareHostOutputsByLiveness: frees the host storage of every output
@@ -25856,6 +25856,12 @@ function VolumeBytes(V: TNNetVolume): int64;
 begin
   if Assigned(V) then Result := int64(Length(V.FData)) * csNeuralFloatSize
   else Result := 0;
+end;
+
+// The bytes Layer's output takes on its own (its Size, not a shared capacity).
+function OutputSizeBytes(Layer: TNNetLayer): int64;
+begin
+  Result := int64(Layer.FOutput.Size) * csNeuralFloatSize;
 end;
 
 function Quant8Bytes(Q: TNNetVolumeQuant8): int64;
@@ -125579,14 +125585,14 @@ end;
 function TNNet.NonWeightBytes(): int64;
 var
   LayerCnt, LastLayerIdx, SharedLayerCount: integer;
-  SharedBytes, PrivateBytes: int64;
+  SharedBytes, PrivateBytes, HeldBytes: int64;
 begin
   Result := 0;
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
     Result := Result + FLayers[LayerCnt].NonWeightBytes();
-  CountHostSharedOutputs(SharedLayerCount, SharedBytes, PrivateBytes);
-  Result := Result - (PrivateBytes - SharedBytes);
+  CountHostSharedOutputs(SharedLayerCount, SharedBytes, PrivateBytes, HeldBytes);
+  Result := Result - (HeldBytes - SharedBytes);
 end;
 
 // A shared buffer counts once, not once per layer still writing into it.
@@ -148593,7 +148599,7 @@ begin
   for LayerCnt := 0 to LastLayerIdx do
     Shareable[LayerCnt] := FLayers[LayerCnt].CanShareHostOutput() and
       not Assigned(FLayers[LayerCnt].FHostOutputStorage);
-  PlanOutputSlotsByLiveness(Shareable, {ExactSize=}true, FHostOutputPlan);
+  PlanOutputSlotsByLiveness(Shareable, {ExactSize=}false, FHostOutputPlan);
   MaxSlotPos := High(FHostOutputPlan.SlotBytes);
   SetLength(FHostOutputSlotHolders, MaxSlotPos + 1);
   SetLength(SlotLayerCount, MaxSlotPos + 1);
@@ -148619,9 +148625,10 @@ begin
     if HolderIdx < 0 then
     begin
       FHostOutputSlotHolders[SlotPos] := LayerCnt;
-      if not LayerOutput.HasData() then LayerOutput.UnshareData();
+      LayerOutput.AllocateData(
+        FHostOutputPlan.SlotBytes[SlotPos] div csNeuralFloatSize);
     end
-    else LayerOutput.ShareDataWith(FLayers[HolderIdx].FOutput);
+    else LayerOutput.ShareDataPrefixWith(FLayers[HolderIdx].FOutput);
   end;
   {$IFDEF OpenCL}
   if IsOnOpenCL then
@@ -148703,7 +148710,7 @@ end;
 // A layer counts while its FOutput still holds its slot holder's or planned
 // storage (a ReSize to another size gives it its own).
 procedure TNNet.CountHostSharedOutputs(out LayerCount: integer;
-  out SharedBytes, PrivateBytes: int64);
+  out SharedBytes, PrivateBytes, HeldBytes: int64);
 var
   LayerCnt, MaxPlannedLayerPos, SlotPos, MaxSlotPos, HolderIdx: integer;
   Storage: TNNetVolume;
@@ -148712,6 +148719,7 @@ begin
   LayerCount := 0;
   SharedBytes := 0;
   PrivateBytes := 0;
+  HeldBytes := 0;
   MaxSlotPos := High(FHostOutputSlotHolders);
   SetLength(HolderCounted, MaxSlotPos + 1);
   for SlotPos := 0 to MaxSlotPos do HolderCounted[SlotPos] := false;
@@ -148727,7 +148735,8 @@ begin
         (Pointer(FLayers[LayerCnt].FOutput.FData) = Pointer(Storage.FData)) then
       begin
         Inc(LayerCount);
-        PrivateBytes := PrivateBytes + VolumeBytes(FLayers[LayerCnt].FOutput);
+        PrivateBytes := PrivateBytes + OutputSizeBytes(FLayers[LayerCnt]);
+        HeldBytes := HeldBytes + VolumeBytes(FLayers[LayerCnt].FOutput);
       end;
       continue;
     end;
@@ -148735,35 +148744,37 @@ begin
     if (HolderIdx = LayerCnt) or (Pointer(FLayers[LayerCnt].FOutput.FData) <>
       Pointer(FLayers[HolderIdx].FOutput.FData)) then continue;
     Inc(LayerCount);
-    PrivateBytes := PrivateBytes + VolumeBytes(FLayers[LayerCnt].FOutput);
+    PrivateBytes := PrivateBytes + OutputSizeBytes(FLayers[LayerCnt]);
+    HeldBytes := HeldBytes + VolumeBytes(FLayers[LayerCnt].FOutput);
     if HolderCounted[SlotPos] then continue;
     HolderCounted[SlotPos] := true;
     SharedBytes := SharedBytes + VolumeBytes(FLayers[HolderIdx].FOutput);
-    PrivateBytes := PrivateBytes + VolumeBytes(FLayers[HolderIdx].FOutput);
+    PrivateBytes := PrivateBytes + OutputSizeBytes(FLayers[HolderIdx]);
+    HeldBytes := HeldBytes + VolumeBytes(FLayers[HolderIdx].FOutput);
   end;
 end;
 
 function TNNet.HostSharedOutputLayerCount(): integer;
 var
-  SharedBytes, PrivateBytes: int64;
+  SharedBytes, PrivateBytes, HeldBytes: int64;
 begin
-  CountHostSharedOutputs(Result, SharedBytes, PrivateBytes);
+  CountHostSharedOutputs(Result, SharedBytes, PrivateBytes, HeldBytes);
 end;
 
 function TNNet.HostSharedOutputBytes(): int64;
 var
   LayerCount: integer;
-  PrivateBytes: int64;
+  PrivateBytes, HeldBytes: int64;
 begin
-  CountHostSharedOutputs(LayerCount, Result, PrivateBytes);
+  CountHostSharedOutputs(LayerCount, Result, PrivateBytes, HeldBytes);
 end;
 
 function TNNet.HostSharedOutputPrivateBytes(): int64;
 var
   LayerCount: integer;
-  SharedBytes: int64;
+  SharedBytes, HeldBytes: int64;
 begin
-  CountHostSharedOutputs(LayerCount, SharedBytes, Result);
+  CountHostSharedOutputs(LayerCount, SharedBytes, Result, HeldBytes);
 end;
 
 procedure TNNet.InvalidateInferencePlan();

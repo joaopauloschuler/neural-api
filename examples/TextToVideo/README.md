@@ -144,10 +144,12 @@ TileOverlapFactorHeight, TileOverlapFactorWidth)` with the diffusers defaults;
 - **Memory:** the decoder holds one batch (2-3 latent frames, 8-9 output
   frames) of one tile, not the whole clip. The pico fixture needs a few MB.
   The batch nets share activation storage by liveness, and only one of them
-  holds activations at a time. Measured on random weights of the CogVideoX-2b
-  VAE shape, a decode peaks at about 6.7 MB per latent cell (93 MB without
-  sharing) on top of the 0.47 GB of FP32 weights, so one 30x45-cell
-  `--vae-tiling` tile needs about 9 GB and the untiled 60x90 latent about 36 GB.
+  holds activations at a time; a smaller activation reuses the storage of a
+  larger dead one. Measured on random weights of the CogVideoX-2b VAE shape,
+  the first-batch net holds about 3.7 MiB of activations per latent cell
+  (47 MiB without sharing) on top of the 0.47 GB of FP32 weights, so one
+  30x45-cell `--vae-tiling` tile needs an estimated 5.5 GB and the untiled
+  60x90 latent about 21 GB.
 - **Text states:** deterministic synthetic values stand in for a real T5 tower.
 - **Output:** writes `frame_<ii>.ppm` (P6, or `.png` with `--png`) for each
   decoded frame, the `--gif` file when asked, and prints the config, the

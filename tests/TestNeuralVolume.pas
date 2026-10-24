@@ -21,6 +21,9 @@ type
     procedure TestVolumeMul;
     procedure TestVolumeDiv;
     procedure TestVolumeResize;
+    // ShareDataPrefixWith: a volume viewing the prefix of larger storage reads
+    // and writes only its Size elements; ReSize/UnshareData detach it.
+    procedure TestVolumeSharePrefixView;
     procedure TestVolumeStatistics;
     procedure TestVolumeMinMax;
     procedure TestVolumeMaxAbsNegativeFirst;
@@ -443,6 +446,84 @@ begin
     AssertEquals('After resize total size should be 1500', 1500, V.Size);
   finally
     V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSharePrefixView;
+var
+  Storage, View, Private, Copied: TNNetVolume;
+  ElementPos, MaxElementPos: integer;
+  Raised: boolean;
+begin
+  Storage := TNNetVolume.Create(4, 3, 2);
+  View := TNNetVolume.Create(3, 2, 2);
+  Private := TNNetVolume.Create(3, 2, 2);
+  Copied := TNNetVolume.Create();
+  try
+    Storage.AllocateData(40);
+    AssertEquals('AllocateData capacity', 40, Length(Storage.FData));
+    AssertEquals('AllocateData keeps Size', 24, Storage.Size);
+    AssertTrue('HasData with spare capacity', Storage.HasData());
+    MaxElementPos := Length(Storage.FData) - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Storage.FData[ElementPos] := 1000 + ElementPos;
+    View.ShareDataPrefixWith(Storage);
+    AssertTrue('same storage', Pointer(View.FData) = Pointer(Storage.FData));
+    AssertTrue('DataPtr follows', View.DataPtr = Storage.DataPtr);
+    MaxElementPos := View.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      View.FData[ElementPos] := ElementPos - 5.5;
+      Private.FData[ElementPos] := ElementPos - 5.5;
+    end;
+    AssertEquals('a write reaches the storage', -5.5, Storage.FData[0], 0);
+    AssertEquals('GetSum reads Size', Private.GetSum(), View.GetSum(), 0);
+    AssertEquals('GetSumSqr reads Size', Private.GetSumSqr(), View.GetSumSqr(), 0);
+    AssertEquals('GetMax reads Size', Private.GetMax(), View.GetMax(), 0);
+    AssertEquals('GetMin reads Size', Private.GetMin(), View.GetMin(), 0);
+    AssertEquals('GetMaxAbs reads Size', Private.GetMaxAbs(), View.GetMaxAbs(), 0);
+    AssertEquals('GetNonZero reads Size', Private.GetNonZero(), View.GetNonZero());
+    AssertEquals('GetClass reads Size', Private.GetClass(), View.GetClass());
+    AssertEquals('SaveToString reads Size', Private.SaveToString(),
+      View.SaveToString());
+    Copied.Copy(View);
+    AssertEquals('Copy takes Size elements', 12, Length(Copied.FData));
+    AssertEquals('Copy matches', 0, Copied.SumDiff(Private), 0);
+    View.Fill(2);
+    View.Add(Private);
+    View.Mul(3);
+    View.Sub(Private);
+    View.Divi(2);
+    AssertEquals('bulk ops stop at Size', 1000 + 12, Storage.FData[12], 0);
+    AssertEquals('bulk ops stop at the last element', 1000 + 39,
+      Storage.FData[39], 0);
+    Raised := false;
+    try
+      Private.ReSize(10, 5, 1);
+      Private.ShareDataPrefixWith(Storage);
+    except
+      Raised := true;
+    end;
+    AssertTrue('storage smaller than Size raises', Raised);
+    // A ReSize to another size gives the view its own copy of the prefix.
+    View.ReSize(2, 2, 2);
+    AssertTrue('ReSize detaches', Pointer(View.FData) <> Pointer(Storage.FData));
+    AssertEquals('detached length', 8, Length(View.FData));
+    View.ReSize(3, 2, 2);
+    View.ShareDataPrefixWith(Storage);
+    View.UnshareData();
+    AssertTrue('UnshareData detaches', Pointer(View.FData) <> Pointer(Storage.FData));
+    AssertEquals('UnshareData takes Size elements', 12, Length(View.FData));
+    View.ShareDataPrefixWith(Storage);
+    View.FData[0] := 7;
+    Storage.UnshareData();
+    AssertEquals('UnshareData trims the storage', 24, Length(Storage.FData));
+    AssertEquals('the view keeps the old storage', 7, View.FData[0], 0);
+  finally
+    Copied.Free;
+    Private.Free;
+    View.Free;
+    Storage.Free;
   end;
 end;
 
