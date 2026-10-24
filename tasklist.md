@@ -85,6 +85,15 @@ rather than acted on.
       plain conv chunk path at all. Options: override `WinogradEligible` (and
       `ChunkEligible`) to false in `TNNetDeformableConv`, or move the packed
       field to a free slot.
+- [ ] Possible bug (found during f90b4f0c, not fixed, awaits user decision):
+      `TNNetGridSample` border-padding backward clamps the four corner indices
+      and zeroes each clamped corner's term. When exactly one corner pair is
+      clamped the sample is locally constant, but the grid gradient comes out
+      as +/-v instead of 0 (e.g. sx in (-1, 0) gives dSdx = v10). torch
+      `clip_coordinates` clips the pixel coordinate instead, with zero
+      gradient where it clips; `TNNetTriplaneSample` already does that. Fix:
+      clip the coordinate in `TNNetGridSample` the same way, and add a
+      border-padding gradient check at the edge.
 - [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
       (neural/neuralvolume.pas) calls `ReSize` only when `Size` differs,
       so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
@@ -1942,6 +1951,29 @@ rather than acted on.
       gradient check, OpenCL parity (max |diff| 8.3e-7, not bit-identical).
       Still open: the importer, vertex colouring and the example; chunk the
       256^3 grid (N * 3 * Cp must stay below 2^31 per forward).
+  - [ ] T3. Checkpoint reader: load model.ckpt through `TNNetTorchBinReader`,
+        list the tensor names (image_tokenizer.*, tokenizer.*, backbone.*,
+        post_processor.*, decoder.*) and read config.yaml sizes into a
+        `TTripoSRConfig`. Check whether DINO v1 ViT-B/16 loads through
+        BuildViTFromSafeTensors' name mapping and whether the checkpoint's
+        tokenizer enables the adaLN camera modulation (TripoSR feeds a fixed
+        camera). Ask the user before downloading (~1.7 GB) or writing a
+        Python oracle.
+  - [ ] T4. Backbone: factor the BasicTransformerBlock (self-attn + cross-attn
+        + GEGLU FFN) out of AddSDTransformer2D into a shared builder routine,
+        then build Transformer1D over the 3 x 32 x 32 learned tokens
+        (GroupNorm, proj_in, 16 blocks, proj_out) and the 2x2 stride-2
+        post-processor; verify the triplane layout against
+        TNNetDeconvolution's output (planes must not mix).
+  - [ ] T5. NeRF decoder + density sweep: the per-point MLP after
+        TNNetTriplaneSample (pointwise convs, SiLU, density bias/activation,
+        RGB sigmoid), queried over the marching grid in chunks so
+        N * 3 * Cp < 2^31 and RAM stays under the 2 GB cap; MarchingCubes on
+        the density, then a second query at the vertices for colours.
+  - [ ] T6. examples/ImageTo3D (+ README, examples/README.md row): background
+        removal via the BiRefNet path, grey composite, centred 512 px resize,
+        --mc-resolution / --threshold / --no-remove-bg / --gpu, mesh out as
+        PLY and OBJ.
 - [ ] 3D Gaussian Splatting viewer follow-ups (arXiv:2308.04079). Landed:
       neural/neuralply.pas (`TNNetPLYReader` / `TNNetPLYWriter`),
       neural/neuralgaussiansplat.pas (`TGaussianSplatScene`,
@@ -2361,6 +2393,11 @@ rather than acted on.
             and backward. The OpenCL forward runs weight groups as one grouped
             GEMM on `cai_conv_transpose` (untiled); one weight group keeps the
             tiled dense GEMM.
+      - [ ] GPU-box timing of the grouped deformable GEMM (91ffe673) at 2 and
+            4 weight groups against the parent commit's block-diagonal tiled
+            GEMM: fewer multiply-adds on an untiled kernel may still lose at
+            2 groups. If it loses, add a tiled grouped GEMM (a group axis on
+            the tiled dense kernel) rather than reverting.
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on
