@@ -32,10 +32,15 @@ last_hidden_state for the pinned image.
 "silu" (the vith16plus / 7B SwiGLU MLP, down_proj(silu(gate_proj(x)) *
 up_proj(x))).
 
+--variant nonsquare loads the committed tiny_dinov3.safetensors and writes only
+tiny_dinov3_nonsquare_hidden.json: the same model run at a non-native,
+non-square H x W = 8 x 20 (2 x 5 patch grid; DINOv3ViTModel recomputes the
+RoPE patch-centre coordinates per axis from the pixel_values size).
+
 Coded by Claude (AI).
 
 Usage (from the repo root):
-  /home/bpsa/x/bin/python tools/dinov3_tiny_fixture.py [--variant base|gated]
+  /home/bpsa/x/bin/python tools/dinov3_tiny_fixture.py [--variant base|gated|nonsquare]
 writes tests/fixtures/tiny_dinov3{,_gated}{.safetensors,_config.json,
 _hidden.json}.
 Needs torch + transformers (>=5.11, ships dinov3_vit) + safetensors.
@@ -45,7 +50,7 @@ import copy
 import json
 
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers import DINOv3ViTModel, DINOv3ViTConfig
 
 HIDDEN = 16
@@ -58,10 +63,14 @@ N_REGISTER = 2
 ROPE_THETA = 100.0
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--variant', choices=('base', 'gated'), default='base')
+parser.add_argument('--variant', choices=('base', 'gated', 'nonsquare'),
+                    default='base')
 VARIANT = parser.parse_args().variant
 GATED = VARIANT == 'gated'
+NONSQUARE = VARIANT == 'nonsquare'
 NAME = 'tiny_dinov3' if VARIANT == 'base' else 'tiny_dinov3_' + VARIANT
+# The oracle's pixel_values size (H, W); nonsquare = a 2 x 5 patch grid.
+IN_H, IN_W = (8, 20) if NONSQUARE else (IMAGE, IMAGE)
 
 torch.manual_seed(20261026 if GATED else 20260627)
 
@@ -106,6 +115,12 @@ with torch.no_grad():
         layer.layer_scale2.lambda1.normal_(0.5, 0.3)
     model.norm.weight.normal_(1.0, 0.25)
     model.norm.bias.normal_(0.0, 0.2)
+if NONSQUARE:
+    # Reuse the committed base weights so tiny_dinov3.* stays byte-identical.
+    missing, unexpected = model.load_state_dict(
+        load_file('tests/fixtures/tiny_dinov3.safetensors'), strict=False)
+    assert not unexpected and all(k.endswith(('mask_token', 'inv_freq'))
+                                  for k in missing), (missing, unexpected)
 model = model.double().eval()
 
 assert model.embeddings.patch_embeddings.bias is not None, \
@@ -114,34 +129,47 @@ assert model.model.layer[0].attention.k_proj.bias is None, \
     'DINOv3 k_proj must be UNbiased (key_bias=False)'
 
 # Pinned input: deterministic dyadic pixel values (exact in f32 and JSON).
-pixels = torch.zeros(1, 3, IMAGE, IMAGE, dtype=torch.float64)
+pixels = torch.zeros(1, 3, IN_H, IN_W, dtype=torch.float64)
 for c in range(3):
-    for y in range(IMAGE):
-        for x in range(IMAGE):
+    for y in range(IN_H):
+        for x in range(IN_W):
             pixels[0, c, y, x] = (((c * 256 + y * 16 + x) * 5) % 17 - 8) / 8.0
 
 sd = {k: v.to(torch.float32).clone().contiguous()
       for k, v in model.state_dict().items()
       if not k.endswith('position_ids') and not k.endswith('inv_freq')
       and not k.endswith('mask_token')}
-save_file(sd, 'tests/fixtures/' + NAME + '.safetensors')
-with open('tests/fixtures/' + NAME + '_config.json', 'w') as f:
-    json.dump(cfg.to_dict(), f, indent=1, default=str)
+if not NONSQUARE:
+    save_file(sd, 'tests/fixtures/' + NAME + '.safetensors')
+    with open('tests/fixtures/' + NAME + '_config.json', 'w') as f:
+        json.dump(cfg.to_dict(), f, indent=1, default=str)
 
 with torch.no_grad():
     hidden = model(pixel_values=pixels).last_hidden_state   # [1][N_TOK][HIDDEN]
 n_tok = hidden.shape[1]
+if NONSQUARE:
+    # The loaded weights must reproduce the committed native-size oracle.
+    with open('tests/fixtures/tiny_dinov3_hidden.json') as f:
+        native = json.load(f)
+    with torch.no_grad():
+        got = model(pixel_values=torch.tensor(
+            [native['pixels']], dtype=torch.float64)).last_hidden_state[0]
+    d = (got - torch.tensor(native['hidden'], dtype=torch.float64)).abs().max()
+    assert d < 1e-9, f'reloaded weights miss the native oracle ({d})'
 with open('tests/fixtures/' + NAME + '_hidden.json', 'w') as f:
     json.dump({
-        'pixels': pixels[0].tolist(),                    # [3][IMAGE][IMAGE]
+        'pixels': pixels[0].tolist(),                    # [3][IN_H][IN_W]
         'hidden': hidden[0].tolist(),                    # [N_TOK][HIDDEN]
         'num_tokens': n_tok,
         'hidden_size': HIDDEN,
         'num_register_tokens': N_REGISTER,
+        'height': IN_H,
+        'width': IN_W,
     }, f)
-print(f'wrote {NAME}.safetensors ({len(sd)} tensors) + config + oracle')
+n_patch = (IN_H // PATCH) * (IN_W // PATCH)
+print(f'wrote {NAME} ({len(sd)} tensors) oracle at {IN_H}x{IN_W}')
 print(f'  last_hidden_state shape = {list(hidden.shape)} (1 CLS + '
-      f'{N_REGISTER} reg + 9 patch = {n_tok} tokens)')
+      f'{N_REGISTER} reg + {n_patch} patch = {n_tok} tokens)')
 for k in sorted(sd):
     print(f'  {k} {list(sd[k].shape)}')
 
@@ -207,6 +235,24 @@ with torch.no_grad():
     d = (alt(pixel_values=pixels).last_hidden_state - base).abs().max()
     assert d > 1e-3, f'patch projection bias had no effect ({d})'
     print(f'patch bias effect on hidden: max |diff| = {d:.4f}')
+
+    # 8. nonsquare: per-axis normalization must matter. A square-grid RoPE
+    # (both axes normalized by the longer side) must move the hidden states.
+    if NONSQUARE:
+        import transformers.models.dinov3_vit.modeling_dinov3_vit as m3
+        orig = m3.get_patches_center_coordinates
+
+        def square_coords(nh, nw, dtype, device):
+            n = max(nh, nw)
+            c = orig(n, n, dtype=dtype, device=device).view(n, n, 2)
+            return c[:nh, :nw].reshape(-1, 2)
+        m3.get_patches_center_coordinates = square_coords
+        try:
+            d = (model(pixel_values=pixels).last_hidden_state - base).abs().max()
+        finally:
+            m3.get_patches_center_coordinates = orig
+        assert d > 1e-3, f'per-axis RoPE normalization had no effect ({d})'
+        print(f'per-axis RoPE normalization effect: max |diff| = {d:.4f}')
 
     # 7. gated MLP: swapping gate_proj and up_proj must move the hidden states.
     if GATED:

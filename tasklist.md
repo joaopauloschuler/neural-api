@@ -430,10 +430,14 @@ rather than acted on.
       parity < 1e-4 vs a float64 HF DINOv3ViTModel oracle, scalar + AVX2 green):
   - [ ] use_gated_mlp (gate/up/down_proj; silu/gelu gate) coded with pico parity
         TestDINOv3GatedMLPParity; no real vith16plus / 7B checkpoint run.
-  - [ ] non-square / non-native image_size (dynamic RoPE grid) not yet plumbed —
-        TNNetVisionRoPE2D is fixed to the build-time grid. DINOv3-backed
-        dense prediction also needs the BuildDPT register-token item under
-        Depth Anything V2 below.
+  - [X] non-square / non-native input: TDINOv3Config.InputWidth/InputHeight
+        (multiples of patch_size, 0 = image_size) set the input and the RoPE
+        grid (TNNetVisionRoPE2D normalizes each axis by its own patch count, as
+        HF get_patches_center_coordinates; DINOv3 has no position table to
+        interpolate, and the RoPE shift/jitter/rescale are training-only).
+        Pico parity TestDINOv3NonSquareParity (12x12 weights at 8 x 20 H x W).
+        DINOv3-backed dense prediction still needs the BuildDPT register-token
+        item under Depth Anything V2 below.
 
 - [ ] Kandinsky 2.2 unCLIP text-to-image importer
       (`BuildKandinskyPriorFromSafeTensors[Ex]` + `BuildKandinskyDecoderFromSafeTensors[Ex]`,

@@ -262,6 +262,9 @@ type
     // tests/fixtures/<HiddenFile> ({"pixels", "hidden", "num_tokens"}).
     function DINOHiddenParityMaxDiff(NN: TNNet; const HiddenFile: string;
       ImageSize, NumChannels, HiddenSize: integer): double;
+    // As DINOHiddenParityMaxDiff for an ImageWidth x ImageHeight input.
+    function DINOHiddenParityMaxDiffXY(NN: TNNet; const HiddenFile: string;
+      ImageWidth, ImageHeight, NumChannels, HiddenSize: integer): double;
     // tiny_vitmatte_io.json: image (W, H, 3), trimap (W, H, 1), the processor's
     // pixel_values (padded W, H, 4) and the float64 alphas (padded W, H, 1).
     procedure LoadViTMatteIO(Image, Trimap, PixelValues, Alphas: TNNetVolume);
@@ -1832,6 +1835,7 @@ type
     procedure TestDINOv3ConfigFromJSONFile;
     procedure TestDINOv3Parity;
     procedure TestDINOv3GatedMLPParity;
+    procedure TestDINOv3NonSquareParity;
     procedure TestBeitConfigFromJSONFile;
     procedure TestBeitParity;
     procedure TestBeitImageClassificationParity;
@@ -65736,6 +65740,15 @@ end;
 
 function TTestNeuralPretrained.DINOHiddenParityMaxDiff(NN: TNNet;
   const HiddenFile: string; ImageSize, NumChannels, HiddenSize: integer): double;
+begin
+  Result := DINOHiddenParityMaxDiffXY(NN, HiddenFile, ImageSize, ImageSize,
+    NumChannels, HiddenSize);
+end;
+
+// Coded by Claude (AI).
+function TTestNeuralPretrained.DINOHiddenParityMaxDiffXY(NN: TNNet;
+  const HiddenFile: string; ImageWidth, ImageHeight, NumChannels,
+  HiddenSize: integer): double;
 var
   RefRoot: TJSONData;
   RefJson: TStringList;
@@ -65749,7 +65762,8 @@ begin
   RefRoot := nil;
   try
     AssertTrue('net built', NN <> nil);
-    AssertEquals('input grid', ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('input width', ImageWidth, NN.Layers[0].Output.SizeX);
+    AssertEquals('input height', ImageHeight, NN.Layers[0].Output.SizeY);
     AssertEquals('output depth = hidden_size', HiddenSize,
       NN.GetLastLayer().Output.Depth);
     RefJson.LoadFromFile(FixturePath(HiddenFile));
@@ -65761,15 +65775,15 @@ begin
     AssertEquals('oracle token rows', NumTokens, HiddenArr.Count);
     AssertEquals('output rows = every token (NO crop)',
       NumTokens, NN.GetLastLayer().Output.SizeX);
-    ImageInput.ReSize(ImageSize, ImageSize, NumChannels);
+    ImageInput.ReSize(ImageWidth, ImageHeight, NumChannels);
     for ChanCnt := 0 to NumChannels - 1 do
     begin
       RowArr := TJSONArray(Pixels.Items[ChanCnt]);
-      for YCnt := 0 to ImageSize - 1 do
+      for YCnt := 0 to ImageHeight - 1 do
       begin
         ChanArr := TJSONArray(RowArr.Items[YCnt]);
-        for XCnt := 0 to ImageSize - 1 do
-          ImageInput.FData[(YCnt * ImageSize + XCnt) * NumChannels + ChanCnt] :=
+        for XCnt := 0 to ImageWidth - 1 do
+          ImageInput.FData[(YCnt * ImageWidth + XCnt) * NumChannels + ChanCnt] :=
             ChanArr.Items[XCnt].AsFloat;
       end;
     end;
@@ -65912,6 +65926,35 @@ begin
     WriteLn('  DINOv3 gated MLP hidden max|diff| = ', MaxDiff:0:9);
     AssertTrue('gated-MLP hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NN.Free;
+  end;
+end;
+
+// tiny_dinov3_nonsquare_hidden.json: the tiny_dinov3 weights run by HF at a
+// non-native 8 x 20 (H x W) input -> 2 x 5 patch grid, RoPE coordinates
+// normalized per axis; < 1e-4 vs the float64 oracle. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestDINOv3NonSquareParity;
+var
+  NN: TNNet;
+  Config: TDINOv3Config;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadDINOv3ConfigFromJSONFile(FixturePath('tiny_dinov3_config.json'));
+  Config.InputWidth := 20;
+  Config.InputHeight := 8;
+  NN := BuildDINOv3FromSafeTensorsEx(FixturePath('tiny_dinov3.safetensors'),
+    Config);
+  try
+    AssertEquals('output rows = 1 + 2 + 2*5', 13,
+      NN.GetLastLayer().Output.SizeX);
+    MaxDiff := DINOHiddenParityMaxDiffXY(NN, 'tiny_dinov3_nonsquare_hidden.json',
+      Config.InputWidth, Config.InputHeight, Config.NumChannels,
+      Config.HiddenSize);
+    WriteLn('  DINOv3 non-square hidden max|diff| = ', MaxDiff:0:9);
+    AssertTrue('non-square hidden states: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     NN.Free;
   end;

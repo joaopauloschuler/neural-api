@@ -16186,6 +16186,9 @@ type
     UseGatedMLP: boolean;       // use_gated_mlp (gate/up/down_proj, giant models)
     MlpBias: boolean;           // mlp_bias (true default)
     ModelType: string;          // 'dinov3_vit'
+    // The built net's input size (multiples of PatchSize; 0 = image_size); the
+    // RoPE grid follows it, as DINOv3ViTModel does for any pixel_values size.
+    InputWidth, InputHeight: integer;
   end;
 
 // Reads a HF DINOv3 config.json (model_type "dinov3_vit"). Required:
@@ -16201,7 +16204,7 @@ function DINOv3ConfigToString(const Config: TDINOv3Config): string;
 
 // Builds the DINOv3 visual-embedding net described by Config and loads every
 // weight from Reader (the caller owns Reader). The net takes an
-// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs the
+// (InputWidth, InputHeight, NumChannels) normalized RGB volume and outputs the
 // (1+NumRegisterTokens+num_patches, 1, HiddenSize) post-final-LayerNorm hidden
 // states: row 0 is the CLS global feature, the next NumRegisterTokens rows are
 // the register tokens, and the rest are the per-patch dense features. There is
@@ -90496,6 +90499,8 @@ begin
         IntToStr(Result.IntermediateSize) + '.');
     Result.NumRegisterTokens := Obj.Get('num_register_tokens', 4);
     Result.RopeTheta := Obj.Get('rope_theta', 100.0);
+    Result.InputWidth := 0;
+    Result.InputHeight := 0;
   finally
     Root.Free;
     JsonText.Free;
@@ -90518,6 +90523,9 @@ begin
     ', rope_theta=' + FloatToStr(Config.RopeTheta);
   if Config.UseGatedMLP then Result := Result + ', gated_mlp=true';
   if not Config.MlpBias then Result := Result + ', mlp_bias=false';
+  if (Config.InputWidth > 0) or (Config.InputHeight > 0) then
+    Result := Result + ', input=' + IntToStr(Config.InputWidth) + 'x' +
+      IntToStr(Config.InputHeight);
 end;
 
 type
@@ -90536,7 +90544,8 @@ type
 //   x1 = x + LS1 * RoPEAttn(LN1(x))
 //   y  = x1 + LS2 * MLP(LN2(x1))
 procedure AddDINOv3EncoderBlock(NN: TNNet; const Config: TDINOv3Config;
-  Grid, NumPrefix: integer; var Block: TDINOv3BlockLayers; pTrainable: boolean);
+  GridH, GridW, NumPrefix: integer; var Block: TDINOv3BlockLayers;
+  pTrainable: boolean);
 var
   BranchInput, GateLayer: TNNetLayer;
 begin
@@ -90548,7 +90557,7 @@ begin
   Block.QKV := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
   Block.AttnDense := NN.AddMultiHeadVisionRoPE2DAttention(Config.NumHeads,
-    Grid, Grid, NumPrefix, Config.RopeTheta);
+    GridH, GridW, NumPrefix, Config.RopeTheta);
   Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
   BranchInput := NN.GetLastLayer();
@@ -90633,7 +90642,8 @@ var
   PatchConv, PrefixEmb, FinalLN: TNNetLayer;
   Blocks: TDINOv3BlockLayersArray;
   Tmp: TNNetVolume;
-  Grid, NumPatches, NumPrefix, NumTokens, BlockCnt, ci, d: integer;
+  InputX, InputY, GridX, GridY: integer;
+  NumPatches, NumPrefix, NumTokens, BlockCnt, ci, d: integer;
   DM1, LayersM1: integer;
   PatchBiasName, Pfx: string;
 begin
@@ -90648,24 +90658,30 @@ begin
     ImportError('DINOv3 import: head_dim=' + IntToStr(d div Config.NumHeads) +
       ' (hidden_size div num_attention_heads) must be divisible by 4 for ' +
       '2-D axial RoPE.');
-  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0)
-  then
-    ImportError('DINOv3 import: image_size=' + IntToStr(Config.ImageSize) +
-      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  InputX := Config.InputWidth;
+  InputY := Config.InputHeight;
+  if InputX < 1 then InputX := Config.ImageSize;
+  if InputY < 1 then InputY := Config.ImageSize;
+  if (Config.PatchSize < 1) or (InputX < Config.PatchSize) or
+     (InputY < Config.PatchSize) or ((InputX mod Config.PatchSize) <> 0) or
+     ((InputY mod Config.PatchSize) <> 0) then
+    ImportError('DINOv3 import: input ' + IntToStr(InputX) + 'x' +
+      IntToStr(InputY) + ' is not a positive multiple of patch_size=' +
+      IntToStr(Config.PatchSize) + '.');
   if Config.NumRegisterTokens < 0 then
     ImportError('DINOv3 import: num_register_tokens must be >= 0, got ' +
       IntToStr(Config.NumRegisterTokens) + '.');
-  Grid := Config.ImageSize div Config.PatchSize;
-  NumPatches := Grid * Grid;
+  GridX := InputX div Config.PatchSize;
+  GridY := InputY div Config.PatchSize;
+  NumPatches := GridX * GridY;
   NumPrefix := 1 + Config.NumRegisterTokens;        // CLS + register tokens
   NumTokens := NumPrefix + NumPatches;
   NN := TNNet.Create();
   try
     // ---------------- Architecture ----------------
-    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
-      Config.NumChannels) );
+    NN.AddLayer( TNNetInput.Create(InputX, InputY, Config.NumChannels) );
     // BIASED patch embedding: kernel = stride = patch_size, no padding ->
-    // a (Grid, Grid, hidden) patch grid, flattened row-major over (y,x).
+    // a (GridX, GridY, hidden) patch grid, flattened row-major over (y,x).
     PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
       d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
       {pSuppressBias=}0).SetTrainable(pTrainable) );
@@ -90681,8 +90697,8 @@ begin
     if not pTrainable then NN.SetTrainable();
     SetLength(Blocks, Config.NumLayers);
     for BlockCnt := 0 to LayersM1 do
-      AddDINOv3EncoderBlock(NN, Config, Grid, NumPrefix, Blocks[BlockCnt],
-        pTrainable);
+      AddDINOv3EncoderBlock(NN, Config, GridY, GridX, NumPrefix,
+        Blocks[BlockCnt], pTrainable);
     // Final layernorm over every token; output = CLS + register + patch hidden
     // states (NO classifier head).
     FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
