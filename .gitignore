@@ -133,3 +133,4 @@ examples/ObjectTracking/ObjectTracking
 examples/ObjectTracking/*.gif
 examples/ObjectTracking/tracking_smoke_frames/
 examples/ObjectTracking/tracking_smoke_out/
+examples/GaussianSplatView/gaussian_splat_frames/

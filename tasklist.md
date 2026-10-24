@@ -1904,10 +1904,17 @@ rather than acted on.
         `TGaussianSplatRasterizer` Preprocess / BinTiles / BlendTile / Render
         with the per-Gaussian and per-tile results in flat public arrays for
         the OpenCL upload); tests in tests/TestNeuralGaussianSplat.pas. Open:
-        - [ ] (4) OpenCL preprocess + per-tile blend kernels, CPU vs OpenCL test.
-        - [ ] examples/GaussianSplatView (.lpr + .lpi + README.md).
+        - [X] (4) `TGaussianSplatRasterizerCL`: cai_gaussian_splat_preprocess
+              (one work-item per Gaussian) + cai_gaussian_splat_blend (one
+              16x16 work-group per tile, 256-Gaussian batches in local memory);
+              BinTiles on the host between them (Radii/Depths/TileRects down,
+              tile lists up). TestOpenCLMatchesCPU: 400-Gaussian SH-3 scene,
+              two cameras, max |diff| < 1e-4 on PoCL. Not done: device-side
+              sort/binning (a radix sort on (tile, depth) keys).
+        - [X] examples/GaussianSplatView (.lpr + .lpi + README.md); `--demo`
+              smoke runs on CPU and PoCL.
         - [ ] Real INRIA scene check (small scene on the dev box, big ones on
-              the user's GPU box).
+              the user's GPU box), including a `--cameras cameras.json` run.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
