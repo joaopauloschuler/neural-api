@@ -1843,6 +1843,7 @@ type
     procedure TestSAMAutomaticMaskGenerationParity;
     procedure TestSAMMaskGeneratorHelpers;
     procedure TestSAMMaskInputParity;
+    procedure TestSAMMaskImageToInputLogits;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -67058,6 +67059,52 @@ begin
     Mask.Free;
     Logits.Free;
     RefJson.Free;
+  end;
+end;
+
+// A white rectangle on a 40x20 photo: the 0.8 longest-side resize to 32x16
+// plus bottom padding, then 2x down to 16x16, puts it at cells x 4..11, y 2..5.
+procedure TTestNeuralPretrained.TestSAMMaskImageToInputLogits;
+var
+  MaskImage, MaskInput: TNNetVolume;
+  X, Y, Channel: integer;
+  InsideRect: boolean;
+  CellName: string;
+begin
+  MaskImage := TNNetVolume.Create(40, 20, 3);
+  MaskInput := TNNetVolume.Create;
+  try
+    MaskImage.Fill(0);
+    for Y := 5 to 14 do
+      for X := 10 to 29 do
+        for Channel := 0 to 2 do MaskImage[X, Y, Channel] := 255;
+    SAMMaskImageToInputLogits(MaskImage, MaskInput, 32, 16);
+    AssertEquals('low-res width', 16, MaskInput.SizeX);
+    AssertEquals('low-res height', 16, MaskInput.SizeY);
+    AssertEquals('low-res depth', 1, MaskInput.Depth);
+    for Y := 0 to 15 do
+      for X := 0 to 15 do
+      begin
+        CellName := '(' + IntToStr(X) + ',' + IntToStr(Y) + ')';
+        InsideRect := (X >= 4) and (X <= 11) and (Y >= 2) and (Y <= 5);
+        AssertEquals('sign at ' + CellName, InsideRect, MaskInput[X, Y, 0] > 0);
+        if Y >= 8 then
+          AssertEquals('padding at ' + CellName, -csSAMMaskInputLogit,
+            MaskInput[X, Y, 0], 1e-5);
+      end;
+    for Y := 3 to 4 do
+      for X := 6 to 9 do
+        AssertEquals('inside at (' + IntToStr(X) + ',' + IntToStr(Y) + ')',
+          csSAMMaskInputLogit, MaskInput[X, Y, 0], 1e-4);
+    AssertEquals('outside at (0,0)', -csSAMMaskInputLogit, MaskInput[0, 0, 0], 1e-5);
+    AssertEquals('outside at (15,0)', -csSAMMaskInputLogit,
+      MaskInput[15, 0, 0], 1e-5);
+    SAMMaskImageToInputLogits(MaskImage, MaskInput, 32, 16, 4);
+    AssertEquals('custom logit inside', 4, MaskInput[7, 3, 0], 1e-4);
+    AssertEquals('custom logit outside', -4, MaskInput[0, 0, 0], 1e-5);
+  finally
+    MaskInput.Free;
+    MaskImage.Free;
   end;
 end;
 

@@ -15,14 +15,16 @@ program SegmentAnything;
 //   examples/SegmentAnything/SegmentAnything
 //   examples/SegmentAnything/SegmentAnything /path/to/sam-vit-base/model.safetensors \
 //     --image photo.jpg --point 320,240 --point 100,80,0 [--box x0,y0,x1,y1]
-//     [--multimask] [--refine 2] [--out sam]
+//     [--multimask] [--mask-input prev_mask.png] [--refine 2] [--out sam]
 //   examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
 //     --image photo.jpg --everything [--points-per-side 32] [--crop-layers 1]
 //
 // Writes <out>_mask.png (white = mask, at the photo's resolution) and
 // <out>_overlay.png (the photo with the mask tinted red). --refine N feeds the
 // kept low-res mask logits back N times as a mask prompt (SAM's mask_input,
-// HF input_masks) with the same clicks / box. --everything runs the
+// HF input_masks) with the same clicks / box. --mask-input FILE gives the
+// first decode a mask prompt from a mask image at the photo's size (white =
+// +10 logits, black = -10, see SAMMaskImageToInputLogits). --everything runs the
 // automatic mask generator (TSAMPredictor.GenerateMasks) instead and writes
 // <out>_everything.png: every mask in its own colour with its box outlined.
 //
@@ -107,13 +109,15 @@ procedure Usage();
 begin
   WriteLn('Usage: SegmentAnything [checkpoint.safetensors] [--config FILE]');
   WriteLn('  [--image FILE] [--point X,Y[,LABEL]]... [--box X0,Y0,X1,Y1]');
-  WriteLn('  [--multimask] [--refine N] [--out PREFIX]');
+  WriteLn('  [--multimask] [--mask-input FILE] [--refine N] [--out PREFIX]');
   WriteLn('  [--everything [--points-per-side N] [--crop-layers N]');
   WriteLn('   [--crop-points-downscale N] [--pred-iou-thresh T]');
   WriteLn('   [--stability-thresh T] [--stability-offset T] [--nms-thresh T]]');
   WriteLn('Coordinates are original-image pixels; LABEL 1 = foreground');
   WriteLn('(default), 0 = background. Without --image a synthetic 96x64 image');
   WriteLn('is segmented; without a prompt the click is the image centre.');
+  WriteLn('--mask-input FILE: a mask image at the photo''s size (white = object)');
+  WriteLn('as the first decode''s mask prompt; alone, it is a mask-only prompt.');
   WriteLn('--refine N feeds the kept low-res mask back N times as a mask prompt');
   WriteLn('together with the same points / box (one mask per refinement).');
   WriteLn('--everything segments the whole image from a point grid (defaults:');
@@ -170,9 +174,9 @@ begin
 end;
 
 var
-  Ckpt, ConfigPath, ImagePath, OutPrefix, Arg: string;
+  Ckpt, ConfigPath, ImagePath, OutPrefix, MaskInputPath, Arg: string;
   Predictor: TSAMPredictor;
-  Image, Masks, IoUScores, MaskImage, Overlay, MaskInput: TNNetVolume;
+  Image, Masks, IoUScores, MaskImage, Overlay, MaskInput, PromptMask: TNNetVolume;
   Points, Box, Fields: TNeuralFloatDynArr;
   Labels: array of integer;
   MultiMask, Everything: boolean;
@@ -186,6 +190,7 @@ begin
   Ckpt := '';
   ConfigPath := '';
   ImagePath := '';
+  MaskInputPath := '';
   OutPrefix := 'sam';
   MultiMask := false;
   Everything := false;
@@ -234,7 +239,7 @@ begin
       else GeneratorOptions.CropsNMSThresh := OptionValue;
     end
     else if (Arg = '--image') or (Arg = '--point') or (Arg = '--box') or
-      (Arg = '--out') or (Arg = '--config') then
+      (Arg = '--out') or (Arg = '--config') or (Arg = '--mask-input') then
     begin
       if ArgPos = ParamCount then
       begin
@@ -245,6 +250,7 @@ begin
       if Arg = '--image' then ImagePath := ParamStr(ArgPos)
       else if Arg = '--out' then OutPrefix := ParamStr(ArgPos)
       else if Arg = '--config' then ConfigPath := ParamStr(ArgPos)
+      else if Arg = '--mask-input' then MaskInputPath := ParamStr(ArgPos)
       else if Arg = '--point' then
       begin
         if not ParseFloatList(ParamStr(ArgPos), Fields) or
@@ -299,6 +305,7 @@ begin
   MaskImage := TNNetVolume.Create;
   Overlay := TNNetVolume.Create;
   MaskInput := TNNetVolume.Create;
+  PromptMask := nil;
   Predictor := TSAMPredictor.Create(Ckpt, ConfigPath);
   try
     WriteLn('  ', SAMConfigToString(Predictor.Config));
@@ -321,7 +328,26 @@ begin
       SegmentEverything(Predictor, Image, GeneratorOptions, OutPrefix);
       Exit;
     end;
-    if (Length(Labels) = 0) and (Length(Box) = 0) then
+    if MaskInputPath <> '' then
+    begin
+      if not LoadImageFromFileIntoVolume(MaskInputPath, MaskImage) then
+      begin
+        WriteLn('Could not load mask image: ', MaskInputPath);
+        Halt(1);
+      end;
+      if (MaskImage.SizeX <> Image.SizeX) or (MaskImage.SizeY <> Image.SizeY) then
+      begin
+        WriteLn('The mask image is ', MaskImage.SizeX, 'x', MaskImage.SizeY,
+          '; it must have the photo''s size ', Image.SizeX, 'x', Image.SizeY, '.');
+        Halt(1);
+      end;
+      SAMMaskImageToInputLogits(MaskImage, MaskInput, Predictor.Config.ImageSize,
+        4 * Predictor.DecoderConfig.Grid);
+      PromptMask := MaskInput;
+      WriteLn('  mask input: ', MaskInputPath, ' (', MaskInput.SizeX, 'x',
+        MaskInput.SizeY, ' low-res logits)');
+    end;
+    if (Length(Labels) = 0) and (Length(Box) = 0) and (PromptMask = nil) then
     begin
       SetLength(Points, 2);
       SetLength(Labels, 1);
@@ -338,7 +364,8 @@ begin
 
     // The encoder runs once here; every Predict call afterwards is decoder-only.
     Predictor.SetImage(Image);
-    Predictor.Predict(Points, Labels, Box, MultiMask, Masks, IoUScores);
+    Predictor.Predict(Points, Labels, Box, MultiMask, Masks, IoUScores,
+      {Binarize=}true, PromptMask);
 
     BestMask := 0;
     MaxMaskPos := Masks.Depth - 1;

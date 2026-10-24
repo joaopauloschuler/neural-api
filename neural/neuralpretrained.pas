@@ -11591,6 +11591,16 @@ procedure SAMScaleCoordinates(var Coords: array of TNeuralFloat;
 procedure SAMPostprocessMasks(MaskLogits, Masks: TNNetVolume;
   ImageSize, OriginalWidth, OriginalHeight: integer; Binarize: boolean = true);
 
+const
+  // SAM 2's mask-as-prompt logit range: white -> +10, black -> -10.
+  csSAMMaskInputLogit = 10;
+
+// MaskImage (photo W,H; 0..255, PIL 'L' of RGB) -> MaskInput (LowResSize^2, 1): 0..255
+// as -Logit..+Logit, resized + padded as SAMPreprocessImage, bilinear to LowResSize.
+// Coded by Claude (AI).
+procedure SAMMaskImageToInputLogits(MaskImage, MaskInput: TNNetVolume;
+  ImageSize, LowResSize: integer; Logit: TNeuralFloat = csSAMMaskInputLogit);
+
 // SAM automatic mask generation ("segment everything"): transformers
 // MaskGenerationPipeline + SamImageProcessor filter_masks / NMS.
 type
@@ -92570,42 +92580,20 @@ end;
 procedure SAMPreprocessImage(Image, Dst: TNNetVolume; ImageSize: integer);
 var
   Work: TNNetVolume;
-  ResizedWidth, ResizedHeight, MaxRowPos, MaxPixelPos: integer;
-  RowPos, PixelPos, ChannelPos, WorkPos, DstPos: integer;
-  ChannelScale, ChannelBias: array[0..2] of TNeuralFloat;
+  ResizedWidth, ResizedHeight: integer;
 begin
   if Image.Depth <> 3 then
     ImportError('SAM processor: the image must be RGB (depth 3), got depth ' +
       IntToStr(Image.Depth) + '.');
   SAMResizedImageSize(Image.SizeX, Image.SizeY, ImageSize, ResizedWidth,
     ResizedHeight);
-  for ChannelPos := 0 to 2 do
-  begin
-    ChannelScale[ChannelPos] := (1 / 255) / csSAMImageStd[ChannelPos];
-    ChannelBias[ChannelPos] := -csSAMImageMean[ChannelPos] /
-      csSAMImageStd[ChannelPos];
-  end;
   Work := TNNetVolume.Create;
   try
     ResizeImagePIL(Image, Work, ResizedWidth, ResizedHeight, irfBilinear,
       {RoundToBytes=}true);
-    Dst.ReSize(ImageSize, ImageSize, 3);
-    Dst.Fill(0);
-    MaxRowPos := ResizedHeight - 1;
-    MaxPixelPos := ResizedWidth - 1;
-    for RowPos := 0 to MaxRowPos do
-    begin
-      WorkPos := Work.GetRawPos(0, RowPos);
-      DstPos := Dst.GetRawPos(0, RowPos);
-      for PixelPos := 0 to MaxPixelPos do
-      begin
-        for ChannelPos := 0 to 2 do
-          Dst.FData[DstPos + ChannelPos] := Work.FData[WorkPos + ChannelPos] *
-            ChannelScale[ChannelPos] + ChannelBias[ChannelPos];
-        Inc(WorkPos, 3);
-        Inc(DstPos, 3);
-      end;
-    end;
+    // pad_image runs after normalize, so the right / bottom padding is 0.
+    CropAndNormalizeImage(Work, Dst, 0, 0, ImageSize, ImageSize,
+      csSAMImageMean, csSAMImageStd, {PadBeforeNormalize=}false);
   finally
     Work.Free;
   end;
@@ -92656,6 +92644,31 @@ begin
     for MaskPos := 0 to MaxMaskPos do
       if Masks.FData[MaskPos] > 0 then Masks.FData[MaskPos] := 1
       else Masks.FData[MaskPos] := 0;
+  end;
+end;
+
+procedure SAMMaskImageToInputLogits(MaskImage, MaskInput: TNNetVolume;
+  ImageSize, LowResSize: integer; Logit: TNeuralFloat);
+var
+  Resized, Padded: TNNetVolume;
+  ResizedWidth, ResizedHeight: integer;
+begin
+  SAMResizedImageSize(MaskImage.SizeX, MaskImage.SizeY, ImageSize,
+    ResizedWidth, ResizedHeight);
+  Resized := TNNetVolume.Create;
+  Padded := TNNetVolume.Create;
+  try
+    // 0..2*Logit first so the zero padding is black; the -Logit shift comes last.
+    ConvertAndResizeImagePIL(MaskImage, Resized, ResizedWidth, ResizedHeight,
+      {Channels=}1, {ClipToByteRange=}true, 0, 2 * Logit, irfBilinear);
+    Padded.ReSize(ImageSize, ImageSize, 1);
+    Padded.Fill(0);
+    Padded.AddArea(0, 0, 0, 0, ResizedWidth, ResizedHeight, Resized);
+    ResizeImagePIL(Padded, MaskInput, LowResSize, LowResSize, irfBilinear);
+    MaskInput.Add(-Logit);
+  finally
+    Padded.Free;
+    Resized.Free;
   end;
 end;
 

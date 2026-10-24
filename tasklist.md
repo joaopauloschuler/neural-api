@@ -1002,9 +1002,12 @@ rather than acted on.
         head over a DINOv3 trunk (RoPE 2-D, LayerScale); reuse the DINOv3
         builder pieces (AddMultiHeadVisionRoPE2DAttention) and the EoMT head
         code; needs a pico fixture like tiny_eomt.
-  - [ ] Small reuse follow-up: `SAMPreprocessImage` keeps its own normalize
-        loop; route it through `CropAndNormalizeImage` (neuralimageresize) and
-        re-run TestSAMProcessorEndToEndParity.
+  - [X] Small reuse follow-up: `SAMPreprocessImage` now calls
+        `CropAndNormalizeImage(Work, Dst, 0, 0, ImageSize, ImageSize, Mean, Std,
+        PadBeforeNormalize=false)`: SamImageProcessor pads after normalize with
+        0, which is that routine's default padding, so the semantics match.
+        TestSAMProcessorEndToEndParity / TestSAMMaskInputParity /
+        TestSAMAutomaticMaskGenerationParity pass on cpu and avx2.
   - [ ] Fast-processor backend: the port matches EomtImageProcessorPil (PIL
         uint8 bilinear); transformers' default fast processor resizes with
         torchvision antialias. Measure the gap on a real photo first.
@@ -1551,10 +1554,19 @@ rather than acted on.
         (tensor resize); the port matches the PIL backend (uint8 PIL bilinear).
         Measure the pixel_values gap on a real photo; add a torchvision-mode
         resize only if it changes masks.
-  - [ ] examples/SegmentAnything `--mask-input FILE`: read a mask PNG at the
-        photo's size, resize it into the padded low-res frame and convert it to
-        logits for `TSAMPredictor.Predict(..., MaskInput)` (`--refine N` with the
-        decoder's own low-res logits is done; TestSAMMaskInputParity).
+  - [X] examples/SegmentAnything `--mask-input FILE`: `SAMMaskImageToInputLogits`
+        (neuralpretrained) converts a mask image at the photo's size to the
+        `(4*Grid, 4*Grid, 1)` MaskInput: PIL 'L', the SAMPreprocessImage
+        longest-side resize + black padding, PIL bilinear down to the low-res
+        size, 0..255 -> -10..+10 (`csSAMMaskInputLogit`, SAM 2's
+        `mask * 20 - 10`). With no point / box it is a mask-only prompt.
+        TestSAMMaskImageToInputLogits checks the geometry on a 40x20 photo;
+        pico smoke runs (point + mask + refine, mask-only multimask, box + mask,
+        wrong-size error) work.
+  - [ ] `--mask-input` follow-ups: compare L = 10 against other scales (and a
+        plain 0/1 map) on a real sam-vit-base checkpoint and photo, since the
+        pico fixture's random weights say nothing about mask quality; maybe a
+        `--mask-input-logit L` option once that comparison exists.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
