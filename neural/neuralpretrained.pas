@@ -11576,6 +11576,72 @@ procedure SAMScaleCoordinates(var Coords: array of TNeuralFloat;
 procedure SAMPostprocessMasks(MaskLogits, Masks: TNNetVolume;
   ImageSize, OriginalWidth, OriginalHeight: integer; Binarize: boolean = true);
 
+// SAM automatic mask generation ("segment everything"): transformers
+// MaskGenerationPipeline + SamImageProcessor filter_masks / NMS.
+type
+  TSAMMaskGeneratorOptions = record
+    PointsPerSide: integer;            // grid points per side of every crop (32)
+    CropNLayers: integer;              // extra crop layers; layer i has 4^i crops (0)
+    CropOverlapRatio: double;          // crop overlap / short side on layer 1 (512/1500)
+    CropNPointsDownscaleFactor: integer; // layer i grid = PointsPerSide / factor^i (1)
+    PredIoUThresh: TNeuralFloat;       // keep predicted IoU > this (0.88)
+    StabilityScoreThresh: TNeuralFloat; // keep stability score > this (0.95)
+    StabilityScoreOffset: TNeuralFloat; // logit offset of the stability score (1)
+    MaskThreshold: TNeuralFloat;       // logit binarization threshold (0)
+    CropsNMSThresh: TNeuralFloat;      // box NMS IoU threshold (0.7)
+  end;
+
+// The transformers mask-generation defaults listed beside each field.
+function SAMDefaultMaskGeneratorOptions(): TSAMMaskGeneratorOptions;
+
+// _build_point_grid: Points := PointsPerSide^2 (x, y) pairs in (0, 1), centred
+// in their cells, x varying fastest.
+procedure SAMBuildPointGrid(PointsPerSide: integer;
+  out Points: TNeuralFloatDynArr);
+
+// _generate_per_layer_crops: Boxes := 4 integers (x0, y0, x1, y1; x1, y1
+// exclusive) per crop, the whole image first; Layers := each crop's layer.
+procedure SAMGenerateCropBoxes(Width, Height, CropNLayers: integer;
+  OverlapRatio: double; out Boxes, Layers: TNeuralIntegerArray);
+
+// _compute_stability_score of MaskLogits channel Channel: pixel count above
+// MaskThreshold + Offset over the count above MaskThreshold - Offset (0 if none).
+function SAMStabilityScore(MaskLogits: TNNetVolume; Channel: integer;
+  MaskThreshold, Offset: TNeuralFloat): TNeuralFloat;
+
+type
+  // Binary masks at one image size, run-length coded (row-major runs that start
+  // with a background run), with IoU score, stability score and inclusive box.
+  TSAMGeneratedMasks = class(TObject)
+  private
+    FWidth, FHeight, FCount, FRunCount, FCandidateCount: integer;
+    FRuns, FRunStarts, FBoxes: TNeuralIntegerArray;
+    FIoUScores, FStabilityScores: TNeuralFloatDynArr;
+    function GetIoUScore(Index: integer): TNeuralFloat;
+    function GetStabilityScore(Index: integer): TNeuralFloat;
+    function GetBox(Index, Corner: integer): integer;
+    procedure AppendRun(RunLength: integer);
+  public
+    procedure Clear(Width, Height: integer);
+    // Appends MaskLogits channel Channel > MaskThreshold, placed at (Left, Top).
+    procedure AddMask(MaskLogits: TNNetVolume; Channel, Left, Top: integer;
+      MaskThreshold, IoUScore, StabilityScore: TNeuralFloat;
+      X1, Y1, X2, Y2: integer);
+    // Keeps only the masks listed in Order, in that order.
+    procedure Select(const Order: TNeuralIntegerArray);
+    // Mask := (Width, Height, 1) holding 1 inside mask Index, 0 elsewhere.
+    procedure GetMask(Index: integer; Mask: TNNetVolume);
+    property Width: integer read FWidth;
+    property Height: integer read FHeight;
+    property Count: integer read FCount;
+    // Masks that passed filter_masks before the box NMS.
+    property CandidateCount: integer read FCandidateCount write FCandidateCount;
+    property IoUScores[Index: integer]: TNeuralFloat read GetIoUScore;
+    property StabilityScores[Index: integer]: TNeuralFloat read GetStabilityScore;
+    // Corner 0..3 = x1, y1, x2, y2 in image pixels, both ends inclusive.
+    property Boxes[Index, Corner: integer]: integer read GetBox;
+  end;
+
 type
   // Encoder net + open checkpoint + decoder weight cache: SetImage runs the
   // image encoder once, then each Predict (a click or a box) runs the decoder only.
@@ -11600,6 +11666,10 @@ type
       const PointLabels: array of integer; const Box: array of TNeuralFloat;
       MultiMaskOutput: boolean; Masks: TNNetVolume;
       IoUScores: TNNetVolume = nil; Binarize: boolean = true);
+    // Segments everything in Image (W,H,3 RGB 0..255) from a point grid per crop;
+    // Output gets the masks by descending IoU; Image stays set for Predict.
+    procedure GenerateMasks(Image: TNNetVolume;
+      const Options: TSAMMaskGeneratorOptions; Output: TSAMGeneratedMasks);
     property Config: TSAMConfig read FConfig;
     property DecoderConfig: TSAMMaskDecoderConfig read FDecoderConfig;
     property ModelInput: TNNetVolume read FModelInput;
@@ -91892,6 +91962,364 @@ begin
     FCache);
   SAMPostprocessMasks(FLowResLogits, Masks, FConfig.ImageSize, FImageWidth,
     FImageHeight, Binarize);
+end;
+
+const
+  // _is_box_near_crop_edge atol, in image pixels.
+  csSAMCropEdgeTolerance = 20;
+
+function SAMDefaultMaskGeneratorOptions(): TSAMMaskGeneratorOptions;
+begin
+  Result.PointsPerSide := 32;
+  Result.CropNLayers := 0;
+  Result.CropOverlapRatio := 512 / 1500;
+  Result.CropNPointsDownscaleFactor := 1;
+  Result.PredIoUThresh := 0.88;
+  Result.StabilityScoreThresh := 0.95;
+  Result.StabilityScoreOffset := 1;
+  Result.MaskThreshold := 0;
+  Result.CropsNMSThresh := 0.7;
+end;
+
+procedure SAMBuildPointGrid(PointsPerSide: integer;
+  out Points: TNeuralFloatDynArr);
+var
+  RowPos, ColumnPos, MaxSidePos, PointPos: integer;
+begin
+  if PointsPerSide < 1 then
+    ImportError('SAMBuildPointGrid: PointsPerSide must be >= 1, got ' +
+      IntToStr(PointsPerSide) + '.');
+  SetLength(Points, 2 * PointsPerSide * PointsPerSide);
+  MaxSidePos := PointsPerSide - 1;
+  PointPos := 0;
+  for RowPos := 0 to MaxSidePos do
+    for ColumnPos := 0 to MaxSidePos do
+    begin
+      Points[PointPos] := (2 * ColumnPos + 1) / (2 * PointsPerSide);
+      Points[PointPos + 1] := (2 * RowPos + 1) / (2 * PointsPerSide);
+      Inc(PointPos, 2);
+    end;
+end;
+
+procedure SAMGenerateCropBoxes(Width, Height, CropNLayers: integer;
+  OverlapRatio: double; out Boxes, Layers: TNeuralIntegerArray);
+var
+  CropCount, LayerPos, MaxLayerPos, CropsPerSide, Overlap: integer;
+  CropWidth, CropHeight, XPos, YPos, MaxSidePos, Left, Top: integer;
+
+  procedure AppendCrop(X1, Y1, X2, Y2, Layer: integer);
+  begin
+    Boxes[CropCount * 4] := X1;
+    Boxes[CropCount * 4 + 1] := Y1;
+    Boxes[CropCount * 4 + 2] := X2;
+    Boxes[CropCount * 4 + 3] := Y2;
+    Layers[CropCount] := Layer;
+    Inc(CropCount);
+  end;
+
+begin
+  CropCount := 1;
+  MaxLayerPos := CropNLayers - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    Inc(CropCount, Sqr(1 shl (LayerPos + 1)));
+  SetLength(Boxes, CropCount * 4);
+  SetLength(Layers, CropCount);
+  CropCount := 0;
+  AppendCrop(0, 0, Width, Height, 0);
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    CropsPerSide := 1 shl (LayerPos + 1);
+    Overlap := Trunc(OverlapRatio * Min(Width, Height) * (2 / CropsPerSide));
+    CropWidth := (Overlap * (CropsPerSide - 1) + Width + CropsPerSide - 1) div
+      CropsPerSide;
+    CropHeight := (Overlap * (CropsPerSide - 1) + Height + CropsPerSide - 1) div
+      CropsPerSide;
+    MaxSidePos := CropsPerSide - 1;
+    for XPos := 0 to MaxSidePos do
+      for YPos := 0 to MaxSidePos do
+      begin
+        Left := (CropWidth - Overlap) * XPos;
+        Top := (CropHeight - Overlap) * YPos;
+        AppendCrop(Left, Top, Min(Left + CropWidth, Width),
+          Min(Top + CropHeight, Height), LayerPos + 1);
+      end;
+  end;
+end;
+
+function SAMStabilityScore(MaskLogits: TNNetVolume; Channel: integer;
+  MaskThreshold, Offset: TNeuralFloat): TNeuralFloat;
+var
+  LogitPos, MaxLogitPos, IntersectionCount, UnionCount: integer;
+  HighThreshold, LowThreshold, Logit: TNeuralFloat;
+begin
+  HighThreshold := MaskThreshold + Offset;
+  LowThreshold := MaskThreshold - Offset;
+  IntersectionCount := 0;
+  UnionCount := 0;
+  MaxLogitPos := MaskLogits.Size - 1;
+  LogitPos := Channel;
+  while LogitPos <= MaxLogitPos do
+  begin
+    Logit := MaskLogits.FData[LogitPos];
+    if Logit > HighThreshold then Inc(IntersectionCount);
+    if Logit > LowThreshold then Inc(UnionCount);
+    Inc(LogitPos, MaskLogits.Depth);
+  end;
+  if UnionCount > 0 then Result := IntersectionCount / UnionCount
+  else Result := 0;
+end;
+
+function TSAMGeneratedMasks.GetIoUScore(Index: integer): TNeuralFloat;
+begin
+  Result := FIoUScores[Index];
+end;
+
+function TSAMGeneratedMasks.GetStabilityScore(Index: integer): TNeuralFloat;
+begin
+  Result := FStabilityScores[Index];
+end;
+
+function TSAMGeneratedMasks.GetBox(Index, Corner: integer): integer;
+begin
+  Result := FBoxes[Index * 4 + Corner];
+end;
+
+procedure TSAMGeneratedMasks.AppendRun(RunLength: integer);
+begin
+  if FRunCount = Length(FRuns) then SetLength(FRuns, 2 * FRunCount + 64);
+  FRuns[FRunCount] := RunLength;
+  Inc(FRunCount);
+end;
+
+procedure TSAMGeneratedMasks.Clear(Width, Height: integer);
+begin
+  FWidth := Width;
+  FHeight := Height;
+  FCount := 0;
+  FRunCount := 0;
+  FCandidateCount := 0;
+  if Length(FRunStarts) = 0 then SetLength(FRunStarts, 1);
+  FRunStarts[0] := 0;
+end;
+
+procedure TSAMGeneratedMasks.AddMask(MaskLogits: TNNetVolume; Channel, Left,
+  Top: integer; MaskThreshold, IoUScore, StabilityScore: TNeuralFloat;
+  X1, Y1, X2, Y2: integer);
+var
+  IsForeground: boolean;
+  RunLength, X, Y, MaxX, MaxY, MaskRight, MaskBottom, LogitPos, Capacity: integer;
+
+  procedure ExtendRun(PixelIsForeground: boolean; PixelCount: integer);
+  begin
+    if PixelIsForeground <> IsForeground then
+    begin
+      AppendRun(RunLength);
+      IsForeground := PixelIsForeground;
+      RunLength := 0;
+    end;
+    Inc(RunLength, PixelCount);
+  end;
+
+begin
+  if FCount = Length(FIoUScores) then
+  begin
+    Capacity := 2 * FCount + 16;
+    SetLength(FIoUScores, Capacity);
+    SetLength(FStabilityScores, Capacity);
+    SetLength(FBoxes, Capacity * 4);
+    SetLength(FRunStarts, Capacity + 1);
+  end;
+  MaskRight := Min(Left + MaskLogits.SizeX, FWidth);
+  MaskBottom := Min(Top + MaskLogits.SizeY, FHeight);
+  IsForeground := false;
+  RunLength := 0;
+  MaxY := FHeight - 1;
+  for Y := 0 to MaxY do
+    if (Y < Top) or (Y >= MaskBottom) then ExtendRun(false, FWidth)
+    else
+    begin
+      ExtendRun(false, Left);
+      LogitPos := MaskLogits.GetRawPos(0, Y - Top, Channel);
+      MaxX := MaskRight - 1;
+      for X := Left to MaxX do
+      begin
+        ExtendRun(MaskLogits.FData[LogitPos] > MaskThreshold, 1);
+        Inc(LogitPos, MaskLogits.Depth);
+      end;
+      ExtendRun(false, FWidth - MaskRight);
+    end;
+  AppendRun(RunLength);
+  FIoUScores[FCount] := IoUScore;
+  FStabilityScores[FCount] := StabilityScore;
+  FBoxes[FCount * 4] := X1;
+  FBoxes[FCount * 4 + 1] := Y1;
+  FBoxes[FCount * 4 + 2] := X2;
+  FBoxes[FCount * 4 + 3] := Y2;
+  Inc(FCount);
+  FRunStarts[FCount] := FRunCount;
+end;
+
+procedure TSAMGeneratedMasks.Select(const Order: TNeuralIntegerArray);
+var
+  OldRuns, OldRunStarts, OldBoxes: TNeuralIntegerArray;
+  OldIoUScores, OldStabilityScores: TNeuralFloatDynArr;
+  OrderPos, MaxOrderPos, MaskPos, RunPos, MaxRunPos, CornerPos: integer;
+begin
+  OldRuns := Copy(FRuns, 0, FRunCount);
+  OldRunStarts := Copy(FRunStarts, 0, FCount + 1);
+  OldBoxes := Copy(FBoxes, 0, FCount * 4);
+  OldIoUScores := Copy(FIoUScores, 0, FCount);
+  OldStabilityScores := Copy(FStabilityScores, 0, FCount);
+  FCount := 0;
+  FRunCount := 0;
+  MaxOrderPos := Length(Order) - 1;
+  for OrderPos := 0 to MaxOrderPos do
+  begin
+    MaskPos := Order[OrderPos];
+    MaxRunPos := OldRunStarts[MaskPos + 1] - 1;
+    for RunPos := OldRunStarts[MaskPos] to MaxRunPos do
+      AppendRun(OldRuns[RunPos]);
+    FIoUScores[FCount] := OldIoUScores[MaskPos];
+    FStabilityScores[FCount] := OldStabilityScores[MaskPos];
+    for CornerPos := 0 to 3 do
+      FBoxes[FCount * 4 + CornerPos] := OldBoxes[MaskPos * 4 + CornerPos];
+    Inc(FCount);
+    FRunStarts[FCount] := FRunCount;
+  end;
+end;
+
+procedure TSAMGeneratedMasks.GetMask(Index: integer; Mask: TNNetVolume);
+var
+  RunPos, MaxRunPos, PixelPos, LastPixelPos, ForegroundPos: integer;
+  IsForeground: boolean;
+begin
+  if (Index < 0) or (Index >= FCount) then
+    ImportError('TSAMGeneratedMasks.GetMask: index ' + IntToStr(Index) +
+      ' is outside 0..' + IntToStr(FCount - 1) + '.');
+  Mask.ReSize(FWidth, FHeight, 1);
+  Mask.Fill(0);
+  PixelPos := 0;
+  IsForeground := false;
+  MaxRunPos := FRunStarts[Index + 1] - 1;
+  for RunPos := FRunStarts[Index] to MaxRunPos do
+  begin
+    LastPixelPos := PixelPos + FRuns[RunPos] - 1;
+    if IsForeground then
+      for ForegroundPos := PixelPos to LastPixelPos do
+        Mask.FData[ForegroundPos] := 1;
+    PixelPos := LastPixelPos + 1;
+    IsForeground := not IsForeground;
+  end;
+end;
+
+procedure TSAMPredictor.GenerateMasks(Image: TNNetVolume;
+  const Options: TSAMMaskGeneratorOptions; Output: TSAMGeneratedMasks);
+var
+  CropBoxes, CropLayers, KeptOrder, Classes: TNeuralIntegerArray;
+  GridPoints, BoxX1, BoxY1, BoxX2, BoxY2, Scores: TNeuralFloatDynArr;
+  Point: array[0..1] of TNeuralFloat;
+  PointLabel: array[0..0] of integer;
+  NoBox: array of TNeuralFloat;
+  Crop, MaskLogits, IoUScores: TNNetVolume;
+  CropPos, Left, Top, CropWidth, CropHeight, PointPos, MaxPointPos: integer;
+  MaskPos, MaxMaskPos, CandidatePos, MaxCandidatePos, X1, Y1, X2, Y2: integer;
+  StabilityScore: TNeuralFloat;
+
+  // _is_box_near_crop_edge: a box side within the tolerance of an inner crop side.
+  function IsNearCropEdge(): boolean;
+  var
+    Box, CropSide, ImageSide: array[0..3] of integer;
+    SidePos: integer;
+  begin
+    Box[0] := X1; Box[1] := Y1; Box[2] := X2; Box[3] := Y2;
+    CropSide[0] := Left; CropSide[1] := Top;
+    CropSide[2] := Left + CropWidth; CropSide[3] := Top + CropHeight;
+    ImageSide[0] := 0; ImageSide[1] := 0;
+    ImageSide[2] := Image.SizeX; ImageSide[3] := Image.SizeY;
+    Result := false;
+    for SidePos := 0 to 3 do
+      if (Abs(Box[SidePos] - CropSide[SidePos]) <= csSAMCropEdgeTolerance) and
+        (Abs(Box[SidePos] - ImageSide[SidePos]) > csSAMCropEdgeTolerance) then
+        Result := true;
+  end;
+
+begin
+  SAMGenerateCropBoxes(Image.SizeX, Image.SizeY, Options.CropNLayers,
+    Options.CropOverlapRatio, CropBoxes, CropLayers);
+  Output.Clear(Image.SizeX, Image.SizeY);
+  SetLength(NoBox, 0);
+  PointLabel[0] := 1;
+  Crop := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  IoUScores := TNNetVolume.Create;
+  try
+    // The whole image goes last so it stays set for Predict.
+    for CropPos := Length(CropLayers) - 1 downto 0 do
+    begin
+      Left := CropBoxes[CropPos * 4];
+      Top := CropBoxes[CropPos * 4 + 1];
+      CropWidth := CropBoxes[CropPos * 4 + 2] - Left;
+      CropHeight := CropBoxes[CropPos * 4 + 3] - Top;
+      if CropPos = 0 then SetImage(Image)
+      else
+      begin
+        Crop.CopyCropping(Image, Left, Top, CropWidth, CropHeight);
+        SetImage(Crop);
+      end;
+      SAMBuildPointGrid(Trunc(Options.PointsPerSide /
+        IntPower(Options.CropNPointsDownscaleFactor, CropLayers[CropPos])),
+        GridPoints);
+      MaxPointPos := Length(GridPoints) div 2 - 1;
+      for PointPos := 0 to MaxPointPos do
+      begin
+        Point[0] := GridPoints[PointPos * 2] * CropWidth;
+        Point[1] := GridPoints[PointPos * 2 + 1] * CropHeight;
+        Predict(Point, PointLabel, NoBox, {MultiMaskOutput=}true, MaskLogits,
+          IoUScores, {Binarize=}false);
+        MaxMaskPos := MaskLogits.Depth - 1;
+        for MaskPos := 0 to MaxMaskPos do
+        begin
+          if (Options.PredIoUThresh > 0) and
+            not (IoUScores.FData[MaskPos] > Options.PredIoUThresh) then Continue;
+          StabilityScore := SAMStabilityScore(MaskLogits, MaskPos,
+            Options.MaskThreshold, Options.StabilityScoreOffset);
+          if (Options.StabilityScoreThresh > 0) and
+            not (StabilityScore > Options.StabilityScoreThresh) then Continue;
+          MaskChannelBounds(MaskLogits, MaskPos, Options.MaskThreshold,
+            X1, Y1, X2, Y2);
+          Inc(X1, Left); Inc(X2, Left);
+          Inc(Y1, Top); Inc(Y2, Top);
+          if IsNearCropEdge() then Continue;
+          Output.AddMask(MaskLogits, MaskPos, Left, Top, Options.MaskThreshold,
+            IoUScores.FData[MaskPos], StabilityScore, X1, Y1, X2, Y2);
+        end;
+      end;
+    end;
+  finally
+    IoUScores.Free;
+    MaskLogits.Free;
+    Crop.Free;
+  end;
+  Output.CandidateCount := Output.Count;
+  SetLength(BoxX1, Output.Count);
+  SetLength(BoxY1, Output.Count);
+  SetLength(BoxX2, Output.Count);
+  SetLength(BoxY2, Output.Count);
+  SetLength(Scores, Output.Count);
+  SetLength(Classes, Output.Count);
+  MaxCandidatePos := Output.Count - 1;
+  for CandidatePos := 0 to MaxCandidatePos do
+  begin
+    BoxX1[CandidatePos] := Output.Boxes[CandidatePos, 0];
+    BoxY1[CandidatePos] := Output.Boxes[CandidatePos, 1];
+    BoxX2[CandidatePos] := Output.Boxes[CandidatePos, 2];
+    BoxY2[CandidatePos] := Output.Boxes[CandidatePos, 3];
+    Scores[CandidatePos] := Output.IoUScores[CandidatePos];
+    Classes[CandidatePos] := 0;
+  end;
+  KeptOrder := NeuralGreedyNMS(BoxX1, BoxY1, BoxX2, BoxY2, Scores, Classes,
+    Output.Count, Options.CropsNMSThresh);
+  Output.Select(KeptOrder);
 end;
 
 // ===========================================================================

@@ -16,9 +16,13 @@ program SegmentAnything;
 //   examples/SegmentAnything/SegmentAnything /path/to/sam-vit-base/model.safetensors \
 //     --image photo.jpg --point 320,240 --point 100,80,0 [--box x0,y0,x1,y1]
 //     [--multimask] [--out sam]
+//   examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
+//     --image photo.jpg --everything [--points-per-side 32] [--crop-layers 1]
 //
 // Writes <out>_mask.png (white = mask, at the photo's resolution) and
-// <out>_overlay.png (the photo with the mask tinted red).
+// <out>_overlay.png (the photo with the mask tinted red). --everything runs the
+// automatic mask generator (TSAMPredictor.GenerateMasks) instead and writes
+// <out>_everything.png: every mask in its own colour with its box outlined.
 //
 // This example is coded by Claude (AI).
 {$mode objfpc}{$H+}
@@ -26,7 +30,7 @@ program SegmentAnything;
 uses
   {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Math, Classes, neuralvolume, neuralnetwork, neuralpretrained,
-  neuraldatasets;
+  neuraldatasets, neuralimageresize;
 
 function DefaultCheckpoint(): string;
 begin
@@ -102,9 +106,63 @@ begin
   WriteLn('Usage: SegmentAnything [checkpoint.safetensors] [--config FILE]');
   WriteLn('  [--image FILE] [--point X,Y[,LABEL]]... [--box X0,Y0,X1,Y1]');
   WriteLn('  [--multimask] [--out PREFIX]');
+  WriteLn('  [--everything [--points-per-side N] [--crop-layers N]');
+  WriteLn('   [--crop-points-downscale N] [--pred-iou-thresh T]');
+  WriteLn('   [--stability-thresh T] [--stability-offset T] [--nms-thresh T]]');
   WriteLn('Coordinates are original-image pixels; LABEL 1 = foreground');
   WriteLn('(default), 0 = background. Without --image a synthetic 96x64 image');
   WriteLn('is segmented; without a prompt the click is the image centre.');
+  WriteLn('--everything segments the whole image from a point grid (defaults:');
+  WriteLn('32 points per side, no crop layers, IoU > 0.88, stability > 0.95 at');
+  WriteLn('offset 1, box NMS 0.7).');
+end;
+
+// Runs the automatic mask generator and writes <OutPrefix>_everything.png.
+procedure SegmentEverything(Predictor: TSAMPredictor; Image: TNNetVolume;
+  const Options: TSAMMaskGeneratorOptions; const OutPrefix: string);
+var
+  Generated: TSAMGeneratedMasks;
+  Mask, Overlay: TNNetVolume;
+  Color: array[0..2] of TNeuralFloat;
+  MaskPos, MaxMaskPos: integer;
+begin
+  WriteLn('  everything: ', Options.PointsPerSide, ' points per side, ',
+    Options.CropNLayers, ' crop layer(s), IoU > ', Options.PredIoUThresh:0:3,
+    ', stability > ', Options.StabilityScoreThresh:0:3, ' (offset ',
+    Options.StabilityScoreOffset:0:3, '), NMS ', Options.CropsNMSThresh:0:2);
+  Generated := TSAMGeneratedMasks.Create;
+  Mask := TNNetVolume.Create;
+  Overlay := TNNetVolume.Create;
+  try
+    Predictor.GenerateMasks(Image, Options, Generated);
+    WriteLn('  ', Generated.CandidateCount, ' masks passed the filters, ',
+      Generated.Count, ' kept after box NMS');
+    Overlay.Copy(Image);
+    MaxMaskPos := Generated.Count - 1;
+    for MaskPos := 0 to MaxMaskPos do
+    begin
+      Color[0] := (MaskPos * 97 + 200) mod 256;
+      Color[1] := (MaskPos * 57 + 80) mod 256;
+      Color[2] := (MaskPos * 151 + 30) mod 256;
+      Generated.GetMask(MaskPos, Mask);
+      BlendColorWhereMask(Overlay, Mask, 0, Color, 0.5);
+      DrawRectangleOutline(Overlay, Generated.Boxes[MaskPos, 0],
+        Generated.Boxes[MaskPos, 1], Generated.Boxes[MaskPos, 2],
+        Generated.Boxes[MaskPos, 3], Color);
+      WriteLn('  mask ', MaskPos, ': IoU ', Generated.IoUScores[MaskPos]:0:4,
+        ', stability ', Generated.StabilityScores[MaskPos]:0:4, ', box (',
+        Generated.Boxes[MaskPos, 0], ',', Generated.Boxes[MaskPos, 1], ')-(',
+        Generated.Boxes[MaskPos, 2], ',', Generated.Boxes[MaskPos, 3], '), ',
+        Round(Mask.GetSum()), ' pixels');
+    end;
+    SaveImageFromVolumeIntoFile(Overlay, OutPrefix + '_everything.png');
+    WriteLn('  wrote ', OutPrefix, '_everything.png (', Image.SizeX, 'x',
+      Image.SizeY, ')');
+  finally
+    Overlay.Free;
+    Mask.Free;
+    Generated.Free;
+  end;
 end;
 
 var
@@ -113,7 +171,9 @@ var
   Image, Masks, IoUScores, MaskImage, Overlay: TNNetVolume;
   Points, Box, Fields: TNeuralFloatDynArr;
   Labels: array of integer;
-  MultiMask: boolean;
+  MultiMask, Everything: boolean;
+  GeneratorOptions: TSAMMaskGeneratorOptions;
+  OptionValue: TNeuralFloat;
   ArgPos, PointCount, BestMask, MaskPos, MaxMaskPos, X, Y, MaxX, MaxY: integer;
   ForegroundCount: integer;
   MaskValue: TNeuralFloat;
@@ -123,6 +183,8 @@ begin
   ImagePath := '';
   OutPrefix := 'sam';
   MultiMask := false;
+  Everything := false;
+  GeneratorOptions := SAMDefaultMaskGeneratorOptions();
   SetLength(Points, 0);
   SetLength(Labels, 0);
   SetLength(Box, 0);
@@ -136,6 +198,34 @@ begin
       Halt(0);
     end
     else if (Arg = '--multimask') then MultiMask := true
+    else if (Arg = '--everything') then Everything := true
+    else if (Arg = '--points-per-side') or (Arg = '--crop-layers') or
+      (Arg = '--crop-points-downscale') or (Arg = '--pred-iou-thresh') or
+      (Arg = '--stability-thresh') or (Arg = '--stability-offset') or
+      (Arg = '--nms-thresh') then
+    begin
+      Inc(ArgPos);
+      if (ArgPos > ParamCount) or not ParseFloatList(ParamStr(ArgPos), Fields) or
+        (Length(Fields) <> 1) then
+      begin
+        WriteLn(Arg, ' needs one number.');
+        Halt(2);
+      end;
+      OptionValue := Fields[0];
+      if Arg = '--points-per-side' then
+        GeneratorOptions.PointsPerSide := Round(OptionValue)
+      else if Arg = '--crop-layers' then
+        GeneratorOptions.CropNLayers := Round(OptionValue)
+      else if Arg = '--crop-points-downscale' then
+        GeneratorOptions.CropNPointsDownscaleFactor := Round(OptionValue)
+      else if Arg = '--pred-iou-thresh' then
+        GeneratorOptions.PredIoUThresh := OptionValue
+      else if Arg = '--stability-thresh' then
+        GeneratorOptions.StabilityScoreThresh := OptionValue
+      else if Arg = '--stability-offset' then
+        GeneratorOptions.StabilityScoreOffset := OptionValue
+      else GeneratorOptions.CropsNMSThresh := OptionValue;
+    end
     else if (Arg = '--image') or (Arg = '--point') or (Arg = '--box') or
       (Arg = '--out') or (Arg = '--config') then
     begin
@@ -218,6 +308,11 @@ begin
       BuildSyntheticImage(Image, 96, 64);
       WriteLn('  image     : synthetic ', Image.SizeX, 'x', Image.SizeY);
     end;
+    if Everything then
+    begin
+      SegmentEverything(Predictor, Image, GeneratorOptions, OutPrefix);
+      Exit;
+    end;
     if (Length(Labels) = 0) and (Length(Box) = 0) then
     begin
       SetLength(Points, 2);
@@ -260,14 +355,9 @@ begin
         MaskImage[X, Y, 0] := 255 * MaskValue;
         MaskImage[X, Y, 1] := 255 * MaskValue;
         MaskImage[X, Y, 2] := 255 * MaskValue;
-        if MaskValue > 0 then
-        begin
-          Inc(ForegroundCount);
-          Overlay[X, Y, 0] := 0.5 * Overlay[X, Y, 0] + 127.5;
-          Overlay[X, Y, 1] := 0.5 * Overlay[X, Y, 1];
-          Overlay[X, Y, 2] := 0.5 * Overlay[X, Y, 2];
-        end;
+        if MaskValue > 0 then Inc(ForegroundCount);
       end;
+    BlendColorWhereMask(Overlay, Masks, BestMask, [255, 0, 0], 0.5);
     SaveImageFromVolumeIntoFile(MaskImage, OutPrefix + '_mask.png');
     SaveImageFromVolumeIntoFile(Overlay, OutPrefix + '_overlay.png');
     WriteLn('  wrote ', OutPrefix, '_mask.png and ', OutPrefix, '_overlay.png (',

@@ -1484,9 +1484,11 @@ rather than acted on.
         (tensor resize); the port matches the PIL backend (uint8 PIL bilinear).
         Measure the pixel_values gap on a real photo; add a torchvision-mode
         resize only if it changes masks.
+  - [x] Automatic mask generator: TSAMPredictor.GenerateMasks (point grid,
+        crop layers, IoU / stability filters, box NMS), parity vs the
+        transformers mask-generation pipeline; examples/SegmentAnything --everything.
   - [ ] Not exposed (the decoder lacks it): the input_masks prompt (previous
-        low-res mask fed back) and the automatic mask generator
-        (generate_crop_boxes + point grid + filter_masks + NMS).
+        low-res mask fed back).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,

@@ -69,6 +69,17 @@ procedure CannyEdges(Source, Dest: TNNetVolume; LowThreshold,
 function LabelEightConnectedComponents(Map: TNNetVolume; Channel: integer;
   Threshold: TNeuralFloat; var Labels: TNeuralIntegerArray): integer;
 
+// X1..X2, Y1..Y2 (inclusive) bound the pixels of Map channel Channel above
+// Threshold; False and all zero when there are none.
+function MaskChannelBounds(Map: TNNetVolume; Channel: integer;
+  Threshold: TNeuralFloat; out X1, Y1, X2, Y2: integer): boolean;
+
+// Where Mask channel MaskChannel > Threshold, Image := (1 - Alpha) * Image +
+// Alpha * Color (one value per channel of Image); Mask has Image's SizeX, SizeY.
+procedure BlendColorWhereMask(Image, Mask: TNNetVolume; MaskChannel: integer;
+  const Color: array of TNeuralFloat; Alpha: TNeuralFloat;
+  Threshold: TNeuralFloat = 0);
+
 // Canvas := Image with Left/Top/Right/Bottom pixels added on each side, each
 // new pixel copying the nearest edge pixel (torch F.pad mode="replicate").
 procedure PadImageClampToEdge(Image: TNNetVolume; Left, Top, Right,
@@ -2020,6 +2031,78 @@ begin
       Inc(PixelPos, DestDepth);
       Inc(PaddedPos);
     end;
+  end;
+end;
+
+function MaskChannelBounds(Map: TNNetVolume; Channel: integer;
+  Threshold: TNeuralFloat; out X1, Y1, X2, Y2: integer): boolean;
+var
+  X, Y, MaxX, MaxY, PixelPos, Depth: integer;
+begin
+  if (Channel < 0) or (Channel >= Map.Depth) then
+    raise Exception.Create('MaskChannelBounds: channel ' + IntToStr(Channel) +
+      ' is outside depth ' + IntToStr(Map.Depth) + '.');
+  X1 := Map.SizeX;
+  Y1 := Map.SizeY;
+  X2 := -1;
+  Y2 := -1;
+  Depth := Map.Depth;
+  MaxX := Map.SizeX - 1;
+  MaxY := Map.SizeY - 1;
+  PixelPos := Channel;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      if Map.FData[PixelPos] > Threshold then
+      begin
+        if X < X1 then X1 := X;
+        if X > X2 then X2 := X;
+        if Y < Y1 then Y1 := Y;
+        Y2 := Y;
+      end;
+      Inc(PixelPos, Depth);
+    end;
+  Result := X2 >= 0;
+  if not Result then
+  begin
+    X1 := 0;
+    Y1 := 0;
+    X2 := 0;
+    Y2 := 0;
+  end;
+end;
+
+procedure BlendColorWhereMask(Image, Mask: TNNetVolume; MaskChannel: integer;
+  const Color: array of TNeuralFloat; Alpha: TNeuralFloat;
+  Threshold: TNeuralFloat);
+var
+  PixelPos, MaxPixelPos, ChannelPos, MaxChannelPos, ImagePos, MaskPos: integer;
+  MaskDepth: integer;
+  KeepWeight: TNeuralFloat;
+  BlendedColor: array of TNeuralFloat;
+begin
+  CheckDrawColor(Image, Color, 'BlendColorWhereMask');
+  if (Mask.SizeX <> Image.SizeX) or (Mask.SizeY <> Image.SizeY) or
+    (MaskChannel < 0) or (MaskChannel >= Mask.Depth) then
+    raise EArgumentException.Create('BlendColorWhereMask: Mask must match ' +
+      'the image size and hold channel ' + IntToStr(MaskChannel) + '.');
+  MaxChannelPos := Image.Depth - 1;
+  SetLength(BlendedColor, Image.Depth);
+  for ChannelPos := 0 to MaxChannelPos do
+    BlendedColor[ChannelPos] := Alpha * Color[ChannelPos];
+  KeepWeight := 1 - Alpha;
+  MaskDepth := Mask.Depth;
+  MaxPixelPos := Image.SizeX * Image.SizeY - 1;
+  MaskPos := MaskChannel;
+  ImagePos := 0;
+  for PixelPos := 0 to MaxPixelPos do
+  begin
+    if Mask.FData[MaskPos] > Threshold then
+      for ChannelPos := 0 to MaxChannelPos do
+        Image.FData[ImagePos + ChannelPos] := KeepWeight *
+          Image.FData[ImagePos + ChannelPos] + BlendedColor[ChannelPos];
+    Inc(MaskPos, MaskDepth);
+    Inc(ImagePos, MaxChannelPos + 1);
   end;
 end;
 

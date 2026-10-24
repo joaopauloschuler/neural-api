@@ -1,4 +1,4 @@
-# Segment Anything (SAM) — promptable click → mask
+# Segment Anything (SAM) — promptable click → mask, and "segment everything"
 
 A self-contained, CPU/offline demo of **Segment Anything** (Kirillov et al. 2023,
 ["Segment Anything"](https://arxiv.org/abs/2304.02643)) running the real
@@ -25,6 +25,14 @@ into a mask cheaply. This example:
 6. writes `<out>_mask.png` (white = mask) and `<out>_overlay.png` (photo with the
    mask tinted red), both at the photo's resolution.
 
+With `--everything` it runs SAM's **automatic mask generator** instead (the
+transformers `mask-generation` pipeline): a grid of single-point prompts over
+the image (and, with `--crop-layers`, over overlapping crops, each encoded on its
+own), 3 masks per point, kept when the predicted IoU and the stability score
+pass their thresholds, then box non-maximum suppression. It writes
+`<out>_everything.png`: every kept mask blended in its own colour, its box
+outlined, and prints each mask's IoU, stability score, box and area.
+
 ### Key neural-api pieces (`neuralpretrained`)
 
 - **`TSAMPredictor`** — holds the encoder net, the open checkpoint and the
@@ -33,6 +41,10 @@ into a mask cheaply. This example:
   decoder-only.
 - **`SAMPreprocessImage`**, **`SAMScaleCoordinates`**, **`SAMPostprocessMasks`**,
   **`SAMResizedImageSize`** — the processor steps on their own.
+- **`TSAMPredictor.GenerateMasks`** + **`TSAMGeneratedMasks`** — automatic mask
+  generation; the masks are stored run-length coded and decoded on demand
+  (`GetMask`). **`SAMBuildPointGrid`**, **`SAMGenerateCropBoxes`** and
+  **`SAMStabilityScore`** are its steps; the box NMS is `NeuralGreedyNMS`.
 - **`BuildSAMFromSafeTensors`** / **`RunSAMMaskDecoderEx`** — the encoder and
   decoder importers underneath (float64 parity < 1e-4).
 
@@ -47,6 +59,17 @@ examples/SegmentAnything/SegmentAnything /path/to/sam-vit-base/model.safetensors
   --image photo.jpg --point 320,240 --point 100,80,0
 examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
   --image photo.jpg --box 50,40,400,300 --multimask --out photo
+examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
+  --image photo.jpg --everything --out photo
+```
+
+On the random pico fixture the default thresholds keep nothing; this relaxed
+run keeps a mask and exercises the crop layer:
+
+```
+examples/SegmentAnything/SegmentAnything --everything --points-per-side 4 \
+  --crop-layers 1 --crop-points-downscale 2 --pred-iou-thresh 0.5 \
+  --stability-thresh 0.7 --stability-offset 0.05 --nms-thresh 0.8
 ```
 
 Options:
@@ -59,6 +82,13 @@ Options:
 - `--multimask` — ask for SAM's 3 masks and keep the highest predicted IoU.
 - `--config FILE` — config.json (default: beside the checkpoint).
 - `--out PREFIX` — output file prefix (default `sam`).
+- `--everything` — automatic mask generation (prompts are ignored), with:
+  - `--points-per-side N` — grid points per side (default 32, so 1024 decoder
+    runs per crop);
+  - `--crop-layers N` — extra crop layers, layer i has 4^i crops (default 0);
+  - `--crop-points-downscale N` — layer i uses N^i fewer points per side (1);
+  - `--pred-iou-thresh T` (0.88), `--stability-thresh T` (0.95),
+    `--stability-offset T` (1), `--nms-thresh T` (0.7).
 
 Build first with the usual conventions:
 
@@ -77,6 +107,12 @@ lazbuild -B SegmentAnything.lpi
 - **Parity:** `TestSAMProcessorEndToEndParity` compares the preprocessed pixels,
   scaled prompts, IoU scores and full-resolution mask logits with
   `SamImageProcessorPil` + `SamModel` (float64) on the pico fixture.
+  `TestSAMAutomaticMaskGenerationParity` compares the generated masks (count,
+  IoU, stability score, box, every pixel) with transformers' `mask-generation`
+  pipeline and its processor functions, with and without a crop layer.
+- **Crop layers:** transformers' pipeline feeds crop points to the whole image;
+  here each crop is encoded on its own with its grid scaled to the crop and its
+  boxes moved to the image frame, as in the original SAM.
 - **Status:** coded; not yet tested on a real sam-vit-* checkpoint.
 
 Coded by Claude (AI).

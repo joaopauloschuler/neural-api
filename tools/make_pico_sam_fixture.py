@@ -23,17 +23,207 @@ Coded by Claude (AI).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/make_pico_sam_fixture.py
-writes tests/fixtures/tiny_sam{.safetensors,_config.json,_embed.json}.
+writes tests/fixtures/tiny_sam{.safetensors,_config.json,_embed.json} and the
+automatic-mask-generation oracle tiny_sam_amg.json;
+  /home/bpsa/x/bin/python tools/make_pico_sam_fixture.py --amg-oracle
+only rewrites tiny_sam_amg.json from the COMMITTED pico fixture.
 """
 import copy
 import json
+import sys
+import types
 
 import numpy as np
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers import SamConfig, SamModel
 from transformers.models.sam.configuration_sam import (
     SamVisionConfig, SamPromptEncoderConfig, SamMaskDecoderConfig)
+
+
+def _batched_nms(boxes, scores, idxs, iou_threshold):
+    """torchvision.ops.batched_nms in pure torch (greedy; IoU > threshold
+    suppresses), installed because torchvision is not in the venv."""
+    order = torch.argsort(scores, descending=True, stable=True)
+    area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    removed = [False] * len(order)
+    keep = []
+    for a in range(len(order)):
+        if removed[a]:
+            continue
+        i = order[a]
+        keep.append(int(i))
+        for b in range(a + 1, len(order)):
+            j = order[b]
+            if removed[b] or idxs[i] != idxs[j]:
+                continue
+            lt = torch.maximum(boxes[i, :2], boxes[j, :2])
+            rb = torch.minimum(boxes[i, 2:], boxes[j, 2:])
+            wh = (rb - lt).clamp(min=0)
+            inter = wh[0] * wh[1]
+            if inter / (area[i] + area[j] - inter) > iou_threshold:
+                removed[b] = True
+    return torch.tensor(keep, dtype=torch.long)
+
+
+def _install_torchvision_nms():
+    tv = types.ModuleType('torchvision')
+    tvo = types.ModuleType('torchvision.ops')
+    tvb = types.ModuleType('torchvision.ops.boxes')
+    tvb.batched_nms = _batched_nms
+    tv.ops, tvo.boxes = tvo, tvb
+    sys.modules.setdefault('torchvision', tv)
+    sys.modules.setdefault('torchvision.ops', tvo)
+    sys.modules.setdefault('torchvision.ops.boxes', tvb)
+
+
+def _row_major_rle(mask):
+    """Runs of a (H, W) bool mask in row-major order, starting with a 0-run."""
+    flat = np.asarray(mask, dtype=bool).reshape(-1)
+    runs, cur, run = [], False, 0
+    for v in flat:
+        if bool(v) != cur:
+            runs.append(run)
+            cur, run = bool(v), 0
+        run += 1
+    runs.append(run)
+    return runs
+
+
+def _amg_pattern(width, height):
+    arr = np.zeros((height, width, 3), np.uint8)
+    for y in range(height):
+        for x in range(width):
+            arr[y, x] = [(x * 7 + y * 13) % 256, (x * x + 3 * y) % 256,
+                         (x * y * 5 + 17) % 256]
+    return arr
+
+
+def _amg_manual(model, proc, arr, opt):
+    """Automatic mask generation from transformers' processor functions, one
+    crop at a time (each crop encoded on its own, its grid scaled to the crop,
+    boxes moved to the image frame), then post_process_for_mask_generation."""
+    import transformers.models.sam.image_processing_pil_sam as ips
+    from PIL import Image
+    height, width = arr.shape[:2]
+    crop_boxes, layer_idxs = ips._generate_per_layer_crops(
+        opt['crop_n_layers'], opt['crop_overlap_ratio'], (height, width))
+    all_masks, all_scores, all_boxes, all_stability = [], [], [], []
+    for crop_box, layer in zip(crop_boxes, layer_idxs):
+        left, top, right, bottom = crop_box
+        crop = Image.fromarray(arr[top:bottom, left:right])
+        n_side = int(opt['points_per_side'] /
+                     (opt['crop_n_points_downscale_factor'] ** layer))
+        grid = ips._build_point_grid(n_side) * np.array(
+            [[right - left, bottom - top]])
+        points = ips._normalize_coordinates(
+            proc.size['longest_edge'], grid, (bottom - top, right - left))
+        inputs = proc(images=crop, return_tensors='pt')
+        with torch.no_grad():
+            emb = model.get_image_embeddings(inputs['pixel_values'].double())
+            out = model(image_embeddings=emb,
+                        input_points=torch.tensor(points)[None, :, None, :],
+                        input_labels=torch.ones(1, len(points), 1,
+                                                dtype=torch.long),
+                        multimask_output=True)
+        logits = proc.post_process_masks(
+            out.pred_masks, inputs['original_sizes'],
+            inputs['reshaped_input_sizes'], binarize=False)
+        stability_flat = ips._compute_stability_score(
+            logits[0].flatten(0, 1), opt['mask_threshold'],
+            opt['stability_score_offset'])
+        iou_flat = out.iou_scores[0].flatten()
+        masks, scores, boxes = proc.filter_masks(
+            logits[0], out.iou_scores[0], (height, width),
+            [left, top, right, bottom], opt['pred_iou_thresh'],
+            opt['stability_score_thresh'], opt['mask_threshold'],
+            opt['stability_score_offset'])
+        for s in scores:
+            all_stability.append(float(stability_flat[
+                (iou_flat == s).nonzero()[0, 0]]))
+        all_masks.extend(masks)
+        all_scores.append(scores)
+        all_boxes.append(boxes + torch.tensor([[left, top, left, top]]))
+    scores = torch.cat(all_scores)
+    out_masks, out_scores, _, out_boxes = proc.post_process_for_mask_generation(
+        all_masks, scores, torch.cat(all_boxes), opt['crops_nms_thresh'])
+    stability = [all_stability[int((scores == s).nonzero()[0, 0])]
+                 for s in out_scores]
+    return {'candidates': len(all_masks),
+            'count': len(out_masks),
+            'iou_scores': [float(s) for s in out_scores],
+            'stability_scores': stability,
+            'boxes': [[int(v) for v in b] for b in out_boxes],
+            'mask_runs': [_row_major_rle(m) for m in out_masks]}
+
+
+def amg_oracle(model, path='tests/fixtures/tiny_sam_amg.json'):
+    """SamImageProcessorPil + SamModel float64 automatic mask generation on the
+    pico fixture, thresholds relaxed so masks survive on random weights."""
+    _install_torchvision_nms()
+    from PIL import Image
+    from transformers import pipeline
+    from transformers.models.sam.image_processing_pil_sam import (
+        SamImageProcessorPil)
+    import transformers.models.sam.image_processing_pil_sam as ips
+    proc = SamImageProcessorPil(size={'longest_edge': IMAGE_SIZE},
+                                pad_size={'height': IMAGE_SIZE,
+                                          'width': IMAGE_SIZE})
+    result = {'point_grid_3': ips._build_point_grid(3).tolist(),
+              'crop_boxes_100x60_2': ips._generate_per_layer_crops(
+                  2, 512 / 1500, (60, 100))[0],
+              'runs': []}
+    cases = [
+        (45, 30, dict(points_per_side=4, crop_n_layers=0,
+                      crop_overlap_ratio=512 / 1500,
+                      crop_n_points_downscale_factor=1, pred_iou_thresh=0.6,
+                      stability_score_thresh=0.75, stability_score_offset=0.05,
+                      mask_threshold=0.0, crops_nms_thresh=0.9)),
+        # Every crop edge lies within 20 px of the image edge: crop masks survive.
+        (45, 30, dict(points_per_side=4, crop_n_layers=1,
+                      crop_overlap_ratio=512 / 1500,
+                      crop_n_points_downscale_factor=2, pred_iou_thresh=0.5,
+                      stability_score_thresh=0.7, stability_score_offset=0.05,
+                      mask_threshold=0.0, crops_nms_thresh=0.8)),
+        # The near-crop-edge filter drops the crop masks here; no stability filter.
+        (160, 120, dict(points_per_side=4, crop_n_layers=1,
+                        crop_overlap_ratio=512 / 1500,
+                        crop_n_points_downscale_factor=2, pred_iou_thresh=0.5,
+                        stability_score_thresh=0.0, stability_score_offset=0.05,
+                        mask_threshold=0.0, crops_nms_thresh=0.8)),
+    ]
+    for width, height, opt in cases:
+        arr = _amg_pattern(width, height)
+        run = _amg_manual(model, proc, arr, opt)
+        if opt['crop_n_layers'] == 0:
+            gen = pipeline(task='mask-generation', model=model,
+                           image_processor=proc, device='cpu')
+            ref = gen(Image.fromarray(arr), points_per_crop=opt['points_per_side'],
+                      points_per_batch=5, pred_iou_thresh=opt['pred_iou_thresh'],
+                      stability_score_thresh=opt['stability_score_thresh'],
+                      stability_score_offset=opt['stability_score_offset'],
+                      crops_nms_thresh=opt['crops_nms_thresh'],
+                      output_bboxes_mask=True)
+            assert np.allclose(ref['scores'].numpy(), run['iou_scores'],
+                               rtol=0, atol=1e-9)
+            assert ref['bounding_boxes'].int().tolist() == run['boxes']
+        run.update(width=width, height=height, options=opt)
+        result['runs'].append(run)
+        print(f'AMG {width}x{height} crops={opt["crop_n_layers"]}: '
+              f'{run["candidates"]} candidates -> {run["count"]} masks, '
+              f'iou {[round(s, 4) for s in run["iou_scores"]]}')
+    with open(path, 'w') as f:
+        json.dump(result, f)
+
+
+IMAGE_SIZE = 32
+if __name__ == '__main__' and '--amg-oracle' in sys.argv:
+    fixture_cfg = SamConfig.from_dict(
+        json.load(open('tests/fixtures/tiny_sam_config.json')))
+    fixture_model = SamModel(fixture_cfg)
+    fixture_model.load_state_dict(load_file('tests/fixtures/tiny_sam.safetensors'))
+    amg_oracle(fixture_model.double().eval())
+    sys.exit(0)
 
 HIDDEN = 24
 N_LAYER = 4
@@ -318,3 +508,5 @@ with torch.no_grad():
     assert d > 1e-3, f'neck conv2 had no effect ({d})'
     print(f'neck conv2 effect: max |diff| = {d:.4f}')
 print('all fixture self-checks passed')
+
+amg_oracle(model)

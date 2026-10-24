@@ -37,7 +37,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained,
-  neuralhftokenizer;
+  neuralhftokenizer, neuralimageresize;
 
 const
   FixturesDir = '../../tests/fixtures/';
@@ -214,25 +214,17 @@ end;
 procedure DrawMasks(Image, ImageMasks: TNNetVolume; const FileName: string);
 var
   Overlay: TNNetVolume;
-  X, Y, MaskPos, MaxX, MaxY, MaxMaskPos, ColorPos: integer;
+  MaskPos, MaxMaskPos, ColorPos: integer;
 begin
   Overlay := TNNetVolume.Create;
   try
     Overlay.Copy(Image);
-    MaxX := Image.SizeX - 1;
-    MaxY := Image.SizeY - 1;
     MaxMaskPos := ImageMasks.Depth - 1;
     for MaskPos := 0 to MaxMaskPos do
     begin
       ColorPos := MaskPos mod 6;
-      for Y := 0 to MaxY do
-        for X := 0 to MaxX do
-          if ImageMasks[X, Y, MaskPos] > 0.5 then
-          begin
-            Overlay[X, Y, 0] := 0.5 * Overlay[X, Y, 0] + 0.5 * PaletteR[ColorPos];
-            Overlay[X, Y, 1] := 0.5 * Overlay[X, Y, 1] + 0.5 * PaletteG[ColorPos];
-            Overlay[X, Y, 2] := 0.5 * Overlay[X, Y, 2] + 0.5 * PaletteB[ColorPos];
-          end;
+      BlendColorWhereMask(Overlay, ImageMasks, MaskPos, [PaletteR[ColorPos],
+        PaletteG[ColorPos], PaletteB[ColorPos]], 0.5, 0.5);
     end;
     if not SaveImageFromVolumeIntoFile(Overlay, FileName) then
       raise Exception.Create('could not save ' + FileName);

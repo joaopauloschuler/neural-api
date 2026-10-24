@@ -1774,6 +1774,8 @@ type
     procedure TestSAMMaskDecoderV2Parity;
     procedure TestSAMWeightCacheParity;
     procedure TestSAMProcessorEndToEndParity;
+    procedure TestSAMAutomaticMaskGenerationParity;
+    procedure TestSAMMaskGeneratorHelpers;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -64795,6 +64797,209 @@ begin
     Masks.Free;
     Image.Free;
     Predictor.Free;
+  end;
+end;
+
+// TSAMPredictor.GenerateMasks vs tools/make_pico_sam_fixture.py --amg-oracle:
+// transformers MaskGenerationPipeline / SamImageProcessorPil processor functions
+// + SamModel float64 on the pico fixture, the 45x30 pattern of the test above.
+procedure TTestNeuralPretrained.TestSAMAutomaticMaskGenerationParity;
+var
+  Predictor: TSAMPredictor;
+  Generated: TSAMGeneratedMasks;
+  Image, Mask: TNNetVolume;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  OracleRuns, OracleMaskRuns, MaskRuns, OracleBoxes: TJSONArray;
+  OracleRun, Opt: TJSONObject;
+  Options: TSAMMaskGeneratorOptions;
+  RunPos, MaskPos, CornerPos, X, Y, Width, Height, PixelPos: integer;
+  RunCountPos, RunLength, MismatchCount: integer;
+  OracleValue: boolean;
+  Tag: string;
+begin
+  RefJson := TStringList.Create;
+  Predictor := TSAMPredictor.Create(FixturePath('tiny_sam.safetensors'),
+    FixturePath('tiny_sam_config.json'));
+  Generated := TSAMGeneratedMasks.Create;
+  Image := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_sam_amg.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    OracleRuns := TJSONArray(TJSONObject(RefRoot).Find('runs'));
+    AssertEquals('oracle runs', 3, OracleRuns.Count);
+    for RunPos := 0 to OracleRuns.Count - 1 do
+    begin
+      OracleRun := TJSONObject(OracleRuns.Items[RunPos]);
+      Opt := TJSONObject(OracleRun.Find('options'));
+      Width := OracleRun.Get('width', 0);
+      Height := OracleRun.Get('height', 0);
+      Tag := 'run ' + IntToStr(RunPos) + ' ';
+      Options := SAMDefaultMaskGeneratorOptions();
+      Options.PointsPerSide := Opt.Get('points_per_side', 0);
+      Options.CropNLayers := Opt.Get('crop_n_layers', 0);
+      Options.CropOverlapRatio := Opt.Get('crop_overlap_ratio', 0.0);
+      Options.CropNPointsDownscaleFactor :=
+        Opt.Get('crop_n_points_downscale_factor', 0);
+      Options.PredIoUThresh := Opt.Get('pred_iou_thresh', 0.0);
+      Options.StabilityScoreThresh := Opt.Get('stability_score_thresh', 0.0);
+      Options.StabilityScoreOffset := Opt.Get('stability_score_offset', 0.0);
+      Options.MaskThreshold := Opt.Get('mask_threshold', 0.0);
+      Options.CropsNMSThresh := Opt.Get('crops_nms_thresh', 0.0);
+      Image.ReSize(Width, Height, 3);
+      for Y := 0 to Height - 1 do
+        for X := 0 to Width - 1 do
+        begin
+          Image[X, Y, 0] := (X * 7 + Y * 13) mod 256;
+          Image[X, Y, 1] := (X * X + 3 * Y) mod 256;
+          Image[X, Y, 2] := (X * Y * 5 + 17) mod 256;
+        end;
+      Predictor.GenerateMasks(Image, Options, Generated);
+      AssertEquals(Tag + 'candidates', OracleRun.Get('candidates', -1),
+        Generated.CandidateCount);
+      AssertEquals(Tag + 'mask count', OracleRun.Get('count', -1), Generated.Count);
+      OracleBoxes := TJSONArray(OracleRun.Find('boxes'));
+      MaskRuns := TJSONArray(OracleRun.Find('mask_runs'));
+      for MaskPos := 0 to Generated.Count - 1 do
+      begin
+        AssertEquals(Tag + 'iou ' + IntToStr(MaskPos),
+          TJSONArray(OracleRun.Find('iou_scores')).Items[MaskPos].AsFloat,
+          Generated.IoUScores[MaskPos], 1e-4);
+        AssertEquals(Tag + 'stability ' + IntToStr(MaskPos),
+          TJSONArray(OracleRun.Find('stability_scores')).Items[MaskPos].AsFloat,
+          Generated.StabilityScores[MaskPos], 2e-3);
+        for CornerPos := 0 to 3 do
+          AssertEquals(Tag + 'box ' + IntToStr(MaskPos) + '.' +
+            IntToStr(CornerPos),
+            TJSONArray(OracleBoxes.Items[MaskPos]).Items[CornerPos].AsInteger,
+            Generated.Boxes[MaskPos, CornerPos]);
+        Generated.GetMask(MaskPos, Mask);
+        OracleMaskRuns := TJSONArray(MaskRuns.Items[MaskPos]);
+        PixelPos := 0;
+        MismatchCount := 0;
+        OracleValue := false;
+        for RunCountPos := 0 to OracleMaskRuns.Count - 1 do
+        begin
+          for RunLength := 1 to OracleMaskRuns.Items[RunCountPos].AsInteger do
+          begin
+            if (Mask.FData[PixelPos] > 0) <> OracleValue then Inc(MismatchCount);
+            Inc(PixelPos);
+          end;
+          OracleValue := not OracleValue;
+        end;
+        AssertEquals(Tag + 'mask pixels ' + IntToStr(MaskPos), Mask.Size, PixelPos);
+        // Logits within ~1e-5 of the threshold may flip between float32 and float64.
+        AssertTrue(Tag + 'mask ' + IntToStr(MaskPos) + ' mismatches ' +
+          IntToStr(MismatchCount), MismatchCount <= 2);
+      end;
+    end;
+  finally
+    RefRoot.Free;
+    Mask.Free;
+    Image.Free;
+    Generated.Free;
+    Predictor.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Point grid and crop boxes vs transformers _build_point_grid /
+// _generate_per_layer_crops; stability score, mask bounds and the mask store by hand.
+procedure TTestNeuralPretrained.TestSAMMaskGeneratorHelpers;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  OracleGrid, OracleCrops: TJSONArray;
+  Points: TNeuralFloatDynArr;
+  Boxes, Layers, Order: TNeuralIntegerArray;
+  Logits, Mask: TNNetVolume;
+  Generated: TSAMGeneratedMasks;
+  PointPos, CropPos, CornerPos, X1, Y1, X2, Y2: integer;
+begin
+  RefJson := TStringList.Create;
+  Logits := TNNetVolume.Create;
+  Mask := TNNetVolume.Create;
+  Generated := TSAMGeneratedMasks.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_sam_amg.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    OracleGrid := TJSONArray(TJSONObject(RefRoot).Find('point_grid_3'));
+    SAMBuildPointGrid(3, Points);
+    AssertEquals('grid points', OracleGrid.Count * 2, Length(Points));
+    for PointPos := 0 to OracleGrid.Count - 1 do
+    begin
+      AssertEquals('grid x ' + IntToStr(PointPos),
+        TJSONArray(OracleGrid.Items[PointPos]).Items[0].AsFloat,
+        Points[PointPos * 2], 1e-7);
+      AssertEquals('grid y ' + IntToStr(PointPos),
+        TJSONArray(OracleGrid.Items[PointPos]).Items[1].AsFloat,
+        Points[PointPos * 2 + 1], 1e-7);
+    end;
+    OracleCrops := TJSONArray(TJSONObject(RefRoot).Find('crop_boxes_100x60_2'));
+    SAMGenerateCropBoxes(100, 60, 2, 512 / 1500, Boxes, Layers);
+    AssertEquals('crop count', OracleCrops.Count, Length(Layers));
+    AssertEquals('crop count 1 + 4 + 16', 21, Length(Layers));
+    for CropPos := 0 to OracleCrops.Count - 1 do
+      for CornerPos := 0 to 3 do
+        AssertEquals('crop ' + IntToStr(CropPos) + '.' + IntToStr(CornerPos),
+          TJSONArray(OracleCrops.Items[CropPos]).Items[CornerPos].AsInteger,
+          Boxes[CropPos * 4 + CornerPos]);
+    AssertEquals('layer of crop 0', 0, Layers[0]);
+    AssertEquals('layer of crop 4', 1, Layers[4]);
+    AssertEquals('layer of crop 5', 2, Layers[5]);
+
+    // Channel 1 of a 3x2 two-channel volume: logits 2, 0.5, -0.5 / -2, 1.5, 0.
+    Logits.ReSize(3, 2, 2);
+    Logits.Fill(9);
+    Logits[0, 0, 1] := 2;    Logits[1, 0, 1] := 0.5;  Logits[2, 0, 1] := -0.5;
+    Logits[0, 1, 1] := -2;   Logits[1, 1, 1] := 1.5;  Logits[2, 1, 1] := 0;
+    // above +1: 2 pixels; above -1: 5 pixels.
+    AssertEquals('stability score', 2 / 5,
+      SAMStabilityScore(Logits, 1, 0, 1), 1e-7);
+    AssertEquals('stability score empty union', 0,
+      SAMStabilityScore(Logits, 1, 5, 1), 0);
+    AssertTrue('mask bounds found', MaskChannelBounds(Logits, 1, 0.25,
+      X1, Y1, X2, Y2));
+    AssertEquals('bounds x1', 0, X1);
+    AssertEquals('bounds y1', 0, Y1);
+    AssertEquals('bounds x2', 1, X2);
+    AssertEquals('bounds y2', 1, Y2);
+    AssertFalse('empty mask bounds', MaskChannelBounds(Logits, 1, 5,
+      X1, Y1, X2, Y2));
+    AssertEquals('empty bounds x2', 0, X2);
+
+    // Two masks placed at (2, 1) of a 6x4 image, then reversed by Select.
+    Generated.Clear(6, 4);
+    Generated.AddMask(Logits, 1, 2, 1, 0.25, 0.9, 0.8, 2, 1, 3, 2);
+    Generated.AddMask(Logits, 0, 0, 0, 0, 0.7, 1, 0, 0, 2, 1);
+    SetLength(Order, 2);
+    Order[0] := 1;
+    Order[1] := 0;
+    Generated.Select(Order);
+    AssertEquals('stored masks', 2, Generated.Count);
+    AssertEquals('selected iou', 0.9, Generated.IoUScores[1], 1e-7);
+    AssertEquals('selected stability', 0.8, Generated.StabilityScores[1], 1e-7);
+    AssertEquals('selected box x2', 3, Generated.Boxes[1, 2]);
+    Generated.GetMask(1, Mask);
+    AssertEquals('mask width', 6, Mask.SizeX);
+    AssertEquals('mask height', 4, Mask.SizeY);
+    AssertEquals('mask area', 3, Mask.GetSum(), 0);
+    AssertEquals('mask (2,1)', 1, Mask[2, 1, 0], 0);
+    AssertEquals('mask (3,1)', 1, Mask[3, 1, 0], 0);
+    AssertEquals('mask (3,2)', 1, Mask[3, 2, 0], 0);
+    AssertEquals('mask (4,1)', 0, Mask[4, 1, 0], 0);
+    Generated.GetMask(0, Mask);
+    AssertEquals('full-channel mask area', 6, Mask.GetSum(), 0);
+    AssertEquals('full-channel mask (3,0)', 0, Mask[3, 0, 0], 0);
+  finally
+    RefRoot.Free;
+    Generated.Free;
+    Mask.Free;
+    Logits.Free;
+    RefJson.Free;
   end;
 end;
 
