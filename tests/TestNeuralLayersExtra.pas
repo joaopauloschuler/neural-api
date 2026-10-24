@@ -243,6 +243,10 @@ type
     // align_corners, and the save/load round trip.
     procedure TestTriplaneSampleHandCases;
     procedure TestTriplaneSampleSaveLoad;
+    // TNNetGridSample3D: hand-derived trilinear samples (voxel centre, midpoint,
+    // zeros vs border outside the volume, align_corners, nearest) and save/load.
+    procedure TestGridSample3DHandCases;
+    procedure TestGridSample3DSaveLoad;
     // TNNetMultiScaleDeformableAttention: forward against a naive bilinear
     // reference (cxcywh and xy references), finite-difference gradients of
     // the offsets|logits, value and reference sources, and save/load.
@@ -10163,6 +10167,171 @@ begin
     Planes.Free;
     Loaded.Free;
     NN.Free;
+  end;
+end;
+
+// Normalized torch grid coordinate of source pixel Pixel along Dim pixels.
+function GridSample3DNormalized(Pixel: TNeuralFloat; Dim: integer;
+  AlignCorners: boolean): TNeuralFloat;
+begin
+  if AlignCorners
+    then Result := 2 * Pixel / (Dim - 1) - 1
+    else Result := (2 * Pixel + 1) / Dim - 1;
+end;
+
+procedure TTestNeuralLayersExtra.TestGridSample3DHandCases;
+type
+  TGridSample3DCase = record
+    // Source pixel (x, y, z), the channel-0 value and the summed weight of the
+    // in-bound corners (channel 1 adds 0.5 * that weight).
+    px, py, pz, Value, WeightSum: TNeuralFloat;
+  end;
+const
+  csWidth = 3;
+  csHeight = 2;
+  csFrames = 4;
+  csChannels = 2;
+  // Voxel (x, y, z) channel c holds 100z + 10y + x + 0.5c, so an interior
+  // trilinear sample at (px, py, pz) is 100pz + 10py + px.
+  csZeros: array[0..4] of TGridSample3DCase = (
+    // Voxel centre, then the midpoint of eight voxels.
+    (px: 1; py: 0; pz: 2; Value: 201; WeightSum: 1),
+    (px: 0.5; py: 0.5; pz: 1.5; Value: 155.5; WeightSum: 1),
+    // Half a voxel left of the volume: the x = -1 corners read zero padding.
+    (px: -0.5; py: 1; pz: 1; Value: 55; WeightSum: 0.5),
+    // Every corner outside along the frame axis.
+    (px: 1; py: 0; pz: 4.5; Value: 0; WeightSum: 0),
+    // A quarter frame before frame 0: weight 0.75 on frame 0.
+    (px: 1; py: 1; pz: -0.25; Value: 8.25; WeightSum: 0.75));
+  // padding_mode='border' clips the pixel coordinate to the volume.
+  csBorder: array[0..2] of TGridSample3DCase = (
+    (px: -0.5; py: 1; pz: 1; Value: 110; WeightSum: 1),
+    (px: 1; py: 0; pz: 4.5; Value: 301; WeightSum: 1),
+    (px: 1; py: 1; pz: -0.25; Value: 11; WeightSum: 1));
+  // align_corners=True: the volume corners sit at normalized -1 and +1.
+  csAlign: array[0..2] of TGridSample3DCase = (
+    (px: 2; py: 1; pz: 3; Value: 312; WeightSum: 1),
+    (px: 0; py: 0; pz: 0; Value: 0; WeightSum: 1),
+    (px: 1; py: 0.5; pz: 1.5; Value: 156; WeightSum: 1));
+  // nearest rounds half to even: z 2.5 -> 2, z 3.5 -> 4 (outside), x -0.5 -> 0.
+  csNearest: array[0..2] of TGridSample3DCase = (
+    (px: 1.4; py: 0.6; pz: 2.5; Value: 211; WeightSum: 1),
+    (px: 0.5; py: 0.5; pz: 3.5; Value: 0; WeightSum: 0),
+    (px: -0.5; py: 1; pz: 1; Value: 110; WeightSum: 1));
+
+  procedure CheckCases(const Cases: array of TGridSample3DCase;
+    Interp: TNNetGridSampleInterp; Pad: TNNetGridSamplePad;
+    AlignCorners: boolean; const CaseName: string);
+  var
+    NN: TNNet;
+    FeaturesInput, GridInput: TNNetLayer;
+    Features, Grid, Output: TNNetVolume;
+    CasePos, MaxCasePos, PixelX, PixelY, Frame, Channel: integer;
+    Expected: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Features := TNNetVolume.Create(csWidth, csHeight, csFrames * csChannels);
+    // Every case is one output frame of a single grid column.
+    Grid := TNNetVolume.Create(1, 1, 3 * Length(Cases));
+    try
+      FeaturesInput := NN.AddLayer(TNNetInput.Create(csWidth, csHeight,
+        csFrames * csChannels, 1));
+      GridInput := NN.AddLayerAfter(TNNetInput.Create(1, 1, 3 * Length(Cases), 1), 0);
+      NN.AddLayerAfter(TNNetGridSample3D.Create(GridInput, csChannels, Interp,
+        Pad, AlignCorners), FeaturesInput);
+      for Frame := 0 to csFrames - 1 do
+      for PixelY := 0 to csHeight - 1 do
+      for PixelX := 0 to csWidth - 1 do
+      for Channel := 0 to csChannels - 1 do
+        Features.Store(PixelX, PixelY, Frame * csChannels + Channel,
+          100 * Frame + 10 * PixelY + PixelX + 0.5 * Channel);
+      MaxCasePos := High(Cases);
+      for CasePos := 0 to MaxCasePos do
+      begin
+        Grid.Raw[CasePos * 3] := GridSample3DNormalized(Cases[CasePos].px,
+          csWidth, AlignCorners);
+        Grid.Raw[CasePos * 3 + 1] := GridSample3DNormalized(Cases[CasePos].py,
+          csHeight, AlignCorners);
+        Grid.Raw[CasePos * 3 + 2] := GridSample3DNormalized(Cases[CasePos].pz,
+          csFrames, AlignCorners);
+      end;
+      GridInput.Output.Copy(Grid);
+      NN.Compute(Features);
+      Output := NN.GetLastLayer.Output;
+      AssertEquals(CaseName + ' output SizeX', 1, Output.SizeX);
+      AssertEquals(CaseName + ' output SizeY', 1, Output.SizeY);
+      AssertEquals(CaseName + ' output Depth = frames * C',
+        Length(Cases) * csChannels, Output.Depth);
+      for CasePos := 0 to MaxCasePos do
+      for Channel := 0 to csChannels - 1 do
+      begin
+        Expected := Cases[CasePos].Value +
+          0.5 * Channel * Cases[CasePos].WeightSum;
+        AssertEquals(CaseName + ' case ' + IntToStr(CasePos) + ' channel ' +
+          IntToStr(Channel), Expected,
+          Output.Raw[CasePos * csChannels + Channel], 1e-3);
+      end;
+    finally
+      Grid.Free;
+      Features.Free;
+      NN.Free;
+    end;
+  end;
+
+begin
+  CheckCases(csZeros, gsiBilinear, gspZeros, false, 'zeros');
+  CheckCases(csBorder, gsiBilinear, gspBorder, false, 'border');
+  CheckCases(csAlign, gsiBilinear, gspZeros, true, 'align_corners');
+  CheckCases(csNearest, gsiNearest, gspZeros, false, 'nearest');
+end;
+
+procedure TTestNeuralLayersExtra.TestGridSample3DSaveLoad;
+var
+  NN, Loaded: TNNet;
+  FeaturesInput, GridInput: TNNetLayer;
+  Features, Grid: TNNetVolume;
+  Interp: TNNetGridSampleInterp;
+  Saved: string;
+  Pos, MaxPos: integer;
+begin
+  for Interp := gsiBilinear to gsiNearest do
+  begin
+    NN := TNNet.Create();
+    Loaded := TNNet.Create();
+    Features := TNNetVolume.Create(3, 2, 4 * 2);
+    Grid := TNNetVolume.Create(4, 3, 2 * 3);
+    try
+      RandSeed := 20261024 + Ord(Interp);
+      FeaturesInput := NN.AddLayer(TNNetInput.Create(3, 2, 4 * 2, 1));
+      GridInput := NN.AddLayerAfter(TNNetInput.Create(4, 3, 2 * 3, 1), 0);
+      NN.AddLayerAfter(TNNetGridSample3D.Create(GridInput, 2, Interp, gspBorder,
+        true), FeaturesInput);
+      Features.RandomizeGaussian();
+      Grid.Randomize();
+      GridInput.Output.Copy(Grid);
+      NN.Compute(Features);
+      Saved := NN.SaveToString();
+      Loaded.LoadFromString(Saved);
+      AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+      AssertTrue('loaded layer class', Loaded.GetLastLayer is TNNetGridSample3D);
+      AssertTrue('grid source reconnected',
+        TNNetGridSample3D(Loaded.GetLastLayer).GridSource = Loaded.Layers[1]);
+      AssertEquals('channels per frame', 2,
+        TNNetGridSample3D(Loaded.GetLastLayer).Channels);
+      AssertEquals('output Depth = grid frames * C', 4,
+        Loaded.GetLastLayer.Output.Depth);
+      Loaded.Layers[1].Output.Copy(Grid);
+      Loaded.Compute(Features);
+      MaxPos := NN.GetLastLayer.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+        AssertEquals('output ' + IntToStr(Pos), NN.GetLastLayer.Output.Raw[Pos],
+          Loaded.GetLastLayer.Output.Raw[Pos], 1e-6);
+    finally
+      Grid.Free;
+      Features.Free;
+      Loaded.Free;
+      NN.Free;
+    end;
   end;
 end;
 

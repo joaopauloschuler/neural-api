@@ -721,6 +721,9 @@ type
     // TNNetTriplaneSample on OpenCL vs the CPU for both paddings and both
     // align_corners values; triplane and points are bound, not downloaded.
     procedure TestTriplaneSampleOpenCLParity;
+    // TNNetGridSample3D on OpenCL vs the CPU for both modes, both paddings and
+    // both align_corners values; features and grid are bound, not downloaded.
+    procedure TestGridSample3DOpenCLParity;
     // TNNetTopKGatherTokens on OpenCL vs the CPU over two inputs with different
     // top-K tokens; the gathered features are bound, not downloaded.
     procedure TestTopKGatherTokensOpenCLParity;
@@ -2104,6 +2107,9 @@ type
     // TNNetTriplaneSample: finite-difference dL/d(triplane) and dL/d(points),
     // zeros and border padding, with samples that straddle the plane edges.
     procedure TestTriplaneSampleGradientCheck;
+    // TNNetGridSample3D: finite-difference dL/d(features) and dL/d(grid) for
+    // trilinear zeros/border x align_corners and nearest, samples past the edges.
+    procedure TestGridSample3DGradientCheck;
     // TNNetFlowWarp dense per-pixel (dx,dy) backward-warp sampler
     procedure TestFlowWarpFeatureGradientCheck;
     procedure TestFlowWarpFlowGradientCheck;
@@ -22406,6 +22412,130 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSample3DGradientCheck;
+type
+  TGridSample3DConfig = record
+    Interp: TNNetGridSampleInterp;
+    Pad: TNNetGridSamplePad;
+    AlignCorners: boolean;
+  end;
+const
+  csWidth = 3;
+  csHeight = 3;
+  csFrames = 3;
+  csChannels = 2;
+  csPointCount = 8;
+  // Target source pixel (x, y, z) per grid point (align_corners=False): off the
+  // trilinear kinks and the nearest half-way points, some past the edges.
+  csPointPixels: array[0..csPointCount - 1, 0..2] of TNeuralFloat = (
+    (0.4, 1.3, 0.6), (1.7, 0.55, 1.35), (-0.4, 2.2, 1.6), (2.4, 1.45, -0.3),
+    (1.25, 2.6, 2.35), (0.65, -0.35, 0.8), (2.7, 0.3, 1.1), (1.55, 1.85, 2.6));
+  csConfigs: array[0..4] of TGridSample3DConfig = (
+    (Interp: gsiBilinear; Pad: gspZeros; AlignCorners: false),
+    (Interp: gsiBilinear; Pad: gspBorder; AlignCorners: false),
+    (Interp: gsiBilinear; Pad: gspZeros; AlignCorners: true),
+    (Interp: gsiBilinear; Pad: gspBorder; AlignCorners: true),
+    (Interp: gsiNearest; Pad: gspZeros; AlignCorners: false));
+  csAxisSize: array[0..2] of integer = (csWidth, csHeight, csFrames);
+var
+  NN: TNNet;
+  FeaturesInput, GridInput: TNNetLayer;
+  Features, Grid, Desired: TNNetVolume;
+  Sources: array[0..1] of TNNetVolume;
+  ConfigPos, SourcePos, Pos, MaxPos, PointPos, Axis, Checked: integer;
+  Epsilon, Saved, LossPlus, LossMinus, Numerical, Analytical, MaxError: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    OutputPos, MaxOutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    GridInput.Output.Copy(Grid);
+    NN.Compute(Features);
+    Result := 0;
+    MaxOutputPos := NN.GetLastLayer.Output.Size - 1;
+    for OutputPos := 0 to MaxOutputPos do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  Epsilon := 0.001;
+  MaxError := 0;
+  Checked := 0;
+  Features := TNNetVolume.Create(csWidth, csHeight, csFrames * csChannels);
+  // Two output frames of 2 x 2 points.
+  Grid := TNNetVolume.Create(2, 2, 2 * 3);
+  Desired := TNNetVolume.Create(2, 2, 2 * csChannels);
+  Sources[0] := Features;
+  Sources[1] := Grid;
+  try
+    MaxPos := Features.Size - 1;
+    for Pos := 0 to MaxPos do Features.Raw[Pos] := Sin(Pos * 0.53) * 0.9 + 0.1;
+    MaxPos := Desired.Size - 1;
+    for Pos := 0 to MaxPos do Desired.Raw[Pos] := Cos(Pos * 0.31);
+    for ConfigPos := 0 to High(csConfigs) do
+    begin
+      // Point p is grid element p * 3 (points are laid out frame-innermost).
+      for PointPos := 0 to csPointCount - 1 do
+        for Axis := 0 to 2 do
+          if csConfigs[ConfigPos].AlignCorners
+            then Grid.Raw[PointPos * 3 + Axis] :=
+              2 * csPointPixels[PointPos, Axis] / (csAxisSize[Axis] - 1) - 1
+            else Grid.Raw[PointPos * 3 + Axis] :=
+              (2 * csPointPixels[PointPos, Axis] + 1) / csAxisSize[Axis] - 1;
+      NN := TNNet.Create();
+      try
+        FeaturesInput := NN.AddLayer(TNNetInput.Create(csWidth, csHeight,
+          csFrames * csChannels, 1));
+        GridInput := NN.AddLayerAfter(TNNetInput.Create(2, 2, 2 * 3, 1), 0);
+        NN.AddLayerAfter(TNNetGridSample3D.Create(GridInput, csChannels,
+          csConfigs[ConfigPos].Interp, csConfigs[ConfigPos].Pad,
+          csConfigs[ConfigPos].AlignCorners), FeaturesInput);
+        NN.SetLearningRate(1.0, 0.0);
+        NN.SetBatchUpdate(true);
+        for SourcePos := 0 to 1 do
+        begin
+          MaxPos := Sources[SourcePos].Size - 1;
+          for Pos := 0 to MaxPos do
+          begin
+            Saved := Sources[SourcePos].Raw[Pos];
+            Sources[SourcePos].Raw[Pos] := Saved + Epsilon;
+            LossPlus := ComputeLoss();
+            Sources[SourcePos].Raw[Pos] := Saved - Epsilon;
+            LossMinus := ComputeLoss();
+            Sources[SourcePos].Raw[Pos] := Saved;
+            Numerical := (LossPlus - LossMinus) / (2 * Epsilon);
+            ComputeLoss();
+            FeaturesInput.OutputError.Fill(0);
+            GridInput.OutputError.Fill(0);
+            NN.Backpropagate(Desired);
+            if SourcePos = 0
+              then Analytical := FeaturesInput.OutputError.Raw[Pos]
+              else Analytical := GridInput.OutputError.Raw[Pos];
+            MaxError := Max(MaxError, Abs(Numerical - Analytical));
+            AssertTrue('config ' + IntToStr(ConfigPos) + ' source ' +
+              IntToStr(SourcePos) + ' element ' + IntToStr(Pos) + ' numerical ' +
+              FloatToStr(Numerical) + ' analytical ' + FloatToStr(Analytical),
+              Abs(Numerical - Analytical) < 0.01);
+            Inc(Checked);
+          end;
+        end;
+      finally
+        NN.Free;
+      end;
+    end;
+    WriteLn('  TestGridSample3DGradientCheck max gradient error: ',
+      FloatToStr(MaxError), ' over ', Checked, ' elements');
+  finally
+    Desired.Free;
+    Grid.Free;
+    Features.Free;
   end;
 end;
 
@@ -75227,6 +75357,123 @@ begin
         AssertEquals('both sources must be read in OpenCL memory',
           SentinelTotal, SentinelSurvivors);
         AssertTrue('triplane sample OpenCL vs CPU parity: max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    for InputPos := 0 to 1 do
+    begin
+      OutCPU[InputPos].Free;
+      Inputs[InputPos].Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGridSample3DOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csWidth = 5;
+  csHeight = 4;
+  csFrames = 3;
+  csChannels = 6;
+  csInputDepth = 4;
+var
+  NN: TNNet;
+  Inputs: array[0..1] of TNNetVolume;
+  OutCPU: array[0..1] of TNNetVolume;
+  InputLayer, Features, Grid: TNNetLayer;
+  GridSample: TNNetGridSample3D;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Interp: TNNetGridSampleInterp;
+  Pad: TNNetGridSamplePad;
+  AlignCorners: boolean;
+  InputPos, Pos, MaxPos, SentinelSurvivors, SentinelTotal: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for InputPos := 0 to 1 do
+  begin
+    Inputs[InputPos] := TNNetVolume.Create(csWidth, csHeight, csInputDepth);
+    OutCPU[InputPos] := TNNetVolume.Create();
+  end;
+  try
+    for Interp := gsiBilinear to gsiNearest do
+    for Pad := gspZeros to gspBorder do
+    for AlignCorners := false to true do
+    begin
+      RandSeed := 20261024 + Ord(Interp) * 4 + Ord(Pad) * 2 + Ord(AlignCorners);
+      NN := TNNet.Create();
+      try
+        InputLayer := NN.AddLayer(TNNetInput.Create(csWidth, csHeight,
+          csInputDepth));
+        Features := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+          csFrames * csChannels), InputLayer);
+        // Two output frames per input position; many points land outside [-1, 1].
+        Grid := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(2 * 3), InputLayer);
+        GridSample := TNNetGridSample3D.Create(Grid, csChannels, Interp, Pad,
+          AlignCorners);
+        NN.AddLayerAfter(GridSample, Features);
+        NN.SetTrainable(False, False);
+        for InputPos := 0 to 1 do
+        begin
+          Inputs[InputPos].RandomizeGaussian();
+          NN.Compute(Inputs[InputPos]);
+          OutCPU[InputPos].Copy(NN.GetLastLayer.Output);
+        end;
+        AssertEquals('grid sample 3D ran on the CPU before EnableOpenCL', 0,
+          GridSample.ForwardGPUCnt);
+
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        NN.ForceOpenCL(True);
+        MaxDiff := 0;
+        try
+          NN.Compute(Inputs[1]);
+          // Parity cannot tell a bind from a download: the next forwards must
+          // leave the host copies of both sources untouched.
+          Features.Output.Fill(csSentinel);
+          Grid.Output.Fill(csSentinel);
+          for InputPos := 0 to 1 do
+          begin
+            NN.Compute(Inputs[InputPos]);
+            AssertEquals('output size match', OutCPU[InputPos].Size,
+              NN.GetLastLayer.Output.Size);
+            MaxPos := OutCPU[InputPos].Size - 1;
+            for Pos := 0 to MaxPos do
+              MaxDiff := Max(MaxDiff, Abs(OutCPU[InputPos].Raw[Pos] -
+                NN.GetLastLayer.Output.Raw[Pos]));
+          end;
+          SentinelSurvivors := 0;
+          SentinelTotal := Features.Output.Size + Grid.Output.Size;
+          MaxPos := Features.Output.Size - 1;
+          for Pos := 0 to MaxPos do
+            if Features.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          MaxPos := Grid.Output.Size - 1;
+          for Pos := 0 to MaxPos do
+            if Grid.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+        finally
+          NN.ForceOpenCL(False);
+        end;
+        WriteLn('  GridSample3D OpenCL parity (interp ', Ord(Interp), ', pad ',
+          Ord(Pad), ', align_corners ', AlignCorners, '): max|diff|=',
+          MaxDiff:0:9, ' gpu forwards=', GridSample.ForwardGPUCnt,
+          ' source sentinels=', SentinelSurvivors, '/', SentinelTotal);
+        AssertTrue('grid sample 3D must reach OpenCL', GridSample.ForwardGPUCnt > 0);
+        AssertEquals('both sources must be read in OpenCL memory',
+          SentinelTotal, SentinelSurvivors);
+        AssertTrue('grid sample 3D OpenCL vs CPU parity: max |diff| = ' +
           FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
       finally
         NN.Free;

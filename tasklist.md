@@ -1994,11 +1994,13 @@ rather than acted on.
       trailing `pPaddingT` parameter of TNNetConvolution3D (temporal zero
       padding, packed in the high half of FStruct[7], old nets load with 0;
       PaddingT > 0 runs on the host because cai_conv_implicit has no depth
-      bounds check, so an OpenCL padded-time path is still open); a trilinear
-      3-D grid sample (torch F.grid_sample on 5-D input, align_corners=False,
-      zeros padding) built on the TNNetGridSample
-      gather helpers, with OpenCL forward, since 16 x 64 x 64 x 32 samples per
-      frame dominate the warp; a SPADE layer or builder (param-free
+      bounds check, so an OpenCL padded-time path is still open); LANDED,
+      TNNetGridSample3D (torch F.grid_sample on 5-D input: trilinear and
+      nearest, zeros and border padding, both align_corners; features and grid
+      packed along Depth like TNNetConvolution3D; CPU forward + backward to
+      features and grid, OpenCL inference forward cai_grid_sample_3d; tests
+      TestGridSample3DHandCases/SaveLoad/GradientCheck/OpenCLParity). Still
+      open: a SPADE layer or builder (param-free
       InstanceNorm/BatchNorm + conv-predicted gamma/beta from a resized segmap)
       if TNNetInstanceNorm + TNNetCellMulByCell + TNNetSum cannot express it
       without copies. Tests: trilinear grid sample against hand-derived cases

@@ -569,7 +569,7 @@ begin
   //      TNNetConcat, TNNetDeepConcat, TNNetSum, TNNetFiLM,
   //      TNNetShakeShakeMerge, TNNetShakeDropMerge, TNNetCrossAttention,
   //      TNNetCrossWKV, TNNetAffineGridSample, TNNetFlowWarp,
-  //      TNNetMultiScaleDeformableAttention, TNNetTriplaneSample,
+  //      TNNetMultiScaleDeformableAttention, TNNetTriplaneSample, TNNetGridSample3D,
   //      TNNetTopKGatherTokens,
   //      TNNetBackwardWarp, TNNetCorrelationVolume, TNNetCorrelationLookup,
   //      TNNetHyperLinear, TNNetHyperConv, TNNetModulatedConv2D,

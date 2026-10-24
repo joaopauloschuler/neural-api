@@ -4830,6 +4830,17 @@ __kernel void cai_ms_deformable_attn
   for (int c = 0; c < ChannelCount; c++) Out[c] = acc[c];
 }
 
+// torch grid_sampler_compute_source_index: normalized c in [-1, 1] -> pixel
+// coordinate along Dim pixels; BorderPad clips it to [0, Dim-1].
+static inline float cai_grid_source_index(const float c, const int Dim,
+  const int AlignCorners, const int BorderPad)
+{
+  float p = AlignCorners ? (c + 1.0f) * 0.5f * (float)(Dim - 1)
+                         : ((c + 1.0f) * (float)Dim - 1.0f) * 0.5f;
+  if (BorderPad) p = (p < 0.0f) ? 0.0f : ((p > (float)(Dim - 1)) ? (float)(Dim - 1) : p);
+  return p;
+}
+
 // CAI triplane sample (TNNetTriplaneSample forward, TripoSR query_triplane):
 // FDst[(point*3 + plane)*FChannels + c] = torch grid_sample (bilinear) of channel
 // c of plane `plane` at the point's (x, y), (x, z) or (y, z) times FInvRadius.
@@ -4859,24 +4870,10 @@ __kernel void cai_triplane_sample
   const int Plane = Feature / FChannels;
   const int Channel = Feature - Plane * FChannels;
   __global const float* P = FPoints + Point * 3;
-  const float u = P[(Plane == 2) ? 1 : 0] * FInvRadius;
-  const float v = P[(Plane == 0) ? 1 : 2] * FInvRadius;
-  float px, py;
-  if (FAlignCorners)
-  {
-    px = (u + 1.0f) * 0.5f * (float)(FWidth - 1);
-    py = (v + 1.0f) * 0.5f * (float)(FHeight - 1);
-  }
-  else
-  {
-    px = ((u + 1.0f) * (float)FWidth - 1.0f) * 0.5f;
-    py = ((v + 1.0f) * (float)FHeight - 1.0f) * 0.5f;
-  }
-  if (FBorderPad)
-  {
-    px = (px < 0.0f) ? 0.0f : ((px > (float)(FWidth - 1)) ? (float)(FWidth - 1) : px);
-    py = (py < 0.0f) ? 0.0f : ((py > (float)(FHeight - 1)) ? (float)(FHeight - 1) : py);
-  }
+  const float px = cai_grid_source_index(P[(Plane == 2) ? 1 : 0] * FInvRadius,
+    FWidth, FAlignCorners, FBorderPad);
+  const float py = cai_grid_source_index(P[(Plane == 0) ? 1 : 2] * FInvRadius,
+    FHeight, FAlignCorners, FBorderPad);
   float acc = 0.0f;
   // Every corner outside (also NaN): the sample is zero. Inside, the int
   // conversions below are bounded.
@@ -4898,6 +4895,88 @@ __kernel void cai_triplane_sample
     if (InX1 && InY0) acc += (fx * (1.0f - fy)) * FPlanes[Base + FChannels];
     if (InX0 && InY1) acc += ((1.0f - fx) * fy) * FPlanes[RowBelow];
     if (InX1 && InY1) acc += (fx * fy) * FPlanes[RowBelow + FChannels];
+  }
+  FDst[g_id] = acc;
+}
+
+// CAI 3-D grid sample (TNNetGridSample3D forward, torch F.grid_sample on 5-D
+// input): FDst[point*FChannels + c] = the trilinear (FNearest: nearest, rint is
+// half-to-even like torch nearbyint) sample of channel c at the point's
+// normalized (x, y, z) in FGrid[point*3..]. FFeatures is (FWidth, FHeight,
+// FFrames*FChannels), frame z on depth [z*FChannels, (z+1)*FChannels).
+// FBorderPad != 0 clips the coordinate, else zero padding. One work-item per
+// output float. Coded by Claude (AI).
+__kernel void cai_grid_sample_3d
+(
+  const int FPointCount,
+  const int FWidth,
+  const int FHeight,
+  const int FFrames,
+  const int FChannels,
+  const int FNearest,
+  const int FAlignCorners,
+  const int FBorderPad,
+  __global const float* FFeatures,
+  __global const float* FGrid,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FPointCount * FChannels) return;
+  const int Point = g_id / FChannels;
+  const int Channel = g_id - Point * FChannels;
+  __global const float* G = FGrid + Point * 3;
+  const float px = cai_grid_source_index(G[0], FWidth, FAlignCorners, FBorderPad);
+  const float py = cai_grid_source_index(G[1], FHeight, FAlignCorners, FBorderPad);
+  const float pz = cai_grid_source_index(G[2], FFrames, FAlignCorners, FBorderPad);
+  const int FrameStride = FChannels;
+  const int ColumnStride = FFrames * FChannels;
+  const int RowStride = FWidth * ColumnStride;
+  float acc = 0.0f;
+  // Every corner outside (also NaN): the sample is zero. Inside, the int
+  // conversions below are bounded.
+  if ((px > -1.0f) && (px < (float)FWidth) && (py > -1.0f) && (py < (float)FHeight) &&
+      (pz > -1.0f) && (pz < (float)FFrames))
+  {
+    if (FNearest)
+    {
+      const int nx = (int)rint(px);
+      const int ny = (int)rint(py);
+      const int nz = (int)rint(pz);
+      if ((nx >= 0) && (nx < FWidth) && (ny >= 0) && (ny < FHeight) &&
+          (nz >= 0) && (nz < FFrames))
+        acc = FFeatures[ny * RowStride + nx * ColumnStride + nz * FrameStride + Channel];
+    }
+    else
+    {
+      const float x0f = floor(px);
+      const float y0f = floor(py);
+      const float z0f = floor(pz);
+      const int x0 = (int)x0f;
+      const int y0 = (int)y0f;
+      const int z0 = (int)z0f;
+      const float fx = px - x0f;
+      const float fy = py - y0f;
+      const float fz = pz - z0f;
+      const int InX0 = x0 >= 0;
+      const int InX1 = x0 + 1 < FWidth;
+      const int InY0 = y0 >= 0;
+      const int InY1 = y0 + 1 < FHeight;
+      const int InZ0 = z0 >= 0;
+      const int InZ1 = z0 + 1 < FFrames;
+      const int Base = y0 * RowStride + x0 * ColumnStride + z0 * FrameStride + Channel;
+      for (int k = 0; k < 2; k++)
+      {
+        if (!(k ? InZ1 : InZ0)) continue;
+        const float wz = k ? fz : 1.0f - fz;
+        const int B = Base + k * FrameStride;
+        const int BelowB = B + RowStride;
+        if (InX0 && InY0) acc += (wz * (1.0f - fx) * (1.0f - fy)) * FFeatures[B];
+        if (InX1 && InY0) acc += (wz * fx * (1.0f - fy)) * FFeatures[B + ColumnStride];
+        if (InX0 && InY1) acc += (wz * (1.0f - fx) * fy) * FFeatures[BelowB];
+        if (InX1 && InY1) acc += (wz * fx * fy) * FFeatures[BelowB + ColumnStride];
+      }
+    }
   }
   FDst[g_id] = acc;
 }
