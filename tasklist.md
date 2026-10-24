@@ -2042,6 +2042,46 @@ rather than acted on.
               (model_type rt_detr_v2: per-level point counts, discrete
               sampling) is a separate importer.
 
+- [ ] D-FINE detector importer (BuildDFineFromSafeTensors[Ex], transformers
+      model_type "d_fine", DFineForObjectDetection; Apache-2.0 checkpoints
+      ustc-community/dfine-{nano,small,medium,large,xlarge}-coco and the obj365
+      variants). D-FINE (Peng et al., ICLR 2025) is the RT-DETR design with a
+      stronger box head: it is more accurate than RT-DETR at the same speed, and
+      the nano/small models run in real time on a CPU. Reuse from the RT-DETR
+      importer: the AIFI encoder layer, sine position table, top-K query
+      selection (TNNetTopKGatherTokens), TNNetInverseSigmoid,
+      TNNetMultiScaleDeformableAttention and the no-NMS post-process
+      (DecodeRtDetrDetections). Share the code; do not copy it. New code:
+        - HGNetV2 backbone (transformers hgnet_v2: stem, HGNetV2BasicLayer
+          with light depthwise convs and aggregation, LearnableAffineBlock as
+          a scalar scale + bias). Build it as its own routine so that RT-DETRv2
+          and DEIM checkpoints can reuse it later.
+        - Neck blocks DFineRepNCSPELAN4 (RepVgg + CSP) and DFineSCDown
+          (pointwise + strided depthwise) in place of the RT-DETR CCFM convs.
+        - Deformable attention with one point count per level
+          (decoder_n_points as a list, num_points_scale = 1/n per point) and
+          decoder_offset_scale. Extend TNNetMultiScaleDeformableAttention and
+          its OpenCL kernel with this option rather than adding a second
+          layer; with equal counts it must give the same result as now.
+        - Decoder gate (DFineGate: sigmoid(Linear(concat)) mixes the residual
+          and the cross-attention output, then LayerNorm).
+        - Fine-grained Distribution Refinement: each layer predicts 4 x
+          (max_num_bins + 1) logits; the box is the softmax over the bins
+          times the fixed weighting_function(max_num_bins, up, reg_scale),
+          then distance2bbox. The weighting vector is a constant computed at
+          build time. Each layer adds its corners to the previous ones.
+        - LQE head: top-k (top_prob_values) of each softmaxed side + their
+          mean -> small MLP -> added to the class logits.
+      Honour eval_idx (the output layer can be before the last decoder layer;
+      do not build the layers after it). Add ObjectDetection --dfine
+      [--image], a pico fixture generator next to
+      tools/make_pico_rtdetr_fixture.py, and parity tests against transformers
+      (logits and boxes < 1e-4) on two pico configs: one with equal and one
+      with per-level point counts. Agent check on dfine-nano-coco at 640 x 640
+      under the 2 GB cap: same detections as transformers. Update
+      examples/ObjectDetection/README.md. Inference only; training (FDR/GO-LSD
+      distillation losses) is out of scope.
+
 - [ ] Fuyu decoder-only multimodal importer (BuildFuyuFromSafeTensors[Ex],
       model_type "fuyu", e.g. adept/fuyu-8b). Architecturally DISTINCT from every
       landed vision-language importer (CLIP/SigLIP-ViT tower + projector feeding a
