@@ -346,6 +346,12 @@ type
     procedure TestSpectralConv1DGradientCheckAboveNyquist;
     procedure TestSpectralConv1DModesTruncation;
     procedure TestSpectralConv1DSerializationRoundTrip;
+    // FNO mode (torch SpectralConv1d): rfft -> mix -> irfft vs a naive Double
+    // DFT reference in torch layout; gradients, guard and round-trip.
+    procedure TestSpectralConv1DFNOMatchesNaiveIrfft;
+    procedure TestSpectralConv1DFNOGradientCheck;
+    procedure TestSpectralConv1DFNOGuard;
+    procedure TestSpectralConv1DFNOSerializationRoundTrip;
     // TNNetDWT1D lifting-scheme single-level 1-D discrete wavelet transform
     procedure TestDWT1DInputGradientCheck;
     procedure TestDWT1DLearnableTapGradientCheck;
@@ -64600,7 +64606,7 @@ begin
 end;
 
 procedure SpectralConv1DGradCheck(ATestCase: TTestCase; SeqLen: integer;
-  Modes: integer = 3);
+  Modes: integer = 3; FNOMode: boolean = False);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
@@ -64641,7 +64647,7 @@ begin
   maxErr := 0;
   try
     NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1)); // 1 = collect input error
-    SC := TNNetSpectralConv1D.Create(OutDepth, Modes);
+    SC := TNNetSpectralConv1D.Create(OutDepth, Modes, FNOMode);
     NN.AddLayer(SC);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
@@ -64825,6 +64831,241 @@ begin
         AssertEquals('SpectralConv1D Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// torch FNO SpectralConv1d forward in Double on an NCL tensor read from the
+// (SizeX=L, 1, C) volume: rfft, the :modes mix, then irfft(n=L) with pocketfft's
+// c2r semantics (Hermitian extension, Im of DC/Nyquist dropped).
+procedure NaiveTorchFNO1DForward(Input: TNNetVolume; const W1: array of TNeuralFloat;
+  OutDepth, Modes: integer; Output: TNNetVolume);
+var
+  SeqLen, HalfLen, InDepth, n, k, ci, co, b: integer;
+  Ang, Xr, Xi, Wr, Wi, Zr, Zi, Fr, Fi, Acc: Double;
+  XftRe, XftIm: array of array of Double;   // [ci][k]
+  ZRe, ZIm: array of Double;                // [k] of one output channel
+begin
+  SeqLen := Input.SizeX; InDepth := Input.Depth;
+  HalfLen := SeqLen div 2 + 1;
+  SetLength(XftRe, InDepth, HalfLen);
+  SetLength(XftIm, InDepth, HalfLen);
+  for ci := 0 to InDepth - 1 do
+    for k := 0 to HalfLen - 1 do
+    begin
+      Xr := 0; Xi := 0;
+      for n := 0 to SeqLen - 1 do
+      begin
+        Ang := 2 * Pi * k * n / SeqLen;
+        Xr := Xr + Input[n, 0, ci] * Cos(Ang);
+        Xi := Xi - Input[n, 0, ci] * Sin(Ang);
+      end;
+      XftRe[ci][k] := Xr;
+      XftIm[ci][k] := Xi;
+    end;
+  Output.ReSize(SeqLen, 1, OutDepth);
+  SetLength(ZRe, HalfLen);
+  SetLength(ZIm, HalfLen);
+  for co := 0 to OutDepth - 1 do
+  begin
+    for k := 0 to HalfLen - 1 do
+    begin
+      ZRe[k] := 0;
+      ZIm[k] := 0;
+    end;
+    // out_ft[:, :, :modes] = einsum('bix,iox->box', x_ft[:, :, :modes], weights1).
+    for k := 0 to Modes - 1 do
+    begin
+      Zr := 0; Zi := 0;
+      for ci := 0 to InDepth - 1 do
+      begin
+        b := ((ci * OutDepth + co) * Modes + k) * 2;
+        Wr := W1[b]; Wi := W1[b + 1];
+        Xr := XftRe[ci][k];
+        Xi := XftIm[ci][k];
+        Zr := Zr + Xr * Wr - Xi * Wi;
+        Zi := Zi + Xr * Wi + Xi * Wr;
+      end;
+      ZRe[k] := Zr;
+      ZIm[k] := Zi;
+    end;
+    ZIm[0] := 0;
+    if SeqLen mod 2 = 0 then ZIm[SeqLen div 2] := 0;
+    // c2r: full inverse DFT of the Hermitian extension F[L-k] = conj F[k].
+    for n := 0 to SeqLen - 1 do
+    begin
+      Acc := 0;
+      for k := 0 to SeqLen - 1 do
+      begin
+        if k < HalfLen then
+        begin
+          Fr := ZRe[k]; Fi := ZIm[k];
+        end
+        else
+        begin
+          Fr := ZRe[SeqLen - k]; Fi := -ZIm[SeqLen - k];
+        end;
+        Ang := 2 * Pi * k * n / SeqLen;
+        Acc := Acc + Fr * Cos(Ang) - Fi * Sin(Ang);
+      end;
+      Output[n, 0, co] := Acc / SeqLen;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DFNOMatchesNaiveIrfft;
+const
+  // L, InDepth, OutDepth, modes: even L with the Nyquist bin (radix-2 and
+  // Bluestein), even L without it, odd L with every half-spectrum bin, L = 1.
+  csShapes: array[0..4, 0..3] of integer = (
+    (8, 2, 3, 5), (12, 2, 3, 7), (8, 3, 2, 3), (7, 2, 2, 4), (1, 2, 2, 1));
+var
+  NN: TNNet;
+  Input, Want: TNNetVolume;
+  SC: TNNetSpectralConv1D;
+  W1: array of TNeuralFloat;
+  ShapePos, i, WeightCount: integer;
+  MaxDiff: Double;
+  ShapeName: string;
+begin
+  RandSeed := 424242;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    ShapeName := 'FNO 1D L=' + IntToStr(csShapes[ShapePos, 0]) + ' modes ' +
+      IntToStr(csShapes[ShapePos, 3]);
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], 1, csShapes[ShapePos, 1]);
+    Want := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+      SC := TNNetSpectralConv1D.Create(csShapes[ShapePos, 2],
+        csShapes[ShapePos, 3], True);
+      NN.AddLayer(SC);
+      NN.SetTrainable(False, False);
+      AssertEquals(ShapeName + ' kept modes', csShapes[ShapePos, 3], SC.Modes);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Random * 2 - 1;
+      WeightCount := 2 * csShapes[ShapePos, 1] * csShapes[ShapePos, 2] *
+        csShapes[ShapePos, 3];
+      SetLength(W1, WeightCount);
+      for i := 0 to WeightCount - 1 do
+        W1[i] := Random * 2 - 1;
+      SC.ImportTorchFNOWeights(W1);
+      NN.Compute(Input);
+      NaiveTorchFNO1DForward(Input, W1, csShapes[ShapePos, 2],
+        csShapes[ShapePos, 3], Want);
+      AssertEquals(ShapeName + ' output size', Want.Size, SC.Output.Size);
+      AssertTrue(ShapeName + ' reference is not degenerate', Want.GetMaxAbs() > 0.1);
+      MaxDiff := 0;
+      for i := 0 to Want.Size - 1 do
+        MaxDiff := Max(MaxDiff, Abs(Want.Raw[i] - SC.Output.Raw[i]));
+      MaxDiff := MaxDiff / Want.GetMaxAbs();
+      WriteLn('  SpectralConv1D ', ShapeName, ' vs naive irfft rel max-diff: ',
+        MaxDiff:0:9);
+      AssertTrue(ShapeName + ' rel max-diff ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      NN.Free;
+      Input.Free;
+      Want.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DFNOGradientCheck;
+begin
+  // SeqLen, Modes: even SeqLen with the Nyquist bin kept, odd SeqLen with every
+  // half-spectrum bin, and a low-pass on an even SeqLen.
+  SpectralConv1DGradCheck(Self, 8, 5, True);
+  SpectralConv1DGradCheck(Self, 7, 4, True);
+  SpectralConv1DGradCheck(Self, 6, 2, True);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DFNOGuard;
+var
+  NN: TNNet;
+  SC: TNNetSpectralConv1D;
+  Capture: TErrorCapture;
+begin
+  // Modes above the half spectrum of a real FFT along SeqLen: reported and clamped.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 2));
+    SC := TNNetSpectralConv1D.Create(2, 5, True);
+    SC.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(SC);
+    AssertTrue('FNO Modes > SeqLen div 2 + 1 must fire FErrorProc',
+      Capture.Triggered);
+    AssertTrue('FNO Modes message names the limit',
+      Pos('SeqLen div 2 + 1', Capture.Message) > 0);
+    AssertEquals('FNO Modes clamps to SeqLen div 2 + 1', 4, SC.Modes);
+    AssertEquals('FNO weights sized for the clamped Modes', 2 * 4 * 2 * 2,
+      SC.Neurons[0].Weights.Size);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
+  // The legacy one-sided layer keeps accepting Modes up to SeqLen, and refuses
+  // a torch import.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 2));
+    SC := TNNetSpectralConv1D.Create(2, 5);
+    SC.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(SC);
+    AssertFalse('legacy Modes 5 at SeqLen 6 is accepted', Capture.Triggered);
+    SC.ImportTorchFNOWeights([0.0, 0.0]);
+    AssertTrue('legacy layer rejects ImportTorchFNOWeights', Capture.Triggered);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv1DFNOSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Layers: 0 input, 1 FNO SpectralConv1D (builder), 2 pointwise, 3 sum,
+  // 4 legacy SpectralConv1D.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(9, 1, 2));
+    NN.AddFourierNeuralOperator1D(3, 5, nil, True);
+    NN.AddLayer(TNNetSpectralConv1D.Create(2, 3));
+    AssertTrue('builder makes an FNO-mode spectral branch',
+      (NN.Layers[1] as TNNetSpectralConv1D).FNOMode);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('FNO 1D SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('FNO 1D mode round-trips',
+        (NN2.Layers[1] as TNNetSpectralConv1D).FNOMode);
+      AssertEquals('FNO 1D Modes round-trips', 5,
+        (NN2.Layers[1] as TNNetSpectralConv1D).Modes);
+      AssertFalse('legacy 1D layer stays legacy',
+        (NN2.Layers[4] as TNNetSpectralConv1D).FNOMode);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FNO 1D Compute matches after round-trip pos ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
       NN2.Free;
     end;

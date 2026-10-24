@@ -2803,9 +2803,10 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
       (`FStruct[3]`) is torch's `SpectralConv2d` (two Y corners, irfft2), CPU +
       OpenCL, with `ImportTorchFNOWeights`; the default stays the one-corner,
       real-part-of-IFFT variant. Checked against a naive Double rfft2/irfft2.
-      Still open: `TNNetSpectralConv1D` is the one-sided real-part variant, not
-      torch's `SpectralConv1d` (irfft doubles the non-DC bins), and no
-      safetensors FNO checkpoint loader exists yet.
+      `TNNetSpectralConv1D` has the same mode: `Create(OutDepth, Modes, True)`
+      (`FStruct[1]`) is torch's `SpectralConv1d` (rfft, `:modes` mix, irfft),
+      CPU only (the 1-D layer has no OpenCL path), checked against a naive
+      Double rfft/irfft. Still open: no safetensors FNO checkpoint loader.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and

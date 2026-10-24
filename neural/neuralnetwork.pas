@@ -18267,8 +18267,15 @@ type
   /// Weight layout: a single weight neuron holding 2 * FModes * InDepth * OutDepth
   /// reals (real then imag for each (mode, in, out)), indexed
   ///   base = ((m*InDepth + ci)*OutDepth + co)*2;  [base]=Re R, [base+1]=Im R.
-  /// Constructor: Create(OutDepth, Modes). OutDepth round-trips via FStruct[0],
-  /// Modes via FStruct[5]; dispatch is wired through Create(St[0], St[5]).
+  ///
+  /// FNO mode (Create(..., True)) is torch's SpectralConv1d on an NCL tensor
+  /// stored as (SizeX=L, 1, Depth=C): rfft along L, out_ft[:, :, :modes] =
+  /// einsum(x_ft[:, :, :modes], weights1), irfft(n=L). Modes <= SeqLen div 2 + 1
+  /// is required, and kept bins other than DC and an even SeqLen's Nyquist count
+  /// twice in the inverse (the Im of those two is dropped).
+  /// Constructor: Create(OutDepth, Modes, FNOMode). OutDepth round-trips via
+  /// FStruct[0], Modes via FStruct[5], FNOMode via FStruct[1] (older saved
+  /// structures load as 0); dispatch is Create(St[0], St[5], St[1] <> 0).
   /// Backward is the exact real adjoint of the linear FFT -> complex-matmul ->
   /// Hermitian-IFFT pipeline (the imag-part path is where a silent sign bug would
   /// hide, so both the input AND complex-weight gradients are numerically tested).
@@ -18277,6 +18284,8 @@ type
   private
     FOutDepth: integer;     // requested output Depth
     FModes: integer;        // number of kept low-frequency modes
+    FFNOMode: boolean;      // irfft inverse (torch FNO SpectralConv1d)
+    FBinWeight: array of Double; // per kept mode count in the inverse: 1, or 2 (FNO irfft)
     FSeqLen: integer;       // SeqLen (= prev SizeX), any length >= 1
     FInDepth: integer;      // input Depth
     FRealPlan: TRealFFTPlan; // length-FSeqLen real plan, built in SetPrevLayer
@@ -18304,20 +18313,24 @@ type
     FdWrPlane, FdWiPlane: array of TNeuralFloat;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
-    function WBase(m, ci, co: integer): integer;
     procedure FreeBackpropScratch();
     procedure SizeBackpropScratch();
     procedure RebuildWeightPlanes();
   public
-    constructor Create(pOutDepth, pModes: integer); reintroduce; overload;
+    constructor Create(pOutDepth, pModes: integer;
+      pFNOMode: boolean = False); reintroduce; overload;
     destructor Destroy(); override;
     function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // FNO mode: loads torch weights1 (in, out, Modes) complex as view_as_real
+    // (trailing Re, Im) row-major reals; call after SetPrevLayer.
+    procedure ImportTorchFNOWeights(const Weights1: array of TNeuralFloat);
     procedure InitDefault(); override;
     procedure AfterWeightUpdate(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property Modes: integer read FModes;
+    property FNOMode: boolean read FFNOMode;
     property SeqLen: integer read FSeqLen;
     property InDepth: integer read FInDepth;
   end;
@@ -18397,7 +18410,6 @@ type
     {$ENDIF}
     procedure ComputeCPU();
     procedure BackpropagateCPU();
-    function WBase(mx, my, ci, co: integer): integer;
     // Re/Im[kx][ky] := 2-D DFT of channel Channel of the real (FSizeX, FSizeY,
     // Depth) grid Src, for kx < FModesX and every ky.
     procedure RealToKeptSpectrum(Src: TNNetVolume; Channel, Depth: integer;
@@ -22292,8 +22304,10 @@ type
       // (TNNetPointwiseConvLinear) in grid space, then an optional activation.
       // Both branches map Depth -> pOutDepth so their (SeqLen,1,pOutDepth)
       // shapes match for the sum. pActFn = nil means no activation.
+      // pFNOMode builds the spectral branch as torch's SpectralConv1d.
       function AddFourierNeuralOperator1D(pOutDepth, pModes: integer;
-        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+        pActFn: TNNetActivationFunctionClass = nil;
+        pFNOMode: boolean = False): TNNetLayer;
       // 2-D Fourier Neural Operator Fourier layer over a (SizeX,SizeY,Depth)
       // grid: y = Activation( SpectralConv2D(x) + W_1x1(x) ). 2-D sibling of
       // AddFourierNeuralOperator1D; the pointwise residual works per-pixel.
@@ -96164,7 +96178,7 @@ begin
 end;
 
 function TNNet.AddFourierNeuralOperator1D(pOutDepth, pModes: integer;
-  pActFn: TNNetActivationFunctionClass): TNNetLayer;
+  pActFn: TNNetActivationFunctionClass; pFNOMode: boolean): TNNetLayer;
 var
   Origin, SpectralBranch, PointwiseBranch: TNNetLayer;
 begin
@@ -96177,7 +96191,8 @@ begin
   Origin := GetLastLayer();
   // Spectral branch: low-pass mode mix in Fourier space (Depth -> pOutDepth).
   SpectralBranch :=
-    AddLayerAfter( TNNetSpectralConv1D.Create(pOutDepth, pModes), Origin );
+    AddLayerAfter( TNNetSpectralConv1D.Create(pOutDepth, pModes, pFNOMode),
+      Origin );
   // Local pointwise 1x1 residual branch from the SAME origin (Depth->pOutDepth).
   PointwiseBranch :=
     AddLayerAfter( TNNetPointwiseConvLinear.Create(pOutDepth), Origin );
@@ -100168,6 +100183,44 @@ begin
   end;
 end;
 
+// Weights[k] := how often half-spectrum bin k counts in an irfft of length N (1 for
+// DC and an even N's Nyquist bin, else 2) when IsIrfft; all 1 otherwise.
+procedure FillIrfftBinWeights(var Weights: array of Double; N: integer;
+  IsIrfft: boolean);
+var
+  BinCnt, MaxBinPos: integer;
+begin
+  MaxBinPos := High(Weights);
+  for BinCnt := 0 to MaxBinPos do
+    if IsIrfft and (BinCnt > 0) and (2 * BinCnt <> N) then
+      Weights[BinCnt] := 2
+    else
+      Weights[BinCnt] := 1;
+end;
+
+// Copies torch view_as_real complex weights (InDepth, OutDepth, Length(ModeOf), 2)
+// row-major into the spectral layout ((ModeOf[m]*InDepth + ci)*OutDepth + co)*2.
+procedure ImportTorchSpectralWeights(Weights: TNNetVolume;
+  const Src: array of TNeuralFloat; InDepth, OutDepth: integer;
+  const ModeOf: array of integer);
+var
+  ci, co, m, SrcPos, Dst, MaxInPos, MaxOutPos, MaxModePos: integer;
+begin
+  MaxInPos := InDepth - 1;
+  MaxOutPos := OutDepth - 1;
+  MaxModePos := High(ModeOf);
+  SrcPos := 0;
+  for ci := 0 to MaxInPos do
+    for co := 0 to MaxOutPos do
+      for m := 0 to MaxModePos do
+      begin
+        Dst := ((ModeOf[m] * InDepth + ci) * OutDepth + co) * 2;
+        Weights.FData[Dst] := Src[SrcPos];
+        Weights.FData[Dst + 1] := Src[SrcPos + 1];
+        Inc(SrcPos, 2);
+      end;
+end;
+
 { TNNetSpectralConv1D }
 
 // The forward map is the linear pipeline
@@ -100177,7 +100230,8 @@ end;
 // class header). The FFT/IFFT is the shared TFFTPlan (any SeqLen) -- we do NOT
 // hand-roll a second FFT.
 
-constructor TNNetSpectralConv1D.Create(pOutDepth, pModes: integer);
+constructor TNNetSpectralConv1D.Create(pOutDepth, pModes: integer;
+  pFNOMode: boolean);
 begin
   inherited Create();
   if pOutDepth <= 0 then
@@ -100186,7 +100240,9 @@ begin
     FErrorProc('TNNetSpectralConv1D requires Modes >= 1. Got ' + IntToStr(pModes));
   FOutDepth := pOutDepth;
   FModes := pModes;
+  FFNOMode := pFNOMode;
   FStruct[0] := pOutDepth;
+  FStruct[1] := Ord(pFNOMode);
   FStruct[5] := pModes;
   // One weight neuron (complex spectral weights); sized in SetPrevLayer.
   while FNeurons.Count > 1 do
@@ -100233,13 +100289,31 @@ begin
   SetLength(FWiPlane, 0);
   SetLength(FxrPlane, 0);
   SetLength(FximPlane, 0);
+  SetLength(FBinWeight, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
 
-function TNNetSpectralConv1D.WBase(m, ci, co: integer): integer;
+procedure TNNetSpectralConv1D.ImportTorchFNOWeights(
+  const Weights1: array of TNeuralFloat);
+var
+  ModeOf: array of integer;
+  ModeCnt, MaxModePos, WeightCount: integer;
 begin
-  Result := ((m * FInDepth + ci) * FOutDepth + co) * 2;
+  WeightCount := 2 * FInDepth * FOutDepth * FModes;
+  if (not FFNOMode) or (FInDepth <= 0) or (Length(Weights1) <> WeightCount) then
+  begin
+    FErrorProc('TNNetSpectralConv1D.ImportTorchFNOWeights needs FNO mode, a ' +
+      'previous layer and ' + IntToStr(WeightCount) + ' reals.');
+    exit;
+  end;
+  SetLength(ModeOf, FModes);
+  MaxModePos := FModes - 1;
+  for ModeCnt := 0 to MaxModePos do
+    ModeOf[ModeCnt] := ModeCnt;
+  ImportTorchSpectralWeights(FArrNeurons[0].FWeights, Weights1, FInDepth,
+    FOutDepth, ModeOf);
+  AfterWeightUpdate();
 end;
 
 procedure TNNetSpectralConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -100252,9 +100326,21 @@ begin
       IntToStr(pPrevLayer.Output.SizeY) + '.');
   FSeqLen := pPrevLayer.Output.SizeX;
   FInDepth := pPrevLayer.Output.Depth;
-  if FModes > FSeqLen then
+  if FFNOMode then
+  begin
+    // torch's x_ft[:, :, :modes] slice of the half spectrum would not match weights1.
+    if FModes > FSeqLen div 2 + 1 then
+    begin
+      FErrorProc('TNNetSpectralConv1D FNO mode: Modes (' + IntToStr(FModes) +
+        ') must be <= SeqLen div 2 + 1 (' + IntToStr(FSeqLen div 2 + 1) + ').');
+      FModes := FSeqLen div 2 + 1;
+    end;
+  end
+  else if FModes > FSeqLen then
     FErrorProc('TNNetSpectralConv1D: Modes (' + IntToStr(FModes) +
       ') must be <= SeqLen (' + IntToStr(FSeqLen) + ').');
+  SetLength(FBinWeight, FModes);
+  FillIrfftBinWeights(FBinWeight, FSeqLen, FFNOMode);
 
   FOutput.ReSize(FSeqLen, 1, FOutDepth);
   SetOutputErrorSize(FSeqLen, 1, FOutDepth);
@@ -100411,14 +100497,15 @@ begin
     begin
       wBaseIdx := (co * FModes + m) * FInDepth;
       xBaseIdx := m * FInDepth;
-      FSreBuf[m] :=
+      FSreBuf[m] := FBinWeight[m] * (
         TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth) -
-        TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth);
-      FSimBuf[m] :=
+        TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth));
+      FSimBuf[m] := FBinWeight[m] * (
         TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
-        TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
+        TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth));
     end;
-    // Real part of the inverse FFT (includes 1/L).
+    // Real part of the inverse FFT (includes 1/L); with the FNO bin weights
+    // this is irfft.
     RealFFTInverseRealPart(FRealPlan, FSreBuf, FSimBuf, FModes, FRealRow);
     pos := co;
     for n := 0 to SeqLenM1 do
@@ -100450,7 +100537,7 @@ procedure TNNetSpectralConv1D.BackpropagateCPU();
 var
   ci, co, m, n, b: integer;
   WDelta, LocalPrevError: TNNetVolume;
-  invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
+  invL, BinGradScale, gyr, gyi, contrib, lrGyr, lrGyi: Double;
   xr, xi, wr, wi: TNeuralFloat;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
   wBaseIdx, xBaseIdx, wPos, xPos, planeSize, wPlaneSize, pos, OutStride: integer;
@@ -100474,7 +100561,8 @@ begin
 
   for co := 0 to OutDepthM1 do
   begin
-    // dL/dYhat[co][m] = (1/L) * FFT(g[co])[m]  (forward FFT of the output grad).
+    // dL/dYhat[co][m] = (BinWeight[m]/L) * FFT(g[co])[m]  (forward FFT of the
+    // output grad).
     pos := co;
     for n := 0 to SeqLenM1 do
     begin
@@ -100484,8 +100572,9 @@ begin
     RealFFTForwardBins(FRealPlan, FRealRow, FGreBuf, FGimBuf, FModes);
     for m := 0 to ModesM1 do
     begin
-      gyr := invL * FGreBuf[m];
-      gyi := invL * FGimBuf[m];
+      BinGradScale := invL * FBinWeight[m];
+      gyr := BinGradScale * FGreBuf[m];
+      gyi := BinGradScale * FGimBuf[m];
       wBaseIdx := (co * FModes + m) * FInDepth;
       xBaseIdx := m * FInDepth;
       // Transpose of the forward complex GEMM, with -FLearningRate folded into
@@ -101328,17 +101417,11 @@ begin
   inherited Destroy();
 end;
 
-function TNNetSpectralConv2D.WBase(mx, my, ci, co: integer): integer;
-begin
-  Result := (((mx * FKeptRowsY + my) * FInDepth + ci) * FOutDepth + co) * 2;
-end;
-
 procedure TNNetSpectralConv2D.ImportTorchFNOWeights(const Weights1,
   Weights2: array of TNeuralFloat);
 var
-  ci, co, m1, m2, SrcPos, Dst, CornerCount: integer;
-  MaxInPos, MaxOutPos, MaxModeYPos, MaxModeXPos: integer;
-  W: TNNetVolume;
+  ModeOf: array of integer;
+  m1, m2, CornerCount, MaxModeYPos, MaxModeXPos: integer;
 begin
   CornerCount := 2 * FInDepth * FOutDepth * FModesY * FModesX;
   if (not FFNOMode) or (FInDepth <= 0) or (Length(Weights1) <> CornerCount) or
@@ -101348,25 +101431,20 @@ begin
       'previous layer and ' + IntToStr(CornerCount) + ' reals per corner.');
     exit;
   end;
-  W := FArrNeurons[0].FWeights;
-  MaxInPos := FInDepth - 1;
-  MaxOutPos := FOutDepth - 1;
+  // torch mode (m1, m2) is the flat mode m2*FKeptRowsY + kept row of this layer.
+  SetLength(ModeOf, FModesY * FModesX);
   MaxModeYPos := FModesY - 1;
   MaxModeXPos := FModesX - 1;
-  SrcPos := 0;                     // torch row-major [ci][co][m1][m2][Re,Im]
-  for ci := 0 to MaxInPos do
-    for co := 0 to MaxOutPos do
-      for m1 := 0 to MaxModeYPos do
-        for m2 := 0 to MaxModeXPos do
-        begin
-          Dst := WBase(m2, m1, ci, co);
-          W.FData[Dst] := Weights1[SrcPos];
-          W.FData[Dst + 1] := Weights1[SrcPos + 1];
-          Dst := WBase(m2, FModesY + m1, ci, co);
-          W.FData[Dst] := Weights2[SrcPos];
-          W.FData[Dst + 1] := Weights2[SrcPos + 1];
-          Inc(SrcPos, 2);
-        end;
+  for m1 := 0 to MaxModeYPos do
+    for m2 := 0 to MaxModeXPos do
+      ModeOf[m1 * FModesX + m2] := m2 * FKeptRowsY + m1;
+  ImportTorchSpectralWeights(FArrNeurons[0].FWeights, Weights1, FInDepth,
+    FOutDepth, ModeOf);
+  for m1 := 0 to MaxModeYPos do
+    for m2 := 0 to MaxModeXPos do
+      ModeOf[m1 * FModesX + m2] := m2 * FKeptRowsY + FModesY + m1;
+  ImportTorchSpectralWeights(FArrNeurons[0].FWeights, Weights2, FInDepth,
+    FOutDepth, ModeOf);
   AfterWeightUpdate();
 end;
 
@@ -101439,7 +101517,7 @@ end;
 
 procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  WeightCount, KeptRow, BinX, MaxKeptRowPos, MaxBinXPos: integer;
+  WeightCount, KeptRow, MaxKeptRowPos: integer;
 begin
   FPrevLayer := pPrevLayer;
   FSizeX := pPrevLayer.Output.SizeX;
@@ -101478,12 +101556,7 @@ begin
     if KeptRow < FModesY then FKeptBinY[KeptRow] := KeptRow
     else FKeptBinY[KeptRow] := KeptRow + FSizeY - FKeptRowsY;
   SetLength(FBinWeightX, FModesX);
-  MaxBinXPos := FModesX - 1;
-  for BinX := 0 to MaxBinXPos do
-    if FFNOMode and (BinX > 0) and (2 * BinX <> FSizeX) then
-      FBinWeightX[BinX] := 2
-    else
-      FBinWeightX[BinX] := 1;
+  FillIrfftBinWeights(FBinWeightX, FSizeX, FFNOMode);
 
   FOutput.ReSize(FSizeX, FSizeY, FOutDepth);
   SetOutputErrorSize(FSizeX, FSizeY, FOutDepth);
@@ -146066,7 +146139,7 @@ begin
       'TNNetHolographicBinding' :   Result := TNNetHolographicBinding.Create(St[6]);
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
-      'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
+      'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5], St[1] <> 0);
       'TNNetDWT1D' :                Result := TNNetDWT1D.Create(St[0], St[1] <> 0);
       'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2], St[3] <> 0);
       'TNNetRealFFT2D' :            Result := TNNetRealFFT2D.Create(St[0]);
@@ -146530,7 +146603,7 @@ begin
       if S[0] = 'TNNetHolographicBinding' then Result := TNNetHolographicBinding.Create(St[6]) else
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
-      if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
+      if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5], St[1] <> 0) else
       if S[0] = 'TNNetDWT1D' then Result := TNNetDWT1D.Create(St[0], St[1] <> 0) else
       if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2], St[3] <> 0) else
       if S[0] = 'TNNetRealFFT2D' then Result := TNNetRealFFT2D.Create(St[0]) else
