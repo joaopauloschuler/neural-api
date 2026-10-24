@@ -11,6 +11,10 @@ runs in float64 on exactly the float32 weights stored.
   tiny_dfine_perlevel  HGNetV2 with use_learnable_affine_block, per-level
                        decoder_n_points [3, 6, 3], 3 decoder layers and
                        eval_idx = 1 (the output layer is before the last one).
+  tiny_dfine_discrete  tiny_dfine with decoder_method "discrete" (nearest-cell
+                       sampling); the script also asserts that every sampled
+                       loc * (W, H) + 0.5 is at least 1e-3 from an integer, so
+                       a float32 rerun picks the same cells.
 transformers 5.17 indexes bbox_embed past its end when eval_idx is not the
 last decoder layer, so for tiny_dfine_perlevel the reference runs with the
 decoder truncated after layer eval_idx. The layers after eval_idx do not
@@ -29,30 +33,62 @@ The script asserts that every top-K decision (encoder query selection and the
 post-process ranking) has a float64 margin above 1e-4, so a float32 rerun ranks
 the same way.
 
-Writes tests/fixtures/tiny_dfine{,_perlevel}{.safetensors,_config.json,
-_io.safetensors}. Usage (from the repo root):
+Writes tests/fixtures/tiny_dfine{,_perlevel,_discrete}{.safetensors,
+_config.json,_io.safetensors}; fixture names given as arguments limit the run
+to those. Usage (from the repo root):
   systemd-run --user --scope -q -p MemoryMax=2G -p MemorySwapMax=0 \\
-    ~/x/bin/python -I tools/make_pico_dfine_fixture.py
+    ~/x/bin/python -I tools/make_pico_dfine_fixture.py [tiny_dfine_discrete]
 
 Coded by Claude (AI).
 """
 import math
 import os
+import sys
 
 import numpy as np
 import torch
 from safetensors.numpy import save_file
 from transformers import (DFineConfig, DFineForObjectDetection, HGNetV2Config,
                           RTDetrImageProcessor)
+from transformers.models.d_fine import modeling_d_fine
 
 here = os.path.dirname(os.path.abspath(__file__))
 fixtures = os.path.join(here, "..", "tests", "fixtures")
 SIZE = 64
 THRESHOLD = 0.75
 TARGET_H, TARGET_W = 480, 640
+DISCRETE_MARGIN = 1e-3
+
+# The smallest distance of a discrete sampling position loc * (W, H) + 0.5 from
+# an integer over the last forward (inf when nothing was sampled discretely).
+discrete_margin = [math.inf]
+_core = modeling_d_fine.multi_scale_deformable_attention_v2
+
+
+def recording_core(value, shapes, locations, weights, points, method="default"):
+    if method == "discrete":
+        for level, grid in enumerate(locations.split(points, dim=-2)):
+            height, width = shapes[level]
+            scale = torch.tensor([width, height], dtype=grid.dtype)
+            position = (grid * scale + 0.5).flatten(0, -2)
+            # Only positions in [0.5, size) can round to a different cell.
+            for axis, size in ((0, width), (1, height)):
+                coord = position[:, axis]
+                coord = coord[(coord >= 0.5) & (coord < size)]
+                if coord.numel():
+                    gap = (coord - coord.round()).abs().min().item()
+                    discrete_margin[0] = min(discrete_margin[0], gap)
+    return _core(value, shapes, locations, weights, points, method)
+
+
+modeling_d_fine.multi_scale_deformable_attention_v2 = recording_core
 
 
 def make_config(variant):
+    if variant == "discrete":
+        cfg = make_config("equal")
+        cfg.decoder_method = "discrete"
+        return cfg
     if variant == "equal":
         backbone = HGNetV2Config(
             stem_channels=[3, 8, 8], stage_in_channels=[8, 16, 24, 32],
@@ -153,7 +189,10 @@ def build(variant, seed, name):
     with torch.no_grad():
         hidden = model64.model.backbone.model(
             pixels, output_hidden_states=True).hidden_states
+        discrete_margin[0] = math.inf
         out = model64(pixel_values=pixels)
+    if discrete_margin[0] < DISCRETE_MARGIN:
+        return None
     enc_scores = out.enc_outputs_class[0].max(-1).values.numpy()
     gap = min_gap(enc_scores, cfg.num_queries)
     if gap < 1e-4:
@@ -191,11 +230,16 @@ def build(variant, seed, name):
     with open(os.path.join(fixtures, name + "_config.json"), "w") as f:
         f.write(cfg.to_json_string())
     print(name, "seed", seed, "enc gap", gap, "post gap", post_gap,
+          "discrete margin", discrete_margin[0],
           "detections", len(post["scores"]), "weights", len(state))
     return name
 
 
-for variant, name in (("equal", "tiny_dfine"), ("perlevel", "tiny_dfine_perlevel")):
+FIXTURES = (("equal", "tiny_dfine"), ("perlevel", "tiny_dfine_perlevel"),
+            ("discrete", "tiny_dfine_discrete"))
+for variant, name in FIXTURES:
+    if len(sys.argv) > 1 and name not in sys.argv[1:]:
+        continue
     for seed in range(1, 60):
         if build(variant, seed, name):
             break

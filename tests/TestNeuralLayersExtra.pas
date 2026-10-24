@@ -252,6 +252,12 @@ type
     procedure TestMultiScaleDeformableAttentionPerLevelPointsGradients;
     procedure TestMultiScaleDeformableAttentionPerLevelPointsSaveLoad;
     procedure TestMultiScaleDeformableAttentionLoadsOldSave;
+    // decoder_method "discrete" (per-level counts (3, 1), OffsetScale 0.7):
+    // forward against the naive nearest-cell reference with clamping, value and
+    // logit gradients (zero location gradient), and save/load of the flag.
+    procedure TestMultiScaleDeformableAttentionDiscreteForward;
+    procedure TestMultiScaleDeformableAttentionDiscreteGradients;
+    procedure TestMultiScaleDeformableAttentionDiscreteSaveLoad;
     // TNNetTopKGatherTokens: score order, error scatter and save/load.
     procedure TestTopKGatherTokens;
     // A Create with no point counts and no level shapes reports the error
@@ -9815,24 +9821,26 @@ const
   csDeformLevelShapes: array[0..3] of integer = (3, 4, 2, 2); // (H, W) pairs
   csDeformTokens = 3 * 4 + 2 * 2;
   // BuildDeformableAttentionNet modes: the (Points, LevelShapes) constructor,
-  // the per-level constructor with equal counts and OffsetScale 0.5, and the
-  // per-level constructor with csDeformLevelPoints and csDeformOffsetScale.
+  // the per-level constructor with equal counts and OffsetScale 0.5, the
+  // per-level constructor with csDeformLevelPoints and csDeformOffsetScale,
+  // and that one with discrete sampling.
   csDeformModeLegacy = 0;
   csDeformModeEqualLevelPoints = 1;
   csDeformModePerLevelPoints = 2;
+  csDeformModeDiscrete = 3;
   csDeformLevelPoints: array[0..1] of integer = (3, 1);
   csDeformOffsetScale = 0.7;
 
 // P_l of level Level and the OffsetScale a csDeformMode* net is built with.
 function DeformLevelPoints(Mode, Level: integer): integer;
 begin
-  if Mode = csDeformModePerLevelPoints then Result := csDeformLevelPoints[Level]
+  if Mode >= csDeformModePerLevelPoints then Result := csDeformLevelPoints[Level]
   else Result := csDeformPoints;
 end;
 
 function DeformOffsetScale(Mode: integer): TNeuralFloat;
 begin
-  if Mode = csDeformModePerLevelPoints then Result := csDeformOffsetScale
+  if Mode >= csDeformModePerLevelPoints then Result := csDeformOffsetScale
   else Result := 0.5;
 end;
 
@@ -9872,7 +9880,8 @@ begin
   else
     Deformable := TNNetMultiScaleDeformableAttention.Create(csDeformHeads,
       [DeformLevelPoints(Mode, 0), DeformLevelPoints(Mode, 1)],
-      csDeformLevelShapes, ValueInput, ReferenceInput, DeformOffsetScale(Mode));
+      csDeformLevelShapes, ValueInput, ReferenceInput, DeformOffsetScale(Mode),
+      Mode = csDeformModeDiscrete);
   NN.AddLayerAfter(Deformable, OffsetInput);
   ValueInput.Output.Copy(Values);
   ReferenceInput.Output.Copy(References);
@@ -9880,7 +9889,7 @@ end;
 
 // Naive reference: softmax per (query, head) over every level's points,
 // loc = ref + offset scaled, then grid_sample(align_corners=False, zeros)
-// corner by corner.
+// corner by corner, or in discrete mode the clamped trunc(loc * (W, H) + 0.5) cell.
 procedure TTestNeuralLayersExtra.AssertDeformableForwardMatchesReference(
   Mode: integer);
 var
@@ -9892,7 +9901,9 @@ var
   Logits: array[0..7] of double;
   MaxLogit, ExpSum, LocX, LocY, PixelX, PixelY, Weight, Expected, MaxDiff: double;
   OffsetX, OffsetY, OffsetScale: double;
+  ClampedCount: integer;
 begin
+  ClampedCount := 0;
   SampleCount := DeformLevelPoints(Mode, 0) + DeformLevelPoints(Mode, 1);
   OffsetScale := DeformOffsetScale(Mode);
   Depth := csDeformHeads * SampleCount * 3;
@@ -9951,6 +9962,21 @@ begin
                   LocX := References.Raw[Query * 2] + OffsetX / LevelW;
                   LocY := References.Raw[Query * 2 + 1] + OffsetY / LevelH;
                 end;
+                if Mode = csDeformModeDiscrete then
+                begin
+                  // transformers: (loc * [W, H] + 0.5).to(int64).clamp(0, W - 1)
+                  X0 := Trunc(LocX * LevelW + 0.5);
+                  Y0 := Trunc(LocY * LevelH + 0.5);
+                  if (X0 < 0) or (X0 >= LevelW) or (Y0 < 0) or (Y0 >= LevelH) then
+                    Inc(ClampedCount);
+                  X0 := Min(Max(X0, 0), LevelW - 1);
+                  Y0 := Min(Max(Y0, 0), LevelH - 1);
+                  Expected := Expected + Logits[Sample] / ExpSum *
+                    Values.Raw[(LevelStart + Y0 * LevelW + X0) *
+                    csDeformHeads * csDeformHeadDim + Head * csDeformHeadDim +
+                    Channel];
+                  continue;
+                end;
                 PixelX := ((2 * LocX - 1 + 1) * LevelW - 1) / 2;
                 PixelY := ((2 * LocY - 1 + 1) * LevelH - 1) / 2;
                 X0 := Floor(PixelX);
@@ -9985,6 +10011,9 @@ begin
       NN.Free;
     end;
   end;
+  if Mode = csDeformModeDiscrete then
+    AssertTrue('some discrete samples are clamped to the map border',
+      ClampedCount > 0);
 end;
 
 procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionForward;
@@ -10199,6 +10228,101 @@ begin
     for Pos := 0 to NN.GetLastLayer.Output.Size - 1 do
       AssertTrue('output ' + IntToStr(Pos) + ' must be bit-identical',
         NN.GetLastLayer.Output.Raw[Pos] = Loaded.GetLastLayer.Output.Raw[Pos]);
+  finally
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionDiscreteForward;
+begin
+  AssertDeformableForwardMatchesReference(csDeformModeDiscrete);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionDiscreteGradients;
+var
+  NN: TNNet;
+  Offsets, Values, References, Desired: TNNetVolume;
+  SampleCount, Query, Channel: integer;
+  OffsetErrorSum, LogitErrorSum: TNeuralFloat;
+begin
+  // Finite differences: a location step that stays inside a cell leaves the
+  // loss unchanged, so the offset and reference gradients must be 0.
+  AssertDeformableGradientsMatchFiniteDifferences(csDeformModeDiscrete);
+  NN := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  Desired := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References,
+      csDeformModeDiscrete);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.Compute(Offsets);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Desired.Fill(0.25);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Layers[1].OutputError.Fill(0);
+    NN.Layers[2].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    SampleCount := DeformLevelPoints(csDeformModeDiscrete, 0) +
+      DeformLevelPoints(csDeformModeDiscrete, 1);
+    OffsetErrorSum := 0;
+    LogitErrorSum := 0;
+    for Query := 0 to csDeformQueries - 1 do
+      for Channel := 0 to csDeformHeads * SampleCount * 3 - 1 do
+        if Channel < csDeformHeads * SampleCount * 2 then
+          OffsetErrorSum := OffsetErrorSum + Abs(NN.Layers[0].OutputError[Query, 0, Channel])
+        else
+          LogitErrorSum := LogitErrorSum + Abs(NN.Layers[0].OutputError[Query, 0, Channel]);
+    AssertEquals('no offset gradient', 0, OffsetErrorSum, 0);
+    AssertTrue('logit gradient', LogitErrorSum > 0);
+    AssertEquals('no reference gradient', 0, NN.Layers[2].OutputError.GetSumAbs(), 0);
+    AssertTrue('value gradient', NN.Layers[1].OutputError.GetSumAbs() > 0);
+  finally
+    Desired.Free;
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionDiscreteSaveLoad;
+var
+  NN, Loaded, Bilinear: TNNet;
+  Offsets, Values, References: TNNetVolume;
+begin
+  AssertDeformableSaveLoadRoundTrip(csDeformModeDiscrete);
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 2, Offsets, Values, References,
+      csDeformModeDiscrete);
+    Loaded.LoadStructureFromString(NN.SaveStructureToString());
+    AssertTrue('the flag is saved',
+      TNNetMultiScaleDeformableAttention(NN.GetLastLayer).IsDiscreteSampling);
+    AssertTrue('the flag is loaded',
+      TNNetMultiScaleDeformableAttention(Loaded.GetLastLayer).IsDiscreteSampling);
+    Bilinear := TNNet.Create();
+    try
+      BuildDeformableAttentionNet(Bilinear, 2, Offsets, Values, References,
+        csDeformModePerLevelPoints);
+      Loaded.Free;
+      Loaded := TNNet.Create();
+      Loaded.LoadStructureFromString(Bilinear.SaveStructureToString());
+      AssertFalse('bilinear stays bilinear',
+        TNNetMultiScaleDeformableAttention(Loaded.GetLastLayer).IsDiscreteSampling);
+    finally
+      Bilinear.Free;
+    end;
   finally
     References.Free;
     Values.Free;

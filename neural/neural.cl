@@ -4712,6 +4712,8 @@ __kernel void cai_row_dot_products
 // (Queries, Heads*FSampleCount*3) offsets|logits, FValue (Tokens, Heads*FHeadDim),
 // FRef (Queries, FRefDepth = 2 or 4), FLevelTable (H, W, first token, P_l) per level.
 // A box reference scales an offset by (w, h) * FOffsetScale / P_l.
+// FIsDiscrete != 0 reads the one cell trunc(loc * (W, H) + 0.5) clamped to the map
+// (transformers decoder_method "discrete") instead of the bilinear sample.
 // Coded by Claude (AI).
 #define CAI_DEFORM_GROUP 4
 __kernel void cai_ms_deformable_attn
@@ -4727,7 +4729,8 @@ __kernel void cai_ms_deformable_attn
   __global const float* FOffsets,
   __global const float* FValue,
   __global const float* FRef,
-  __global float* FDst
+  __global float* FDst,
+  const int FIsDiscrete
 )
 {
   const int g_id = get_global_id(0);
@@ -4766,6 +4769,18 @@ __kernel void cai_ms_deformable_attn
     const float dLocY = (FRefDepth == 4) ? Ref[3] * LevelOffsetScale : 1.0f / H;
     for (int p = 0; p < Points; p++, s++)
     {
+      if (FIsDiscrete)
+      {
+        const float sx = (Ref[0] + Offs[2 * s] * dLocX) * W + 0.5f;
+        const float sy = (Ref[1] + Offs[2 * s + 1] * dLocY) * H + 0.5f;
+        // !(v >= 1) also maps NaN to cell 0; the float tests bound the int conversion.
+        const int cx = !(sx >= 1.0f) ? 0 : ((sx >= (float)W) ? W - 1 : (int)sx);
+        const int cy = !(sy >= 1.0f) ? 0 : ((sy >= (float)H) ? H - 1 : (int)sy);
+        const float Prob = cai_exp_floored(Logits[s] - MaxLogit) * InvProbSum;
+        const int Cell = (Start + cy * W + cx) * ValueDepth + HeadOffset;
+        for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Prob, FValue[Cell + c], acc[c]);
+        continue;
+      }
       const float px = (Ref[0] + Offs[2 * s] * dLocX) * W - 0.5f;
       const float py = (Ref[1] + Offs[2 * s + 1] * dLocY) * H - 0.5f;
       // Every corner outside (also NaN): the sample is zero. Inside, the int

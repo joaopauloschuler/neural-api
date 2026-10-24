@@ -1890,10 +1890,11 @@ rather than acted on.
         - [ ] Unsupported config options raise: normalize_before = true,
               learn_initial_query = true, use_timm_backbone.
         - [ ] RT-DETRv2 importer (model_type rt_detr_v2): per-level point
-              counts are now in TNNetMultiScaleDeformableAttention (bba33083)
-              and the encoder/decoder helpers live on TRtDetrNetBuilder, so the
-              new code is the discrete sampling method (shared with D-FINE's
-              decoder_method "discrete") and the config reader.
+              counts and discrete sampling (decoder_method "discrete") exist
+              in TNNetMultiScaleDeformableAttention; ReadRtDetrDetectorFields
+              reads decoder_method into DecoderDiscreteSampling and
+              TRtDetrNetBuilder.AddDeformableAttention applies it, so the new
+              code is the config reader and the v2 decoder wiring.
 
 - [ ] D-FINE importer follow-ups (BuildDFineFromSafeTensors[Ex], model_type
       "d_fine": BuildHGNetV2Backbone, BuildDFineEncoder on the shared
@@ -1902,10 +1903,6 @@ rather than acted on.
         - [ ] Agent or user check on a real ustc-community/dfine-* checkpoint
               (dfine-nano-coco at 640 x 640 under the 2 GB cap): same
               detections as transformers. Not run on the dev box.
-        - [ ] decoder_method "discrete" (rejected at load now): integer-
-              rounded sampling positions instead of bilinear; add it as an
-              option of TNNetMultiScaleDeformableAttention (CPU + the
-              cai_ms_deformable_attn kernel), not a second layer.
         - [ ] DEIM detector (same HGNetV2 + D-FINE decoder, different
               training): check whether its checkpoints load through
               BuildDFineFromSafeTensors unchanged; if so, list them in

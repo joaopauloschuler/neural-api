@@ -1695,7 +1695,8 @@ type
     procedure TestDFineEncoderParity;
     procedure TestDFineEncoderOpenCL;
     // The whole D-FINE: logits, pred_boxes and post-process against
-    // transformers on both pico fixtures, CPU and forced OpenCL.
+    // transformers on the three pico fixtures (bilinear equal, per-level and
+    // discrete sampling), CPU and forced OpenCL.
     procedure TestDFineParity;
     procedure TestDFineOpenCL;
     procedure TestDFineSkipsLayersAfterEvalIdx;
@@ -59528,6 +59529,10 @@ begin
   AssertEquals('no anchor size', 0, Config.AnchorImageWidth);
   AssertEquals('labels', 5, Config.Detector.NumLabels);
   AssertEquals('input width', 64, Config.Detector.ImageWidth);
+  AssertFalse('default decoder_method', Config.Detector.DecoderDiscreteSampling);
+  Config := ReadDFineConfigFromJSONFile(
+    FixturePath('tiny_dfine_discrete_config.json'), 64, 64);
+  AssertTrue('decoder_method discrete', Config.Detector.DecoderDiscreteSampling);
   Config := ReadDFineConfigFromJSONFile(
     FixturePath('tiny_dfine_perlevel_config.json'), 64, 64);
   AssertEquals('per-level points', 6, Config.DecoderPointsPerLevel[1]);
@@ -59647,6 +59652,7 @@ var
   NN: TNNet;
   IO: TNNetSafeTensorsReader;
   Image: TNNetVolume;
+  LayerPos, MaxLayerPos: integer;
   {$IFDEF OpenCL}
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -59660,6 +59666,12 @@ begin
     NN := BuildDFineFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
       {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
       Image.SizeY);
+    MaxLayerPos := NN.CountLayers() - 1;
+    for LayerPos := 0 to MaxLayerPos do
+      if NN.Layers[LayerPos] is TNNetMultiScaleDeformableAttention then
+        ATest.AssertEquals(Name + ' layer ' + IntToStr(LayerPos) + ' sampling',
+          Config.Detector.DecoderDiscreteSampling,
+          TNNetMultiScaleDeformableAttention(NN.Layers[LayerPos]).IsDiscreteSampling);
     {$IFDEF OpenCL}
     if OnOpenCL then
     begin
@@ -59690,6 +59702,7 @@ procedure TTestNeuralPretrained.TestDFineParity;
 begin
   RunDFineParity(Self, 'tiny_dfine', {OnOpenCL=}false);
   RunDFineParity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}false);
+  RunDFineParity(Self, 'tiny_dfine_discrete', {OnOpenCL=}false);
 end;
 
 // The pico nets on OpenCL (forced) against the same transformers oracle.
@@ -59698,6 +59711,7 @@ begin
   {$IFDEF OpenCL}
   RunDFineParity(Self, 'tiny_dfine', {OnOpenCL=}true);
   RunDFineParity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}true);
+  RunDFineParity(Self, 'tiny_dfine_discrete', {OnOpenCL=}true);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}

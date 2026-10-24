@@ -681,7 +681,7 @@ type
     // Q.K, unmasked ValueT.W) run in OpenCL, binding Q and K. Coded by Claude (AI).
     procedure TestDotProductsOpenCLParity;
     // TNNetMultiScaleDeformableAttention on OpenCL vs the CPU, box (cxcywh) and
-    // point (xy) references, two inputs, all three sources bound.
+    // point (xy) references, bilinear and discrete, two inputs, all sources bound.
     procedure TestMultiScaleDeformableAttentionOpenCLParity;
     // TNNetTopKGatherTokens on OpenCL vs the CPU over two inputs with different
     // top-K tokens; the gathered features are bound, not downloaded.
@@ -73022,7 +73022,7 @@ var
   DeviceId: cl_device_id;
   ReferenceDepth, InputPos, Pos, MaxPos, SentinelSurvivors, SentinelTotal: integer;
   SampleCount: integer;
-  HasLevelPoints: boolean;
+  HasLevelPoints, IsDiscrete: boolean;
   MaxDiff: TNeuralFloat;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -73036,6 +73036,7 @@ begin
     OutCPU[InputPos] := TNNetVolume.Create();
   end;
   try
+    for IsDiscrete := false to true do
     for HasLevelPoints := false to true do
     for ReferenceDepth := 2 to 4 do
     begin
@@ -73056,7 +73057,11 @@ begin
           csHeads * SampleCount * 3), Queries);
         if HasLevelPoints then
           Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads,
-            csLevelPoints, csLevelShapes, Values, References, csOffsetScale)
+            csLevelPoints, csLevelShapes, Values, References, csOffsetScale,
+            IsDiscrete)
+        else if IsDiscrete then
+          Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads,
+            [csPoints, csPoints], csLevelShapes, Values, References, 0.5, true)
         else
           Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads,
             csPoints, csLevelShapes, Values, References);
@@ -73106,7 +73111,8 @@ begin
           NN.ForceOpenCL(False);
         end;
         WriteLn('  MultiScaleDeformableAttention OpenCL parity (reference depth ',
-          ReferenceDepth, ', per-level points ', HasLevelPoints, '): max|diff|=',
+          ReferenceDepth, ', per-level points ', HasLevelPoints, ', discrete ',
+          IsDiscrete, '): max|diff|=',
           MaxDiff:0:9,
           ' gpu forwards=', Deformable.ForwardGPUCnt,
           ' source sentinels=', SentinelSurvivors, '/', SentinelTotal);

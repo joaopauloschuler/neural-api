@@ -17016,6 +17016,7 @@ type
     DModel, NumQueries, DecoderLayers, DecoderHeads, DecoderFFNDim: integer;
     DecoderInChannels: array of integer;
     NumFeatureLevels, DecoderPoints: integer;
+    DecoderDiscreteSampling: boolean;      // decoder_method = "discrete"
     DecoderActivation: string;
     NumLabels: integer;
     ClassNames: array of string;           // id2label ('' when absent)
@@ -96181,6 +96182,7 @@ var
   Field: TJSONData;
   Labels: TJSONObject;
   LabelPos, MaxLabelPos, LabelId: integer;
+  DecoderMethod: string;
 begin
   if Obj.Get('normalize_before', false) then
     ImportError(ImporterName + ' import: normalize_before = true is not supported.');
@@ -96212,6 +96214,12 @@ begin
   Config.DecoderInChannels := ReadJSONIntArray(Obj, 'decoder_in_channels',
     [256, 256, 256]);
   Config.NumFeatureLevels := Obj.Get('num_feature_levels', 3);
+  // RT-DETRv2 and D-FINE: "default" (bilinear) or "discrete" sampling.
+  DecoderMethod := Obj.Get('decoder_method', 'default');
+  if (DecoderMethod <> 'default') and (DecoderMethod <> 'discrete') then
+    ImportError(ImporterName + ' import: decoder_method "' + DecoderMethod +
+      '" is not supported (only "default" and "discrete").');
+  Config.DecoderDiscreteSampling := DecoderMethod = 'discrete';
   Config.DecoderActivation := Obj.Get('decoder_activation_function', 'relu');
   Config.LayerNormEps := ReadJSONFloatOrDefault(Obj, 'layer_norm_eps', 0.00001);
   Config.BatchNormEps := ReadJSONFloatOrDefault(Obj, 'batch_norm_eps', 0.00001);
@@ -96379,6 +96387,7 @@ type
     FTrainable: boolean;
     FEncHidden: integer;
     FImporterName: string;      // prefixes the ImportError messages
+    FDiscreteSampling: boolean;
   public
     // Raises ImportError (prefixed ImporterName) on an unsupported Config.
     constructor Create(NN: TNNet; Reader: TNNetSafeTensorsReader;
@@ -96409,6 +96418,17 @@ type
     // (queries, 1, 3 * SampleChannels) TNNetMultiScaleDeformableAttention input.
     function AddSamplingOffsetsAndLogits(Source: TNNetLayer;
       SampleChannels: integer; const AttnPrefix: string): TNNetLayer;
+    // TNNetMultiScaleDeformableAttention after OffsetsLogits with DiscreteSampling;
+    // LevelPoints holds one count per level.
+    function AddDeformableAttention(OffsetsLogits, ValueSource,
+      ReferenceSource: TNNetLayer; Heads: integer;
+      const LevelPoints, LevelShapes: array of integer;
+      OffsetScale: TNeuralFloat): TNNetLayer; overload;
+    // Points samples on every level.
+    function AddDeformableAttention(OffsetsLogits, ValueSource,
+      ReferenceSource: TNNetLayer; Heads, Points: integer;
+      const LevelShapes: array of integer;
+      OffsetScale: TNeuralFloat): TNNetLayer; overload;
     // CSPRepLayer: conv3(RepVGG^BlockCount(conv1(x)) + conv2(x)); every RepVGG
     // block folds into one 3x3 conv; conv3 only when HiddenCh <> OutCh.
     function AddCSPRepLayer(Source: TNNetLayer; HiddenCh, OutCh,
@@ -96428,6 +96448,8 @@ type
     function AddQuerySelection(SourceFlat: TNNetLayer;
       const LevelShapes: TNeuralIntegerArray;
       out Target, ReferenceLogits: TNNetLayer): TNNetTopKGatherTokens;
+    // decoder_method "discrete" (Config.DecoderDiscreteSampling unless reset).
+    property DiscreteSampling: boolean read FDiscreteSampling write FDiscreteSampling;
   end;
 
 constructor TRtDetrNetBuilder.Create(NN: TNNet; Reader: TNNetSafeTensorsReader;
@@ -96440,6 +96462,7 @@ begin
   FTrainable := pTrainable;
   FEncHidden := Config.EncoderHiddenDim;
   FImporterName := ImporterName;
+  FDiscreteSampling := Config.DecoderDiscreteSampling;
   if (Config.ImageWidth < 32) or (Config.ImageHeight < 32) or
      ((Config.ImageWidth mod 32) <> 0) or ((Config.ImageHeight mod 32) <> 0) then
     ImportError(FImporterName + ' import: the input size must be a multiple of ' +
@@ -96574,6 +96597,32 @@ begin
   LoadLlamaLinearWeights(FReader, Result, AttnPrefix + 'attention_weights.weight',
     FConfig.DModel, SampleChannels, 2 * SampleChannels, 3 * SampleChannels, 0,
     AttnPrefix + 'attention_weights.bias');
+end;
+
+function TRtDetrNetBuilder.AddDeformableAttention(OffsetsLogits, ValueSource,
+  ReferenceSource: TNNetLayer; Heads: integer;
+  const LevelPoints, LevelShapes: array of integer;
+  OffsetScale: TNeuralFloat): TNNetLayer;
+begin
+  Result := FNN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(Heads,
+    LevelPoints, LevelShapes, ValueSource, ReferenceSource, OffsetScale,
+    FDiscreteSampling).SetTrainable(FTrainable), OffsetsLogits);
+end;
+
+function TRtDetrNetBuilder.AddDeformableAttention(OffsetsLogits, ValueSource,
+  ReferenceSource: TNNetLayer; Heads, Points: integer;
+  const LevelShapes: array of integer;
+  OffsetScale: TNeuralFloat): TNNetLayer;
+var
+  LevelPoints: TNeuralIntegerArray;
+  LevelPos, MaxLevelPos: integer;
+begin
+  LevelPoints := nil;
+  SetLength(LevelPoints, Max(Length(LevelShapes) div 2, 1));
+  MaxLevelPos := High(LevelPoints);
+  for LevelPos := 0 to MaxLevelPos do LevelPoints[LevelPos] := Points;
+  Result := AddDeformableAttention(OffsetsLogits, ValueSource, ReferenceSource,
+    Heads, LevelPoints, LevelShapes, OffsetScale);
 end;
 
 function TRtDetrNetBuilder.AddCSPRepLayer(Source: TNNetLayer; HiddenCh, OutCh,
@@ -97014,9 +97063,8 @@ begin
         Prefix + 'encoder_attn.value_proj');
       OffsetsLogits := Builder.AddSamplingOffsetsAndLogits(QueryKey,
         SampleChannels, Prefix + 'encoder_attn.');
-      Attention := NN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(
-        Config.DecoderHeads, Config.DecoderPoints, LevelShapes, Values,
-        Reference).SetTrainable(pTrainable), OffsetsLogits);
+      Attention := Builder.AddDeformableAttention(OffsetsLogits, Values,
+        Reference, Config.DecoderHeads, Config.DecoderPoints, LevelShapes, 0.5);
       Attention := Builder.AddLinear(Attention, DModel, DModel,
         Prefix + 'encoder_attn.output_proj');
       Attention := NN.AddLayer(TNNetSum.Create([Attention, AttentionNorm])
@@ -97386,9 +97434,6 @@ begin
         Result.Detector.ModelType + '", expected "d_fine".');
     if Obj.Get('use_timm_backbone', false) then
       ImportError('D-FINE import: use_timm_backbone is not supported.');
-    if Obj.Get('decoder_method', 'default') <> 'default' then
-      ImportError('D-FINE import: decoder_method "' +
-        Obj.Get('decoder_method', '') + '" is not supported (only "default").');
     Field := Obj.Find('backbone_config');
     if Field is TJSONObject then
       Result.Backbone := ReadHGNetV2Config(TJSONObject(Field))
@@ -97495,6 +97540,7 @@ begin
     IntToStr(Config.Detector.DecoderHeads) + 'h points=[' +
     JoinIntegers(Config.DecoderPointsPerLevel) + '] eval_idx=' +
     IntToStr(Config.EvalIdx) + ' bins=' + IntToStr(Config.MaxNumBins) +
+    BoolToStr(Config.Detector.DecoderDiscreteSampling, ' discrete', '') +
     ', queries=' + IntToStr(Config.Detector.NumQueries) +
     ', labels=' + IntToStr(Config.Detector.NumLabels) +
     ', input=' + IntToStr(Config.Detector.ImageWidth) + 'x' +
@@ -97853,10 +97899,9 @@ begin
     OffsetsLogits := AddSamplingOffsetsAndLogits(CrossInput, SampleChannels,
       Prefix + 'encoder_attn.');
     // D-FINE samples the decoder memory itself: no value_proj, no output_proj.
-    Attention := FNN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(
+    Attention := AddDeformableAttention(OffsetsLogits, Encoder.SourceFlat, Box,
       FConfig.DecoderHeads, FDFineConfig.DecoderPointsPerLevel,
-      Encoder.LevelShapes, Encoder.SourceFlat, Box,
-      FDFineConfig.DecoderOffsetScale).SetTrainable(FTrainable), OffsetsLogits);
+      Encoder.LevelShapes, FDFineConfig.DecoderOffsetScale);
     Hidden := AddGate(AttentionNorm, Attention, Prefix + 'gateway.');
     Hidden := AddFeedForward(Hidden, DModel, FConfig.DecoderFFNDim,
       FConfig.DecoderActivation, Prefix);

@@ -6361,7 +6361,7 @@ type
     // ResultBuffer (Queries, Heads*HeadDim) := the deformable attention output.
     procedure Sample(BufOffsets, BufValue, BufReference: cl_mem;
       QueryCount, Heads, SampleCount, HeadDim, ReferenceDepth: integer;
-      OffsetScale: TNeuralFloat);
+      OffsetScale: TNeuralFloat; IsDiscreteSampling: boolean);
     function BufferBytes(): int64; override;
   end;
 
@@ -7100,6 +7100,9 @@ type
   //   reference (x, y):         loc = (x, y) + offset / (W_l, H_l)
   //   (px, py) = loc * (W_l, H_l) - 0.5   (grid_sample, align_corners=False,
   //   zeros padding).
+  // Discrete sampling (transformers decoder_method "discrete", RT-DETRv2 and
+  // D-FINE) instead reads the one cell (trunc(loc * (W_l, H_l) + 0.5) clamped
+  // to [0, W_l-1] x [0, H_l-1]); its gradient wrt the sampling location is 0.
   // Three sources:
   //   PrevLayer       (Queries, 1, Heads*SampleCount*3), SampleCount = sum_l P_l:
   //                   channels [0, HS*2) = sampling offsets in (head, level,
@@ -7118,7 +7121,8 @@ type
   // FStruct: [0] Heads, [1] P_0, [2] Levels, [3..] (H_l shl 16) or W_l, so
   // at most 5 levels. FFloatSt: [0] OffsetScale, [1 + l] P_l; a net saved
   // before these existed has FFloatSt[1] = 0 and loads as P_l = FStruct[1],
-  // OffsetScale = 0.5 (Deformable DETR / RT-DETR).
+  // OffsetScale = 0.5 (Deformable DETR / RT-DETR). FFloatSt[7] = 1 selects
+  // discrete sampling (0 in older saves = bilinear).
   // Coded by Claude (AI).
   TNNetMultiScaleDeformableAttention = class(TNNetLayer)
   private
@@ -7128,6 +7132,9 @@ type
     FInvLevelHeight, FInvLevelWidth: array of TNeuralFloat;
     FLevelOffsetScale: array of TNeuralFloat; // OffsetScale / P_l
     FIsBoxReference: boolean;             // reference depth 4 (cxcywh)
+    FIsDiscreteSampling: boolean;
+    // Added to loc * (W_l, H_l): -0.5 (bilinear pixel centre) or +0.5 (discrete rounding).
+    FPixelShift: TNeuralFloat;
     FAttnProbs: TNNetVolume;              // (Queries, 1, Heads*SampleCount)
     FProbGrad: array of TNeuralFloat;     // dL/da for one (query, head)
     {$IFDEF OpenCL}
@@ -7137,10 +7144,14 @@ type
     procedure ComputeOpenCL();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    // Sampling position (px, py) in pixels of level Level for the offset pair
-    // at OffsetPtr and the reference at RefPtr; also d(loc)/d(offset).
+    // Sampling position (px, py) = loc * (W, H) + FPixelShift of level Level for
+    // the offset pair at OffsetPtr and the reference at RefPtr; also d(loc)/d(offset).
     procedure SamplePosition(OffsetPtr, RefPtr: TNeuralFloatArrPtr;
       Level: integer; out px, py, dLocXdOff, dLocYdOff: TNeuralFloat);
+      {$IFDEF Release} inline; {$ENDIF}
+    // The discrete-sampling cell index of Pos = loc * Size + 0.5: trunc clamped
+    // to [0, Size-1]; NaN gives 0.
+    class function DiscreteCell(Pos: TNeuralFloat; Size: integer): integer;
       {$IFDEF Release} inline; {$ENDIF}
   public
     // pLevelShapes = (H_0, W_0, H_1, W_1, ...), one pair per level; pPoints
@@ -7149,11 +7160,12 @@ type
       const pLevelShapes: array of integer;
       ValueSource, ReferenceSource: TNNetLayer); reintroduce; overload;
     // pLevelPoints = P_l per level (D-FINE decoder_n_points); pOffsetScale is
-    // D-FINE's decoder_offset_scale (box references only).
+    // decoder_offset_scale (box references only); pDiscreteSampling = "discrete".
     constructor Create(pHeads: integer;
       const pLevelPoints, pLevelShapes: array of integer;
       ValueSource, ReferenceSource: TNNetLayer;
-      pOffsetScale: TNeuralFloat = 0.5); reintroduce; overload;
+      pOffsetScale: TNeuralFloat = 0.5;
+      pDiscreteSampling: boolean = false); reintroduce; overload;
     destructor Destroy(); override;
     // The (H, W) pairs packed in a saved FStruct (CreateLayer's decoder).
     class function LevelShapesFromStruct(
@@ -7163,12 +7175,15 @@ type
       const pFloatSt: array of TNeuralFloat): TNeuralIntegerArray;
     class function OffsetScaleFromStruct(
       const pFloatSt: array of TNeuralFloat): TNeuralFloat;
+    class function DiscreteSamplingFromStruct(
+      const pFloatSt: array of TNeuralFloat): boolean;
     function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure AppendInputLayers(pList: TList); override;
     property ValueSource: TNNetLayer read FValueLayer;
     property ReferenceSource: TNNetLayer read FReferenceLayer;
+    property IsDiscreteSampling: boolean read FIsDiscreteSampling;
     {$IFDEF OpenCL}
     // Inference only: Backpropagate reads FAttnProbs, which the OpenCL forward
     // does not write.
@@ -43824,10 +43839,11 @@ end;
 
 procedure TNNetMultiScaleDeformableAttentionCL.Sample(BufOffsets, BufValue,
   BufReference: cl_mem; QueryCount, Heads, SampleCount, HeadDim,
-  ReferenceDepth: integer; OffsetScale: TNeuralFloat);
+  ReferenceDepth: integer; OffsetScale: TNeuralFloat; IsDiscreteSampling: boolean);
 var
   k: cl_kernel;
   iQueryCount, iHeads, iLevels, iSampleCount, iHeadDim, iReferenceDepth: longint;
+  iIsDiscrete: longint;
   fOffsetScale: single;
   GroupCount: integer;
 begin
@@ -43839,6 +43855,7 @@ begin
   iHeadDim := HeadDim;
   iReferenceDepth := ReferenceDepth;
   fOffsetScale := OffsetScale;
+  iIsDiscrete := Ord(IsDiscreteSampling);
   clSetKernelArg(k, 0, csLongintSize, @iQueryCount);
   clSetKernelArg(k, 1, csLongintSize, @iHeads);
   clSetKernelArg(k, 2, csLongintSize, @iLevels);
@@ -43851,6 +43868,7 @@ begin
   clSetKernelArg(k, 9, csCLMemSize, @BufValue);
   clSetKernelArg(k, 10, csCLMemSize, @BufReference);
   clSetKernelArg(k, 11, csCLMemSize, @FBufY);
+  clSetKernelArg(k, 12, csLongintSize, @iIsDiscrete);
   GroupCount := (HeadDim + csDeformableChannelGroup - 1) div csDeformableChannelGroup;
   FKernel.RunKernel(k, QueryCount * Heads * GroupCount);
 end;
@@ -47593,7 +47611,8 @@ end;
 
 constructor TNNetMultiScaleDeformableAttention.Create(pHeads: integer;
   const pLevelPoints, pLevelShapes: array of integer;
-  ValueSource, ReferenceSource: TNNetLayer; pOffsetScale: TNeuralFloat);
+  ValueSource, ReferenceSource: TNNetLayer; pOffsetScale: TNeuralFloat;
+  pDiscreteSampling: boolean);
 var
   Level, MaxLevel: integer;
 begin
@@ -47616,6 +47635,9 @@ begin
   else FStruct[1] := 1;
   FStruct[2] := FLevels;
   FFloatSt[0] := pOffsetScale;
+  FIsDiscreteSampling := pDiscreteSampling;
+  FFloatSt[csNNetMaxParameterIdx] := Ord(pDiscreteSampling);
+  if pDiscreteSampling then FPixelShift := 0.5 else FPixelShift := -0.5;
   SetLength(FLevelHeight, FLevels);
   SetLength(FLevelWidth, FLevels);
   SetLength(FLevelStart, FLevels);
@@ -47716,6 +47738,21 @@ begin
   if pFloatSt[1] >= 1 then Result := pFloatSt[0] else Result := 0.5;
 end;
 
+class function TNNetMultiScaleDeformableAttention.DiscreteSamplingFromStruct(
+  const pFloatSt: array of TNeuralFloat): boolean;
+begin
+  Result := pFloatSt[csNNetMaxParameterIdx] <> 0;
+end;
+
+class function TNNetMultiScaleDeformableAttention.DiscreteCell(
+  Pos: TNeuralFloat; Size: integer): integer;
+begin
+  // Pos < 1 truncates to 0 (as does a negative Pos after the clamp).
+  if not (Pos >= 1) then Result := 0
+  else if Pos >= Size then Result := Size - 1
+  else Result := Trunc(Pos);
+end;
+
 function TNNetMultiScaleDeformableAttention.SaveStructureToString(): string;
 begin
   Result := StringReplace(inherited SaveStructureToString, '::',
@@ -47778,8 +47815,8 @@ begin
     dLocXdOff := FInvLevelWidth[Level];
     dLocYdOff := FInvLevelHeight[Level];
   end;
-  px := (RefPtr^[0] + OffsetPtr^[0] * dLocXdOff) * LevelWidth - 0.5;
-  py := (RefPtr^[1] + OffsetPtr^[1] * dLocYdOff) * LevelHeight - 0.5;
+  px := (RefPtr^[0] + OffsetPtr^[0] * dLocXdOff) * LevelWidth + FPixelShift;
+  py := (RefPtr^[1] + OffsetPtr^[1] * dLocYdOff) * LevelHeight + FPixelShift;
 end;
 
 procedure TNNetMultiScaleDeformableAttention.Compute();
@@ -47791,7 +47828,7 @@ var
   LevelWidth, LevelHeight, x0, y0, HeadOffset, RowBase: integer;
   OutPtr, ProbPtr, OffsetPtr, RefPtr, LogitPtr: TNeuralFloatArrPtr;
   px, py, fx, fy, Prob, dLocXdOff, dLocYdOff, MaxLogit, ProbSum: TNeuralFloat;
-  InX0, InX1, InY0, InY1: boolean;
+  InX0, InX1, InY0, InY1, IsDiscrete: boolean;
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
@@ -47820,6 +47857,7 @@ begin
   MaxQueryPos := FOutput.SizeX - 1;
   MaxHead := FHeads - 1;
   MaxLevel := FLevels - 1;
+  IsDiscrete := FIsDiscreteSampling;
   FOutput.Fill(0);
   for QueryPos := 0 to MaxQueryPos do
   begin
@@ -47852,6 +47890,13 @@ begin
           Prob := ProbPtr^[SamplePos];
           OffsetPtr := TNeuralFloatArrPtr(@OffsetPtr^[2]);
           Inc(SamplePos);
+          if IsDiscrete then
+          begin
+            RowBase := (FLevelStart[Level] + DiscreteCell(py, LevelHeight) *
+              LevelWidth + DiscreteCell(px, LevelWidth)) * ValueDepth + HeadOffset;
+            TNNetVolume.MulAdd(OutPtr, Value.GetRawPtr(RowBase), Prob, FHeadDim);
+            continue;
+          end;
           // Every corner outside (also NaN): the sample is zero.
           if not ((px > -1) and (px < LevelWidth) and
                   (py > -1) and (py < LevelHeight)) then continue;
@@ -47898,7 +47943,7 @@ var
   px, py, fx, fy, Prob, dLocXdOff, dLocYdOff, dLocX, dLocY: TNeuralFloat;
   Grad00, Grad10, Grad01, Grad11, WeightedSum, LevelOffsetScale: TNeuralFloat;
   InX0, InX1, InY0, InY1, HasValueErr, HasOffsetErr, HasReferenceErr: boolean;
-  IsBoxReference: boolean;
+  IsBoxReference, IsDiscrete: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -47914,6 +47959,7 @@ begin
   HasOffsetErr := OffsetErr.Size = Offsets.Size;
   HasReferenceErr := ReferenceErr.Size = References.Size;
   IsBoxReference := FIsBoxReference;
+  IsDiscrete := FIsDiscreteSampling;
   ValueDepth := Value.Depth;
   InDepth := Offsets.Depth;
   SampleCount := FSampleCount;
@@ -47947,7 +47993,18 @@ begin
           SamplePosition(OffsetPtr, RefPtr, Level, px, py, dLocXdOff, dLocYdOff);
           Prob := ProbPtr^[SamplePos];
           FProbGrad[SamplePos] := 0;
-          if (px > -1) and (px < LevelWidth) and (py > -1) and (py < LevelHeight) then
+          if IsDiscrete then
+          begin
+            // The cell index is piecewise constant in the location: no
+            // offset or reference gradient.
+            RowBase := (FLevelStart[Level] + DiscreteCell(py, LevelHeight) *
+              LevelWidth + DiscreteCell(px, LevelWidth)) * ValueDepth + HeadOffset;
+            FProbGrad[SamplePos] := TNNetVolume.DotProduct(OutErrPtr,
+              Value.GetRawPtr(RowBase), FHeadDim);
+            if HasValueErr then TNNetVolume.MulAdd(ValueErr.GetRawPtr(RowBase),
+              OutErrPtr, Prob, FHeadDim);
+          end
+          else if (px > -1) and (px < LevelWidth) and (py > -1) and (py < LevelHeight) then
           begin
             x0 := Floor(px);
             y0 := Floor(py);
@@ -48100,7 +48157,7 @@ begin
     UploadReference);
   FDeformableCL.Sample(BufferOffsets, BufferValue, BufferReference,
     FPrevLayer.FOutput.SizeX, FHeads, FSampleCount, FHeadDim,
-    FReferenceLayer.FOutput.Depth, FFloatSt[0]);
+    FReferenceLayer.FOutput.Depth, FFloatSt[0], FIsDiscreteSampling);
   // No read back: the result stays in OpenCL memory until a host reader calls
   // ForceOutputOnRAM.
   FOutputOnOpenCL := true;
@@ -144746,7 +144803,7 @@ begin
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetGridSample' :           Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1);
-      'TNNetMultiScaleDeformableAttention' : Result := TNNetMultiScaleDeformableAttention.Create(St[0], TNNetMultiScaleDeformableAttention.LevelPointsFromStruct(St, Ft), TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1], TNNetMultiScaleDeformableAttention.OffsetScaleFromStruct(Ft));
+      'TNNetMultiScaleDeformableAttention' : Result := TNNetMultiScaleDeformableAttention.Create(St[0], TNNetMultiScaleDeformableAttention.LevelPointsFromStruct(St, Ft), TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1], TNNetMultiScaleDeformableAttention.OffsetScaleFromStruct(Ft), TNNetMultiScaleDeformableAttention.DiscreteSamplingFromStruct(Ft));
       'TNNetTopKGatherTokens' :     Result := TNNetTopKGatherTokens.Create(St[0], aL[0]);
       'TNNetFlowWarp' :             Result := TNNetFlowWarp.Create(aL[0]);
       'TNNetBackwardWarp' :         Result := TNNetBackwardWarp.Create(aL[0]);
@@ -145205,7 +145262,7 @@ begin
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetGridSample' then Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1) else
-      if S[0] = 'TNNetMultiScaleDeformableAttention' then Result := TNNetMultiScaleDeformableAttention.Create(St[0], TNNetMultiScaleDeformableAttention.LevelPointsFromStruct(St, Ft), TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1], TNNetMultiScaleDeformableAttention.OffsetScaleFromStruct(Ft)) else
+      if S[0] = 'TNNetMultiScaleDeformableAttention' then Result := TNNetMultiScaleDeformableAttention.Create(St[0], TNNetMultiScaleDeformableAttention.LevelPointsFromStruct(St, Ft), TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1], TNNetMultiScaleDeformableAttention.OffsetScaleFromStruct(Ft), TNNetMultiScaleDeformableAttention.DiscreteSamplingFromStruct(Ft)) else
       if S[0] = 'TNNetTopKGatherTokens' then Result := TNNetTopKGatherTokens.Create(St[0], aL[0]) else
       if S[0] = 'TNNetFlowWarp' then Result := TNNetFlowWarp.Create(aL[0]) else
       if S[0] = 'TNNetBackwardWarp' then Result := TNNetBackwardWarp.Create(aL[0]) else
