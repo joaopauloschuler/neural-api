@@ -243,8 +243,8 @@ function RotatedRectHeight(const Rect: TImageRotatedRect): TNeuralFloat;
 // Moves each side of Rect outward by Distance (inward when negative).
 procedure OffsetRotatedRect(var Rect: TImageRotatedRect; Distance: TNeuralFloat);
 
-// Crop := Rect of Image made upright, Round(width) x Round(height) (at least 1):
-// corners 0, 1, 2 go to (0, 0), (W - 1, 0), (W - 1, H - 1); WarpImageAffine bilinear.
+// Crop := Rect of Image made upright, Round(|c1 - c0|) x Round(|c2 - c1|) (at least 1): corners
+// 0, 1, 2 go to (0, 0), (W - 1, 0), (W - 1, H - 1) (docTR extract_rcrops); WarpImageAffine bilinear.
 procedure CropRotatedRect(Image, Crop: TNNetVolume; const Rect: TImageRotatedRect;
   const BorderValue: array of TNeuralFloat);
 
@@ -2105,7 +2105,8 @@ var
 begin
   RectWidth := RotatedRectWidth(Rect);
   CropSizeX := Max(1, Round(RectWidth));
-  CropSizeY := Max(1, Round(RotatedRectHeight(Rect)));
+  CropSizeY := Max(1, Round(Hypot(Rect.CornerX[2] - Rect.CornerX[1],
+    Rect.CornerY[2] - Rect.CornerY[1])));
   if RectWidth > 0 then
   begin
     UnitX := (Rect.CornerX[1] - Rect.CornerX[0]) / RectWidth;

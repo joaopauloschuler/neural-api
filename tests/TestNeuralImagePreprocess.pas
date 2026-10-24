@@ -2297,6 +2297,23 @@ begin
       AssertEquals('top row white ' + IntToStr(X), 255, Crop[X, 0, 0], 1e-3);
       AssertEquals('bottom row white ' + IntToStr(X), 255, Crop[X, 7, 2], 1e-3);
     end;
+    // A clipped, non-rectangular quadrilateral: corners 0, 1, 2 set the affine map
+    // and |c2 - c1| = 6 the height (|c3 - c0| is 4).
+    Image.ReSize(48, 40, 3);
+    for Y := 0 to 39 do
+      for X := 0 to 47 do
+        for Channel := 0 to 2 do Image[X, Y, Channel] := 2 * X + 3 * Y + Channel;
+    Rect.CornerX[0] := 10;  Rect.CornerY[0] := 8;
+    Rect.CornerX[1] := 30;  Rect.CornerY[1] := 8;
+    Rect.CornerX[2] := 30;  Rect.CornerY[2] := 14;
+    Rect.CornerX[3] := 10;  Rect.CornerY[3] := 12;
+    CropRotatedRect(Image, Crop, Rect, [255, 255, 255]);
+    AssertEquals('quad crop width', 20, Crop.SizeX);
+    AssertEquals('quad crop height', 6, Crop.SizeY);
+    for Y := 0 to 5 do
+      for X := 0 to 19 do
+        AssertEquals('quad pixel ' + IntToStr(X) + ',' + IntToStr(Y),
+          2 * (10 + X * 20 / 19) + 3 * (8 + Y * 6 / 5), Crop[X, Y, 0], 1e-3);
   finally
     Crop.Free;
     Image.Free;

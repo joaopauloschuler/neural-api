@@ -1599,8 +1599,16 @@ rather than acted on.
           hull's min-area rectangle is offset directly. Same for convex regions up
           to the orientation choice and the arc approximation; a concave region
           (curved text) gets a different D. Port a polygon offset if a real page shows it.
-    - [ ] Score = mean over the region's pixels; docTR fills the outer contour (holes
-          included). Corners are not clipped to [0, 1] as docTR does.
+    - [X] Corners are clipped to the image as docTR does (np.clip to [0, 1] in
+          bitmap_to_boxes and again in _remove_padding; checked in docTR main on
+          GitHub). A clipped box can be non-rectangular: CropRotatedRect warps
+          corners 0, 1, 2 and sizes the height from |c2 - c1| (docTR extract_rcrops).
+          TestDBNetDecodeRotatedBorderAndHoles, TestCropRotatedRect.
+    - [X] Score = mean non-zero probability over the filled outer contour (region +
+          holes: the bounding box grown by 1 minus its 4-connected outside), as
+          docTR's fillPoly + count_nonzero. TestDBNetDecodeRotatedBorderAndHoles.
+    - [ ] CropRotatedRect rounds the crop size and maps corner 1 to W - 1; docTR
+          truncates (int(d1), int(d2)) and maps it to d1 - 1 (sub-pixel difference).
     - [ ] Not ported: cv2.findContours RETR_EXTERNAL drops a region that sits inside
           another region's hole; the labelling keeps it (both decoders).
     - [ ] Real rotated page (street photo) through `--rotated`, after the real-run item.

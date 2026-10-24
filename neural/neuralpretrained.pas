@@ -17894,8 +17894,8 @@ function DecodeDBNetTextBoxes(ProbMap: TNNetVolume; const Config: TDBNetConfig;
 function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
   Image: TNNetVolume; ProbMap: TNNetVolume = nil): TDBNetTextBoxArray;
 
-// docTR DBPostProcessor (assume_straight_pages=False): per region the convex hull, its
-// min-area rectangle grown by hull area x UnclipRatio / perimeter, mean region probability.
+// docTR DBPostProcessor (assume_straight_pages=False): per region the min-area rectangle of its hull
+// grown by area x UnclipRatio / perimeter, corners clipped to the image; score over region + holes.
 function DecodeDBNetRotatedTextBoxes(ProbMap: TNNetVolume;
   const Config: TDBNetConfig; const Placement: TYoloLetterbox; ImageWidth,
   ImageHeight: integer): TDBNetRotatedTextBoxArray;
@@ -122432,12 +122432,94 @@ function DecodeDBNetRotatedTextBoxes(ProbMap: TNNetVolume;
   const Config: TDBNetConfig; const Placement: TYoloLetterbox; ImageWidth,
   ImageHeight: integer): TDBNetRotatedTextBoxArray;
 var
-  Labels, MinX, MaxX, MinY, MaxY, PixelCounts: TNeuralIntegerArray;
-  ScoreSums, BoundaryX, BoundaryY, HullX, HullY: TNeuralFloatDynArr;
+  Labels, MinX, MaxX, MinY, MaxY, IsOutside, OutsideQueue: TNeuralIntegerArray;
+  BoundaryX, BoundaryY, HullX, HullY: TNeuralFloatDynArr;
   ClassId, MaxClassId, ComponentCount, Component, PixelPos, X, Y, Depth: integer;
   BoxCount, MapMaxX, MapMaxY, BoundaryCount, RowFirstX, RowLastX, CornerPos: integer;
   Score, Perimeter, UnclipDistance, ToImageX, ToImageY: TNeuralFloat;
   Rect: TImageRotatedRect;
+
+  // docTR box_score: mean of the non-zero probabilities inside the filled outer contour,
+  // i.e. the bounding box grown by 1 minus the cells 4-connected to its border.
+  function OuterContourScore(Component: integer): TNeuralFloat;
+  var
+    WindowX0, WindowY0, WindowSizeX, WindowSizeY, WindowCount, MaxWindowX,
+      MaxWindowY, QueueHead, QueueTail, CellPos, CellX, CellY, FilledCount: integer;
+    ScoreSum, Probability: TNeuralFloat;
+
+    procedure MarkOutside(NeighbourX, NeighbourY: integer);
+    var
+      NeighbourPos: integer;
+    begin
+      if (NeighbourX < 0) or (NeighbourX > MaxWindowX) or (NeighbourY < 0) or
+        (NeighbourY > MaxWindowY) then Exit;
+      NeighbourPos := NeighbourY * WindowSizeX + NeighbourX;
+      if IsOutside[NeighbourPos] <> 0 then Exit;
+      if Labels[(WindowY0 + NeighbourY) * ProbMap.SizeX + WindowX0 + NeighbourX] =
+        Component then Exit;
+      IsOutside[NeighbourPos] := 1;
+      OutsideQueue[QueueTail] := NeighbourPos;
+      Inc(QueueTail);
+    end;
+
+  begin
+    WindowX0 := MinX[Component] - 1;
+    WindowY0 := MinY[Component] - 1;
+    WindowSizeX := MaxX[Component] - MinX[Component] + 3;
+    WindowSizeY := MaxY[Component] - MinY[Component] + 3;
+    MaxWindowX := WindowSizeX - 1;
+    MaxWindowY := WindowSizeY - 1;
+    WindowCount := WindowSizeX * WindowSizeY;
+    if Length(IsOutside) < WindowCount then
+    begin
+      SetLength(IsOutside, WindowCount);
+      SetLength(OutsideQueue, WindowCount);
+    end;
+    FillChar(IsOutside[0], WindowCount * SizeOf(integer), 0);
+    // The border ring lies outside the bounding box (and maybe outside the map).
+    QueueTail := 0;
+    for CellPos := 0 to WindowCount - 1 do
+    begin
+      CellX := CellPos mod WindowSizeX;
+      CellY := CellPos div WindowSizeX;
+      if (CellX = 0) or (CellY = 0) or (CellX = MaxWindowX) or (CellY = MaxWindowY) then
+      begin
+        IsOutside[CellPos] := 1;
+        OutsideQueue[QueueTail] := CellPos;
+        Inc(QueueTail);
+      end;
+    end;
+    QueueHead := 0;
+    while QueueHead < QueueTail do
+    begin
+      CellPos := OutsideQueue[QueueHead];
+      Inc(QueueHead);
+      CellX := CellPos mod WindowSizeX;
+      CellY := CellPos div WindowSizeX;
+      MarkOutside(CellX - 1, CellY);
+      MarkOutside(CellX + 1, CellY);
+      MarkOutside(CellX, CellY - 1);
+      MarkOutside(CellX, CellY + 1);
+    end;
+    ScoreSum := 0;
+    FilledCount := 0;
+    for CellY := 1 to MaxWindowY - 1 do
+      for CellX := 1 to MaxWindowX - 1 do
+        if IsOutside[CellY * WindowSizeX + CellX] = 0 then
+        begin
+          Probability := ProbMap.FData[((WindowY0 + CellY) * ProbMap.SizeX +
+            WindowX0 + CellX) * Depth + ClassId];
+          // docTR divides by np.count_nonzero(pred * mask).
+          if Probability <> 0 then
+          begin
+            ScoreSum := ScoreSum + Probability;
+            Inc(FilledCount);
+          end;
+        end;
+    if FilledCount > 0 then Result := ScoreSum / FilledCount
+    else Result := 0;
+  end;
+
 begin
   Result := nil;
   if (ProbMap.SizeX = 0) or (ProbMap.SizeY = 0) or
@@ -122460,16 +122542,12 @@ begin
     SetLength(MaxX, ComponentCount + 1);
     SetLength(MinY, ComponentCount + 1);
     SetLength(MaxY, ComponentCount + 1);
-    SetLength(PixelCounts, ComponentCount + 1);
-    SetLength(ScoreSums, ComponentCount + 1);
     for Component := 1 to ComponentCount do
     begin
       MinX[Component] := MapMaxX;
       MaxX[Component] := 0;
       MinY[Component] := MapMaxY;
       MaxY[Component] := 0;
-      PixelCounts[Component] := 0;
-      ScoreSums[Component] := 0;
     end;
     PixelPos := 0;
     for Y := 0 to MapMaxY do
@@ -122482,9 +122560,6 @@ begin
           if X > MaxX[Component] then MaxX[Component] := X;
           if Y < MinY[Component] then MinY[Component] := Y;
           if Y > MaxY[Component] then MaxY[Component] := Y;
-          Inc(PixelCounts[Component]);
-          ScoreSums[Component] := ScoreSums[Component] +
-            ProbMap.FData[PixelPos * Depth + ClassId];
         end;
         Inc(PixelPos);
       end;
@@ -122493,9 +122568,7 @@ begin
     begin
       if (MaxX[Component] - MinX[Component] < Config.MinBoxSize) or
         (MaxY[Component] - MinY[Component] < Config.MinBoxSize) then continue;
-      // docTR averages over the filled outer contour; the region's own pixels
-      // are the same set unless the region has holes.
-      Score := ScoreSums[Component] / PixelCounts[Component];
+      Score := OuterContourScore(Component);
       if Score < Config.BoxThreshold then continue;
       BoundaryCount := 0;
       for Y := MinY[Component] to MaxY[Component] do
@@ -122538,8 +122611,11 @@ begin
         Rect.CornerY[2] - Rect.CornerY[0]) < Config.MinBoxSize then continue;
       for CornerPos := 0 to 3 do
       begin
-        Rect.CornerX[CornerPos] := (Rect.CornerX[CornerPos] - Placement.Left) * ToImageX;
-        Rect.CornerY[CornerPos] := (Rect.CornerY[CornerPos] - Placement.Top) * ToImageY;
+        // docTR clips each relative coordinate to [0, 1] after removing the padding.
+        Rect.CornerX[CornerPos] := EnsureRange((Rect.CornerX[CornerPos] -
+          Placement.Left) * ToImageX, 0, ImageWidth);
+        Rect.CornerY[CornerPos] := EnsureRange((Rect.CornerY[CornerPos] -
+          Placement.Top) * ToImageY, 0, ImageHeight);
       end;
       Result[BoxCount].Rect := Rect;
       Result[BoxCount].Score := Score;

@@ -49,10 +49,12 @@ page or photo (RGB)
   on every side by D = hull area x unclip ratio / hull perimeter. docTR
   instead offsets the contour polygon by D with pyclipper (round joins) and
   then takes `cv2.minAreaRect`; for a convex region the two agree up to the
-  orientation choice and pyclipper's arc approximation. The score is the mean
-  probability over the region's own pixels (docTR fills the outer contour, so
-  the two differ only for regions with holes). Corners are not clipped to the
-  image; `CropRotatedRect` warps each box to an upright crop with bilinear
+  orientation choice and pyclipper's arc approximation. As in docTR, the score
+  is the mean non-zero probability inside the filled outer contour (the region
+  plus its holes), and each corner coordinate is clipped to the image, so a box
+  at the border can become a non-rectangular quadrilateral. `CropRotatedRect`
+  then warps the parallelogram of corners 0, 1, 2 to an upright crop of
+  |c1 - c0| x |c2 - c1| pixels, as docTR's `extract_rcrops` does, with bilinear
   sampling (`WarpImageAffine`, white outside the image). `--rotated` and
   `--merge-lines` do not combine.
 - The TrOCR decoder is built with `DecSeqLen=1`, so `DecodeTrOCRGreedy` feeds

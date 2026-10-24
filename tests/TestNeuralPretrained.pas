@@ -1728,6 +1728,9 @@ type
     // MergeDBNetTextBoxesIntoLines on hand-made word boxes.
     procedure TestDBNetMergeLines;
     procedure TestDBNetDecodeRotatedMap;
+    // Rotated boxes of regions touching the map border have their corners clipped
+    // to the image; the score fills a region's holes but not an open bay.
+    procedure TestDBNetDecodeRotatedBorderAndHoles;
     // FaceAlignmentMatrix + AlignWarpFace + PasteFaceIntoImage against a numpy
     // port of facexlib (float warp, cv2 4.10 erode / GaussianBlur / Lanczos4).
     procedure TestFacePasteMatchesFacexlibOracle;
@@ -61579,6 +61582,89 @@ begin
     Config.BoxThreshold := 0.85;
     Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 128, 64);
     AssertEquals('box_thresh 0.85 keeps A', 1, Length(Boxes));
+  finally
+    ProbMap.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDBNetDecodeRotatedBorderAndHoles;
+var
+  ProbMap: TNNetVolume;
+  Config: TDBNetConfig;
+  Placement: TYoloLetterbox;
+  Boxes: TDBNetRotatedTextBoxArray;
+  X, Y: integer;
+  DistanceA, DistanceB: TNeuralFloat;
+begin
+  ProbMap := TNNetVolume.Create(64, 64, 1);
+  try
+    ProbMap.Fill(0.05);
+    for Y := 0 to 9 do                      // A: pixels x 0..19, y 0..9
+      for X := 0 to 19 do ProbMap[X, Y, 0] := 0.9;
+    for Y := 54 to 63 do                    // B: pixels x 50..63, y 54..63
+      for X := 50 to 63 do ProbMap[X, Y, 0] := 0.9;
+    Config := DefaultDBNetConfig();
+    Placement.Left := 0;
+    Placement.Top := 0;
+    Placement.ContentX := 64;
+    Placement.ContentY := 64;
+    Placement.Scale := 1;
+    Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 64, 64);
+    AssertEquals('two border regions', 2, Length(Boxes));
+    // A: 19 x 9 hull, D = 171 * 1.5 / 56; the -D sides clip to 0.
+    DistanceA := 171 * 1.5 / 56;
+    AssertEquals('A TL x', 0, Boxes[0].Rect.CornerX[0], 1e-4);
+    AssertEquals('A TL y', 0, Boxes[0].Rect.CornerY[0], 1e-4);
+    AssertEquals('A TR x', 19 + DistanceA, Boxes[0].Rect.CornerX[1], 1e-4);
+    AssertEquals('A TR y', 0, Boxes[0].Rect.CornerY[1], 1e-4);
+    AssertEquals('A BR x', 19 + DistanceA, Boxes[0].Rect.CornerX[2], 1e-4);
+    AssertEquals('A BR y', 9 + DistanceA, Boxes[0].Rect.CornerY[2], 1e-4);
+    AssertEquals('A BL x', 0, Boxes[0].Rect.CornerX[3], 1e-4);
+    AssertEquals('A BL y', 9 + DistanceA, Boxes[0].Rect.CornerY[3], 1e-4);
+    // B: 13 x 9 hull, D = 117 * 1.5 / 44; the 63 + D sides clip to the 64 px image.
+    DistanceB := 117 * 1.5 / 44;
+    AssertEquals('B TL x', 50 - DistanceB, Boxes[1].Rect.CornerX[0], 1e-4);
+    AssertEquals('B TL y', 54 - DistanceB, Boxes[1].Rect.CornerY[0], 1e-4);
+    AssertEquals('B TR x', 64, Boxes[1].Rect.CornerX[1], 1e-4);
+    AssertEquals('B BR x', 64, Boxes[1].Rect.CornerX[2], 1e-4);
+    AssertEquals('B BR y', 64, Boxes[1].Rect.CornerY[2], 1e-4);
+    AssertEquals('B BL y', 64, Boxes[1].Rect.CornerY[3], 1e-4);
+    // Content at (4, 2) holding 32 x 32 net pixels of a 128 x 64 image: A's right
+    // side maps to (19 + D - 4) x 4 = 78.3, B lies wholly past 128 x 64 except its TL.
+    Placement.Left := 4;
+    Placement.Top := 2;
+    Placement.ContentX := 32;
+    Placement.ContentY := 32;
+    Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 128, 64);
+    AssertEquals('A TL x in image pixels', 0, Boxes[0].Rect.CornerX[0], 1e-4);
+    AssertEquals('A TR x in image pixels', (19 + DistanceA - 4) * 4,
+      Boxes[0].Rect.CornerX[1], 1e-3);
+    AssertEquals('A BR y in image pixels', (9 + DistanceA - 2) * 2,
+      Boxes[0].Rect.CornerY[2], 1e-3);
+    AssertEquals('B TL x in image pixels', 128, Boxes[1].Rect.CornerX[0], 1e-4);
+    AssertEquals('B TL y in image pixels', 64, Boxes[1].Rect.CornerY[0], 1e-4);
+    // Ring x 10..29, y 30..41 around a closed hole x 14..25, y 34..37 at 0.1 (one
+    // pixel exactly 0); bay x 40..59, y 30..41 with a notch open at the top.
+    ProbMap.Fill(0.05);
+    for Y := 30 to 41 do
+      for X := 10 to 29 do ProbMap[X, Y, 0] := 0.9;
+    for Y := 34 to 37 do
+      for X := 14 to 25 do ProbMap[X, Y, 0] := 0.1;
+    ProbMap[20, 35, 0] := 0;
+    for Y := 30 to 41 do
+      for X := 40 to 59 do ProbMap[X, Y, 0] := 0.9;
+    for Y := 30 to 37 do
+      for X := 44 to 55 do ProbMap[X, Y, 0] := 0.1;
+    Placement.Left := 0;
+    Placement.Top := 0;
+    Placement.ContentX := 64;
+    Placement.ContentY := 64;
+    Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 64, 64);
+    AssertEquals('ring and bay', 2, Length(Boxes));
+    // 192 ring pixels at 0.9 + 47 non-zero hole pixels at 0.1 (docTR count_nonzero).
+    AssertEquals('ring score fills the hole', (192 * 0.9 + 47 * 0.1) / 239,
+      Boxes[0].Score, 1e-5);
+    AssertEquals('open bay is not filled', 0.9, Boxes[1].Score, 1e-5);
   finally
     ProbMap.Free;
   end;
