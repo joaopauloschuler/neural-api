@@ -1670,6 +1670,8 @@ type
     // Pico net + matcher: coarse confidence, matches, fine windows, keypoints.
     procedure TestEfficientLoFTRParity;
     procedure TestEfficientLoFTRRejectsInputSize;
+    // Image 1's branch of an inference net borrows image 0's weights.
+    procedure TestEfficientLoFTRBranchesShareWeights;
     // RT-DETR (rt_detr): config defaults, pico parity of the logits, boxes,
     // encoder top-K and post_process_object_detection for the basic-block
     // (r18vd layout) and bottleneck (r50vd layout, 4 levels) fixtures.
@@ -59053,6 +59055,50 @@ begin
     NN.Free;
   end;
   AssertTrue('120 x 96 must be rejected', Raised);
+end;
+
+procedure TTestNeuralPretrained.TestEfficientLoFTRBranchesShareWeights;
+var
+  Config: TEfficientLoFTRConfig;
+  InferenceNN, TrainableNN: TNNet;
+  Layer: TNNetLayer;
+  LayerPos, MaxLayerPos, BorrowerCount, ExpectedBorrowers, Stage: integer;
+begin
+  InferenceNN := nil;
+  TrainableNN := nil;
+  try
+    InferenceNN := BuildEfficientLoFTRFromSafeTensors(
+      FixturePath('tiny_efficientloftr.safetensors'), 128, 96, Config,
+      {pTrainable=}false, FixturePath('tiny_efficientloftr_config.json'));
+    TrainableNN := BuildEfficientLoFTRFromSafeTensorsEx(
+      FixturePath('tiny_efficientloftr.safetensors'), Config, {pTrainable=}true);
+    AssertEquals('one copy of the weights', TrainableNN.CountWeights(),
+      2 * InferenceNN.CountWeights());
+    // Backbone blocks, 10 weight layers per attention block (self and cross
+    // per attention layer) and 7 pyramid convolutions.
+    ExpectedBorrowers := 20 * Config.NumAttentionLayers + 7;
+    for Stage := 0 to 3 do Inc(ExpectedBorrowers, Config.StageNumBlocks[Stage]);
+    BorrowerCount := 0;
+    MaxLayerPos := InferenceNN.GetLastLayerIdx();
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Layer := InferenceNN.Layers[LayerPos];
+      if not Assigned(Layer.WeightOwner) then continue;
+      Inc(BorrowerCount);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' reads its owner''s neurons',
+        Layer.Neurons = Layer.WeightOwner.Neurons);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' borrows an earlier layer',
+        Layer.WeightOwner.LayerIdx < LayerPos);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' owner owns its weights',
+        Layer.WeightOwner.WeightOwner = nil);
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' same class as its owner',
+        Layer.ClassType = Layer.WeightOwner.ClassType);
+    end;
+    AssertEquals('borrowing layers', ExpectedBorrowers, BorrowerCount);
+  finally
+    TrainableNN.Free;
+    InferenceNN.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestRtDetrConfigFromJSONFile;

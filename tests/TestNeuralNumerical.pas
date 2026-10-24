@@ -923,6 +923,9 @@ type
     // ShareHostOutputsByLiveness with outputs of several sizes: a slot grows to
     // its largest user, smaller outputs view its prefix; identical to unshared.
     procedure TestShareHostOutputsGrowingSlots;
+    // TNNetLeakyReLU, TNNetBilinearUpsample and TNNetTokenLayerNorm share their
+    // host outputs when inference-only; identical to unshared.
+    procedure TestShareHostOutputsUpsampleLeakyLayerNorm;
     // ShareHostOutputsByLiveness on OpenCL with host-computed layers and a host
     // reader in the pass: identical to unshared; off with per-layer queues.
     procedure TestOpenCLShareHostOutputsByLiveness;
@@ -82503,6 +82506,96 @@ begin
     CheckPass('off', true);
   finally
     Input.Free;
+    NetOn.Free;
+    NetOff.Free;
+  end;
+end;
+
+// Input -> conv -> LeakyReLU -> 2x upsample -> token LayerNorm, twice, -> conv.
+function BuildUpsampleLeakyLayerNormTestNet(pTrainable: boolean): TNNet;
+var
+  LayerCnt, NeuronCnt, WeightCnt, BlockPos: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(6, 5, 8));
+  for BlockPos := 0 to 1 do
+  begin
+    Result.AddLayer(TNNetConvolutionLinear.Create(8, 3, 1, 1, 0));
+    Result.AddLayer(TNNetLeakyReLU.Create());
+    Result.AddLayer(TNNetBilinearUpsample.Create(2));
+    Result.AddLayer(TNNetTokenLayerNorm.Create(1e-5));
+  end;
+  Result.AddLayer(TNNetConvolutionLinear.Create(4, 3, 1, 1, 0));
+  Result.SetTrainable(pTrainable);
+  for LayerCnt := 0 to Result.GetLastLayerIdx() do
+  begin
+    for NeuronCnt := 0 to Result.Layers[LayerCnt].Neurons.Count - 1 do
+    begin
+      for WeightCnt := 0 to
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Size - 1 do
+        Result.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Raw[WeightCnt] :=
+          0.02 + 0.3 * Sin(LayerCnt * 1.7 + NeuronCnt * 0.9 + WeightCnt * 0.23);
+      Result.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight :=
+        0.1 * Cos(LayerCnt + NeuronCnt * 0.17);
+    end;
+    Result.Layers[LayerCnt].FlushWeightCache();
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestShareHostOutputsUpsampleLeakyLayerNorm;
+var
+  NetOff, NetOn, NetTrainable: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  PassPos, ElementPos, MaxElementPos, LayerPos, MaxLayerPos, OtherPos: integer;
+  CheckedCount: integer;
+  SharesStorage: boolean;
+begin
+  NetOff := BuildUpsampleLeakyLayerNormTestNet({pTrainable=}false);
+  NetOn := BuildUpsampleLeakyLayerNormTestNet({pTrainable=}false);
+  NetTrainable := BuildUpsampleLeakyLayerNormTestNet({pTrainable=}true);
+  Input := TNNetVolume.Create(6, 5, 8);
+  try
+    MaxElementPos := Input.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Input.Raw[ElementPos] := 0.8 * Sin(ElementPos * 0.043) - 0.1;
+    NetOn.ShareHostOutputsByLiveness := true;
+    for PassPos := 0 to 3 do
+    begin
+      NetOff.Compute(Input, 0, {Parallel=}PassPos >= 2);
+      NetOn.Compute(Input, 0, {Parallel=}PassPos >= 2);
+      AssertEquals('pass ' + IntToStr(PassPos) + ': shared vs private', 0,
+        MaxAbsDiffOfVolumes(NetOn.GetLastLayer().Output,
+        NetOff.GetLastLayer().Output), 0);
+    end;
+    AssertTrue('the output is not trivial',
+      NetOff.GetLastLayer().Output.GetSumSqr() > 1e-3);
+    CheckedCount := 0;
+    MaxLayerPos := NetOn.GetLastLayerIdx();
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Layer := NetOn.Layers[LayerPos];
+      if not ((Layer is TNNetLeakyReLU) or (Layer is TNNetBilinearUpsample) or
+        (Layer is TNNetTokenLayerNorm)) then continue;
+      Inc(CheckedCount);
+      AssertTrue(Layer.ClassName + ' shares when inference-only',
+        Layer.CanShareHostOutput());
+      AssertFalse(Layer.ClassName + ' keeps its output when trainable',
+        NetTrainable.Layers[LayerPos].CanShareHostOutput());
+      SharesStorage := false;
+      for OtherPos := 0 to MaxLayerPos do
+        if (OtherPos <> LayerPos) and (Pointer(Layer.Output.FData) =
+          Pointer(NetOn.Layers[OtherPos].Output.FData)) then
+          SharesStorage := true;
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' (' + Layer.ClassName +
+        ') holds storage another layer also uses', SharesStorage);
+    end;
+    AssertEquals('checked layers', 6, CheckedCount);
+    AssertTrue('host bytes saved',
+      NetOn.NonWeightBytes() < NetOff.NonWeightBytes());
+  finally
+    Input.Free;
+    NetTrainable.Free;
     NetOn.Free;
     NetOff.Free;
   end;

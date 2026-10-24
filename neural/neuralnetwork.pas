@@ -9619,6 +9619,7 @@ type
       // for serialization so the layer round-trips through Save/LoadFromString.
       constructor Create(pAlpha: TNeuralFloat); reintroduce; overload;
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       property Alpha: TNeuralFloat read FAlpha;
   end;
 
@@ -10382,6 +10383,7 @@ type
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       function SupportsErrorOnlyBackprop(): boolean; override;
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       property ElementwiseAffine: boolean read FElementwiseAffine;
@@ -20488,6 +20490,7 @@ type
     public
       constructor Create(pFactor: integer = 2); reintroduce; overload;
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
@@ -67322,6 +67325,11 @@ begin
   {$ENDIF}
 end;
 
+function TNNetBilinearUpsample.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
+
 procedure TNNetBilinearUpsample.Compute();
 var
   s: integer;
@@ -68438,6 +68446,11 @@ begin
   FThreshold := 0.0;
   FFloatSt[0] := FAlpha;
   FActivationOpcode := csActLeakyReLU;
+end;
+
+function TNNetLeakyReLU.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
 end;
 
 procedure TNNetLeakyReLU.Compute();
@@ -89029,6 +89042,11 @@ begin
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.54x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
   {$ENDIF}
   InitDefault();
+end;
+
+function TNNetTokenLayerNorm.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
 end;
 
 procedure TNNetTokenLayerNorm.Compute();

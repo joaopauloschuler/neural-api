@@ -103779,7 +103779,30 @@ var
   Previous, Residual: TNNetLayer;
   Prefix, StepPrefix: string;
   WeightScale: TNeuralFloat;
-  NeuronPos, MaxNeuronPos: integer;
+  NeuronPos, MaxNeuronPos, LoadedSideCount: integer;
+
+  procedure LinkBranchLayer(Borrower, Owner: TNNetLayer);
+  begin
+    if not Borrower.LinkWeightsFrom(Owner) then
+      ImportError('EfficientLoFTR import: layer ' + IntToStr(Borrower.LayerIdx) +
+        ' could not borrow the weights of layer ' + IntToStr(Owner.LayerIdx) + '.');
+  end;
+
+  procedure LinkBranchAttention(const Borrower,
+    Owner: TEfficientLoFTRAttentionLayers);
+  begin
+    LinkBranchLayer(Borrower.QAggregation, Owner.QAggregation);
+    LinkBranchLayer(Borrower.QNorm, Owner.QNorm);
+    LinkBranchLayer(Borrower.KVNorm, Owner.KVNorm);
+    LinkBranchLayer(Borrower.QProj, Owner.QProj);
+    LinkBranchLayer(Borrower.KProj, Owner.KProj);
+    LinkBranchLayer(Borrower.VProj, Owner.VProj);
+    LinkBranchLayer(Borrower.OProj, Owner.OProj);
+    LinkBranchLayer(Borrower.FC1, Owner.FC1);
+    LinkBranchLayer(Borrower.FC2, Owner.FC2);
+    LinkBranchLayer(Borrower.MLPNorm, Owner.MLPNorm);
+  end;
+
 begin
   CheckEfficientLoFTRConfig(Config);
   BlockCount := 0;
@@ -103867,7 +103890,10 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights (both images load the same tensors) ----------
-    for Side := 0 to 1 do
+    // An inference net loads image 0's branch only; image 1's borrows it.
+    if pTrainable then LoadedSideCount := 2
+    else LoadedSideCount := 1;
+    for Side := 0 to LoadedSideCount - 1 do
     begin
       BlockCount := 0;
       InWidth := 1;
@@ -103918,6 +103944,24 @@ begin
         LoadResNetConvFoldBN(Reader, Pyramids[Side].OutConv3[Step],
           StepPrefix + '.out_conv3.weight', '', FineDims[Step + 1],
           FineDims[Step], 3, Config.BatchNormEps);
+      end;
+    end;
+    if not pTrainable then
+    begin
+      MaxBlockPos := High(Blocks[0]);
+      for BlockPos := 0 to MaxBlockPos do
+        LinkBranchLayer(Blocks[1][BlockPos], Blocks[0][BlockPos]);
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        LinkBranchAttention(SelfLayers[1][LayerPos], SelfLayers[0][LayerPos]);
+        LinkBranchAttention(CrossLayers[1][LayerPos], CrossLayers[0][LayerPos]);
+      end;
+      LinkBranchLayer(Pyramids[1].OutConv, Pyramids[0].OutConv);
+      for Step := 0 to 1 do
+      begin
+        LinkBranchLayer(Pyramids[1].OutConv1[Step], Pyramids[0].OutConv1[Step]);
+        LinkBranchLayer(Pyramids[1].OutConv2[Step], Pyramids[0].OutConv2[Step]);
+        LinkBranchLayer(Pyramids[1].OutConv3[Step], Pyramids[0].OutConv3[Step]);
       end;
     end;
     Result := NN;

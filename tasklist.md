@@ -2461,21 +2461,23 @@ rather than acted on.
             about 6.9 GB at 640 x 480). Every CPU 3x3 convolution keeps its
             im2col (`FInputPrepared`), its padded input copy (`FInputCopy`),
             `FOutputRaw` and `FBiasOutput` for the life of the net, and
-            `ShareHostOutputsByLiveness` shares only `FOutput`. Candidates:
+            `ShareHostOutputsByLiveness` shares only `FOutput`. Candidate:
             one conv scratch shared by every layer of an inference-only net
-            (it must stay safe with the parallel layer scheduler), and
+            (it must stay safe with the parallel layer scheduler). Done:
             `CanShareHostOutput` overrides on `TNNetBilinearUpsample`,
-            `TNNetLeakyReLU` and `TNNetTokenLayerNorm`. A 640 x 480 run fits
-            the dev box only after this. The im2col part is the same
+            `TNNetLeakyReLU` and `TNNetTokenLayerNorm` (pico 128 x 96 host
+            bytes after a forward 33.18 -> 31.17 MB). A 640 x 480 run fits
+            the dev box only after the conv part. The im2col part is the same
             library-wide question as "Decision for the user: inference-time
             release of the convolution im2col matrix" below; it now blocks
             big-lama 512x512, EfficientLoFTR 640x480 and RT-DETR 640x640.
       - [ ] Real-checkpoint run at 640 x 480 on a real image pair, user-tested,
             with the transformers comparison (the 256 x 192 check used
             docs/park.jpg and a crop of it).
-      - [ ] The backbone, attention and pyramid weights are loaded twice, once
-            per image branch (+64 MB at the real size). Borrow them with
-            `LinkWeightsFrom` / `BuildWeightOwner` instead.
+      - [x] The backbone, attention and pyramid weights are loaded once: an
+            inference `BuildEfficientLoFTR` net links image 1's branch to
+            image 0's (`LinkWeightsFrom`), covered by
+            `TestEfficientLoFTRBranchesShareWeights`.
       - [ ] Speed: the coarse similarity (`DotProductsPacked`, 4800 x 4800 x
             256 at 640 x 480) and the per-match refinement run on one thread;
             no OpenCL path has been tested.
