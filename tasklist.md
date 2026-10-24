@@ -2310,6 +2310,40 @@ rather than acted on.
             im2col column matrix of the 7x7 64->3 output conv and 3.4 GB the
             column matrices of the 36 FFC-unit 3x3 convs; releasing
             `FInputPrepared` is the user-decision item under "Layer follow-ups".
+- [ ] ProPainter video inpainting / object removal importer + examples/VideoInpaint
+      (sczhou/ProPainter, ICCV 2023; release files `ProPainter.pth`,
+      `recurrent_flow_completion.pth`, `raft-things.pth`, read with
+      neuraltorchbin.pas; the weights are under the NTU S-Lab License 1.0,
+      non-commercial, so say so in the example README and do not ship them).
+      Input: a frame folder plus one mask per frame (or one mask for all); output:
+      the completed frames and a GIF (the GIF writer exists). Its three stages
+      map onto code that exists today: (1) bidirectional flow with
+      `BuildRaftFromSafeTensors` / `RaftPredictFlow` (check that `raft-things`
+      loads through `TRaftConfig`); (2) the recurrent flow-completion net
+      (`TNNetConvolution3D` P3D blocks, an edge branch) and the image propagation
+      step: warp the known pixels along the completed flow with
+      `TNNetBackwardWarp`, keep only pixels that pass the forward-backward flow
+      consistency check; (3) `InpaintGenerator`: encoder, the deformable
+      feature propagation, the temporal sparse window transformer
+      (`TNNetWindowAttention`-style windows of 5x9 tokens plus pooled global
+      tokens, mask-guided token selection) and the decoder.
+      SoftSplit (nn.Unfold 7x7 / stride 3 / padding 3, then Linear) IS a
+      7x7 stride-3 convolution, and SoftComp (Linear, then nn.Fold) IS a 7x7
+      stride-3 transposed convolution, so build both from the existing conv and
+      deconvolution layers; do not add Unfold/Fold layers for them.
+      Prerequisite, a torch port with its own commit and tests:
+      `TNNetDeformableConv` predicts its offsets from its OWN input, but
+      ProPainter's (Second-Order) DeformableAlignment computes
+      offset = flow + residual from concatenated features and flows, with
+      deformable groups, as torchvision.ops.deform_conv2d(input, offset,
+      weight, mask) does. Add an option to the existing class (do not fork a
+      second deformable conv) that takes offsets and the modulation mask
+      from extra sources plus an offset-group count, with numerical-gradient
+      tests and a parity test against torchvision.ops.deform_conv2d. Parity
+      plan: a pico fixture from a tools/ script (fixture generation only, as
+      the other importers do) checked against the reference forward, stage by
+      stage; then a real 432x240 clip on the user's box, frames processed in
+      chunks under the 2 GB agent cap.
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on
