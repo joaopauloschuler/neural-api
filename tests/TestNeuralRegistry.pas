@@ -554,6 +554,7 @@ begin
     384: begin ANet.AddLayer(TNNetInput.Create(4, 3, 12, 1)); Exit(L('TNNetTransposedChannelAttention', TNNetTransposedChannelAttention.Create(2))); end;
     385: begin AddImgInput(ANet); Exit(L('TNNetFreeUFourierFilter', TNNetFreeUFourierFilter.Create(0.2))); end;
     386: begin AddImgInput(ANet); Exit(L('TNNetBoxFilter', TNNetBoxFilter.Create(2))); end;
+    387: begin AddImgInput(ANet); Exit(L('TNNetInverseSigmoid', TNNetInverseSigmoid.Create(0.001))); end;
     else
       Result := False;
   end;
@@ -567,6 +568,7 @@ begin
   //      TNNetConcat, TNNetDeepConcat, TNNetSum, TNNetFiLM,
   //      TNNetShakeShakeMerge, TNNetShakeDropMerge, TNNetCrossAttention,
   //      TNNetCrossWKV, TNNetAffineGridSample, TNNetFlowWarp,
+  //      TNNetMultiScaleDeformableAttention, TNNetTopKGatherTokens,
   //      TNNetBackwardWarp, TNNetCorrelationVolume, TNNetCorrelationLookup,
   //      TNNetHyperLinear, TNNetHyperConv, TNNetModulatedConv2D,
   //      TNNetScatterToAffine, TNNetRoIAlign, TNNetAdaIN,

@@ -1670,6 +1670,13 @@ type
     // Pico net + matcher: coarse confidence, matches, fine windows, keypoints.
     procedure TestEfficientLoFTRParity;
     procedure TestEfficientLoFTRRejectsInputSize;
+    // RT-DETR (rt_detr): config defaults, pico parity of the logits, boxes,
+    // encoder top-K and post_process_object_detection for the basic-block
+    // (r18vd layout) and bottleneck (r50vd layout, 4 levels) fixtures.
+    procedure TestRtDetrConfigFromJSONFile;
+    procedure TestRtDetrParity;
+    procedure TestRtDetrR50Parity;
+    procedure TestRtDetrRejectsInputSize;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -59023,6 +59030,162 @@ begin
     NN.Free;
   end;
   AssertTrue('120 x 96 must be rejected', Raised);
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrConfigFromJSONFile;
+var
+  Config: TRtDetrConfig;
+begin
+  Config := ReadRtDetrConfigFromJSONFile(FixturePath('tiny_rtdetr_config.json'),
+    64, 64);
+  AssertEquals('model_type', 'rt_detr', Config.ModelType);
+  AssertFalse('basic blocks', Config.BackboneBottleneck);
+  AssertEquals('embedding', 8, Config.BackboneEmbedSize);
+  AssertEquals('stages', 4, Length(Config.BackboneHiddenSizes));
+  AssertEquals('stage 1 depth', 2, Config.BackboneDepths[1]);
+  AssertEquals('out indices', 3, Length(Config.BackboneOutIndices));
+  AssertEquals('first out index', 2, Config.BackboneOutIndices[0]);
+  AssertEquals('encoder hidden', 16, Config.EncoderHiddenDim);
+  AssertEquals('encoder heads', 2, Config.EncoderHeads);
+  AssertEquals('encode_proj_layers', 2, Config.EncodeProjLayers[0]);
+  AssertEquals('expansion', 1.0, Config.HiddenExpansion, 1e-6);
+  AssertEquals('encoder activation', 'gelu', Config.EncoderActivation);
+  AssertEquals('neck activation', 'silu', Config.Activation);
+  AssertTrue('position embedding (eval_size null)', Config.UsePositionEmbedding);
+  AssertEquals('d_model', 16, Config.DModel);
+  AssertEquals('queries', 10, Config.NumQueries);
+  AssertEquals('decoder layers', 2, Config.DecoderLayers);
+  AssertEquals('levels', 3, Config.NumFeatureLevels);
+  AssertEquals('points', 3, Config.DecoderPoints);
+  AssertEquals('labels', 5, Config.NumLabels);
+  AssertEquals('class name', 'LABEL_3', Config.ClassNames[3]);
+  AssertEquals('input width', 64, Config.ImageWidth);
+  AssertTrue('ToString', Pos('basic', RtDetrConfigToString(Config)) > 0);
+end;
+
+// Builds the pico RT-DETR of Name, runs the stored image and compares against
+// the transformers float64 logits, pred_boxes and post-processed detections.
+procedure RunRtDetrParity(ATest: TTestNeuralPretrained; const Name: string);
+var
+  Config: TRtDetrConfig;
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image, Expected, ExpectedBoxes, ExpectedLabels, Settings, Output: TNNetVolume;
+  Detections: TDetrDetectionArray;
+  Query, Channel, MaxQuery, NumLabels, DetectionPos, TargetW, TargetH: integer;
+  LogitDiff, BoxDiff, ScoreDiff, CornerDiff: double;
+  Corners: array[0..3] of double;
+begin
+  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  ExpectedBoxes := TNNetVolume.Create;
+  ExpectedLabels := TNNetVolume.Create;
+  Settings := TNNetVolume.Create;
+  NN := nil;
+  try
+    IO.LoadTensorFlat('image', Expected);
+    Image.ReSize(IO.DimSize('image', 1), IO.DimSize('image', 0), 3);
+    Image.CopyNoChecks(Expected);
+    NN := BuildRtDetrFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
+      {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
+      Image.SizeY);
+    NN.Compute(Image);
+    Output := NN.GetLastLayer.Output;
+    NumLabels := Config.NumLabels;
+    ATest.AssertEquals(Name + ' queries', Config.NumQueries, Output.SizeX);
+    ATest.AssertEquals(Name + ' depth', NumLabels + 4, Output.Depth);
+    MaxQuery := Config.NumQueries - 1;
+    IO.LoadTensorFlat('logits', Expected);
+    LogitDiff := 0;
+    for Query := 0 to MaxQuery do
+      for Channel := 0 to NumLabels - 1 do
+        LogitDiff := Max(LogitDiff, Abs(Expected.FData[Query * NumLabels + Channel] -
+          Output[Query, 0, Channel]));
+    IO.LoadTensorFlat('pred_boxes', Expected);
+    BoxDiff := 0;
+    for Query := 0 to MaxQuery do
+      for Channel := 0 to 3 do
+        BoxDiff := Max(BoxDiff, Abs(Expected.FData[Query * 4 + Channel] -
+          Output[Query, 0, NumLabels + Channel]));
+    WriteLn('  ', Name, ' logits max |diff| ', FloatToStr(LogitDiff),
+      ', boxes max |diff| ', FloatToStr(BoxDiff));
+    ATest.AssertTrue(Name + ' logits max |diff| = ' + FloatToStr(LogitDiff),
+      LogitDiff < 1e-4);
+    ATest.AssertTrue(Name + ' boxes max |diff| = ' + FloatToStr(BoxDiff),
+      BoxDiff < 1e-4);
+    // post_process_object_detection: same detections, same order.
+    IO.LoadTensorFlat('post_threshold', Settings);
+    Detections := DecodeRtDetrDetections(Output, NumLabels, Settings.FData[0]);
+    IO.LoadTensorFlat('post_target_size', Settings);
+    TargetH := Round(Settings.FData[0]);
+    TargetW := Round(Settings.FData[1]);
+    IO.LoadTensorFlat('post_scores', Expected);
+    IO.LoadTensorFlat('post_labels', ExpectedLabels);
+    IO.LoadTensorFlat('post_boxes', ExpectedBoxes);
+    ATest.AssertEquals(Name + ' detection count', Expected.Size, Length(Detections));
+    ScoreDiff := 0;
+    CornerDiff := 0;
+    for DetectionPos := 0 to High(Detections) do
+    begin
+      ATest.AssertEquals(Name + ' label ' + IntToStr(DetectionPos),
+        Round(ExpectedLabels.FData[DetectionPos]), Detections[DetectionPos].ClassId);
+      ScoreDiff := Max(ScoreDiff, Abs(Expected.FData[DetectionPos] -
+        Detections[DetectionPos].Score));
+      Corners[0] := (Detections[DetectionPos].Cx - 0.5 * Detections[DetectionPos].W) * TargetW;
+      Corners[1] := (Detections[DetectionPos].Cy - 0.5 * Detections[DetectionPos].H) * TargetH;
+      Corners[2] := (Detections[DetectionPos].Cx + 0.5 * Detections[DetectionPos].W) * TargetW;
+      Corners[3] := (Detections[DetectionPos].Cy + 0.5 * Detections[DetectionPos].H) * TargetH;
+      for Channel := 0 to 3 do
+        CornerDiff := Max(CornerDiff, Abs(Corners[Channel] -
+          ExpectedBoxes.FData[DetectionPos * 4 + Channel]) / Max(TargetW, TargetH));
+    end;
+    ATest.AssertTrue(Name + ' score max |diff| = ' + FloatToStr(ScoreDiff),
+      ScoreDiff < 1e-4);
+    ATest.AssertTrue(Name + ' xyxy box max |diff| / size = ' +
+      FloatToStr(CornerDiff), CornerDiff < 1e-4);
+  finally
+    NN.Free;
+    Settings.Free;
+    ExpectedLabels.Free;
+    ExpectedBoxes.Free;
+    Expected.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrParity;
+begin
+  RunRtDetrParity(Self, 'tiny_rtdetr');
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrR50Parity;
+begin
+  RunRtDetrParity(Self, 'tiny_rtdetr_r50');
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrRejectsInputSize;
+var
+  Config: TRtDetrConfig;
+  NN: TNNet;
+  Raised: boolean;
+begin
+  Config := ReadRtDetrConfigFromJSONFile(FixturePath('tiny_rtdetr_config.json'),
+    80, 64);
+  Raised := false;
+  NN := nil;
+  try
+    try
+      NN := BuildRtDetrFromSafeTensorsEx(FixturePath('tiny_rtdetr.safetensors'),
+        Config, false);
+    except
+      Raised := true;
+    end;
+  finally
+    NN.Free;
+  end;
+  AssertTrue('80 x 64 must be rejected', Raised);
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;

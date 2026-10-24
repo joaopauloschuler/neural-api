@@ -2256,6 +2256,19 @@ type
     procedure Compute(); override;
   end;
 
+  /// Inverse sigmoid (logit) of a probability, as the DETR family computes it
+  // between box-refinement steps (transformers inverse_sigmoid):
+  //   x' = clamp(x, 0, 1);  y = ln(max(x', Eps) / max(1 - x', Eps)).
+  // Derivative 1/max(x',Eps) + 1/max(1-x',Eps), each term only where its max
+  // picks the variable side. Eps is stored in FFloatSt[0] (default 1e-5).
+  // Coded by Claude (AI).
+  TNNetInverseSigmoid = class(TNNetReLUBase)
+  public
+    constructor Create(); overload; override;
+    constructor Create(pEps: TNeuralFloat); reintroduce; overload;
+    procedure Compute(); override;
+  end;
+
   /// ShiftedReLU activation function.
   // ShiftedReLU(x) = max(-1, x). Parameter-free. Derivative is 1 for x > -1,
   // else 0. Cached in FOutputErrorDeriv so TNNetReLUBase handles the
@@ -7003,6 +7016,68 @@ type
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property GridSource: TNNetLayer read FGridLayer;
+  end;
+
+  /// Multi-scale deformable attention (Zhu et al. 2021, "Deformable DETR",
+  // https://arxiv.org/abs/2010.04159): the sampling core of the cross-attention
+  // of Deformable DETR, RT-DETR and DINO (transformers
+  // MultiScaleDeformableAttention plus the sampling-location arithmetic).
+  // Each query q and head h samples Points locations on each of Levels value
+  // maps and returns the softmax-weighted sum of the bilinear samples:
+  //   out[q, h*HeadDim + c] = sum_{l,p} a[q,h,l,p] * V_l(px, py)[h*HeadDim + c]
+  //   a[q,h,:,:] = softmax over (l,p) of the attention logits
+  //   reference (cx, cy, w, h): loc = (cx, cy) + offset / Points * (w, h) / 2
+  //   reference (x, y):         loc = (x, y) + offset / (W_l, H_l)
+  //   (px, py) = loc * (W_l, H_l) - 0.5   (grid_sample, align_corners=False,
+  //   zeros padding).
+  // Three sources:
+  //   PrevLayer       (Queries, 1, Heads*Levels*Points*3): channels
+  //                   [0, HLP*2) = sampling offsets in (head, level, point, xy)
+  //                   order, [HLP*2, HLP*3) = attention logits in (head, level,
+  //                   point) order (the sampling_offsets and attention_weights
+  //                   Linear outputs side by side).
+  //   ValueSource     (S, 1, D): the levels' maps flattened row-major and
+  //                   concatenated, S = sum H_l*W_l, D mod Heads = 0 (already
+  //                   value-projected).
+  //   ReferenceSource (Queries, 1, 4) cxcywh or (Queries, 1, 2) xy, in [0, 1].
+  // Output (Queries, 1, D). The projections around it (value_proj, the
+  // offsets/logits Linear, output_proj) are TNNetPointwiseConvLinear layers.
+  // Backward writes the gradients of all three sources.
+  // FStruct: [0] Heads, [1] Points, [2] Levels, [3..] (H_l shl 16) or W_l, so
+  // at most 5 levels.
+  // Coded by Claude (AI).
+  TNNetMultiScaleDeformableAttention = class(TNNetLayer)
+  private
+    FValueLayer, FReferenceLayer: TNNetLayer;
+    FHeads, FPoints, FLevels, FHeadDim: integer;
+    FLevelHeight, FLevelWidth, FLevelStart: array of integer;
+    FInvLevelHeight, FInvLevelWidth: array of TNeuralFloat;
+    FHalfOverPoints: TNeuralFloat;        // 0.5 / Points
+    FIsBoxReference: boolean;             // reference depth 4 (cxcywh)
+    FAttnProbs: TNNetVolume;              // (Queries, 1, Heads*Levels*Points)
+    FProbGrad: array of TNeuralFloat;     // dL/da for one (query, head)
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Sampling position (px, py) in pixels of level Level for the offset pair
+    // at OffsetPtr and the reference at RefPtr; also d(loc)/d(offset).
+    procedure SamplePosition(OffsetPtr, RefPtr: TNeuralFloatArrPtr;
+      Level: integer; out px, py, dLocXdOff, dLocYdOff: TNeuralFloat);
+      {$IFDEF Release} inline; {$ENDIF}
+  public
+    // pLevelShapes = (H_0, W_0, H_1, W_1, ...), one pair per level.
+    constructor Create(pHeads, pPoints: integer;
+      const pLevelShapes: array of integer;
+      ValueSource, ReferenceSource: TNNetLayer); reintroduce; overload;
+    destructor Destroy(); override;
+    // The (H, W) pairs packed in a saved FStruct (CreateLayer's decoder).
+    class function LevelShapesFromStruct(
+      const pStruct: array of integer): TNeuralIntegerArray;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure AppendInputLayers(pList: TList); override;
+    property ValueSource: TNNetLayer read FValueLayer;
+    property ReferenceSource: TNNetLayer read FReferenceLayer;
+    property AttentionProbabilities: TNNetVolume read FAttnProbs;
   end;
 
   /// Dense per-pixel backward-warp sampler. Given a feature map (the main
@@ -14580,6 +14655,9 @@ type
       function HasGatherCopyPlan(): boolean; override;
       procedure BuildGatherCopyPlan(Plan: TNNetGatherCopyCL); override;
       {$ENDIF}
+    protected
+      // The ';'-separated layer-index segment SaveStructureToString writes.
+      function IndexSegment(): string; virtual;
     public
       constructor Create(); overload; override;
       constructor Create(pTokens: array of integer); reintroduce; overload;
@@ -14589,6 +14667,38 @@ type
       procedure Backpropagate(); override;
 
       function SaveStructureToString(): string; override;
+  end;
+
+  /// Data-dependent token gather: the K tokens with the largest score, where a
+  // token's score is the maximum over the Depth of ScoreSource at that token.
+  //   Output[k, 0, d] := Input[Top[k], 0, d], Top sorted by score DESCENDING
+  //   (ties: lower index first).
+  // This is the two-stage DETR query selection (RT-DETR / Deformable DETR /
+  // DINO: topk(enc_outputs_class.max(-1)) then gather). PrevLayer and
+  // ScoreSource are (SeqLen, 1, Depth) sequences of the same SeqLen. Backward
+  // scatters the output error onto the selected input tokens (TNNetGatherTokens);
+  // the selection itself is locally constant, so ScoreSource gets no gradient.
+  // K is stored in FStruct[0].
+  // Coded by Claude (AI).
+  TNNetTopKGatherTokens = class(TNNetGatherTokens)
+    private
+      FScoreLayer: TNNetLayer;
+      FTokenScores: array of TNeuralFloat; // per-token max score
+      FKeptTokens: array of boolean;       // NeuralMarkTopK output
+      FTopScores: array of TNeuralFloat;   // NeuralMarkTopK scratch
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      function HasGatherCopyPlan(): boolean; override;
+      {$ENDIF}
+    protected
+      function IndexSegment(): string; override;
+    public
+      constructor Create(pK: integer; ScoreSource: TNNetLayer); reintroduce; overload;
+      procedure Compute(); override;
+      // The scatter, then the score source's backward (it receives no error).
+      procedure Backpropagate(); override;
+      procedure AppendInputLayers(pList: TList); override;
+      property ScoreSource: TNNetLayer read FScoreLayer;
   end;
 
   /// ShuffleNet-style channel-shuffle layer. Parameter-free permutation across
@@ -25720,6 +25830,14 @@ type
   procedure NeuralBilinearGatherColumn(Src: TNNetVolume;
     OutPtr: TNeuralFloatArrPtr; sx, sy: TNeuralFloat;
     W, H, D: integer; BorderPad: boolean);
+
+  // Marks the pK largest of pValues^[pBase + i*pStride] (+ pBias^[i]) in the
+  // zeroed pKept; pTopIdx/pTopVal (>= pK entries) end sorted, largest first.
+  procedure NeuralMarkTopK(pValues, pBias: TNeuralFloatArrPtr;
+    pBase, pStride, pCount, pK: integer;
+    var pKept: array of boolean;
+    var pTopIdx: array of integer;
+    var pTopVal: array of TNeuralFloat);
 
   {$IFNDEF FPC}
   procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
@@ -47079,6 +47197,410 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetMultiScaleDeformableAttention }
+
+const
+  csDeformableMaxLevels = csNNetMaxParameterIdx - 2;
+
+constructor TNNetMultiScaleDeformableAttention.Create(pHeads, pPoints: integer;
+  const pLevelShapes: array of integer;
+  ValueSource, ReferenceSource: TNNetLayer);
+var
+  Level, MaxLevel: integer;
+begin
+  inherited Create();
+  FLevels := Length(pLevelShapes) div 2;
+  if (pHeads < 1) or (pPoints < 1) or (FLevels < 1) or
+     (FLevels > csDeformableMaxLevels) or Odd(Length(pLevelShapes)) then
+    FErrorProc('TNNetMultiScaleDeformableAttention needs Heads >= 1, ' +
+      'Points >= 1 and 1..' + IntToStr(csDeformableMaxLevels) +
+      ' (H, W) level pairs.');
+  if (ValueSource = nil) or (ReferenceSource = nil) then
+    FErrorProc('TNNetMultiScaleDeformableAttention requires non-nil value ' +
+      'and reference sources.');
+  FLevels := Min(FLevels, csDeformableMaxLevels);
+  FHeads := pHeads;
+  FPoints := pPoints;
+  FStruct[0] := pHeads;
+  FStruct[1] := pPoints;
+  FStruct[2] := FLevels;
+  SetLength(FLevelHeight, FLevels);
+  SetLength(FLevelWidth, FLevels);
+  SetLength(FLevelStart, FLevels);
+  SetLength(FInvLevelHeight, FLevels);
+  SetLength(FInvLevelWidth, FLevels);
+  FHalfOverPoints := 0.5 / FPoints;
+  MaxLevel := FLevels - 1;
+  for Level := 0 to MaxLevel do
+  begin
+    FLevelHeight[Level] := pLevelShapes[2 * Level];
+    FLevelWidth[Level] := pLevelShapes[2 * Level + 1];
+    if (FLevelHeight[Level] < 1) or (FLevelWidth[Level] < 1) or
+       (FLevelHeight[Level] > $7FFF) or (FLevelWidth[Level] > $FFFF) then
+      FErrorProc('TNNetMultiScaleDeformableAttention: bad level shape ' +
+        IntToStr(FLevelHeight[Level]) + 'x' + IntToStr(FLevelWidth[Level]));
+    FStruct[3 + Level] := (FLevelHeight[Level] shl 16) or FLevelWidth[Level];
+    FInvLevelHeight[Level] := 1 / FLevelHeight[Level];
+    FInvLevelWidth[Level] := 1 / FLevelWidth[Level];
+    if Level = 0 then FLevelStart[Level] := 0
+    else FLevelStart[Level] := FLevelStart[Level - 1] +
+      FLevelHeight[Level - 1] * FLevelWidth[Level - 1];
+  end;
+  FAttnProbs := TNNetVolume.Create();
+  FValueLayer := ValueSource;
+  FReferenceLayer := ReferenceSource;
+  if FValueLayer is TNNetInput then TNNetInput(FValueLayer).EnableErrorCollection;
+  if FReferenceLayer is TNNetInput then
+    TNNetInput(FReferenceLayer).EnableErrorCollection;
+  FValueLayer.IncDepartingBranchesCnt();
+  FReferenceLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetMultiScaleDeformableAttention.Destroy();
+begin
+  FAttnProbs.Free;
+  inherited Destroy();
+end;
+
+class function TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(
+  const pStruct: array of integer): TNeuralIntegerArray;
+var
+  Level, MaxLevel: integer;
+begin
+  Result := nil;
+  SetLength(Result, 2 * pStruct[2]);
+  MaxLevel := pStruct[2] - 1;
+  for Level := 0 to MaxLevel do
+  begin
+    Result[2 * Level] := pStruct[3 + Level] shr 16;
+    Result[2 * Level + 1] := pStruct[3 + Level] and $FFFF;
+  end;
+end;
+
+function TNNetMultiScaleDeformableAttention.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString, '::',
+    ':' + IntToStr(FValueLayer.LayerIdx) + ';' +
+    IntToStr(FReferenceLayer.LayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetMultiScaleDeformableAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  QueryCount, TokenCount, Level, MaxLevel, ValueDepth: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  QueryCount := pPrevLayer.Output.SizeX;
+  ValueDepth := FValueLayer.Output.Depth;
+  TokenCount := 0;
+  MaxLevel := FLevels - 1;
+  for Level := 0 to MaxLevel do
+    Inc(TokenCount, FLevelHeight[Level] * FLevelWidth[Level]);
+  if (pPrevLayer.Output.SizeY <> 1) or
+     (pPrevLayer.Output.Depth <> FHeads * FLevels * FPoints * 3) then
+    FErrorProc('TNNetMultiScaleDeformableAttention needs a (Queries, 1, ' +
+      IntToStr(FHeads * FLevels * FPoints * 3) + ') offsets|logits input, got (' +
+      IntToStr(pPrevLayer.Output.SizeX) + ', ' + IntToStr(pPrevLayer.Output.SizeY) +
+      ', ' + IntToStr(pPrevLayer.Output.Depth) + ').');
+  if (FValueLayer.Output.SizeX <> TokenCount) or
+     (FValueLayer.Output.SizeY <> 1) or ((ValueDepth mod FHeads) <> 0) then
+    FErrorProc('TNNetMultiScaleDeformableAttention needs a (' +
+      IntToStr(TokenCount) + ', 1, D) value source with D mod Heads = 0, got (' +
+      IntToStr(FValueLayer.Output.SizeX) + ', ' +
+      IntToStr(FValueLayer.Output.SizeY) + ', ' + IntToStr(ValueDepth) + ').');
+  if (FReferenceLayer.Output.SizeX <> QueryCount) or
+     (FReferenceLayer.Output.SizeY <> 1) or
+     ((FReferenceLayer.Output.Depth <> 2) and
+      (FReferenceLayer.Output.Depth <> 4)) then
+    FErrorProc('TNNetMultiScaleDeformableAttention needs a (' +
+      IntToStr(QueryCount) + ', 1, 2 or 4) reference source.');
+  FHeadDim := ValueDepth div FHeads;
+  FIsBoxReference := FReferenceLayer.Output.Depth = 4;
+  FOutput.ReSize(QueryCount, 1, ValueDepth);
+  SetOutputErrorSize(FOutput);
+  FAttnProbs.ReSize(QueryCount, 1, FHeads * FLevels * FPoints);
+  SetLength(FProbGrad, FLevels * FPoints);
+end;
+
+procedure TNNetMultiScaleDeformableAttention.SamplePosition(
+  OffsetPtr, RefPtr: TNeuralFloatArrPtr; Level: integer;
+  out px, py, dLocXdOff, dLocYdOff: TNeuralFloat);
+var
+  LevelWidth, LevelHeight: integer;
+begin
+  LevelWidth := FLevelWidth[Level];
+  LevelHeight := FLevelHeight[Level];
+  if FIsBoxReference then
+  begin
+    dLocXdOff := RefPtr^[2] * FHalfOverPoints;
+    dLocYdOff := RefPtr^[3] * FHalfOverPoints;
+  end
+  else
+  begin
+    dLocXdOff := FInvLevelWidth[Level];
+    dLocYdOff := FInvLevelHeight[Level];
+  end;
+  px := (RefPtr^[0] + OffsetPtr^[0] * dLocXdOff) * LevelWidth - 0.5;
+  py := (RefPtr^[1] + OffsetPtr^[1] * dLocYdOff) * LevelHeight - 0.5;
+end;
+
+procedure TNNetMultiScaleDeformableAttention.Compute();
+var
+  StartTime: double;
+  Value, Offsets, References: TNNetVolume;
+  QueryPos, MaxQueryPos, Head, MaxHead, Level, MaxLevel, Point, MaxPoint: integer;
+  SampleCount, MaxSamplePos, SamplePos, ValueDepth, InDepth, LogitBase: integer;
+  LevelWidth, LevelHeight, x0, y0, HeadOffset, RowBase: integer;
+  OutPtr, ProbPtr, OffsetPtr, RefPtr, LogitPtr: TNeuralFloatArrPtr;
+  px, py, fx, fy, Prob, dLocXdOff, dLocYdOff, MaxLogit, ProbSum: TNeuralFloat;
+  InX0, InX1, InY0, InY1: boolean;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL}
+  FPrevLayer.ForceOutputOnRAM();
+  FValueLayer.ForceOutputOnRAM();
+  FReferenceLayer.ForceOutputOnRAM();
+  {$ENDIF}
+  Value := FValueLayer.Output;
+  Offsets := FPrevLayer.Output;
+  References := FReferenceLayer.Output;
+  ValueDepth := Value.Depth;
+  InDepth := Offsets.Depth;
+  SampleCount := FLevels * FPoints;
+  MaxSamplePos := SampleCount - 1;
+  LogitBase := FHeads * SampleCount * 2;
+  MaxQueryPos := FOutput.SizeX - 1;
+  MaxHead := FHeads - 1;
+  MaxLevel := FLevels - 1;
+  MaxPoint := FPoints - 1;
+  FOutput.Fill(0);
+  for QueryPos := 0 to MaxQueryPos do
+  begin
+    RefPtr := References.GetRawPtr(QueryPos * References.Depth);
+    for Head := 0 to MaxHead do
+    begin
+      // Softmax of this head's Levels*Points logits into FAttnProbs.
+      ProbPtr := FAttnProbs.GetRawPtr((QueryPos * FHeads + Head) * SampleCount);
+      LogitPtr := Offsets.GetRawPtr(QueryPos * InDepth + LogitBase +
+        Head * SampleCount);
+      MaxLogit := TNNetVolume.MaxValue(LogitPtr, SampleCount);
+      Move(LogitPtr^, ProbPtr^, SampleCount * csNeuralFloatSize);
+      TNNetVolume.AddScalar(ProbPtr, -MaxLogit, SampleCount);
+      TNNetVolume.Exp(ProbPtr, ProbPtr, SampleCount);
+      ProbSum := 0;
+      for SamplePos := 0 to MaxSamplePos do ProbSum := ProbSum + ProbPtr^[SamplePos];
+      TNNetVolume.Mul(ProbPtr, 1 / ProbSum, SampleCount);
+      HeadOffset := Head * FHeadDim;
+      OutPtr := FOutput.GetRawPtr(QueryPos * ValueDepth + HeadOffset);
+      OffsetPtr := Offsets.GetRawPtr(QueryPos * InDepth + Head * SampleCount * 2);
+      SamplePos := 0;
+      for Level := 0 to MaxLevel do
+      begin
+        LevelWidth := FLevelWidth[Level];
+        LevelHeight := FLevelHeight[Level];
+        for Point := 0 to MaxPoint do
+        begin
+          SamplePosition(OffsetPtr, RefPtr, Level, px, py, dLocXdOff, dLocYdOff);
+          Prob := ProbPtr^[SamplePos];
+          OffsetPtr := TNeuralFloatArrPtr(@OffsetPtr^[2]);
+          Inc(SamplePos);
+          // Every corner outside (also NaN): the sample is zero.
+          if not ((px > -1) and (px < LevelWidth) and
+                  (py > -1) and (py < LevelHeight)) then continue;
+          x0 := Floor(px);
+          y0 := Floor(py);
+          fx := px - x0;
+          fy := py - y0;
+          InX0 := x0 >= 0;
+          InX1 := x0 + 1 < LevelWidth;
+          InY0 := y0 >= 0;
+          InY1 := y0 + 1 < LevelHeight;
+          RowBase := (FLevelStart[Level] + y0 * LevelWidth + x0) * ValueDepth +
+            HeadOffset;
+          if InY0 then
+          begin
+            if InX0 then TNNetVolume.MulAdd(OutPtr, Value.GetRawPtr(RowBase),
+              Prob * (1 - fx) * (1 - fy), FHeadDim);
+            if InX1 then TNNetVolume.MulAdd(OutPtr,
+              Value.GetRawPtr(RowBase + ValueDepth), Prob * fx * (1 - fy), FHeadDim);
+          end;
+          if InY1 then
+          begin
+            Inc(RowBase, LevelWidth * ValueDepth);
+            if InX0 then TNNetVolume.MulAdd(OutPtr, Value.GetRawPtr(RowBase),
+              Prob * (1 - fx) * fy, FHeadDim);
+            if InX1 then TNNetVolume.MulAdd(OutPtr,
+              Value.GetRawPtr(RowBase + ValueDepth), Prob * fx * fy, FHeadDim);
+          end;
+        end;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMultiScaleDeformableAttention.Backpropagate();
+var
+  StartTime: double;
+  Value, ValueErr, Offsets, OffsetErr, References, ReferenceErr: TNNetVolume;
+  QueryPos, MaxQueryPos, Head, MaxHead, Level, MaxLevel, Point, MaxPoint: integer;
+  SampleCount, MaxSamplePos, SamplePos, ValueDepth, InDepth, LogitBase: integer;
+  LevelWidth, LevelHeight, x0, y0, HeadOffset, RowBase, OffsetPos: integer;
+  OutErrPtr, ProbPtr, OffsetPtr, RefPtr, RefErrPtr: TNeuralFloatArrPtr;
+  px, py, fx, fy, Prob, dLocXdOff, dLocYdOff, dLocX, dLocY: TNeuralFloat;
+  Grad00, Grad10, Grad01, Grad11, WeightedSum: TNeuralFloat;
+  InX0, InX1, InY0, InY1, HasValueErr, HasOffsetErr, HasReferenceErr: boolean;
+  IsBoxReference: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Value := FValueLayer.Output;
+  ValueErr := FValueLayer.OutputError;
+  Offsets := FPrevLayer.Output;
+  OffsetErr := FPrevLayer.OutputError;
+  References := FReferenceLayer.Output;
+  ReferenceErr := FReferenceLayer.OutputError;
+  HasValueErr := ValueErr.Size = Value.Size;
+  HasOffsetErr := OffsetErr.Size = Offsets.Size;
+  HasReferenceErr := ReferenceErr.Size = References.Size;
+  IsBoxReference := FIsBoxReference;
+  ValueDepth := Value.Depth;
+  InDepth := Offsets.Depth;
+  SampleCount := FLevels * FPoints;
+  MaxSamplePos := SampleCount - 1;
+  LogitBase := FHeads * SampleCount * 2;
+  MaxQueryPos := FOutput.SizeX - 1;
+  MaxHead := FHeads - 1;
+  MaxLevel := FLevels - 1;
+  MaxPoint := FPoints - 1;
+  RefErrPtr := nil;
+  for QueryPos := 0 to MaxQueryPos do
+  begin
+    RefPtr := References.GetRawPtr(QueryPos * References.Depth);
+    if HasReferenceErr then
+      RefErrPtr := ReferenceErr.GetRawPtr(QueryPos * References.Depth);
+    for Head := 0 to MaxHead do
+    begin
+      ProbPtr := FAttnProbs.GetRawPtr((QueryPos * FHeads + Head) * SampleCount);
+      HeadOffset := Head * FHeadDim;
+      OutErrPtr := FOutputError.GetRawPtr(QueryPos * ValueDepth + HeadOffset);
+      OffsetPos := QueryPos * InDepth + Head * SampleCount * 2;
+      SamplePos := 0;
+      for Level := 0 to MaxLevel do
+      begin
+        LevelWidth := FLevelWidth[Level];
+        LevelHeight := FLevelHeight[Level];
+        for Point := 0 to MaxPoint do
+        begin
+          OffsetPtr := Offsets.GetRawPtr(OffsetPos);
+          SamplePosition(OffsetPtr, RefPtr, Level, px, py, dLocXdOff, dLocYdOff);
+          Prob := ProbPtr^[SamplePos];
+          FProbGrad[SamplePos] := 0;
+          if (px > -1) and (px < LevelWidth) and (py > -1) and (py < LevelHeight) then
+          begin
+            x0 := Floor(px);
+            y0 := Floor(py);
+            fx := px - x0;
+            fy := py - y0;
+            InX0 := x0 >= 0;
+            InX1 := x0 + 1 < LevelWidth;
+            InY0 := y0 >= 0;
+            InY1 := y0 + 1 < LevelHeight;
+            // GradXY = dL/d(sample) . V at corner XY (zero outside the map).
+            Grad00 := 0; Grad10 := 0; Grad01 := 0; Grad11 := 0;
+            RowBase := (FLevelStart[Level] + y0 * LevelWidth + x0) * ValueDepth +
+              HeadOffset;
+            if InY0 then
+            begin
+              if InX0 then
+              begin
+                Grad00 := TNNetVolume.DotProduct(OutErrPtr,
+                  Value.GetRawPtr(RowBase), FHeadDim);
+                if HasValueErr then TNNetVolume.MulAdd(ValueErr.GetRawPtr(RowBase),
+                  OutErrPtr, Prob * (1 - fx) * (1 - fy), FHeadDim);
+              end;
+              if InX1 then
+              begin
+                Grad10 := TNNetVolume.DotProduct(OutErrPtr,
+                  Value.GetRawPtr(RowBase + ValueDepth), FHeadDim);
+                if HasValueErr then TNNetVolume.MulAdd(
+                  ValueErr.GetRawPtr(RowBase + ValueDepth), OutErrPtr,
+                  Prob * fx * (1 - fy), FHeadDim);
+              end;
+            end;
+            if InY1 then
+            begin
+              Inc(RowBase, LevelWidth * ValueDepth);
+              if InX0 then
+              begin
+                Grad01 := TNNetVolume.DotProduct(OutErrPtr,
+                  Value.GetRawPtr(RowBase), FHeadDim);
+                if HasValueErr then TNNetVolume.MulAdd(ValueErr.GetRawPtr(RowBase),
+                  OutErrPtr, Prob * (1 - fx) * fy, FHeadDim);
+              end;
+              if InX1 then
+              begin
+                Grad11 := TNNetVolume.DotProduct(OutErrPtr,
+                  Value.GetRawPtr(RowBase + ValueDepth), FHeadDim);
+                if HasValueErr then TNNetVolume.MulAdd(
+                  ValueErr.GetRawPtr(RowBase + ValueDepth), OutErrPtr,
+                  Prob * fx * fy, FHeadDim);
+              end;
+            end;
+            FProbGrad[SamplePos] := (1 - fy) * ((1 - fx) * Grad00 + fx * Grad10) +
+              fy * ((1 - fx) * Grad01 + fx * Grad11);
+            dLocX := Prob * ((1 - fy) * (Grad10 - Grad00) + fy * (Grad11 - Grad01)) *
+              LevelWidth;
+            dLocY := Prob * ((1 - fx) * (Grad01 - Grad00) + fx * (Grad11 - Grad10)) *
+              LevelHeight;
+            if HasOffsetErr then
+            begin
+              OffsetErr.FData[OffsetPos] := OffsetErr.FData[OffsetPos] +
+                dLocX * dLocXdOff;
+              OffsetErr.FData[OffsetPos + 1] := OffsetErr.FData[OffsetPos + 1] +
+                dLocY * dLocYdOff;
+            end;
+            if HasReferenceErr then
+            begin
+              RefErrPtr^[0] := RefErrPtr^[0] + dLocX;
+              RefErrPtr^[1] := RefErrPtr^[1] + dLocY;
+              if IsBoxReference then
+              begin
+                RefErrPtr^[2] := RefErrPtr^[2] + dLocX * OffsetPtr^[0] * FHalfOverPoints;
+                RefErrPtr^[3] := RefErrPtr^[3] + dLocY * OffsetPtr^[1] * FHalfOverPoints;
+              end;
+            end;
+          end;
+          Inc(OffsetPos, 2);
+          Inc(SamplePos);
+        end;
+      end;
+      // Softmax backward onto the attention logits.
+      if HasOffsetErr then
+      begin
+        WeightedSum := TNNetVolume.DotProduct(ProbPtr, @FProbGrad[0], SampleCount);
+        OffsetPos := QueryPos * InDepth + LogitBase + Head * SampleCount;
+        for SamplePos := 0 to MaxSamplePos do
+          OffsetErr.FData[OffsetPos + SamplePos] :=
+            OffsetErr.FData[OffsetPos + SamplePos] +
+            ProbPtr^[SamplePos] * (FProbGrad[SamplePos] - WeightedSum);
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if HasReferenceErr then FReferenceLayer.Backpropagate();
+  if HasValueErr then FValueLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetMultiScaleDeformableAttention.AppendInputLayers(pList: TList);
+begin
+  inherited AppendInputLayers(pList);
+  if Assigned(FValueLayer) then pList.Add(FValueLayer);
+  if Assigned(FReferenceLayer) then pList.Add(FReferenceLayer);
+end;
+
 { TNNetFlowWarp }
 
 constructor TNNetFlowWarp.Create(FlowSource: TNNetLayer);
@@ -58410,6 +58932,57 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+{ TNNetInverseSigmoid }
+
+constructor TNNetInverseSigmoid.Create();
+begin
+  Create(0.00001);
+end;
+
+constructor TNNetInverseSigmoid.Create(pEps: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pEps;
+end;
+
+procedure TNNetInverseSigmoid.Compute();
+var
+  MaxOutputPos, OutputPos: integer;
+  PrevOutput: TNNetVolume;
+  StartTime: double;
+  Eps, Clamped, Numerator, Denominator, Derivative: TNeuralFloat;
+  HasDerivative: boolean;
+begin
+  StartTime := Now();
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  PrevOutput := FPrevLayer.Output;
+  MaxOutputPos := PrevOutput.Size - 1;
+  Eps := FFloatSt[0];
+  HasDerivative := (FOutput.Size = FOutputError.Size) and
+    (FOutputErrorDeriv.Size = FOutput.Size);
+  for OutputPos := 0 to MaxOutputPos do
+  begin
+    Clamped := PrevOutput.FData[OutputPos];
+    if Clamped < 0 then Clamped := 0
+    else if Clamped > 1 then Clamped := 1;
+    Derivative := 0;
+    Numerator := Clamped;
+    if Numerator < Eps then Numerator := Eps
+    else if (Clamped > 0) and (Clamped < 1) then Derivative := 1 / Numerator;
+    Denominator := 1 - Clamped;
+    if Denominator < Eps then Denominator := Eps
+    else if (Clamped > 0) and (Clamped < 1) then
+      Derivative := Derivative + 1 / Denominator;
+    FOutput.FData[OutputPos] := pcr_logf(Numerator / Denominator);
+    if HasDerivative then FOutputErrorDeriv.FData[OutputPos] := Derivative;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetShiftedReLU }
 
 constructor TNNetShiftedReLU.Create();
@@ -60310,19 +60883,110 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
-function TNNetGatherTokens.SaveStructureToString(): string;
+function TNNetGatherTokens.IndexSegment(): string;
 var
   I, MaxTokens: integer;
-  TokensStr: string;
 begin
-  TokensStr := '';
+  Result := '';
   MaxTokens := Length(FTokens) - 1;
   for I := 0 to MaxTokens do
   begin
-    if I > 0 then TokensStr := TokensStr + ';';
-    TokensStr := TokensStr + IntToStr(FTokens[I]);
+    if I > 0 then Result := Result + ';';
+    Result := Result + IntToStr(FTokens[I]);
   end;
-  Result := StringReplace(inherited SaveStructureToString,'::',':'+TokensStr+':',[rfReplaceAll]);
+end;
+
+function TNNetGatherTokens.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString, '::',
+    ':' + IndexSegment() + ':', [rfReplaceAll]);
+end;
+
+{ TNNetTopKGatherTokens }
+
+constructor TNNetTopKGatherTokens.Create(pK: integer; ScoreSource: TNNetLayer);
+var
+  InitialTokens: TNeuralIntegerArray;
+begin
+  if pK < 1 then pK := 1;
+  SetLength(InitialTokens, pK);
+  FillChar(InitialTokens[0], pK * SizeOf(integer), 0);
+  inherited Create(InitialTokens);
+  FStruct[0] := pK;
+  if ScoreSource = nil then
+    FErrorProc('TNNetTopKGatherTokens requires a non-nil ScoreSource.');
+  FScoreLayer := ScoreSource;
+  FScoreLayer.IncDepartingBranchesCnt();
+end;
+
+procedure TNNetTopKGatherTokens.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  TokenCount: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  TokenCount := pPrevLayer.Output.SizeX;
+  if (FScoreLayer.Output.SizeX <> TokenCount) or
+     (FScoreLayer.Output.SizeY <> 1) then
+    FErrorProc('TNNetTopKGatherTokens requires a (' + IntToStr(TokenCount) +
+      ', 1, Depth) score source, got (' + IntToStr(FScoreLayer.Output.SizeX) +
+      ', ' + IntToStr(FScoreLayer.Output.SizeY) + ', ' +
+      IntToStr(FScoreLayer.Output.Depth) + ').');
+  if FStruct[0] > TokenCount then
+    FErrorProc('TNNetTopKGatherTokens: K=' + IntToStr(FStruct[0]) +
+      ' exceeds the ' + IntToStr(TokenCount) + ' input tokens.');
+  SetLength(FTokenScores, TokenCount);
+  SetLength(FKeptTokens, TokenCount);
+  SetLength(FTopScores, FStruct[0]);
+end;
+
+{$IFDEF OpenCL}
+function TNNetTopKGatherTokens.HasGatherCopyPlan(): boolean;
+begin
+  Result := false;
+end;
+{$ENDIF}
+
+function TNNetTopKGatherTokens.IndexSegment(): string;
+begin
+  Result := IntToStr(FScoreLayer.LayerIdx);
+end;
+
+procedure TNNetTopKGatherTokens.Compute();
+var
+  Scores: TNNetVolume;
+  TokenPos, MaxTokenPos, ScoreDepth: integer;
+begin
+  {$IFDEF OpenCL}
+  FScoreLayer.ForceOutputOnRAM();
+  FPrevLayer.ForceOutputOnRAM();
+  {$ENDIF}
+  Scores := FScoreLayer.Output;
+  ScoreDepth := Scores.Depth;
+  MaxTokenPos := Scores.SizeX - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    FTokenScores[TokenPos] := TNNetVolume.MaxValue(
+      Scores.GetRawPtr(TokenPos * ScoreDepth), ScoreDepth);
+  FillChar(FKeptTokens[0], Length(FKeptTokens) * SizeOf(boolean), 0);
+  // NeuralMarkTopK leaves FTokens sorted by score, highest first.
+  NeuralMarkTopK(@FTokenScores[0], nil, 0, 1, MaxTokenPos + 1, FStruct[0],
+    FKeptTokens, FTokens, FTopScores);
+  inherited Compute();
+end;
+
+procedure TNNetTopKGatherTokens.Backpropagate();
+var
+  RunsNow: boolean;
+begin
+  RunsNow := FBackPropCallCurrentCnt + 1 >= FDepartingBranchesCnt;
+  inherited Backpropagate();
+  if RunsNow and (FScoreLayer.OutputError.Size = FScoreLayer.Output.Size) then
+    FScoreLayer.Backpropagate();
+end;
+
+procedure TNNetTopKGatherTokens.AppendInputLayers(pList: TList);
+begin
+  inherited AppendInputLayers(pList);
+  if Assigned(FScoreLayer) then pList.Add(FScoreLayer);
 end;
 
 { TNNetChannelShuffle }
@@ -143099,7 +143763,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetGridSample') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetBackwardWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetGridSample') or (S[0] = 'TNNetMultiScaleDeformableAttention') or (S[0] = 'TNNetTopKGatherTokens') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetBackwardWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -143164,6 +143828,7 @@ begin
       'TNNetGaussianActivation' :   Result := TNNetGaussianActivation.Create();
       'TNNetTanhShrink' :           Result := TNNetTanhShrink.Create();
       'TNNetLogSigmoid' :           Result := TNNetLogSigmoid.Create();
+      'TNNetInverseSigmoid' :       Result := TNNetInverseSigmoid.Create(Ft[0]);
       'TNNetShiftedReLU' :          Result := TNNetShiftedReLU.Create();
       'TNNetAbs' :                  Result := TNNetAbs.Create();
       'TNNetSign' :                 Result := TNNetSign.Create();
@@ -143252,6 +143917,8 @@ begin
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetGridSample' :           Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1);
+      'TNNetMultiScaleDeformableAttention' : Result := TNNetMultiScaleDeformableAttention.Create(St[0], St[1], TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1]);
+      'TNNetTopKGatherTokens' :     Result := TNNetTopKGatherTokens.Create(St[0], aL[0]);
       'TNNetFlowWarp' :             Result := TNNetFlowWarp.Create(aL[0]);
       'TNNetBackwardWarp' :         Result := TNNetBackwardWarp.Create(aL[0]);
       'TNNetCorrelationVolume' :    Result := TNNetCorrelationVolume.Create(aL[0]);
@@ -143619,6 +144286,7 @@ begin
       if S[0] = 'TNNetGaussianActivation' then Result := TNNetGaussianActivation.Create() else
       if S[0] = 'TNNetTanhShrink' then Result := TNNetTanhShrink.Create() else
       if S[0] = 'TNNetLogSigmoid' then Result := TNNetLogSigmoid.Create() else
+      if S[0] = 'TNNetInverseSigmoid' then Result := TNNetInverseSigmoid.Create(Ft[0]) else
       if S[0] = 'TNNetShiftedReLU' then Result := TNNetShiftedReLU.Create() else
       if S[0] = 'TNNetAbs' then Result := TNNetAbs.Create() else
       if S[0] = 'TNNetSign' then Result := TNNetSign.Create() else
@@ -143707,6 +144375,8 @@ begin
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetGridSample' then Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1) else
+      if S[0] = 'TNNetMultiScaleDeformableAttention' then Result := TNNetMultiScaleDeformableAttention.Create(St[0], St[1], TNNetMultiScaleDeformableAttention.LevelShapesFromStruct(St), aL[0], aL[1]) else
+      if S[0] = 'TNNetTopKGatherTokens' then Result := TNNetTopKGatherTokens.Create(St[0], aL[0]) else
       if S[0] = 'TNNetFlowWarp' then Result := TNNetFlowWarp.Create(aL[0]) else
       if S[0] = 'TNNetBackwardWarp' then Result := TNNetBackwardWarp.Create(aL[0]) else
       if S[0] = 'TNNetCorrelationVolume' then Result := TNNetCorrelationVolume.Create(aL[0]) else

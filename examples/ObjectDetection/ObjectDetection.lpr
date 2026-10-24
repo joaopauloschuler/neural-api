@@ -19,48 +19,56 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 Coded by Claude (AI).
 *)
 
-// ObjectDetection -- the demo for the landed DETR object-detection importer
-// (BuildDetrFromSafeTensors, facebook/detr-resnet-50: a ResNet backbone + the
-// DETR transformer encoder-decoder + learned object queries + 2-D sinusoidal
-// spatial position embedding + sigmoid-cxcywh box head + class head, inference
-// only, NO Hungarian matcher). It runs a full DETR forward pass on ONE image,
-// DECODES the per-query predictions (softmax the class logits, drop the
-// "no-object" slot, threshold on confidence, convert the normalized cxcywh box
-// to pixel xyxy) with DecodeDetrDetections, DRAWS the surviving boxes as colored
-// rectangle outlines into the image, and writes the result to a PPM. It also
-// prints the (class, score, box) list to the console.
+// ObjectDetection -- the demo for the two DETR-family object-detection
+// importers, inference only:
+//   * DETR (BuildDetrFromSafeTensors, facebook/detr-resnet-50): a ResNet
+//     backbone + transformer encoder-decoder + learned object queries; decoded
+//     with DecodeDetrDetections (softmax, drop the "no-object" slot, threshold).
+//   * RT-DETR with --rtdetr (BuildRtDetrFromSafeTensors, PekingU/rtdetr_r18vd ..
+//     r101vd): a ResNet-vd backbone + the hybrid encoder (AIFI + CSP FPN/PAN) +
+//     top-K query selection + a multi-scale deformable-attention decoder with
+//     iterative box refinement; decoded with DecodeRtDetrDetections (sigmoid
+//     scores, top-K over query x class, threshold, no NMS).
+// It runs the forward pass on ONE image, draws the surviving boxes (with a
+// "class score" tag in RT-DETR mode) and writes the annotated image.
 //
 // Usage:
 //   ObjectDetection [model.safetensors] [config.json] [threshold]
+//   ObjectDetection --rtdetr [--image FILE] [--size N] [model.safetensors]
+//                   [config.json] [threshold]
 //
-// With no arguments it loads the committed pico fixture
-// (tests/fixtures/tiny_detr.*), a tiny random DetrForObjectDetection used by the
-// parity tests, so the demo runs with NO download, fully OFFLINE. Point it at a
-// real facebook/detr-resnet-50 checkpoint + config.json (+ optional confidence
-// threshold) for the real thing.
+// --image resizes a photo to the N x N net input (default 640, as
+// RTDetrImageProcessor: PIL bilinear, / 255), scales the boxes back to the
+// photo and writes <name>_rtdetr.png. With no model argument each mode loads
+// its committed pico fixture (tests/fixtures/tiny_detr.* or tiny_rtdetr.*), a
+// tiny random model used by the parity tests, so the demo runs offline.
 //
-// HONEST NOTE: the pico fixture has RANDOM weights, so the "detections" are not
-// meaningful objects -- the demo's job is to exercise the full DETR
-// decode + draw pipeline end to end and SELF-REPORT: it asserts no NaN/Inf in
-// the network output and that every decoded box converts to in-range pixel
-// coordinates. A real pretrained checkpoint produces real detections through the
-// exact same path. Pure CPU, <1 s on the fixture.
+// HONEST NOTE: the pico fixtures have RANDOM weights, so their "detections" are
+// not meaningful objects -- they exercise the decode + draw pipeline and
+// SELF-REPORT: no NaN/Inf in the output and every decoded box within the
+// sigmoid [0,1] range. A real checkpoint produces real detections through the
+// same path. Pure CPU, < 1 s on the fixtures.
 
 {$mode objfpc}{$H+}
 
-uses
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
   SysUtils, Classes, Math, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralpretrained;
+  neuralvolume, neuralnetwork, neuralpretrained, neuralimageresize,
+  neuraldatasets, neuralsafetensors;
 
 const
   PpmFile = 'object_detection.ppm';
+  FixturesDir = '../../tests/fixtures/';
   // A small fixed palette to color successive boxes.
   PaletteR: array[0..5] of byte = (255, 0, 0, 255, 255, 0);
   PaletteG: array[0..5] of byte = (0, 255, 0, 255, 0, 255);
   PaletteB: array[0..5] of byte = (0, 0, 255, 0, 255, 255);
 
 var
-  ModelFile, ConfigFile, IoFile: string;
+  ModelFile, ConfigFile, IoFile, ImageFile, Arg: string;
+  Positional: array of string;
+  UseRtDetr: boolean;
+  RtDetrSize, ArgPos, MaxArgPos: integer;
   Threshold: TNeuralFloat;
   NN: TNNet;
   Config: TDetrConfig;
@@ -131,14 +139,185 @@ begin
   for py := Y0 to Y1 do begin Plot(X0, py); Plot(X1, py); end;
 end;
 
+// Labels a box with "name score" on a tag of the box colour.
+procedure DrawBoxTag(AImg: TNNetVolume; X0, Y0: integer; const Text: string;
+  ColorIndex: integer);
+var
+  BoxColor, TextColor: array[0..2] of TNeuralFloat;
+  TagTop: integer;
 begin
-  if ParamCount >= 1 then ModelFile := ParamStr(1)
-  else ModelFile := '../../tests/fixtures/tiny_detr.safetensors';
-  if ParamCount >= 2 then ConfigFile := ParamStr(2)
-  else ConfigFile := '../../tests/fixtures/tiny_detr_config.json';
+  BoxColor[0] := PaletteR[ColorIndex mod 6];
+  BoxColor[1] := PaletteG[ColorIndex mod 6];
+  BoxColor[2] := PaletteB[ColorIndex mod 6];
+  if BoxColor[0] + BoxColor[1] + BoxColor[2] >= 510 then TextColor[0] := 0
+  else TextColor[0] := 255;
+  TextColor[1] := TextColor[0];
+  TextColor[2] := TextColor[0];
+  TagTop := Y0 - csBitmapFontGlyphHeight - 2;
+  if TagTop < 0 then TagTop := Y0;
+  FillRectangleCV2(AImg, X0, TagTop, X0 + BitmapTextWidth(Text) + 1,
+    TagTop + csBitmapFontGlyphHeight + 1, BoxColor);
+  DrawBitmapText(AImg, X0 + 1, TagTop + 1, Text, TextColor);
+end;
+
+// RT-DETR mode: forward, DecodeRtDetrDetections, draw, write.
+procedure RunRtDetr();
+var
+  RtConfig: TRtDetrConfig;
+  Net: TNNet;
+  Photo, NetInput, Pinned, NetOutput: TNNetVolume;
+  Reader: TNNetSafeTensorsReader;
+  Detections: TDetrDetectionArray;
+  PhotoW, PhotoH, DetPos, BoxX0, BoxY0, BoxX1, BoxY1, ValuePos, MaxValuePos: integer;
+  Name, OutputFile: string;
+  ScoreThreshold: TNeuralFloat;
+  StartTime: TDateTime;
+begin
+  if Length(Positional) >= 1 then ModelFile := Positional[0]
+  else ModelFile := FixturesDir + 'tiny_rtdetr.safetensors';
+  if Length(Positional) >= 2 then ConfigFile := Positional[1]
+  else ConfigFile := ExtractFilePath(ModelFile) +
+    BoolToStr(Length(Positional) = 0, 'tiny_rtdetr_config.json', 'config.json');
+  // transformers' post-process default is 0.5; the random fixture uses 0.75.
+  if Length(Positional) >= 3 then ScoreThreshold := StrToFloat(Positional[2])
+  else if Length(Positional) = 0 then ScoreThreshold := 0.75
+  else ScoreThreshold := 0.5;
+  Photo := TNNetVolume.Create;
+  NetInput := TNNetVolume.Create;
+  Pinned := TNNetVolume.Create;
+  Net := nil;
+  try
+    if ImageFile <> '' then
+    begin
+      if not LoadImageFromFileIntoVolume(ImageFile, Photo) then
+        raise Exception.Create('could not load ' + ImageFile);
+      // RTDetrImageProcessor: PIL bilinear on the 8-bit image, then / 255.
+      ResizeImagePIL(Photo, NetInput, RtDetrSize, RtDetrSize, irfBilinear, true);
+      NetInput.Mul(1 / 255);
+    end
+    else
+    begin
+      // The pinned 64 x 64 fixture image (0..1), drawn on at 0..255.
+      Reader := TNNetSafeTensorsReader.Create(FixturesDir + 'tiny_rtdetr_io.safetensors');
+      try
+        Reader.LoadTensorFlat('image', Pinned);
+        NetInput.ReSize(Reader.DimSize('image', 1), Reader.DimSize('image', 0), 3);
+      finally
+        Reader.Free;
+      end;
+      NetInput.CopyNoChecks(Pinned);
+      RtDetrSize := NetInput.SizeX;
+      Photo.Copy(NetInput);
+      Photo.Mul(255);
+    end;
+    WriteLn('ObjectDetection (RT-DETR): loading ', ModelFile);
+    Net := BuildRtDetrFromSafeTensors(ModelFile, RtConfig, {pTrainable=}false,
+      ConfigFile, NetInput.SizeX, NetInput.SizeY);
+    WriteLn(RtDetrConfigToString(RtConfig));
+    StartTime := Now();
+    Net.Compute(NetInput);
+    NetOutput := Net.GetLastLayer().Output;
+    WriteLn(Format('  forward pass: %.1f s', [(Now() - StartTime) * 86400.0]));
+    MaxValuePos := NetOutput.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      if IsNan(NetOutput.FData[ValuePos]) or IsInfinite(NetOutput.FData[ValuePos]) then
+      begin
+        WriteLn('ERROR: RT-DETR output contains NaN/Inf.');
+        Halt(1);
+      end;
+    Detections := DecodeRtDetrDetections(NetOutput, RtConfig.NumLabels,
+      ScoreThreshold);
+    WriteLn(Format('  %d detection(s) with score > %.2f:',
+      [Length(Detections), ScoreThreshold]));
+    PhotoW := Photo.SizeX;
+    PhotoH := Photo.SizeY;
+    for DetPos := 0 to High(Detections) do
+    begin
+      if (Detections[DetPos].Cx < 0) or (Detections[DetPos].Cx > 1) or
+         (Detections[DetPos].W < 0) or (Detections[DetPos].W > 1) then
+      begin
+        WriteLn('ERROR: decoded box outside the sigmoid [0,1] range.');
+        Halt(1);
+      end;
+      // cxcywh in [0, 1] -> photo xyxy (post_process_object_detection).
+      BoxX0 := Round((Detections[DetPos].Cx - 0.5 * Detections[DetPos].W) * PhotoW);
+      BoxY0 := Round((Detections[DetPos].Cy - 0.5 * Detections[DetPos].H) * PhotoH);
+      BoxX1 := Round((Detections[DetPos].Cx + 0.5 * Detections[DetPos].W) * PhotoW);
+      BoxY1 := Round((Detections[DetPos].Cy + 0.5 * Detections[DetPos].H) * PhotoH);
+      Name := RtConfig.ClassNames[Detections[DetPos].ClassId];
+      if Name = '' then Name := IntToStr(Detections[DetPos].ClassId);
+      WriteLn(Format('    %-12s score %.4f  xyxy=(%d,%d,%d,%d)',
+        [Name, Detections[DetPos].Score, BoxX0, BoxY0, BoxX1, BoxY1]));
+      BoxX0 := Max(0, Min(PhotoW - 1, BoxX0));
+      BoxY0 := Max(0, Min(PhotoH - 1, BoxY0));
+      BoxX1 := Max(0, Min(PhotoW - 1, BoxX1));
+      BoxY1 := Max(0, Min(PhotoH - 1, BoxY1));
+      DrawBox(Photo, BoxX0, BoxY0, BoxX1, BoxY1, PaletteR[DetPos mod 6],
+        PaletteG[DetPos mod 6], PaletteB[DetPos mod 6]);
+      DrawBoxTag(Photo, BoxX0, BoxY0, Format('%s %.2f',
+        [Name, Detections[DetPos].Score]), DetPos);
+    end;
+    if ImageFile <> '' then
+      OutputFile := ChangeFileExt(ExtractFileName(ImageFile), '') + '_rtdetr.png'
+    else
+      OutputFile := 'object_detection_rtdetr.png';
+    if not SaveImageFromVolumeIntoFile(Photo, OutputFile) then
+      raise Exception.Create('could not save ' + OutputFile);
+    WriteLn('Wrote annotated image to ', OutputFile, ' (', PhotoW, 'x', PhotoH, ').');
+    if Length(Positional) = 0 then
+      WriteLn('(The pico fixture has RANDOM weights, so these are not real ' +
+        'objects. PekingU/rtdetr_r18vd with --image yields real detections ' +
+        'through the same path.)');
+  finally
+    Net.Free;
+    Pinned.Free;
+    NetInput.Free;
+    Photo.Free;
+  end;
+end;
+
+begin
+  ImageFile := '';
+  UseRtDetr := false;
+  RtDetrSize := 640;
+  Positional := nil;
+  MaxArgPos := ParamCount;
+  ArgPos := 1;
+  while ArgPos <= MaxArgPos do
+  begin
+    Arg := ParamStr(ArgPos);
+    if ((Arg = '--image') or (Arg = '--size')) and (ArgPos = MaxArgPos) then
+    begin
+      WriteLn('ERROR: ', Arg, ' needs a value.');
+      Halt(2);
+    end;
+    if Arg = '--rtdetr' then UseRtDetr := true
+    else if Arg = '--image' then begin Inc(ArgPos); ImageFile := ParamStr(ArgPos); end
+    else if Arg = '--size' then begin Inc(ArgPos); RtDetrSize := StrToInt(ParamStr(ArgPos)); end
+    else
+    begin
+      SetLength(Positional, Length(Positional) + 1);
+      Positional[High(Positional)] := Arg;
+    end;
+    Inc(ArgPos);
+  end;
+  if (ImageFile <> '') and not UseRtDetr then
+  begin
+    WriteLn('ERROR: --image needs --rtdetr.');
+    Halt(2);
+  end;
+  if UseRtDetr then
+  begin
+    RunRtDetr();
+    Exit;
+  end;
+  if Length(Positional) >= 1 then ModelFile := Positional[0]
+  else ModelFile := FixturesDir + 'tiny_detr.safetensors';
+  if Length(Positional) >= 2 then ConfigFile := Positional[1]
+  else ConfigFile := FixturesDir + 'tiny_detr_config.json';
   // Threshold defaults to 0 on the random fixture (so EVERY query is decoded and
   // the full draw path is exercised); use ~0.7 on a real checkpoint.
-  if ParamCount >= 3 then Threshold := StrToFloat(ParamStr(3))
+  if Length(Positional) >= 3 then Threshold := StrToFloat(Positional[2])
   else Threshold := 0.0;
   IoFile := ExtractFilePath(ModelFile) + 'tiny_detr_io.json';
 

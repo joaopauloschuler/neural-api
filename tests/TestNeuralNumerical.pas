@@ -1816,6 +1816,9 @@ type
     procedure TestLogSigmoidTrainableInferenceParity;
     procedure TestLogSigmoidSerializationRoundTrip;
     procedure TestLogSigmoidExtremeInputSaturation;
+    procedure TestInverseSigmoidForward;
+    procedure TestInverseSigmoidGradientCheck;
+    procedure TestInverseSigmoidSerializationRoundTrip;
     procedure TestShiftedReLUForward;
     procedure TestShiftedReLUGradientCheck;
     procedure TestShiftedReLUSerializationRoundTrip;
@@ -19092,6 +19095,51 @@ procedure TTestNeuralNumerical.TestLogSigmoidSerializationRoundTrip;
 begin
   SerializationRoundTrip(Self, TNNetLogSigmoid.Create(),
     'LogSigmoid', 3, 1, 4, 1e-5);
+end;
+
+// transformers inverse_sigmoid: clamp to [0, 1], then ln(max(x, eps) /
+// max(1 - x, eps)); the clamps saturate at +-ln((1 - eps) / eps).
+procedure TTestNeuralNumerical.TestInverseSigmoidForward;
+const
+  Inputs: array[0..5] of TNeuralFloat = (0.5, 0.25, 0.9, -0.3, 1.7, 0.000001);
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Expected: array[0..5] of double;
+  Pos: integer;
+begin
+  Expected[0] := 0;
+  Expected[1] := Ln(0.25 / 0.75);
+  Expected[2] := Ln(0.9 / 0.1);
+  Expected[3] := Ln(0.00001 / 1);
+  Expected[4] := Ln(1 / 0.00001);
+  Expected[5] := Ln(0.00001 / (1 - 0.000001));
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    NN.AddLayer(TNNetInverseSigmoid.Create());
+    for Pos := 0 to 5 do Input.Raw[Pos] := Inputs[Pos];
+    NN.Compute(Input);
+    for Pos := 0 to 5 do
+      AssertEquals('InverseSigmoid(' + FloatToStr(Inputs[Pos]) + ')',
+        Expected[Pos], NN.GetLastLayer.Output.Raw[Pos], 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInverseSigmoidGradientCheck;
+begin
+  ActivationGradientCheck(Self, TNNetInverseSigmoid.Create(), 'InverseSigmoid',
+    [0.5, 0.2, 0.8, 0.35, 0.65, 0.05], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestInverseSigmoidSerializationRoundTrip;
+begin
+  SerializationRoundTrip(Self, TNNetInverseSigmoid.Create(0.001),
+    'InverseSigmoid', 3, 1, 4, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestShiftedReLUSerializationRoundTrip;

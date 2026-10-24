@@ -1955,7 +1955,7 @@ rather than acted on.
               use an opacity-weighted median (or the cameras.json look-at
               centre) as the default target.
 
-- [ ] RT-DETR real-time detection-transformer importer
+- [X] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
       detection model family from the landed DETR (ResNet+sinusoidal+vanilla
       transformer decoder, the slow NMS-free baseline): RT-DETR is the real-time
@@ -1970,6 +1970,30 @@ rather than acted on.
       the first real-time / production-grade detector importer (DETR is reference,
       not deployable speed). Pico-fixture smoke + a real-checkpoint top-1/box
       parity follow-up via the structured-vision detection eval harness.
+      DONE: BuildRtDetrFromSafeTensors[Ex] + ReadRtDetrConfigFromJSONFile +
+      DecodeRtDetrDetections (post_process_object_detection, no NMS); new
+      layers TNNetMultiScaleDeformableAttention (forward + backward of value,
+      offsets/logits and reference), TNNetTopKGatherTokens, TNNetInverseSigmoid;
+      ObjectDetection --rtdetr [--image]. Parity < 1e-4 on two pico fixtures
+      (tools/make_pico_rtdetr_fixture.py); agent run of PekingU/rtdetr_r18vd
+      at 640 x 640: logits 3.4e-5, boxes 2.7e-4 over all 300 queries, same 5
+      detections as transformers.
+        - [ ] User run of a real checkpoint (r18vd and r50vd/r101vd; only r18vd
+              was run, by the agent).
+        - [ ] RAM: r18vd at 640 x 640 peaks at 1.86 GB RSS with
+              ShareHostOutputsByLiveness on (80 MB of weights); profile which
+              layers hold it (stem convs at 320 x 320, the valid-mask
+              TNNetCellMul table of 8400 x 256) and trim.
+        - [ ] OpenCL paths for TNNetMultiScaleDeformableAttention and
+              TNNetTopKGatherTokens (CPU only; the gather forces its sources to
+              RAM), with PoCL parity tests in the opencl suite.
+        - [ ] Training: contrastive denoising queries, the varifocal class loss
+              and the auxiliary per-layer losses (inference-only now; the
+              decoder computes only the last layer's class head).
+        - [ ] Unsupported config options raise: normalize_before = true,
+              learn_initial_query = true, use_timm_backbone; RT-DETRv2
+              (model_type rt_detr_v2: per-level point counts, discrete
+              sampling) is a separate importer.
 
 - [ ] Fuyu decoder-only multimodal importer (BuildFuyuFromSafeTensors[Ex],
       model_type "fuyu", e.g. adept/fuyu-8b). Architecturally DISTINCT from every

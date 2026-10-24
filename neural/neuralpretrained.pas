@@ -16982,6 +16982,75 @@ type
 function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
   Threshold: TNeuralFloat = 0.5): TDetrDetectionArray;
 
+// ===========================================================================
+// RT-DETR real-time object-detection import (HF model_type "rt_detr",
+// PekingU/rtdetr_r18vd .. rtdetr_r101vd). A ResNet-vd backbone (deep 3-conv
+// stem, average-pool shortcut downsample), the efficient hybrid encoder (AIFI
+// self-attention on the top map + an FPN/PAN of CSP-RepVGG blocks), top-K
+// query selection from the encoder proposals, and a decoder of multi-scale
+// deformable cross-attention (TNNetMultiScaleDeformableAttention) with
+// iterative box refinement. Inference only: no denoising queries.
+// ===========================================================================
+type
+  TRtDetrConfig = record
+    // backbone (nested "backbone_config", model_type "rt_detr_resnet")
+    BackboneEmbedSize: integer;            // embedding_size (stem width)
+    BackboneHiddenSizes: array of integer; // hidden_sizes
+    BackboneDepths: array of integer;      // depths
+    BackboneBottleneck: boolean;           // layer_type = "bottleneck"
+    BackboneOutIndices: array of integer;  // out_indices (1 = stage1)
+    DownsampleInFirstStage: boolean;
+    DownsampleInBottleneck: boolean;
+    BackboneActivation: string;            // hidden_act
+    NumChannels: integer;
+    // hybrid encoder
+    EncoderHiddenDim, EncoderLayers, EncoderHeads, EncoderFFNDim: integer;
+    EncoderInChannels: array of integer;
+    EncodeProjLayers: array of integer;
+    HiddenExpansion: TNeuralFloat;
+    EncoderActivation: string;             // encoder_activation_function
+    Activation: string;                    // activation_function (CNN neck)
+    PositionalTemperature: TNeuralFloat;
+    UsePositionEmbedding: boolean;         // eval_size is null
+    // decoder
+    DModel, NumQueries, DecoderLayers, DecoderHeads, DecoderFFNDim: integer;
+    DecoderInChannels: array of integer;
+    NumFeatureLevels, DecoderPoints: integer;
+    DecoderActivation: string;
+    NumLabels: integer;
+    ClassNames: array of string;           // id2label ('' when absent)
+    LayerNormEps, BatchNormEps: TNeuralFloat;
+    // input
+    ImageWidth, ImageHeight: integer;      // net input (multiple of 32)
+    ModelType: string;                     // 'rt_detr'
+  end;
+
+// Reads a HF RT-DETR config.json; missing backbone_config fields take the
+// RTDetrResNetConfig defaults (r50vd). The net input is ImageWidth x ImageHeight.
+function ReadRtDetrConfigFromJSONFile(const FileName: string;
+  ImageWidth: integer = 640; ImageHeight: integer = 640): TRtDetrConfig;
+
+function RtDetrConfigToString(const Config: TRtDetrConfig): string;
+
+// Input (ImageWidth, ImageHeight, 3) RGB in 0..1; output (NumQueries, 1,
+// NumLabels + 4) = transformers logits | pred_boxes (cxcywh in 0..1).
+function BuildRtDetrFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TRtDetrConfig; pTrainable: boolean = false): TNNet; overload;
+
+function BuildRtDetrFromSafeTensorsEx(const FileName: string;
+  const Config: TRtDetrConfig; pTrainable: boolean = false): TNNet;
+
+// Config is read from ConfigFileName ('' = "config.json" beside FileName).
+function BuildRtDetrFromSafeTensors(const FileName: string;
+  out Config: TRtDetrConfig; pTrainable: boolean = false;
+  const ConfigFileName: string = ''; ImageWidth: integer = 640;
+  ImageHeight: integer = 640): TNNet; overload;
+
+// post_process_object_detection: the MaxDetections (0 = NumQueries) best
+// sigmoid (query, class) scores above Threshold, best first, no NMS; cxcywh boxes.
+function DecodeRtDetrDetections(Output: TNNetVolume; NumLabels: integer;
+  Threshold: TNeuralFloat = 0.5; MaxDetections: integer = 0): TDetrDetectionArray;
+
 // ---------------------------------------------------------------------------
 // MASK2FORMER UNIVERSAL-SEGMENTATION IMPORT (HF "mask2former", e.g.
 // facebook/mask2former-swin-tiny-*-semantic) -- the repo's FIRST mask-
@@ -95914,6 +95983,826 @@ begin
     end;
   end;
   SetLength(Result, Cnt);
+end;
+
+// ===========================================================================
+// RT-DETR importer
+// ===========================================================================
+function ReadRtDetrConfigFromJSONFile(const FileName: string;
+  ImageWidth: integer; ImageHeight: integer): TRtDetrConfig;
+var
+  JsonText: TStringList;
+  Root, Field: TJSONData;
+  Obj, Backbone, Labels: TJSONObject;
+  OutFeatures: TJSONArray;
+  FeaturePos, MaxFeaturePos, LabelId: integer;
+
+  function FloatField(O: TJSONObject; const FieldName: string;
+    Default: TNeuralFloat): TNeuralFloat;
+  begin
+    if (O <> nil) and (O.Find(FieldName) is TJSONNumber) then
+      Result := O.Find(FieldName).AsFloat
+    else Result := Default;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('RT-DETR import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RT-DETR import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RT-DETR import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'rt_detr');
+    if Result.ModelType <> 'rt_detr' then
+      ImportError('RT-DETR import: config model_type is "' + Result.ModelType +
+        '", expected "rt_detr".');
+    if Obj.Get('use_timm_backbone', false) then
+      ImportError('RT-DETR import: use_timm_backbone is not supported.');
+    if Obj.Get('normalize_before', false) then
+      ImportError('RT-DETR import: normalize_before = true is not supported.');
+    if Obj.Get('learn_initial_query', false) then
+      ImportError('RT-DETR import: learn_initial_query = true is not supported.');
+    if not Obj.Get('with_box_refine', true) then
+      ImportError('RT-DETR import: with_box_refine = false is not supported.');
+    // ---- backbone (RTDetrResNetConfig defaults = the r50vd layout) ----
+    Field := Obj.Find('backbone_config');
+    if Field is TJSONObject then Backbone := TJSONObject(Field)
+    else Backbone := TJSONObject.Create;
+    try
+      if Backbone.Get('model_type', 'rt_detr_resnet') <> 'rt_detr_resnet' then
+        ImportError('RT-DETR import: backbone model_type "' +
+          Backbone.Get('model_type', '') + '" is not "rt_detr_resnet".');
+      Result.BackboneEmbedSize := Backbone.Get('embedding_size', 64);
+      Result.BackboneHiddenSizes := ReadJSONIntArray(Backbone, 'hidden_sizes',
+        [256, 512, 1024, 2048]);
+      Result.BackboneDepths := ReadJSONIntArray(Backbone, 'depths', [3, 4, 6, 3]);
+      Result.BackboneBottleneck :=
+        LowerCase(Backbone.Get('layer_type', 'bottleneck')) = 'bottleneck';
+      Result.BackboneActivation := Backbone.Get('hidden_act', 'relu');
+      Result.DownsampleInFirstStage :=
+        Backbone.Get('downsample_in_first_stage', false);
+      Result.DownsampleInBottleneck :=
+        Backbone.Get('downsample_in_bottleneck', false);
+      Result.NumChannels := Backbone.Get('num_channels', 3);
+      if Backbone.Find('out_indices') is TJSONArray then
+        Result.BackboneOutIndices := ReadJSONIntArray(Backbone, 'out_indices',
+          [2, 3, 4])
+      else if Backbone.Find('out_features') is TJSONArray then
+      begin
+        OutFeatures := TJSONArray(Backbone.Find('out_features'));
+        SetLength(Result.BackboneOutIndices, OutFeatures.Count);
+        MaxFeaturePos := OutFeatures.Count - 1;
+        for FeaturePos := 0 to MaxFeaturePos do
+          Result.BackboneOutIndices[FeaturePos] := StrToIntDef(
+            StringReplace(OutFeatures.Strings[FeaturePos], 'stage', '', []), 0);
+      end
+      else
+        Result.BackboneOutIndices := ReadJSONIntArray(Backbone, 'out_indices',
+          [2, 3, 4]);
+    finally
+      if Backbone <> Field then Backbone.Free;
+    end;
+    if Length(Result.BackboneDepths) <> Length(Result.BackboneHiddenSizes) then
+      ImportError('RT-DETR import: backbone hidden_sizes / depths length mismatch.');
+    // ---- hybrid encoder ----
+    Result.EncoderHiddenDim := Obj.Get('encoder_hidden_dim', 256);
+    Result.EncoderLayers := Obj.Get('encoder_layers', 1);
+    Result.EncoderHeads := Obj.Get('encoder_attention_heads', 8);
+    Result.EncoderFFNDim := Obj.Get('encoder_ffn_dim', 1024);
+    Result.EncoderInChannels := ReadJSONIntArray(Obj, 'encoder_in_channels',
+      [512, 1024, 2048]);
+    Result.EncodeProjLayers := ReadJSONIntArray(Obj, 'encode_proj_layers', [2]);
+    Result.HiddenExpansion := FloatField(Obj, 'hidden_expansion', 1.0);
+    Result.EncoderActivation := Obj.Get('encoder_activation_function', 'gelu');
+    Result.Activation := Obj.Get('activation_function', 'silu');
+    Result.PositionalTemperature :=
+      FloatField(Obj, 'positional_encoding_temperature', 10000);
+    Field := Obj.Find('eval_size');
+    Result.UsePositionEmbedding := (Field = nil) or (Field.JSONType = jtNull);
+    // ---- decoder ----
+    Result.DModel := Obj.Get('d_model', 256);
+    Result.NumQueries := Obj.Get('num_queries', 300);
+    Result.DecoderLayers := Obj.Get('decoder_layers', 6);
+    Result.DecoderHeads := Obj.Get('decoder_attention_heads', 8);
+    Result.DecoderFFNDim := Obj.Get('decoder_ffn_dim', 1024);
+    Result.DecoderInChannels := ReadJSONIntArray(Obj, 'decoder_in_channels',
+      [256, 256, 256]);
+    Result.NumFeatureLevels := Obj.Get('num_feature_levels', 3);
+    Result.DecoderPoints := Obj.Get('decoder_n_points', 4);
+    Result.DecoderActivation := Obj.Get('decoder_activation_function', 'relu');
+    Result.LayerNormEps := FloatField(Obj, 'layer_norm_eps', 0.00001);
+    Result.BatchNormEps := FloatField(Obj, 'batch_norm_eps', 0.00001);
+    Result.NumLabels := Obj.Get('num_labels', 0);
+    if (Result.NumLabels <= 0) and (Obj.Find('id2label') is TJSONObject) then
+      Result.NumLabels := TJSONObject(Obj.Find('id2label')).Count;
+    if Result.NumLabels <= 0 then Result.NumLabels := 80;
+    SetLength(Result.ClassNames, Result.NumLabels);
+    if Obj.Find('id2label') is TJSONObject then
+    begin
+      Labels := TJSONObject(Obj.Find('id2label'));
+      MaxFeaturePos := Labels.Count - 1;
+      for FeaturePos := 0 to MaxFeaturePos do
+      begin
+        LabelId := StrToIntDef(Labels.Names[FeaturePos], -1);
+        if (LabelId >= 0) and (LabelId < Result.NumLabels) then
+          Result.ClassNames[LabelId] := Labels.Items[FeaturePos].AsString;
+      end;
+    end;
+    Result.ImageWidth := ImageWidth;
+    Result.ImageHeight := ImageHeight;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RtDetrConfigToString(const Config: TRtDetrConfig): string;
+var
+  StagePos, MaxStagePos: integer;
+  Sizes, Depths: string;
+begin
+  Sizes := '';
+  Depths := '';
+  MaxStagePos := High(Config.BackboneHiddenSizes);
+  for StagePos := 0 to MaxStagePos do
+  begin
+    if StagePos > 0 then
+    begin
+      Sizes := Sizes + ',';
+      Depths := Depths + ',';
+    end;
+    Sizes := Sizes + IntToStr(Config.BackboneHiddenSizes[StagePos]);
+    Depths := Depths + IntToStr(Config.BackboneDepths[StagePos]);
+  end;
+  Result := 'rt_detr config: backbone ' +
+    BoolToStr(Config.BackboneBottleneck, 'bottleneck', 'basic') +
+    ' stages=[' + Sizes + '] depths=[' + Depths + ']' +
+    ', encoder hidden=' + IntToStr(Config.EncoderHiddenDim) +
+    ' layers=' + IntToStr(Config.EncoderLayers) +
+    ' expansion=' + FloatToStr(Config.HiddenExpansion) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', decoder=' + IntToStr(Config.DecoderLayers) + 'x' +
+    IntToStr(Config.DecoderHeads) + 'h/' + IntToStr(Config.NumFeatureLevels) +
+    ' levels/' + IntToStr(Config.DecoderPoints) + ' points' +
+    ', queries=' + IntToStr(Config.NumQueries) +
+    ', labels=' + IntToStr(Config.NumLabels) +
+    ', input=' + IntToStr(Config.ImageWidth) + 'x' + IntToStr(Config.ImageHeight);
+end;
+
+// The HF activation named Name (ACT2FN): relu, silu/swish, gelu (erf),
+// gelu_new / gelu_pytorch_tanh (tanh approximation).
+function RtDetrActivationLayer(const Name: string): TNNetLayer;
+begin
+  if Name = 'relu' then Result := TNNetReLU.Create()
+  else if (Name = 'silu') or (Name = 'swish') then Result := TNNetSiLU.Create()
+  else if Name = 'gelu' then Result := TNNetGELUErf.Create()
+  else if (Name = 'gelu_new') or (Name = 'gelu_pytorch_tanh') then
+    Result := TNNetGELU.Create()
+  else
+  begin
+    Result := nil;
+    ImportError('RT-DETR import: unsupported activation "' + Name + '".');
+  end;
+end;
+
+// RTDetrSinePositionEmbedding of a GridW x GridH map into a
+// TNNetLearnedPositionalEmbedding table: channels [sin y | cos y | sin x | cos x].
+procedure FillRtDetrSinePosEmbed(Layer: TNNetLayer; GridW, GridH,
+  Dim: integer; Temperature: TNeuralFloat);
+var
+  QuarterDim, X, Y, Channel, MaxX, MaxY, MaxChannel, TokenBase: integer;
+  Omega: array of double;
+  Table: TNNetVolume;
+begin
+  QuarterDim := Dim div 4;
+  if QuarterDim * 4 <> Dim then
+    ImportError('RT-DETR import: encoder_hidden_dim must be divisible by 4.');
+  Table := Layer.FArrNeurons[0].Weights;
+  if Table.Size <> GridW * GridH * Dim then
+    ImportError('RT-DETR import: position table size mismatch.');
+  SetLength(Omega, QuarterDim);
+  MaxChannel := QuarterDim - 1;
+  for Channel := 0 to MaxChannel do
+    Omega[Channel] := 1 / Power(Temperature, Channel / QuarterDim);
+  MaxX := GridW - 1;
+  MaxY := GridH - 1;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      TokenBase := (Y * GridW + X) * Dim;
+      for Channel := 0 to MaxChannel do
+      begin
+        Table.FData[TokenBase + Channel] := Sin(Y * Omega[Channel]);
+        Table.FData[TokenBase + QuarterDim + Channel] := Cos(Y * Omega[Channel]);
+        Table.FData[TokenBase + 2 * QuarterDim + Channel] := Sin(X * Omega[Channel]);
+        Table.FData[TokenBase + 3 * QuarterDim + Channel] := Cos(X * Omega[Channel]);
+      end;
+    end;
+  Layer.FlushWeightCache();
+end;
+
+function BuildRtDetrFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TRtDetrConfig; pTrainable: boolean): TNNet;
+const
+  csBackbonePrefix = 'model.backbone.model.';
+  csGridSize = 0.05;
+  csAnchorEps = 0.01;
+var
+  NN: TNNet;
+  StageOutputs, Features, Projected, FpnMaps, PanMaps, Sources: array of TNNetLayer;
+  LevelShapes: array of integer;
+  Previous, Shortcut, Branch, Tokens, Position, Queries, Keys, Values: TNNetLayer;
+  SourceFlat, Memory, EncoderOutput, EncoderClass, Anchors, Selected: TNNetLayer;
+  Hidden, Reference, QueryPosition, QueryKey, Attention, AttentionNorm: TNNetLayer;
+  OffsetsLogits, BoxDelta, Logits: TNNetLayer;
+  Stage, MaxStage, BlockPos, MaxBlockPos, InWidth, OutWidth, Stride: integer;
+  LevelPos, MaxLevelPos, LayerPos, MaxLayerPos, ProjPos, MaxProjPos: integer;
+  EncHidden, CspHidden, DModel, TokenCount, LevelWidth, LevelHeight: integer;
+  X, Y, MaxX, MaxY, Channel, TokenPos, SampleChannels: integer;
+  MaxStepPos, MaxSourcePos, MaxTokenPos, MaxChannel: integer;
+  BlockPrefix, Prefix: string;
+  AnchorValues: array[0..3] of TNeuralFloat;
+  AnchorTable: array of TNeuralFloat;
+  TokenValid: array of boolean;
+  AnchorValid, AnyInvalid: boolean;
+  Channels: array of integer;
+
+  function ActivationAfter(Source: TNNetLayer; const Name: string): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(
+      RtDetrActivationLayer(Name).SetTrainable(pTrainable), Source);
+  end;
+
+  // Conv (bias = folded BatchNorm) + optional activation ('' = none).
+  function AddConvNorm(Source: TNNetLayer; OutCh, InCh, KernelSize,
+    pStride: integer; const ConvWeight, NormPrefix: string; NormEps: TNeuralFloat;
+    const ActivationName: string): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(TNNetConvolutionLinear.Create(OutCh, KernelSize,
+      KernelSize div 2, pStride, 0).SetTrainable(pTrainable), Source);
+    LoadResNetConvFoldBN(Reader, Result, ConvWeight, NormPrefix, OutCh, InCh,
+      KernelSize, NormEps);
+    if ActivationName <> '' then Result := ActivationAfter(Result, ActivationName);
+  end;
+
+  // RTDetrResNetConvLayer: ".convolution" + ".normalization" (frozen, eps 1e-5).
+  function AddBackboneConv(Source: TNNetLayer; OutCh, InCh, KernelSize,
+    pStride: integer; const LayerPrefix: string; HasActivation: boolean): TNNetLayer;
+  var
+    ActivationName: string;
+  begin
+    if HasActivation then ActivationName := Config.BackboneActivation
+    else ActivationName := '';
+    Result := AddConvNorm(Source, OutCh, InCh, KernelSize, pStride,
+      LayerPrefix + '.convolution.weight', LayerPrefix + '.normalization',
+      0.00001, ActivationName);
+  end;
+
+  function AddLinear(Source: TNNetLayer; InDim, OutDim: integer;
+    const LinearPrefix: string): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(OutDim, 0)
+      .SetTrainable(pTrainable), Source);
+    LoadLlamaLinearWeights(Reader, Result, LinearPrefix + '.weight', InDim,
+      OutDim, 0, -1, 0, LinearPrefix + '.bias');
+  end;
+
+  function AddLayerNorm(Source: TNNetLayer; const NormPrefix: string): TNNetLayer;
+  begin
+    Result := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(Config.LayerNormEps)
+      .SetTrainable(pTrainable), Source);
+    LoadLayerNormWeights(Reader, Result, NormPrefix + '.weight',
+      NormPrefix + '.bias', Result.Output.Depth);
+  end;
+
+  // RTDetrMLPPredictionHead: ReLU between the Linear layers.
+  function AddMLPHead(Source: TNNetLayer; InDim, HiddenDim, OutDim,
+    LayerCount: integer; const HeadPrefix: string): TNNetLayer;
+  var
+    HeadLayer, MaxHeadLayer, LayerIn, LayerOut: integer;
+  begin
+    Result := Source;
+    MaxHeadLayer := LayerCount - 1;
+    LayerIn := InDim;
+    for HeadLayer := 0 to MaxHeadLayer do
+    begin
+      if HeadLayer = MaxHeadLayer then LayerOut := OutDim else LayerOut := HiddenDim;
+      Result := AddLinear(Result, LayerIn, LayerOut,
+        HeadPrefix + '.layers.' + IntToStr(HeadLayer));
+      if HeadLayer < MaxHeadLayer then
+        Result := ActivationAfter(Result, 'relu');
+      LayerIn := LayerOut;
+    end;
+  end;
+
+  // The transformers 5.x module name, or the legacy one the PekingU
+  // checkpoints store (out_proj, fc1, encoder.encoder).
+  function PickModule(const NewName, LegacyName: string): string;
+  begin
+    Result := SegPickName(Reader, NewName + '.weight', LegacyName + '.weight');
+    SetLength(Result, Length(Result) - Length('.weight'));
+  end;
+
+  // RTDetrSelfAttention + residual + post LayerNorm; QKSource = hidden + pos.
+  function AddSelfAttention(HiddenSource, QKSource: TNNetLayer; Dim,
+    Heads: integer; const AttnPrefix, NormPrefix: string): TNNetLayer;
+  begin
+    Queries := AddLinear(QKSource, Dim, Dim, AttnPrefix + 'q_proj');
+    Keys := AddLinear(QKSource, Dim, Dim, AttnPrefix + 'k_proj');
+    Values := AddLinear(HiddenSource, Dim, Dim, AttnPrefix + 'v_proj');
+    NN.AddLayer(TNNetDeepConcat.Create([Queries, Keys, Values])
+      .SetTrainable(pTrainable));
+    NN.AddLayer(TNNetFusedSDPA.Create(Heads, Heads, Dim div Heads)
+      .SetTrainable(pTrainable));
+    Result := AddLinear(NN.GetLastLayer(), Dim, Dim,
+      PickModule(AttnPrefix + 'o_proj', AttnPrefix + 'out_proj'));
+    Result := NN.AddLayer(TNNetSum.Create([Result, HiddenSource])
+      .SetTrainable(pTrainable));
+    Result := AddLayerNorm(Result, NormPrefix);
+  end;
+
+  // RTDetrMLP + residual + post LayerNorm.
+  function AddFeedForward(Source: TNNetLayer; Dim, FFNDim: integer;
+    const ActivationName, LayerPrefix: string): TNNetLayer;
+  begin
+    Result := AddLinear(Source, Dim, FFNDim,
+      PickModule(LayerPrefix + 'mlp.fc1', LayerPrefix + 'fc1'));
+    Result := ActivationAfter(Result, ActivationName);
+    Result := AddLinear(Result, FFNDim, Dim,
+      PickModule(LayerPrefix + 'mlp.fc2', LayerPrefix + 'fc2'));
+    Result := NN.AddLayer(TNNetSum.Create([Result, Source]).SetTrainable(pTrainable));
+    Result := AddLayerNorm(Result, LayerPrefix + 'final_layer_norm');
+  end;
+
+  // RTDetrCSPRepLayer: conv3(RepVGG^3(conv1(x)) + conv2(x)); every RepVGG
+  // block folds into one 3x3 conv (ReparamRepVGGBlock).
+  function AddCSPRepLayer(Source: TNNetLayer; const BlockPrefix: string): TNNetLayer;
+  var
+    RepPos: integer;
+    Main, Side: TNNetLayer;
+  begin
+    Main := AddConvNorm(Source, CspHidden, 2 * EncHidden, 1, 1,
+      BlockPrefix + 'conv1.conv.weight', BlockPrefix + 'conv1.norm',
+      Config.BatchNormEps, Config.Activation);
+    for RepPos := 0 to 2 do
+    begin
+      Main := NN.AddLayerAfter(TNNetConvolutionLinear.Create(CspHidden, 3, 1, 1, 0)
+        .SetTrainable(pTrainable), Main);
+      ReparamRepVGGBlock(Reader, Main, BlockPrefix + 'bottlenecks.' +
+        IntToStr(RepPos), CspHidden, CspHidden, {Has1x1=}true,
+        {HasIdentity=}false, Config.BatchNormEps, 'conv1', 'conv2', '', 'norm');
+      Main := ActivationAfter(Main, Config.Activation);
+    end;
+    Side := AddConvNorm(Source, CspHidden, 2 * EncHidden, 1, 1,
+      BlockPrefix + 'conv2.conv.weight', BlockPrefix + 'conv2.norm',
+      Config.BatchNormEps, Config.Activation);
+    Result := NN.AddLayer(TNNetSum.Create([Main, Side]).SetTrainable(pTrainable));
+    if CspHidden <> EncHidden then
+      Result := AddConvNorm(Result, EncHidden, CspHidden, 1, 1,
+        BlockPrefix + 'conv3.conv.weight', BlockPrefix + 'conv3.norm',
+        Config.BatchNormEps, Config.Activation);
+  end;
+
+begin
+  EncHidden := Config.EncoderHiddenDim;
+  DModel := Config.DModel;
+  CspHidden := Trunc(EncHidden * Config.HiddenExpansion + 1e-6);
+  if (Config.ImageWidth < 32) or (Config.ImageHeight < 32) or
+     ((Config.ImageWidth mod 32) <> 0) or ((Config.ImageHeight mod 32) <> 0) then
+    ImportError('RT-DETR import: the input size must be a multiple of 32, got ' +
+      IntToStr(Config.ImageWidth) + 'x' + IntToStr(Config.ImageHeight) + '.');
+  if (Length(Config.BackboneHiddenSizes) < 1) or
+     (Length(Config.BackboneOutIndices) <> Length(Config.EncoderInChannels)) then
+    ImportError('RT-DETR import: backbone out_indices and encoder_in_channels ' +
+      'must have the same length.');
+  if (EncHidden mod Config.EncoderHeads <> 0) or
+     (DModel mod Config.DecoderHeads <> 0) or (CspHidden < 1) then
+    ImportError('RT-DETR import: hidden sizes must divide by the head counts.');
+  if (Config.NumFeatureLevels < Length(Config.DecoderInChannels)) or
+     (Config.NumFeatureLevels > 5) or
+     (Length(Config.DecoderInChannels) <> Length(Config.EncoderInChannels)) then
+    ImportError('RT-DETR import: num_feature_levels must be in [' +
+      IntToStr(Length(Config.DecoderInChannels)) + ', 5] and ' +
+      'decoder_in_channels must have one entry per encoder level.');
+  MaxStage := High(Config.BackboneHiddenSizes);
+  SetLength(StageOutputs, MaxStage + 2);
+  NN := TNNet.Create();
+  try
+    if not pTrainable then NN.ShareHostOutputsByLiveness := true;
+    Previous := NN.AddLayer(TNNetInput.Create(Config.ImageWidth,
+      Config.ImageHeight, Config.NumChannels).SetTrainable(pTrainable));
+    // ---- ResNet-vd backbone: deep stem, max-pool, stages ----
+    Prefix := csBackbonePrefix + 'embedder.embedder.';
+    Previous := AddBackboneConv(Previous, Config.BackboneEmbedSize div 2,
+      Config.NumChannels, 3, 2, Prefix + '0', true);
+    Previous := AddBackboneConv(Previous, Config.BackboneEmbedSize div 2,
+      Config.BackboneEmbedSize div 2, 3, 1, Prefix + '1', true);
+    Previous := AddBackboneConv(Previous, Config.BackboneEmbedSize,
+      Config.BackboneEmbedSize div 2, 3, 1, Prefix + '2', true);
+    Previous := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(3, 2, 1)
+      .SetTrainable(pTrainable), Previous);
+    StageOutputs[0] := Previous;
+    InWidth := Config.BackboneEmbedSize;
+    for Stage := 0 to MaxStage do
+    begin
+      OutWidth := Config.BackboneHiddenSizes[Stage];
+      MaxBlockPos := Config.BackboneDepths[Stage] - 1;
+      for BlockPos := 0 to MaxBlockPos do
+      begin
+        BlockPrefix := csBackbonePrefix + 'encoder.stages.' + IntToStr(Stage) +
+          '.layers.' + IntToStr(BlockPos) + '.';
+        Stride := 1;
+        if (BlockPos = 0) and ((Stage > 0) or Config.DownsampleInFirstStage) then
+          Stride := 2;
+        Shortcut := Previous;
+        if not Config.BackboneBottleneck then
+        begin
+          // RTDetrResNetBasicLayer; only a stage's first block has a shortcut.
+          Branch := AddBackboneConv(Previous, OutWidth, InWidth, 3, Stride,
+            BlockPrefix + 'layer.0', true);
+          Branch := AddBackboneConv(Branch, OutWidth, OutWidth, 3, 1,
+            BlockPrefix + 'layer.1', false);
+          if (BlockPos = 0) and (InWidth <> OutWidth) then
+          begin
+            if Stride <> 2 then
+              ImportError('RT-DETR import: a basic block that widens must ' +
+                'downsample (stage ' + IntToStr(Stage) + ').');
+            Shortcut := NN.AddLayerAfter(TNNetAvgPool.Create(2)
+              .SetTrainable(pTrainable), Previous);
+            Shortcut := AddBackboneConv(Shortcut, OutWidth, InWidth, 1, 1,
+              BlockPrefix + 'shortcut.1', false);
+          end
+          else if BlockPos = 0 then
+            Shortcut := AddBackboneConv(Previous, OutWidth, InWidth, 1, Stride,
+              BlockPrefix + 'shortcut', false);
+        end
+        else
+        begin
+          // RTDetrResNetBottleNeckLayer; stride on the 3x3 unless
+          // downsample_in_bottleneck moves it to the first 1x1.
+          if Config.DownsampleInBottleneck then
+            Branch := AddBackboneConv(Previous, OutWidth div 4, InWidth, 1,
+              Stride, BlockPrefix + 'layer.0', true)
+          else
+            Branch := AddBackboneConv(Previous, OutWidth div 4, InWidth, 1, 1,
+              BlockPrefix + 'layer.0', true);
+          if Config.DownsampleInBottleneck then
+            Branch := AddBackboneConv(Branch, OutWidth div 4, OutWidth div 4, 3,
+              1, BlockPrefix + 'layer.1', true)
+          else
+            Branch := AddBackboneConv(Branch, OutWidth div 4, OutWidth div 4, 3,
+              Stride, BlockPrefix + 'layer.1', true);
+          Branch := AddBackboneConv(Branch, OutWidth, OutWidth div 4, 1, 1,
+            BlockPrefix + 'layer.2', false);
+          if Stride = 2 then
+          begin
+            Shortcut := NN.AddLayerAfter(TNNetAvgPool.Create(2)
+              .SetTrainable(pTrainable), Previous);
+            Shortcut := AddBackboneConv(Shortcut, OutWidth, InWidth, 1, 1,
+              BlockPrefix + 'shortcut.1', false);
+          end
+          else if InWidth <> OutWidth then
+            Shortcut := AddBackboneConv(Previous, OutWidth, InWidth, 1, 1,
+              BlockPrefix + 'shortcut', false);
+        end;
+        Previous := NN.AddLayer(TNNetSum.Create([Branch, Shortcut])
+          .SetTrainable(pTrainable));
+        Previous := ActivationAfter(Previous, Config.BackboneActivation);
+        InWidth := OutWidth;
+      end;
+      StageOutputs[Stage + 1] := Previous;
+    end;
+    // ---- encoder input projections (1x1 conv + BatchNorm) ----
+    MaxLevelPos := High(Config.BackboneOutIndices);
+    SetLength(Features, MaxLevelPos + 1);
+    SetLength(Projected, MaxLevelPos + 1);
+    for LevelPos := 0 to MaxLevelPos do
+    begin
+      if (Config.BackboneOutIndices[LevelPos] < 0) or
+         (Config.BackboneOutIndices[LevelPos] > MaxStage + 1) then
+        ImportError('RT-DETR import: backbone out index out of range.');
+      Features[LevelPos] := StageOutputs[Config.BackboneOutIndices[LevelPos]];
+      if Features[LevelPos].Output.Depth <> Config.EncoderInChannels[LevelPos] then
+        ImportError('RT-DETR import: encoder_in_channels[' + IntToStr(LevelPos) +
+          '] = ' + IntToStr(Config.EncoderInChannels[LevelPos]) +
+          ' but the backbone gives ' + IntToStr(Features[LevelPos].Output.Depth));
+      Prefix := 'model.encoder_input_proj.' + IntToStr(LevelPos) + '.';
+      Projected[LevelPos] := AddConvNorm(Features[LevelPos], EncHidden,
+        Config.EncoderInChannels[LevelPos], 1, 1, Prefix + '0.weight',
+        Prefix + '1', 0.00001, '');
+    end;
+    // ---- AIFI: transformer encoder on the selected maps ----
+    MaxProjPos := High(Config.EncodeProjLayers);
+    MaxLayerPos := Config.EncoderLayers - 1;
+    for ProjPos := 0 to MaxProjPos do
+    begin
+      LevelPos := Config.EncodeProjLayers[ProjPos];
+      if (LevelPos < 0) or (LevelPos > MaxLevelPos) then
+        ImportError('RT-DETR import: encode_proj_layers entry out of range.');
+      LevelWidth := Projected[LevelPos].Output.SizeX;
+      LevelHeight := Projected[LevelPos].Output.SizeY;
+      TokenCount := LevelWidth * LevelHeight;
+      Tokens := NN.AddLayerAfter(TNNetReshape.Create(TokenCount, 1, EncHidden)
+        .SetTrainable(pTrainable), Projected[LevelPos]);
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        Prefix := PickModule('model.encoder.aifi.' + IntToStr(ProjPos) +
+          '.layers.' + IntToStr(LayerPos) + '.self_attn.q_proj',
+          'model.encoder.encoder.' + IntToStr(ProjPos) + '.layers.' +
+          IntToStr(LayerPos) + '.self_attn.q_proj');
+        SetLength(Prefix, Length(Prefix) - Length('self_attn.q_proj'));
+        Position := Tokens;
+        if Config.UsePositionEmbedding then
+        begin
+          Position := NN.AddLayerAfter(TNNetLearnedPositionalEmbedding.Create(
+            TokenCount).SetTrainable(pTrainable), Tokens);
+          FillRtDetrSinePosEmbed(Position, LevelWidth, LevelHeight, EncHidden,
+            Config.PositionalTemperature);
+        end;
+        Tokens := AddSelfAttention(Tokens, Position, EncHidden,
+          Config.EncoderHeads, Prefix + 'self_attn.', Prefix + 'self_attn_layer_norm');
+        Tokens := AddFeedForward(Tokens, EncHidden, Config.EncoderFFNDim,
+          Config.EncoderActivation, Prefix);
+      end;
+      Projected[LevelPos] := NN.AddLayerAfter(TNNetReshape.Create(LevelWidth,
+        LevelHeight, EncHidden).SetTrainable(pTrainable), Tokens);
+    end;
+    // ---- top-down FPN ----
+    MaxStepPos := MaxLevelPos - 1;
+    SetLength(FpnMaps, 1);
+    FpnMaps[0] := Projected[MaxLevelPos];
+    for LevelPos := 0 to MaxStepPos do
+    begin
+      Prefix := 'model.encoder.';
+      FpnMaps[High(FpnMaps)] := AddConvNorm(FpnMaps[High(FpnMaps)], EncHidden,
+        EncHidden, 1, 1, Prefix + 'lateral_convs.' + IntToStr(LevelPos) +
+        '.conv.weight', Prefix + 'lateral_convs.' + IntToStr(LevelPos) + '.norm',
+        Config.BatchNormEps, Config.Activation);
+      Previous := NN.AddLayerAfter(TNNetDeMaxPool.Create(2)
+        .SetTrainable(pTrainable), FpnMaps[High(FpnMaps)]);
+      Previous := NN.AddLayer(TNNetDeepConcat.Create([Previous,
+        Projected[MaxLevelPos - 1 - LevelPos]]).SetTrainable(pTrainable));
+      SetLength(FpnMaps, Length(FpnMaps) + 1);
+      FpnMaps[High(FpnMaps)] := AddCSPRepLayer(Previous,
+        Prefix + 'fpn_blocks.' + IntToStr(LevelPos) + '.');
+    end;
+    // ---- bottom-up PAN (FpnMaps read in reverse: highest resolution first) ----
+    SetLength(PanMaps, MaxLevelPos + 1);
+    PanMaps[0] := FpnMaps[MaxLevelPos];
+    for LevelPos := 0 to MaxStepPos do
+    begin
+      Prefix := 'model.encoder.';
+      Previous := AddConvNorm(PanMaps[LevelPos], EncHidden, EncHidden, 3, 2,
+        Prefix + 'downsample_convs.' + IntToStr(LevelPos) + '.conv.weight',
+        Prefix + 'downsample_convs.' + IntToStr(LevelPos) + '.norm',
+        Config.BatchNormEps, Config.Activation);
+      Previous := NN.AddLayer(TNNetDeepConcat.Create([Previous,
+        FpnMaps[MaxLevelPos - 1 - LevelPos]]).SetTrainable(pTrainable));
+      PanMaps[LevelPos + 1] := AddCSPRepLayer(Previous,
+        Prefix + 'pan_blocks.' + IntToStr(LevelPos) + '.');
+    end;
+    // ---- decoder input projections, flattened and concatenated ----
+    SetLength(Sources, Config.NumFeatureLevels);
+    SetLength(LevelShapes, 2 * Config.NumFeatureLevels);
+    TokenCount := 0;
+    MaxSourcePos := Config.NumFeatureLevels - 1;
+    for LevelPos := 0 to MaxSourcePos do
+    begin
+      Prefix := 'model.decoder_input_proj.' + IntToStr(LevelPos) + '.';
+      if LevelPos <= MaxLevelPos then
+        Previous := AddConvNorm(PanMaps[LevelPos], DModel,
+          Config.DecoderInChannels[LevelPos], 1, 1, Prefix + '0.weight',
+          Prefix + '1', Config.BatchNormEps, '')
+      else
+        // Every extra level is a 3x3/2 conv of the last PAN map.
+        Previous := AddConvNorm(PanMaps[MaxLevelPos], DModel,
+          PanMaps[MaxLevelPos].Output.Depth, 3, 2, Prefix + '0.weight',
+          Prefix + '1', Config.BatchNormEps, '');
+      LevelShapes[2 * LevelPos] := Previous.Output.SizeY;
+      LevelShapes[2 * LevelPos + 1] := Previous.Output.SizeX;
+      Inc(TokenCount, Previous.Output.SizeX * Previous.Output.SizeY);
+      Sources[LevelPos] := NN.AddLayerAfter(TNNetReshape.Create(
+        Previous.Output.SizeX * Previous.Output.SizeY, 1, DModel)
+        .SetTrainable(pTrainable), Previous);
+    end;
+    if Config.NumFeatureLevels > 1 then
+      SourceFlat := NN.AddLayer(TNNetConcat.Create(TokenCount, 1, DModel, Sources)
+        .SetTrainable(pTrainable))
+    else SourceFlat := Sources[0];
+    // ---- query selection: anchors, valid mask, encoder heads, top-K ----
+    // generate_anchors: per level centres + 0.05 * 2^level sizes, in logit
+    // space; a token whose anchor leaves (0.01, 0.99) is masked out.
+    SetLength(AnchorTable, TokenCount * 4);
+    SetLength(TokenValid, TokenCount);
+    AnyInvalid := false;
+    TokenPos := 0;
+    for LevelPos := 0 to MaxSourcePos do
+    begin
+      LevelHeight := LevelShapes[2 * LevelPos];
+      LevelWidth := LevelShapes[2 * LevelPos + 1];
+      MaxX := LevelWidth - 1;
+      MaxY := LevelHeight - 1;
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
+        begin
+          AnchorValues[0] := (X + 0.5) / LevelWidth;
+          AnchorValues[1] := (Y + 0.5) / LevelHeight;
+          AnchorValues[2] := csGridSize * (1 shl LevelPos);
+          AnchorValues[3] := AnchorValues[2];
+          AnchorValid := true;
+          for Channel := 0 to 3 do
+            AnchorValid := AnchorValid and (AnchorValues[Channel] > csAnchorEps)
+              and (AnchorValues[Channel] < 1 - csAnchorEps);
+          TokenValid[TokenPos] := AnchorValid;
+          AnyInvalid := AnyInvalid or not AnchorValid;
+          for Channel := 0 to 3 do
+            if AnchorValid then
+              AnchorTable[TokenPos * 4 + Channel] := Ln(AnchorValues[Channel] /
+                (1 - AnchorValues[Channel]))
+            else
+              AnchorTable[TokenPos * 4 + Channel] := MaxSingle;
+          Inc(TokenPos);
+        end;
+    end;
+    Memory := SourceFlat;
+    if AnyInvalid then
+    begin
+      Memory := NN.AddLayerAfter(TNNetCellMul.Create().SetTrainable(pTrainable),
+        SourceFlat);
+      Memory.FArrNeurons[0].Weights.Fill(1);
+      MaxTokenPos := TokenCount - 1;
+      for TokenPos := 0 to MaxTokenPos do
+        if not TokenValid[TokenPos] then
+          FillChar(Memory.FArrNeurons[0].Weights.FData[TokenPos * DModel],
+            DModel * csNeuralFloatSize, 0);
+      Memory.FlushWeightCache();
+    end;
+    EncoderOutput := AddLinear(Memory, DModel, DModel, 'model.enc_output.0');
+    EncoderOutput := AddLayerNorm(EncoderOutput, 'model.enc_output.1');
+    EncoderClass := AddLinear(EncoderOutput, DModel, Config.NumLabels,
+      'model.enc_score_head');
+    BoxDelta := AddMLPHead(EncoderOutput, DModel, DModel, 4, 3,
+      'model.enc_bbox_head');
+    Anchors := NN.AddLayerAfter(TNNetCellBias.Create().SetTrainable(pTrainable),
+      BoxDelta);
+    Move(AnchorTable[0], Anchors.FArrNeurons[0].Weights.FData[0],
+      TokenCount * 4 * csNeuralFloatSize);
+    Anchors.FlushWeightCache();
+    NN.AddLayer(TNNetDeepConcat.Create([EncoderOutput, Anchors])
+      .SetTrainable(pTrainable));
+    Selected := NN.AddLayer(TNNetTopKGatherTokens.Create(Config.NumQueries,
+      EncoderClass).SetTrainable(pTrainable));
+    SetLength(Channels, DModel);
+    MaxChannel := DModel - 1;
+    for Channel := 0 to MaxChannel do Channels[Channel] := Channel;
+    Hidden := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels)
+      .SetTrainable(pTrainable), Selected);
+    Reference := NN.AddLayerAfter(TNNetSplitChannels.Create(
+      [DModel, DModel + 1, DModel + 2, DModel + 3]).SetTrainable(pTrainable),
+      Selected);
+    Reference := NN.AddLayerAfter(TNNetSigmoid.Create().SetTrainable(pTrainable),
+      Reference);
+    // ---- decoder with iterative box refinement ----
+    SampleChannels := Config.DecoderHeads * Config.NumFeatureLevels *
+      Config.DecoderPoints;
+    MaxLayerPos := Config.DecoderLayers - 1;
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Prefix := 'model.decoder.layers.' + IntToStr(LayerPos) + '.';
+      QueryPosition := AddMLPHead(Reference, 4, 2 * DModel, DModel, 2,
+        'model.decoder.query_pos_head');
+      QueryKey := NN.AddLayer(TNNetSum.Create([Hidden, QueryPosition])
+        .SetTrainable(pTrainable));
+      AttentionNorm := AddSelfAttention(Hidden, QueryKey, DModel,
+        Config.DecoderHeads, Prefix + 'self_attn.', Prefix + 'self_attn_layer_norm');
+      QueryKey := NN.AddLayer(TNNetSum.Create([AttentionNorm, QueryPosition])
+        .SetTrainable(pTrainable));
+      Values := AddLinear(SourceFlat, DModel, DModel,
+        Prefix + 'encoder_attn.value_proj');
+      OffsetsLogits := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+        3 * SampleChannels, 0).SetTrainable(pTrainable), QueryKey);
+      LoadLlamaLinearWeights(Reader, OffsetsLogits,
+        Prefix + 'encoder_attn.sampling_offsets.weight', DModel,
+        2 * SampleChannels, 0, 3 * SampleChannels, 0,
+        Prefix + 'encoder_attn.sampling_offsets.bias');
+      LoadLlamaLinearWeights(Reader, OffsetsLogits,
+        Prefix + 'encoder_attn.attention_weights.weight', DModel,
+        SampleChannels, 2 * SampleChannels, 3 * SampleChannels, 0,
+        Prefix + 'encoder_attn.attention_weights.bias');
+      Attention := NN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(
+        Config.DecoderHeads, Config.DecoderPoints, LevelShapes, Values,
+        Reference).SetTrainable(pTrainable), OffsetsLogits);
+      Attention := AddLinear(Attention, DModel, DModel,
+        Prefix + 'encoder_attn.output_proj');
+      Attention := NN.AddLayer(TNNetSum.Create([Attention, AttentionNorm])
+        .SetTrainable(pTrainable));
+      Attention := AddLayerNorm(Attention, Prefix + 'encoder_attn_layer_norm');
+      Hidden := AddFeedForward(Attention, DModel, Config.DecoderFFNDim,
+        Config.DecoderActivation, Prefix);
+      BoxDelta := AddMLPHead(Hidden, DModel, DModel, 4, 3,
+        'model.decoder.bbox_embed.' + IntToStr(LayerPos));
+      Previous := NN.AddLayerAfter(TNNetInverseSigmoid.Create()
+        .SetTrainable(pTrainable), Reference);
+      NN.AddLayer(TNNetSum.Create([BoxDelta, Previous]).SetTrainable(pTrainable));
+      Reference := NN.AddLayer(TNNetSigmoid.Create().SetTrainable(pTrainable));
+    end;
+    Logits := AddLinear(Hidden, DModel, Config.NumLabels,
+      'model.decoder.class_embed.' + IntToStr(MaxLayerPos));
+    NN.AddLayer(TNNetDeepConcat.Create([Logits, Reference])
+      .SetTrainable(pTrainable));
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRtDetrFromSafeTensorsEx(const FileName: string;
+  const Config: TRtDetrConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRtDetrFromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRtDetrFromSafeTensors(const FileName: string;
+  out Config: TRtDetrConfig; pTrainable: boolean;
+  const ConfigFileName: string; ImageWidth: integer;
+  ImageHeight: integer): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRtDetrConfigFromJSONFile(ConfigPath, ImageWidth, ImageHeight);
+  Result := BuildRtDetrFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+function DecodeRtDetrDetections(Output: TNNetVolume; NumLabels: integer;
+  Threshold: TNeuralFloat; MaxDetections: integer): TDetrDetectionArray;
+var
+  QueryCount, CandidateCount, KeepCount, QueryPos, MaxQueryPos: integer;
+  RankPos, MaxRankPos, Candidate, BoxPos, DetectionCount: integer;
+  Logits, TopLogits: array of TNeuralFloat;
+  TopCandidates: array of integer;
+  Kept: array of boolean;
+  Score: TNeuralFloat;
+begin
+  Result := nil;
+  QueryCount := Output.SizeX;
+  if Output.Depth <> NumLabels + 4 then
+    raise Exception.Create('DecodeRtDetrDetections: output depth ' +
+      IntToStr(Output.Depth) + ' <> NumLabels + 4.');
+  CandidateCount := QueryCount * NumLabels;
+  KeepCount := MaxDetections;
+  if KeepCount <= 0 then KeepCount := QueryCount;
+  if KeepCount > CandidateCount then KeepCount := CandidateCount;
+  // Ranked on the raw logits: the sigmoid is monotonic.
+  SetLength(Logits, CandidateCount);
+  MaxQueryPos := QueryCount - 1;
+  for QueryPos := 0 to MaxQueryPos do
+    Move(Output.FData[QueryPos * Output.Depth], Logits[QueryPos * NumLabels],
+      NumLabels * csNeuralFloatSize);
+  SetLength(Kept, CandidateCount);
+  SetLength(TopCandidates, KeepCount);
+  SetLength(TopLogits, KeepCount);
+  NeuralMarkTopK(@Logits[0], nil, 0, 1, CandidateCount, KeepCount, Kept,
+    TopCandidates, TopLogits);
+  SetLength(Result, KeepCount);
+  DetectionCount := 0;
+  MaxRankPos := KeepCount - 1;
+  for RankPos := 0 to MaxRankPos do
+  begin
+    Score := 1 / (1 + NeuralExp(-TopLogits[RankPos]));
+    if not (Score > Threshold) then break;
+    Candidate := TopCandidates[RankPos];
+    BoxPos := (Candidate div NumLabels) * Output.Depth + NumLabels;
+    Result[DetectionCount].ClassId := Candidate mod NumLabels;
+    Result[DetectionCount].Score := Score;
+    Result[DetectionCount].Cx := Output.FData[BoxPos];
+    Result[DetectionCount].Cy := Output.FData[BoxPos + 1];
+    Result[DetectionCount].W := Output.FData[BoxPos + 2];
+    Result[DetectionCount].H := Output.FData[BoxPos + 3];
+    Inc(DetectionCount);
+  end;
+  SetLength(Result, DetectionCount);
 end;
 
 // ===========================================================================
