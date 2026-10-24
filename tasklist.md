@@ -2289,15 +2289,17 @@ rather than acted on.
       stage; then a real 432x240 clip on the user's box, frames processed in
       chunks under the 2 GB agent cap.
 - [ ] `TNNetDeformableConv` external-offset mode follow-ups:
-      - [ ] torchvision parity fixture: torchvision is not installed in the ~/x
-            venv, so the parity test compares against a Pascal transcription of
-            the torchvision CPU kernel; add a tools/ fixture script and a
-            .safetensors check once torchvision is available.
+      - [X] torchvision parity fixture: tools/deform_conv2d_tiny_fixture.py
+            writes tests/fixtures/deform_conv2d_tiny.safetensors (7243293e);
+            it now also covers dilation 2 and 2 weight groups.
       - [ ] OpenCL bilinear gather: only the patch x weight GEMM runs on the
             device; the per-tap gather (both modes) runs on the CPU and the
             sources are downloaded each forward.
-      - [ ] Not supported yet: OpenCL backward, dilation > 1, weight groups
-            (deform_conv2d with `groups` > 1).
+      - [ ] Not supported yet: OpenCL backward. Dilation > 1 and weight
+            groups (deform_conv2d `groups` > 1) work in both modes, CPU forward
+            and backward; the OpenCL forward runs weight groups as a
+            block-diagonal dense GEMM (zeros between groups), so it does
+            WeightGroups times the needed multiply-adds.
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on

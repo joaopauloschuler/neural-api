@@ -46,7 +46,8 @@ type
     // Finite-difference checks of the external-offset TNNetDeformableConv:
     // input, main weights, bias, offset source and (optionally) mask source.
     procedure CheckExternalDeformableConvGradients(pOffsetGroups, pStride: integer;
-      pUseMask: boolean);
+      pUseMask: boolean; pDilation: integer = 1; pWeightGroups: integer = 1;
+      pInDepth: integer = 4; pFeatures: integer = 3);
     // OnAttentionProbabilities hook of TestAttentionProbabilitiesHook: one-hot
     // on the first key.
     procedure AttentionToFirstKey(Layer: TNNetLayer; Probabilities: TNNetVolume);
@@ -452,7 +453,14 @@ type
     procedure TestDeformableConvExternalGradientsOneGroupMask;
     procedure TestDeformableConvExternalGradientsTwoGroups;
     procedure TestDeformableConvExternalGradientsTwoGroupsMask;
+    procedure TestDeformableConvExternalGradientsDilation;
+    procedure TestDeformableConvExternalGradientsWeightGroups;
+    procedure TestDeformableConvExternalGradientsDilationWeightGroups;
+    // Self-offset mode with dilation 2 and 2 weight groups: input, main and
+    // offset-head gradients against finite differences.
+    procedure TestDeformableConvDilatedGroupedGradientCheck;
     procedure TestDeformableConvExternalSerializationRoundTrip;
+    procedure TestDeformableConvDilatedGroupedSerializationRoundTrip;
     procedure TestDeformableConvExternalOpenCLParity;
     procedure TestGroupConvP4OpenCLParity;
     // OpenCL per-output-pixel bilinear-gather forward offload parity (vs CPU)
@@ -68908,6 +68916,107 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestDeformableConvDilatedGroupedGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  DC: TNNetDeformableConv;
+  epsilon, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure RunBackward();
+  begin
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    DC.ClearDeltas;
+    NN.Backpropagate(Desired);
+  end;
+
+  // Every Step-th entry of V; Grad holds the analytic gradient (Sign = -1 for
+  // neuron deltas, which carry -lr*grad).
+  procedure CheckVolume(const AName: string; V, Grad: TNNetVolume;
+    Sign: TNeuralFloat; Step: integer);
+  var
+    j: integer;
+    Saved, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  begin
+    j := 0;
+    while j < V.Size do
+    begin
+      Saved := V.Raw[j];
+      V.Raw[j] := Saved + epsilon;
+      lossPlus := ComputeLoss();
+      V.Raw[j] := Saved - epsilon;
+      lossMinus := ComputeLoss();
+      V.Raw[j] := Saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      RunBackward();
+      analyticalGrad := Sign * Grad.Raw[j];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('DeformableConv dilated grouped ' + AName + ' gradient at ' +
+        IntToStr(j) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      Inc(j, Step);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 5, 4);
+  Desired := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(6, 5, 4, 1));
+    // 4 features, 3x3, pad 2, stride 1, modulated, dilation 2, 2 weight groups.
+    DC := TNNetDeformableConv.Create(4, 3, 2, 1, 0, 1, 2, 2);
+    NN.AddLayer(DC);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    AssertEquals('dilated output SizeX', 6, DC.Output.SizeX);
+    AssertEquals('dilated output SizeY', 5, DC.Output.SizeY);
+    AssertEquals('grouped main kernel size', 9 * 2 * 4, DC.Neurons[0].Weights.Size);
+    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.013 * i;
+    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+      DC.Neurons[2].Weights.Raw[i] := 0.01 * Sin(i * 0.7);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.5;
+    // Targets near the output keep the loss small, so its float32 rounding
+    // stays well below the finite-difference signal.
+    NN.Compute(Input);
+    Desired := TNNetVolume.Create(DC.Output);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Desired.Raw[i] + 0.3 * Cos(i * 0.31);
+    epsilon := 0.001;
+    maxErr := 0;
+    CheckVolume('input', Input, NN.Layers[0].OutputError, 1, 1);
+    CheckVolume('weight', DC.Neurons[0].Weights, DC.Neurons[0].Delta, -1, 1);
+    CheckVolume('bias', DC.Neurons[1].Weights, DC.Neurons[1].Delta, -1, 1);
+    CheckVolume('offset weight', DC.Neurons[2].Weights, DC.Neurons[2].Delta, -1, 7);
+    CheckVolume('offset bias', DC.Neurons[3].Weights, DC.Neurons[3].Delta, -1, 1);
+    WriteLn('  DeformableConv dilated grouped gradient check max-abs-error: ',
+      maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestDeformableConvShapeInference;
 var
   NN: TNNet;
@@ -71166,28 +71275,25 @@ end;
 {$ENDIF}
 
 // --- TNNetDeformableConv external offsets / mask ----------------------------
-// Builds image -> TNNetDeformableConv(K=3, pad 1) with the offsets (and the
+// Builds image -> TNNetDeformableConv(K=3) with the offsets (and the
 // optional mask) supplied by two extra TNNetInput branches (layers 1 and 2).
 function BuildExternalDeformableNet(NN: TNNet; InW, InH, InD, Features,
   Stride, Groups: integer; UseMask: boolean;
-  out ImgIn, OffIn, MaskIn: TNNetLayer): TNNetDeformableConv;
+  out ImgIn, OffIn, MaskIn: TNNetLayer; Padding: integer = 1;
+  Dilation: integer = 1; WeightGroups: integer = 1): TNNetDeformableConv;
 var
-  OutW, OutH: integer;
+  OutW, OutH, KernelExtent: integer;
 begin
-  OutW := (InW + 2 - 3) div Stride + 1;
-  OutH := (InH + 2 - 3) div Stride + 1;
+  KernelExtent := Dilation * 2 + 1;
+  OutW := (InW + 2 * Padding - KernelExtent) div Stride + 1;
+  OutH := (InH + 2 * Padding - KernelExtent) div Stride + 1;
   ImgIn := NN.AddLayer(TNNetInput.Create(InW, InH, InD, 1));
   OffIn := NN.AddLayerAfter(TNNetInput.Create(OutW, OutH, 2 * Groups * 9, 1), 0);
   MaskIn := nil;
   if UseMask then
-  begin
     MaskIn := NN.AddLayerAfter(TNNetInput.Create(OutW, OutH, Groups * 9, 1), 0);
-    Result := TNNetDeformableConv.Create(Features, 3, 1, Stride, 0, OffIn,
-      MaskIn, Groups);
-  end
-  else
-    Result := TNNetDeformableConv.Create(Features, 3, 1, Stride, 0, OffIn,
-      nil, Groups);
+  Result := TNNetDeformableConv.Create(Features, 3, Padding, Stride, 0, OffIn,
+    MaskIn, Groups, Dilation, WeightGroups);
   NN.AddLayerAfter(Result, ImgIn);
 end;
 
@@ -71254,7 +71360,7 @@ var
   Reader: TNNetSafeTensorsReader;
   Loaded: TNNetVolume;
   FixtureFile, Tag, OutName: string;
-  Stride, UseMaskInt: integer;
+  Stride, UseMaskInt, CaseIdx: integer;
   MaxDiff: TNeuralFloat;
 
   // Copies the flat fixture tensor into Dest, whose raw order it already has.
@@ -71306,6 +71412,45 @@ begin
         NN.Free;
       end;
     end;
+    // Dilation / weight-group cases: (stride, padding, offset groups,
+    // dilation, weight groups) per tag, see the fixture script.
+    for CaseIdx := 0 to 2 do
+    for UseMaskInt := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      try
+        case CaseIdx of
+          0: begin Tag := 'd2.'; DC := BuildExternalDeformableNet(NN, 7, 6, 4, 6,
+               1, 2, UseMaskInt = 1, ImgIn, OffIn, MaskIn, 2, 2, 1); end;
+          1: begin Tag := 'wg2.'; DC := BuildExternalDeformableNet(NN, 7, 6, 4, 6,
+               1, 1, UseMaskInt = 1, ImgIn, OffIn, MaskIn, 1, 1, 2); end;
+        else begin Tag := 'd2wg2.'; DC := BuildExternalDeformableNet(NN, 7, 6, 4, 6,
+               2, 4, UseMaskInt = 1, ImgIn, OffIn, MaskIn, 1, 2, 2); end;
+        end;
+        LoadInto('input', ImgIn.Output);
+        LoadInto(Tag + 'weight', DC.Neurons[0].Weights);
+        LoadInto('bias', DC.Neurons[1].Weights);
+        LoadInto(Tag + 'offset', OffIn.Output);
+        if UseMaskInt = 1 then
+        begin
+          LoadInto(Tag + 'mask', MaskIn.Output);
+          OutName := Tag + 'out_mask';
+        end
+        else
+          OutName := Tag + 'out_nomask';
+        NN.Compute(ImgIn.Output);
+        Reader.LoadTensorFlat(OutName, Loaded);
+        AssertEquals(OutName + ' element count', DC.Output.Size, Loaded.Size);
+        Loaded.Sub(DC.Output);
+        MaxDiff := Loaded.GetMaxAbs();
+        WriteLn('  DeformableConv vs torchvision deform_conv2d ', OutName,
+          ' max-abs-diff: ', MaxDiff:0:9);
+        AssertTrue('DeformableConv vs torchvision ' + OutName + ': max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+      finally
+        NN.Free;
+      end;
+    end;
   finally
     Loaded.Free;
     Reader.Free;
@@ -71313,7 +71458,8 @@ begin
 end;
 
 procedure TTestNeuralNumerical.CheckExternalDeformableConvGradients(
-  pOffsetGroups, pStride: integer; pUseMask: boolean);
+  pOffsetGroups, pStride: integer; pUseMask: boolean; pDilation, pWeightGroups,
+  pInDepth, pFeatures: integer);
 var
   NN: TNNet;
   ImgIn, OffIn, MaskIn: TNNetLayer;
@@ -71379,12 +71525,13 @@ var
 begin
   RandSeed := 424242;
   Label_ := 'DeformableConv external G=' + IntToStr(pOffsetGroups) +
-    ' stride=' + IntToStr(pStride) + ' mask=' + BoolToStr(pUseMask, true);
+    ' stride=' + IntToStr(pStride) + ' mask=' + BoolToStr(pUseMask, true) +
+    ' dilation=' + IntToStr(pDilation) + ' WG=' + IntToStr(pWeightGroups);
   NN := TNNet.Create();
   Img := nil; Off := nil; Mask := nil; Desired := nil;
   try
-    DC := BuildExternalDeformableNet(NN, 5, 4, 4, 3, pStride, pOffsetGroups,
-      pUseMask, ImgIn, OffIn, MaskIn);
+    DC := BuildExternalDeformableNet(NN, 5, 4, pInDepth, pFeatures, pStride,
+      pOffsetGroups, pUseMask, ImgIn, OffIn, MaskIn, 1, pDilation, pWeightGroups);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
     Img := TNNetVolume.Create(ImgIn.Output);
@@ -71428,6 +71575,22 @@ end;
 procedure TTestNeuralNumerical.TestDeformableConvExternalGradientsTwoGroupsMask;
 begin
   CheckExternalDeformableConvGradients(2, 1, true);
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvExternalGradientsDilation;
+begin
+  CheckExternalDeformableConvGradients(2, 1, true, 2);
+end;
+
+// 6 input channels: offset groups of 3 and weight groups of 2 overlap partly.
+procedure TTestNeuralNumerical.TestDeformableConvExternalGradientsWeightGroups;
+begin
+  CheckExternalDeformableConvGradients(2, 1, true, 1, 3, 6, 3);
+end;
+
+procedure TTestNeuralNumerical.TestDeformableConvExternalGradientsDilationWeightGroups;
+begin
+  CheckExternalDeformableConvGradients(1, 2, false, 2, 2, 4, 4);
 end;
 
 procedure TTestNeuralNumerical.TestDeformableConvExternalSerializationRoundTrip;
@@ -71478,6 +71641,60 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestDeformableConvDilatedGroupedSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  ImgIn, OffIn, MaskIn: TNNetLayer;
+  DC, DC2: TNNetDeformableConv;
+  Saved, Saved2: string;
+  ExternalInt, i: integer;
+begin
+  for ExternalInt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    NN2 := TNNet.Create();
+    try
+      if ExternalInt = 1 then
+      begin
+        DC := BuildExternalDeformableNet(NN, 7, 6, 4, 6, 1, 2, true,
+          ImgIn, OffIn, MaskIn, 2, 2, 2);
+        FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskIn.Output);
+      end
+      else
+      begin
+        ImgIn := NN.AddLayer(TNNetInput.Create(7, 6, 4));
+        DC := TNNetDeformableConv.Create(6, 3, 2, 1, 0, 1, 2, 2);
+        NN.AddLayer(DC);
+        for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+          DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.013 * i;
+        for i := 0 to ImgIn.Output.Size - 1 do
+          ImgIn.Output.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+      end;
+      NN.Compute(ImgIn.Output);
+      Saved := NN.SaveToString();
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('dilated grouped DeformableConv SaveToString round-trip',
+        Saved, Saved2);
+      DC2 := NN2.Layers[DC.LayerIdx] as TNNetDeformableConv;
+      AssertEquals('dilation after load', 2, DC2.Dilation);
+      AssertEquals('weight groups after load', 2, DC2.WeightGroups);
+      AssertEquals('modulation after load', 1 - ExternalInt, DC2.Modulated);
+      AssertEquals('mask source presence', ExternalInt = 1, Assigned(DC2.MaskSource));
+      for i := 0 to NN.CountLayers() - 1 do
+        NN2.Layers[i].Output.Copy(NN.Layers[i].Output);
+      NN2.Compute(ImgIn.Output);
+      for i := 0 to DC.Output.Size - 1 do
+        AssertEquals('dilated grouped DeformableConv Compute after round-trip pos ' +
+          IntToStr(i), DC.Output.Raw[i], DC2.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestDeformableConvExternalOpenCLParity;
 {$IFDEF OpenCL}
 var
@@ -71487,7 +71704,7 @@ var
   OutCPU: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i: integer;
+  i, CaseIdx: integer;
   Diff, MaxDiff: TNeuralFloat;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -71495,37 +71712,48 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  RandSeed := 424242;
-  NN := TNNet.Create();
-  OutCPU := TNNetVolume.Create();
-  try
-    DC := BuildExternalDeformableNet(NN, 8, 7, 4, 6, 1, 2, true, ImgIn, OffIn, MaskIn);
-    FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskIn.Output);
-    NN.Compute(ImgIn.Output);
-    OutCPU.Copy(DC.Output);
-    NN.ForceOpenCL(True);
-    NN.EnableOpenCL(PlatformId, DeviceId);
+  // Case 0: dilation 1, one weight group; case 1: dilation 2, 2 weight groups.
+  for CaseIdx := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    OutCPU := TNNetVolume.Create();
     try
-      DC.ForwardGPUCnt := 0;
+      if CaseIdx = 0 then
+        DC := BuildExternalDeformableNet(NN, 8, 7, 4, 6, 1, 2, true, ImgIn, OffIn, MaskIn)
+      else
+        DC := BuildExternalDeformableNet(NN, 8, 7, 4, 6, 1, 2, true, ImgIn, OffIn,
+          MaskIn, 2, 2, 2);
+      FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskIn.Output);
       NN.Compute(ImgIn.Output);
-      AssertEquals('external DeformableConv took the OpenCL GEMM path', 1,
-        DC.ForwardGPUCnt);
-      DC.ForceOutputOnRAM();
-      MaxDiff := 0;
-      AssertEquals('output size match', OutCPU.Size, DC.Output.Size);
-      for i := 0 to OutCPU.Size - 1 do
-      begin
-        Diff := Abs(OutCPU.Raw[i] - DC.Output.Raw[i]);
-        if Diff > MaxDiff then MaxDiff := Diff;
+      OutCPU.Copy(DC.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        DC.ForwardGPUCnt := 0;
+        NN.Compute(ImgIn.Output);
+        AssertEquals('external DeformableConv took the OpenCL GEMM path', 1,
+          DC.ForwardGPUCnt);
+        DC.ForceOutputOnRAM();
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, DC.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - DC.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
       end;
+      WriteLn('  external DeformableConv OpenCL vs CPU case ', CaseIdx,
+        ' max-abs-diff: ', MaxDiff:0:9);
+      AssertTrue('external DeformableConv OpenCL vs CPU parity case ' +
+        IntToStr(CaseIdx) + ': max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
     finally
-      NN.ForceOpenCL(False);
+      OutCPU.Free;
+      NN.Free;
     end;
-    AssertTrue('external DeformableConv OpenCL vs CPU parity: max |diff| = ' +
-      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
-  finally
-    OutCPU.Free;
-    NN.Free;
   end;
 end;
 {$ELSE}

@@ -13,6 +13,12 @@ the CAI volume order:
   s{S}.out_mask  [oH, oW, Cout]      deform_conv2d(..., mask=mask)
   s{S}.out_nomask [oH, oW, Cout]     deform_conv2d(...) without mask
 for stride S in {1, 2}; 3x3 kernel, padding 1, dilation 1, G=2 offset groups.
+Dilation / weight-group cases on the same input, tag T, each with its own
+  T.weight  [kH, kW, Cin/WG, Cout]   torch (Cout, Cin/WG, kH, kW) permuted
+  T.offset, T.mask, T.out_mask, T.out_nomask   as above
+  d2.     dilation 2, stride 1, padding 2, G=2, WG=1
+  wg2.    dilation 1, stride 1, padding 1, G=1, WG=2
+  d2wg2.  dilation 2, stride 2, padding 1, G=4, WG=2
 
 Usage (from the repo root; torchvision is not in the venv, pass its path):
   systemd-run --user --scope -q -p MemoryMax=2G -p MemorySwapMax=0 \\
@@ -64,6 +70,26 @@ for stride in (1, 2):
     out_nomask = deform_conv2d(x, offset, weight, bias, stride=stride,
                                padding=PAD)
     tag = 's%d.' % stride
+    tensors[tag + 'offset'] = hwc(offset)
+    tensors[tag + 'mask'] = hwc(mask)
+    tensors[tag + 'out_mask'] = hwc(out_mask)
+    tensors[tag + 'out_nomask'] = hwc(out_nomask)
+
+# (tag, dilation, stride, padding, offset groups, weight groups)
+for tag, dil, stride, pad, groups, wgroups in (('d2.', 2, 1, 2, 2, 1),
+                                               ('wg2.', 1, 1, 1, 1, 2),
+                                               ('d2wg2.', 2, 2, 1, 4, 2)):
+    ext = dil * (K - 1) + 1
+    oh = (H + 2 * pad - ext) // stride + 1
+    ow = (W + 2 * pad - ext) // stride + 1
+    w = torch.randn(COUT, CIN // wgroups, K, K) * 0.3
+    offset = torch.randn(1, 2 * groups * K * K, oh, ow) * 1.5
+    mask = torch.sigmoid(torch.randn(1, groups * K * K, oh, ow))
+    out_mask = deform_conv2d(x, offset, w, bias, stride=stride, padding=pad,
+                             dilation=dil, mask=mask)
+    out_nomask = deform_conv2d(x, offset, w, bias, stride=stride, padding=pad,
+                               dilation=dil)
+    tensors[tag + 'weight'] = w.permute(2, 3, 1, 0).contiguous()
     tensors[tag + 'offset'] = hwc(offset)
     tensors[tag + 'mask'] = hwc(mask)
     tensors[tag + 'out_mask'] = hwc(out_mask)
