@@ -1896,6 +1896,18 @@ rather than acted on.
       dev-box runs must use a small scene under the 2 GB cap; real scenes are a
       user GPU-box check. Out of scope for v1: training (the differentiable
       backward), which would be a follow-up that fits a scene from posed photos.
+      - Steps (1)-(3) DONE: neural/neuralply.pas (`TNNetPLYReader` /
+        `TNNetPLYWriter`, ascii + both binary byte orders, streamed rows, list
+        properties skipped on read), neural/neuralgaussiansplat.pas
+        (`TGaussianSplatScene` Load/SaveToPLY, `TGaussianSplatCamera` +
+        `InitGaussianSplatCamera` / `SetGaussianSplatCameraLookAt`,
+        `TGaussianSplatRasterizer` Preprocess / BinTiles / BlendTile / Render
+        with the per-Gaussian and per-tile results in flat public arrays for
+        the OpenCL upload); tests in tests/TestNeuralGaussianSplat.pas. Open:
+        - [ ] (4) OpenCL preprocess + per-tile blend kernels, CPU vs OpenCL test.
+        - [ ] examples/GaussianSplatView (.lpr + .lpi + README.md).
+        - [ ] Real INRIA scene check (small scene on the dev box, big ones on
+              the user's GPU box).
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT

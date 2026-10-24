@@ -1939,6 +1939,10 @@ type
   // no heap allocation, ties in unspecified order.
   procedure QuickSortOrderByScoreDesc(var Order: array of integer;
     const Scores: array of TNeuralFloat; iLo, iHi: Integer);
+  // Quicksorts Order[iLo..iHi] in place so Dist[Order[..]] is ascending;
+  // no heap allocation, ties in unspecified order.
+  procedure QuickSortOrderByDist(var Order: array of integer;
+    const Dist: array of TNeuralFloat; iLo, iHi: Integer);
 
   { NeuralGreedyNMS runs greedy, score-sorted, class-aware Non-Max-Suppression
     over Count boxes. Boxes are passed as four parallel flat arrays in corner
