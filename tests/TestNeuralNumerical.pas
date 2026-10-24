@@ -2093,6 +2093,7 @@ type
     procedure TestGridSampleFeatureGradientCheck;
     procedure TestGridSampleGridGradientCheck;
     procedure TestGridSampleBorderGridGradientCheck;
+    procedure TestGridSampleBorderEdgeGradientCheck;
     procedure TestGridSampleNearestForward;
     procedure TestGridSampleLoadFromString;
     // TNNetTriplaneSample: finite-difference dL/d(triplane) and dL/d(points),
@@ -22756,6 +22757,139 @@ begin
   finally
     NN.Free; Img.Free; GridData.Free; GridPlus.Free; Desired.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestGridSampleBorderEdgeGradientCheck;
+// Border padding at and past the edges: a clipped axis must have exactly zero
+// grid gradient (torch clip_coordinates); every element is finite-differenced.
+const
+  csPatternCount = 6;
+  csPixelX: array[0..csPatternCount - 1] of TNeuralFloat = (-0.7, -0.2, 1.3, 4.4, 5.6, 2.6);
+  csPixelY: array[0..csPatternCount - 1] of TNeuralFloat = (1.4, -0.45, 3.35, 0.6, -1.3, 4.2);
+  csWidth = 5;
+  csHeight = 4;
+var
+  NN: TNNet;
+  ImgInput, GridInput: TNNetLayer;
+  Img, GridData, Desired: TNNetVolume;
+  Sources: array[0..1] of TNNetVolume;
+  AlignCorners: boolean;
+  D, DepthCase, SourcePos, Pos, MaxPos, x, y, Pattern, Checked, ClippedZeros: integer;
+  AxisSize: integer;
+  Pixel: TNeuralFloat;
+  Epsilon, Saved, LossPlus, LossMinus, Numerical, Analytical, MaxError: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var
+    OutputPos, MaxOutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    GridInput.Output.Copy(GridData);
+    NN.Compute(Img);
+    Result := 0;
+    MaxOutputPos := NN.GetLastLayer.Output.Size - 1;
+    for OutputPos := 0 to MaxOutputPos do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+  function ToNormalized(Pixel: TNeuralFloat; Dim: integer): TNeuralFloat;
+  begin
+    if AlignCorners
+      then Result := 2 * Pixel / (Dim - 1) - 1
+      else Result := (2 * Pixel + 1) / Dim - 1;
+  end;
+
+  function ToPixel(Normalized: TNeuralFloat; Dim: integer): TNeuralFloat;
+  begin
+    if AlignCorners
+      then Result := (Normalized + 1) * (Dim - 1) / 2
+      else Result := ((Normalized + 1) * Dim - 1) / 2;
+  end;
+
+begin
+  Epsilon := 0.002;
+  MaxError := 0;
+  Checked := 0;
+  ClippedZeros := 0;
+  for DepthCase := 0 to 1 do
+  for AlignCorners := false to true do
+  begin
+    // Depth 2 runs the scalar backward loop, depth 9 the vector one.
+    if DepthCase = 0 then D := 2 else D := 9;
+    NN := TNNet.Create();
+    Img := TNNetVolume.Create(csWidth, csHeight, D);
+    GridData := TNNetVolume.Create(csWidth, csHeight, 2);
+    Desired := TNNetVolume.Create(csWidth, csHeight, D);
+    Sources[0] := Img;
+    Sources[1] := GridData;
+    try
+      ImgInput := NN.AddLayer(TNNetInput.Create(csWidth, csHeight, D, 1));
+      GridInput := NN.AddLayerAfter(TNNetInput.Create(csWidth, csHeight, 2, 1), 0);
+      NN.AddLayerAfter(TNNetGridSample.Create(GridInput, gsiBilinear, gspBorder,
+        AlignCorners), ImgInput);
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(true);
+      MaxPos := Img.Size - 1;
+      for Pos := 0 to MaxPos do Img.Raw[Pos] := Sin(Pos * 0.53) * 0.9 + 0.1;
+      MaxPos := Desired.Size - 1;
+      for Pos := 0 to MaxPos do Desired.Raw[Pos] := Cos(Pos * 0.31);
+      for y := 0 to csHeight - 1 do
+      for x := 0 to csWidth - 1 do
+      begin
+        Pattern := (y * csWidth + x) mod csPatternCount;
+        GridData.Store(x, y, 0, ToNormalized(csPixelX[Pattern], csWidth));
+        GridData.Store(x, y, 1, ToNormalized(csPixelY[(Pattern + y) mod csPatternCount], csHeight));
+      end;
+      for SourcePos := 0 to 1 do
+      begin
+        MaxPos := Sources[SourcePos].Size - 1;
+        for Pos := 0 to MaxPos do
+        begin
+          Saved := Sources[SourcePos].Raw[Pos];
+          Sources[SourcePos].Raw[Pos] := Saved + Epsilon;
+          LossPlus := ComputeLoss();
+          Sources[SourcePos].Raw[Pos] := Saved - Epsilon;
+          LossMinus := ComputeLoss();
+          Sources[SourcePos].Raw[Pos] := Saved;
+          Numerical := (LossPlus - LossMinus) / (2 * Epsilon);
+          ComputeLoss();
+          ImgInput.OutputError.Fill(0);
+          GridInput.OutputError.Fill(0);
+          NN.Backpropagate(Desired);
+          if SourcePos = 0
+            then Analytical := ImgInput.OutputError.Raw[Pos]
+            else Analytical := GridInput.OutputError.Raw[Pos];
+          if SourcePos = 1 then
+          begin
+            // Grid depth is innermost: even elements are x_n, odd are y_n.
+            if (Pos mod 2) = 0 then AxisSize := csWidth else AxisSize := csHeight;
+            Pixel := ToPixel(Saved, AxisSize);
+            if (Pixel < 0) or (Pixel > AxisSize - 1) then
+            begin
+              AssertTrue('clipped axis grid gradient must be 0, got ' +
+                FloatToStr(Analytical) + ' at ' + IntToStr(Pos), Analytical = 0);
+              Inc(ClippedZeros);
+            end;
+          end;
+          MaxError := Max(MaxError, Abs(Numerical - Analytical));
+          AssertTrue('depth ' + IntToStr(D) + ' align ' + BoolToStr(AlignCorners, true) +
+            ' source ' + IntToStr(SourcePos) + ' element ' + IntToStr(Pos) +
+            ' numerical ' + FloatToStr(Numerical) + ' analytical ' +
+            FloatToStr(Analytical), Abs(Numerical - Analytical) < 0.01);
+          Inc(Checked);
+        end;
+      end;
+    finally
+      NN.Free; Img.Free; GridData.Free; Desired.Free;
+    end;
+  end;
+  AssertTrue('some grid coordinates must be clipped', ClippedZeros > 0);
+  WriteLn('  TestGridSampleBorderEdgeGradientCheck max gradient error: ',
+    FloatToStr(MaxError), ' over ', Checked, ' elements, ', ClippedZeros,
+    ' clipped');
 end;
 
 procedure TTestNeuralNumerical.TestGridSampleNearestForward;

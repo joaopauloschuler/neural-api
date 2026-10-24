@@ -7062,9 +7062,9 @@ type
   //       d(px)/d(x_n) = W/2 (align_corners=False) or (W-1)/2 (True), summed
   //       over depth into the (x_n, y_n) channels. nearest mode is locally
   //       constant so its grid gradient is 0 (matches torch). zeros padding
-  //       contributes 0 from out-of-range corners; border padding's clamp is
-  //       locally constant where it saturates, so that axis's grid gradient
-  //       correctly drops out there. The bilinear forward delegates to the
+  //       contributes 0 from out-of-range corners; border padding clips the
+  //       pixel coordinate (torch clip_coordinates), so a clipped axis has 0
+  //       grid gradient. The bilinear forward delegates to the
   //       shared NeuralBilinearGatherColumn helper (also used by
   //       TNNetAffineGridSample and TNNetDeformableConv).
   // TWO sources (wired exactly like TNNetAffineGridSample / TNNetFlowWarp):
@@ -7079,10 +7079,10 @@ type
     FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
     procedure ComputeOpenCL();
     {$ENDIF}
-    // Map a normalized coord in [-1,1] to source-pixel space per align_corners.
-    function Unnormalize(c: TNeuralFloat; Dim: integer): TNeuralFloat; inline;
-    // d(pixel coord)/d(normalized coord) — the chain-rule factor for the grid.
-    function UnnormalizeGrad(Dim: integer): TNeuralFloat; inline;
+    // Source-pixel coordinate of normalized c (align_corners, border clip) and
+    // d(pixel)/d(normalized), 0 where border padding clips.
+    function SourceIndex(c: TNeuralFloat; Dim: integer;
+      out dPixeldNorm: TNeuralFloat): TNeuralFloat; inline;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     // pInterp: gsiBilinear/gsiNearest; pPad: gspZeros/gspBorder; pAlignCorners.
@@ -47172,6 +47172,29 @@ begin
   if AlignCorners then Result := (Dim - 1) * 0.5 else Result := Dim * 0.5;
 end;
 
+// torch grid_sampler_compute_source_index_set_grad: pixel coordinate and its
+// derivative; BorderPad clips to [0, Dim-1] with derivative 0 where it clips.
+function NeuralGridSourceIndex(c: TNeuralFloat; Dim: integer;
+  AlignCorners, BorderPad: boolean; out dPixeldNorm: TNeuralFloat): TNeuralFloat;
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := NeuralGridUnnormalize(c, Dim, AlignCorners);
+  dPixeldNorm := NeuralGridUnnormalizeGrad(Dim, AlignCorners);
+  if BorderPad then
+  begin
+    if Result < 0 then
+    begin
+      Result := 0;
+      dPixeldNorm := 0;
+    end
+    else if Result > Dim - 1 then
+    begin
+      Result := Dim - 1;
+      dPixeldNorm := 0;
+    end;
+  end;
+end;
+
 { TNNetAffineGridSample }
 
 constructor TNNetAffineGridSample.Create(ThetaSource: TNNetLayer);
@@ -47518,14 +47541,11 @@ begin
     '::', ':' + IntToStr(FGridLayer.FLayerIdx) + ':', [rfReplaceAll]);
 end;
 
-function TNNetGridSample.Unnormalize(c: TNeuralFloat; Dim: integer): TNeuralFloat;
+function TNNetGridSample.SourceIndex(c: TNeuralFloat; Dim: integer;
+  out dPixeldNorm: TNeuralFloat): TNeuralFloat;
 begin
-  Result := NeuralGridUnnormalize(c, Dim, FStruct[2] = 1);
-end;
-
-function TNNetGridSample.UnnormalizeGrad(Dim: integer): TNeuralFloat;
-begin
-  Result := NeuralGridUnnormalizeGrad(Dim, FStruct[2] = 1);
+  Result := NeuralGridSourceIndex(c, Dim, FStruct[2] = 1,
+    FStruct[1] = Ord(gspBorder), dPixeldNorm);
 end;
 
 procedure TNNetGridSample.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -47554,9 +47574,8 @@ var
   W, H, D, ox, oy, nx, ny: integer;
   WM1, HM1: integer;
   Grid, Src: TNNetVolume;
-  sx, sy: TNeuralFloat;
+  sx, sy, dPixeldNorm: TNeuralFloat;
   OutPtr: TNeuralFloatArrPtr;
-  BorderPad: boolean;
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
@@ -47567,7 +47586,6 @@ begin
   Grid := FGridLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
   WM1 := W - 1; HM1 := H - 1;
-  BorderPad := (FStruct[1] = Ord(gspBorder));
   {$IFDEF OpenCL}
   if WillOpenCL() then
   begin
@@ -47581,26 +47599,20 @@ begin
   for oy := 0 to HM1 do
   for ox := 0 to WM1 do
   begin
-    sx := Unnormalize(Grid.Get(ox, oy, 0), W);
-    sy := Unnormalize(Grid.Get(ox, oy, 1), H);
+    // Border padding is already applied: SourceIndex clipped the coordinate.
+    sx := SourceIndex(Grid.Get(ox, oy, 0), W, dPixeldNorm);
+    sy := SourceIndex(Grid.Get(ox, oy, 1), H, dPixeldNorm);
     OutPtr := FOutput.GetRawPtr(ox, oy);
     if FStruct[0] = Ord(gsiNearest) then
     begin
-      // nearest: round half-to-even (torch nearbyint), then pad/clamp.
+      // nearest: round half-to-even (torch nearbyint).
       nx := Round(sx); ny := Round(sy);
-      FillDWord(OutPtr^, D, 0);
-      if BorderPad then
-      begin
-        if nx < 0 then nx := 0 else if nx > WM1 then nx := WM1;
-        if ny < 0 then ny := 0 else if ny > HM1 then ny := HM1;
-        Move(Src.GetRawPtr(nx, ny)^, OutPtr^, D * csNeuralFloatSize);
-      end
-      else if (nx >= 0) and (nx < W) and (ny >= 0) and (ny < H) then
-        Move(Src.GetRawPtr(nx, ny)^, OutPtr^, D * csNeuralFloatSize);
+      if (nx >= 0) and (nx < W) and (ny >= 0) and (ny < H)
+        then Move(Src.GetRawPtr(nx, ny)^, OutPtr^, D * csNeuralFloatSize)
+        else FillDWord(OutPtr^, D, 0);
     end
     else
-      // bilinear: shared depth-column gather (zeros or border padding).
-      NeuralBilinearGatherColumn(Src, OutPtr, sx, sy, W, H, D, BorderPad);
+      NeuralBilinearGatherColumn(Src, OutPtr, sx, sy, W, H, D, {BorderPad=}false);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -47630,25 +47642,24 @@ begin
 end;
 
 // Device per-pixel bilinear-gather. The four corner offsets + weights (exact
-// floor / zeros-or-border padding, byte-identical to the CPU forward) are
+// floor, border padding as a clipped coordinate, matching the CPU forward) are
 // computed on the CPU and the depth-blend runs on the device. Only used for the
-// bilinear mode (nearest stays on the CPU). Masked (zero-pad / out-of-range)
-// corner convention is offset -1, which the kernel skips.
+// bilinear mode (nearest stays on the CPU). Masked (out-of-range) corner
+// convention is offset -1, which the kernel skips.
 procedure TNNetGridSample.ComputeOpenCL();
 var
   W, H, D, ox, oy, NumOut, cb: integer;
   WM1, HM1: integer;
   x0, y0, x1, y1: integer;
   Grid, Src: TNNetVolume;
-  sx, sy, fx, fy: TNeuralFloat;
-  BorderPad, inX0, inX1, inY0, inY1: boolean;
+  sx, sy, fx, fy, dPixeldNorm: TNeuralFloat;
+  inX0, inX1, inY0, inY1: boolean;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Src := FPrevLayer.FOutput;
   Grid := FGridLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
   WM1 := W - 1; HM1 := H - 1;
-  BorderPad := (FStruct[1] = Ord(gspBorder));
   NumOut := W * H;
   FCornerBuf.ReSize(NumOut * 4, 1, 1);
   FWeightBuf.ReSize(NumOut * 4, 1, 1);
@@ -47656,8 +47667,8 @@ begin
   for oy := 0 to HM1 do
   for ox := 0 to WM1 do
   begin
-    sx := Unnormalize(Grid.Get(ox, oy, 0), W);
-    sy := Unnormalize(Grid.Get(ox, oy, 1), H);
+    sx := SourceIndex(Grid.Get(ox, oy, 0), W, dPixeldNorm);
+    sy := SourceIndex(Grid.Get(ox, oy, 1), H, dPixeldNorm);
     x0 := Floor(sx); y0 := Floor(sy);
     x1 := x0 + 1;    y1 := y0 + 1;
     fx := sx - x0;   fy := sy - y0;
@@ -47666,28 +47677,14 @@ begin
     FWeightBuf.FData[cb + 1] := fx * (1 - fy);
     FWeightBuf.FData[cb + 2] := (1 - fx) * fy;
     FWeightBuf.FData[cb + 3] := fx * fy;
-    if BorderPad then
-    begin
-      if x0 < 0 then x0 := 0 else if x0 > WM1 then x0 := WM1;
-      if x1 < 0 then x1 := 0 else if x1 > WM1 then x1 := WM1;
-      if y0 < 0 then y0 := 0 else if y0 > HM1 then y0 := HM1;
-      if y1 < 0 then y1 := 0 else if y1 > HM1 then y1 := HM1;
-      FCornerBuf.FData[cb + 0] := y0 * W + x0;
-      FCornerBuf.FData[cb + 1] := y0 * W + x1;
-      FCornerBuf.FData[cb + 2] := y1 * W + x0;
-      FCornerBuf.FData[cb + 3] := y1 * W + x1;
-    end
-    else
-    begin
-      inX0 := (x0 >= 0) and (x0 < W);
-      inX1 := (x1 >= 0) and (x1 < W);
-      inY0 := (y0 >= 0) and (y0 < H);
-      inY1 := (y1 >= 0) and (y1 < H);
-      if inX0 and inY0 then FCornerBuf.FData[cb + 0] := y0 * W + x0 else FCornerBuf.FData[cb + 0] := -1;
-      if inX1 and inY0 then FCornerBuf.FData[cb + 1] := y0 * W + x1 else FCornerBuf.FData[cb + 1] := -1;
-      if inX0 and inY1 then FCornerBuf.FData[cb + 2] := y1 * W + x0 else FCornerBuf.FData[cb + 2] := -1;
-      if inX1 and inY1 then FCornerBuf.FData[cb + 3] := y1 * W + x1 else FCornerBuf.FData[cb + 3] := -1;
-    end;
+    inX0 := (x0 >= 0) and (x0 < W);
+    inX1 := (x1 >= 0) and (x1 < W);
+    inY0 := (y0 >= 0) and (y0 < H);
+    inY1 := (y1 >= 0) and (y1 < H);
+    if inX0 and inY0 then FCornerBuf.FData[cb + 0] := y0 * W + x0 else FCornerBuf.FData[cb + 0] := -1;
+    if inX1 and inY0 then FCornerBuf.FData[cb + 1] := y0 * W + x1 else FCornerBuf.FData[cb + 1] := -1;
+    if inX0 and inY1 then FCornerBuf.FData[cb + 2] := y1 * W + x0 else FCornerBuf.FData[cb + 2] := -1;
+    if inX1 and inY1 then FCornerBuf.FData[cb + 3] := y1 * W + x1 else FCornerBuf.FData[cb + 3] := -1;
   end;
   FGatherCL.Gather(Src, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
   Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * D * csNeuralFloatSize);
@@ -47706,8 +47703,8 @@ var
   gOut, dSdx, dSdy, dLdx, dLdy: TNeuralFloat;
   v00, v01, v10, v11: TNeuralFloat;
   g00, g01, g10, g11: TNeuralFloat;
-  cx0, cy0, cx1, cy1: TNeuralFloat;  // d(clamped index)/d(coord): 1 interior, 0 saturated
-  HasSrcErr, HasGridErr, BorderPad, Nearest: boolean;
+  dsxdNorm, dsydNorm: TNeuralFloat;
+  HasSrcErr, HasGridErr, Nearest: boolean;
   inX0, inX1, inY0, inY1: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -47722,24 +47719,18 @@ begin
   WM1 := W - 1; HM1 := H - 1; DM1 := D - 1;
   HasSrcErr := (SrcErr.Size = Src.Size);
   HasGridErr := (GridErr.Size = Grid.Size);
-  BorderPad := (FStruct[1] = Ord(gspBorder));
   Nearest := (FStruct[0] = Ord(gsiNearest));
   for oy := 0 to HM1 do
   for ox := 0 to WM1 do
   begin
-    sx := Unnormalize(Grid.Get(ox, oy, 0), W);
-    sy := Unnormalize(Grid.Get(ox, oy, 1), H);
+    sx := SourceIndex(Grid.Get(ox, oy, 0), W, dsxdNorm);
+    sy := SourceIndex(Grid.Get(ox, oy, 1), H, dsydNorm);
     if Nearest then
     begin
       // nearest: scatter gradient to the single rounded neighbour; the round
       // is locally constant so the grid gradient is exactly 0 (matches torch).
       nx := Round(sx); ny := Round(sy);
-      if BorderPad then
-      begin
-        if nx < 0 then nx := 0 else if nx > WM1 then nx := WM1;
-        if ny < 0 then ny := 0 else if ny > HM1 then ny := HM1;
-      end
-      else if (nx < 0) or (nx >= W) or (ny < 0) or (ny >= H) then continue;
+      if (nx < 0) or (nx >= W) or (ny < 0) or (ny >= H) then continue;
       if HasSrcErr then
       begin
         p00 := SrcErr.GetRawPos(nx, ny);
@@ -47756,24 +47747,10 @@ begin
     w10 := fx * (1 - fy);
     w01 := (1 - fx) * fy;
     w11 := fx * fy;
-    if BorderPad then
-    begin
-      // Clamp indices; remember per-corner clamp derivatives (0 where saturated).
-      cx0 := 1; cy0 := 1; cx1 := 1; cy1 := 1;
-      if x0 < 0 then begin x0 := 0; cx0 := 0; end else if x0 > WM1 then begin x0 := WM1; cx0 := 0; end;
-      if x1 < 0 then begin x1 := 0; cx1 := 0; end else if x1 > WM1 then begin x1 := WM1; cx1 := 0; end;
-      if y0 < 0 then begin y0 := 0; cy0 := 0; end else if y0 > HM1 then begin y0 := HM1; cy0 := 0; end;
-      if y1 < 0 then begin y1 := 0; cy1 := 0; end else if y1 > HM1 then begin y1 := HM1; cy1 := 0; end;
-      inX0 := true; inX1 := true; inY0 := true; inY1 := true;
-    end
-    else
-    begin
-      cx0 := 1; cy0 := 1; cx1 := 1; cy1 := 1;
-      inX0 := (x0 >= 0) and (x0 < W);
-      inX1 := (x1 >= 0) and (x1 < W);
-      inY0 := (y0 >= 0) and (y0 < H);
-      inY1 := (y1 >= 0) and (y1 < H);
-    end;
+    inX0 := (x0 >= 0) and (x0 < W);
+    inX1 := (x1 >= 0) and (x1 < W);
+    inY0 := (y0 >= 0) and (y0 < H);
+    inY1 := (y1 >= 0) and (y1 < H);
     // Row offsets invariant across the depth loop (Src and SrcErr share shape
     // whenever HasSrcErr, so one base per neighbour addresses both).
     gOutBase := FOutputError.GetRawPos(ox, oy);
@@ -47784,10 +47761,9 @@ begin
     dLdx := 0; dLdy := 0;
     if D >= csWarpBackVectorMinDepth then
     begin
-      // The bilinear weights, the in-bounds flags and the per-corner clamp
-      // derivatives are all invariant across the depth loop, so it is linear in
-      // the four neighbour columns. An out-of-bounds corner reads as zero, so
-      // its column is simply skipped.
+      // The bilinear weights and the in-bounds flags are invariant across the
+      // depth loop, so it is linear in the four neighbour columns. An
+      // out-of-bounds corner reads as zero, so its column is simply skipped.
       if HasSrcErr then
       begin
         if inX0 and inY0 then TNNetVolume.MulAdd(@SrcErr.FData[p00], @FOutputError.FData[gOutBase], w00, D);
@@ -47801,8 +47777,8 @@ begin
         if inX1 and inY0 then g10 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p10], D) else g10 := 0;
         if inX0 and inY1 then g01 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p01], D) else g01 := 0;
         if inX1 and inY1 then g11 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p11], D) else g11 := 0;
-        dLdx := (1 - fy) * (cx1 * g10 - cx0 * g00) + fy * (cx1 * g11 - cx0 * g01);
-        dLdy := (1 - fx) * (cy1 * g01 - cy0 * g00) + fx * (cy1 * g11 - cy0 * g10);
+        dLdx := (1 - fy) * (g10 - g00) + fy * (g11 - g01);
+        dLdy := (1 - fx) * (g01 - g00) + fx * (g11 - g10);
       end;
     end
     else
@@ -47818,26 +47794,22 @@ begin
         if inX0 and inY1 then SrcErr.FData[p01 + dd] := SrcErr.FData[p01 + dd] + w01 * gOut;
         if inX1 and inY1 then SrcErr.FData[p11 + dd] := SrcErr.FData[p11 + dd] + w11 * gOut;
       end;
-      // (b) dL/d(grid): sampler partials. Out-of-range (zeros) corners read 0;
-      //     the per-corner clamp derivative kills the contribution of any
-      //     saturated index (border padding) so the coord stops moving.
+      // (b) dL/d(grid): sampler partials; out-of-range corners read 0.
       if inX0 and inY0 then v00 := Src.FData[p00 + dd] else v00 := 0;
       if inX1 and inY0 then v10 := Src.FData[p10 + dd] else v10 := 0;
       if inX0 and inY1 then v01 := Src.FData[p01 + dd] else v01 := 0;
       if inX1 and inY1 then v11 := Src.FData[p11 + dd] else v11 := 0;
-      // d(sampled)/d(sx) and d(sampled)/d(sy), respecting per-corner clamp:
       //   sampled = (1-fy)*[(1-fx)*v00 + fx*v10] + fy*[(1-fx)*v01 + fx*v11]
-      //   d/dfx of vXY only "moves" the unclamped-x corners.
-      dSdx := (1 - fy) * (cx1 * v10 - cx0 * v00) + fy * (cx1 * v11 - cx0 * v01);
-      dSdy := (1 - fx) * (cy1 * v01 - cy0 * v00) + fx * (cy1 * v11 - cy0 * v10);
+      dSdx := (1 - fy) * (v10 - v00) + fy * (v11 - v01);
+      dSdy := (1 - fx) * (v01 - v00) + fx * (v11 - v10);
       dLdx := dLdx + gOut * dSdx;
       dLdy := dLdy + gOut * dSdy;
     end;
     if HasGridErr then
     begin
-      // chain through d(pixel)/d(normalized) = UnnormalizeGrad.
-      GridErr.Add(ox, oy, 0, dLdx * UnnormalizeGrad(W));
-      GridErr.Add(ox, oy, 1, dLdy * UnnormalizeGrad(H));
+      // Chain through d(pixel)/d(normalized), 0 on a border-clipped axis.
+      GridErr.Add(ox, oy, 0, dLdx * dsxdNorm);
+      GridErr.Add(ox, oy, 1, dLdy * dsydNorm);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -47893,22 +47865,9 @@ end;
 function TNNetTriplaneSample.CoordToPixel(Coord: TNeuralFloat; Dim: integer;
   out dPixeldCoord: TNeuralFloat): TNeuralFloat;
 begin
-  Result := NeuralGridUnnormalize(Coord * FInvRadius, Dim, FAlignCorners);
-  dPixeldCoord := NeuralGridUnnormalizeGrad(Dim, FAlignCorners) * FInvRadius;
-  // padding_mode='border' clips the coordinate (torch clip_coordinates).
-  if FBorderPad then
-  begin
-    if Result < 0 then
-    begin
-      Result := 0;
-      dPixeldCoord := 0;
-    end
-    else if Result > Dim - 1 then
-    begin
-      Result := Dim - 1;
-      dPixeldCoord := 0;
-    end;
-  end;
+  Result := NeuralGridSourceIndex(Coord * FInvRadius, Dim, FAlignCorners,
+    FBorderPad, dPixeldCoord);
+  dPixeldCoord := dPixeldCoord * FInvRadius;
 end;
 
 procedure TNNetTriplaneSample.SetPrevLayer(pPrevLayer: TNNetLayer);

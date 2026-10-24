@@ -85,15 +85,6 @@ rather than acted on.
       plain conv chunk path at all. Options: override `WinogradEligible` (and
       `ChunkEligible`) to false in `TNNetDeformableConv`, or move the packed
       field to a free slot.
-- [ ] Possible bug (found during f90b4f0c, not fixed, awaits user decision):
-      `TNNetGridSample` border-padding backward clamps the four corner indices
-      and zeroes each clamped corner's term. When exactly one corner pair is
-      clamped the sample is locally constant, but the grid gradient comes out
-      as +/-v instead of 0 (e.g. sx in (-1, 0) gives dSdx = v10). torch
-      `clip_coordinates` clips the pixel coordinate instead, with zero
-      gradient where it clips; `TNNetTriplaneSample` already does that. Fix:
-      clip the coordinate in `TNNetGridSample` the same way, and add a
-      border-padding gradient check at the edge.
 - [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
       (neural/neuralvolume.pas) calls `ReSize` only when `Size` differs,
       so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
