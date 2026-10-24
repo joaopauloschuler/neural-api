@@ -258,6 +258,10 @@ type
     // IoFile ({"cases": [{"input", "out_grid_w", "out_grid_h", "output"}]}).
     function DPTDepthParityMaxDiff(const WeightsFile, ConfigFile,
       IoFile: string): double;
+    // Largest |hidden - oracle| of a DINOv2/v3 net NN over every token row of
+    // tests/fixtures/<HiddenFile> ({"pixels", "hidden", "num_tokens"}).
+    function DINOHiddenParityMaxDiff(NN: TNNet; const HiddenFile: string;
+      ImageSize, NumChannels, HiddenSize: integer): double;
     // tiny_vitmatte_io.json: image (W, H, 3), trimap (W, H, 1), the processor's
     // pixel_values (padded W, H, 4) and the float64 alphas (padded W, H, 1).
     procedure LoadViTMatteIO(Image, Trimap, PixelValues, Alphas: TNNetVolume);
@@ -1299,6 +1303,7 @@ type
     procedure TestDepthAnythingV2ResizedParity;
     procedure TestDPTResizeOutputSize;
     procedure TestDepthAnythingV2Parity;
+    procedure TestDepthAnythingV2SwiGLUParity;
     procedure TestVideoMAEConfigFromJSONFile;
     procedure TestVideoMAEClassificationParity;
     procedure TestViTPoseConfigFromJSONFile;
@@ -1812,8 +1817,11 @@ type
     procedure TestBiRefNetOpenCLParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
+    procedure TestDINOv2RegistersParity;
+    procedure TestDINOv2SwiGLUParity;
     procedure TestDINOv3ConfigFromJSONFile;
     procedure TestDINOv3Parity;
+    procedure TestDINOv3GatedMLPParity;
     procedure TestBeitConfigFromJSONFile;
     procedure TestBeitParity;
     procedure TestBeitImageClassificationParity;
@@ -41776,6 +41784,21 @@ begin
     FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
 end;
 
+// tiny_depth_anything_v2_swiglu: the Depth Anything V2 stack on a
+// use_swiglu_ffn DINOv2 backbone; oracle = transformers float64 predicted_depth.
+procedure TTestNeuralPretrained.TestDepthAnythingV2SwiGLUParity;
+var
+  MaxDiff: double;
+begin
+  MaxDiff := DPTDepthParityMaxDiff(
+    FixturePath('tiny_depth_anything_v2_swiglu.safetensors'),
+    FixturePath('tiny_depth_anything_v2_swiglu_config.json'),
+    FixturePath('tiny_depth_anything_v2_swiglu_io.json'));
+  WriteLn('  Depth Anything V2 SwiGLU depth max|diff| = ', MaxDiff:0:9);
+  AssertTrue('Depth Anything V2 SwiGLU depth: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+
 // DPTResizeOutputSize vs transformers get_resize_output_image_size.
 procedure TTestNeuralPretrained.TestDPTResizeOutputSize;
 var
@@ -65175,68 +65198,125 @@ procedure TTestNeuralPretrained.TestDINOv2Parity;
 var
   NN: TNNet;
   Config: TDINOv2Config;
-  RefRoot: TJSONData;
-  RefJson: TStringList;
-  Pixels, RowArr, ChanArr, HiddenArr, TokRow: TJSONArray;
-  ImageInput: TNNetVolume;
-  ChanCnt, YCnt, XCnt, TokCnt, ColCnt, NumTokens: integer;
-  Diff, MaxDiff: double;
+  MaxDiff: double;
 begin
   RandSeed := 424242;
   NN := BuildDINOv2FromSafeTensorsWithConfig(
     FixturePath('tiny_dinov2.safetensors'),
     Config, {pTrainable=}true, FixturePath('tiny_dinov2_config.json'));
+  try
+    MaxDiff := DINOHiddenParityMaxDiff(NN, 'tiny_dinov2_hidden.json',
+      Config.ImageSize, Config.NumChannels, Config.HiddenSize);
+    AssertTrue('CLS+patch hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NN.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.DINOHiddenParityMaxDiff(NN: TNNet;
+  const HiddenFile: string; ImageSize, NumChannels, HiddenSize: integer): double;
+var
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, HiddenArr, TokRow: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, TokCnt, ColCnt, NumTokens: integer;
+begin
+  Result := 0;
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
   try
     AssertTrue('net built', NN <> nil);
-    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
-    AssertEquals('output depth = hidden_size', Config.HiddenSize,
+    AssertEquals('input grid', ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output depth = hidden_size', HiddenSize,
       NN.GetLastLayer().Output.Depth);
-
-    RefJson.LoadFromFile(FixturePath('tiny_dinov2_hidden.json'));
+    RefJson.LoadFromFile(FixturePath(HiddenFile));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
     NumTokens := TJSONObject(RefRoot).Get('num_tokens', 0);
     AssertTrue('pixels present', Pixels <> nil);
     AssertEquals('oracle token rows', NumTokens, HiddenArr.Count);
-    AssertEquals('output rows = num tokens (CLS + patches, NO crop)',
+    AssertEquals('output rows = every token (NO crop)',
       NumTokens, NN.GetLastLayer().Output.SizeX);
-
-    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
-    for ChanCnt := 0 to Config.NumChannels - 1 do
+    ImageInput.ReSize(ImageSize, ImageSize, NumChannels);
+    for ChanCnt := 0 to NumChannels - 1 do
     begin
       RowArr := TJSONArray(Pixels.Items[ChanCnt]);
-      for YCnt := 0 to Config.ImageSize - 1 do
+      for YCnt := 0 to ImageSize - 1 do
       begin
         ChanArr := TJSONArray(RowArr.Items[YCnt]);
-        for XCnt := 0 to Config.ImageSize - 1 do
-          ImageInput.FData[
-            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
-            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+        for XCnt := 0 to ImageSize - 1 do
+          ImageInput.FData[(YCnt * ImageSize + XCnt) * NumChannels + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
       end;
     end;
     NN.Compute(ImageInput);
-    MaxDiff := 0;
     for TokCnt := 0 to NumTokens - 1 do
     begin
       TokRow := TJSONArray(HiddenArr.Items[TokCnt]);
-      for ColCnt := 0 to Config.HiddenSize - 1 do
-      begin
-        Diff := Abs(NN.GetLastLayer().Output.FData[
-          TokCnt * Config.HiddenSize + ColCnt] -
-          TokRow.Items[ColCnt].AsFloat);
-        if Diff > MaxDiff then MaxDiff := Diff;
-      end;
+      for ColCnt := 0 to HiddenSize - 1 do
+        Result := Max(Result, Abs(NN.GetLastLayer().Output.FData[
+          TokCnt * HiddenSize + ColCnt] - TokRow.Items[ColCnt].AsFloat));
     end;
-    AssertTrue('CLS+patch hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
-      ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;
     ImageInput.Free;
     RefJson.Free;
+  end;
+end;
+
+// tiny_dinov2_registers.*: a pico HF Dinov2WithRegistersModel (as tiny_dinov2
+// plus 2 register tokens inserted after the CLS token AFTER the position add).
+// Output rows: CLS, 2 registers, 9 patches; < 1e-4 vs the float64 oracle.
+procedure TTestNeuralPretrained.TestDINOv2RegistersParity;
+var
+  NN: TNNet;
+  Config: TDINOv2Config;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildDINOv2FromSafeTensorsWithConfig(
+    FixturePath('tiny_dinov2_registers.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_dinov2_registers_config.json'));
+  try
+    AssertEquals('model_type', 'dinov2_with_registers', Config.ModelType);
+    AssertEquals('num_register_tokens', 2, Config.NumRegisterTokens);
+    AssertEquals('output rows = 1 + 2 + 9', 12,
+      NN.GetLastLayer().Output.SizeX);
+    MaxDiff := DINOHiddenParityMaxDiff(NN, 'tiny_dinov2_registers_hidden.json',
+      Config.ImageSize, Config.NumChannels, Config.HiddenSize);
+    WriteLn('  DINOv2 with registers hidden max|diff| = ', MaxDiff:0:9);
+    AssertTrue('CLS+register+patch hidden states: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    NN.Free;
+  end;
+end;
+
+// tiny_dinov2_swiglu.*: a pico HF Dinov2Model with use_swiglu_ffn (the giant
+// FFN): mlp_ratio 4 at hidden 16 -> int(64 * 2/3) = 42 rounded up to 48.
+procedure TTestNeuralPretrained.TestDINOv2SwiGLUParity;
+var
+  NN: TNNet;
+  Config: TDINOv2Config;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildDINOv2FromSafeTensorsWithConfig(
+    FixturePath('tiny_dinov2_swiglu.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_dinov2_swiglu_config.json'));
+  try
+    AssertTrue('use_swiglu_ffn', Config.UseSwiGLUFFN);
+    AssertEquals('SwiGLU half width', 48, Config.IntermediateSize);
+    MaxDiff := DINOHiddenParityMaxDiff(NN, 'tiny_dinov2_swiglu_hidden.json',
+      Config.ImageSize, Config.NumChannels, Config.HiddenSize);
+    WriteLn('  DINOv2 SwiGLU hidden max|diff| = ', MaxDiff:0:9);
+    AssertTrue('SwiGLU hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
     NN.Free;
   end;
 end;
@@ -65276,68 +65356,43 @@ procedure TTestNeuralPretrained.TestDINOv3Parity;
 var
   NN: TNNet;
   Config: TDINOv3Config;
-  RefRoot: TJSONData;
-  RefJson: TStringList;
-  Pixels, RowArr, ChanArr, HiddenArr, TokRow: TJSONArray;
-  ImageInput: TNNetVolume;
-  ChanCnt, YCnt, XCnt, TokCnt, ColCnt, NumTokens: integer;
-  Diff, MaxDiff: double;
+  MaxDiff: double;
 begin
   RandSeed := 424242;
   NN := BuildDINOv3FromSafeTensorsWithConfig(
     FixturePath('tiny_dinov3.safetensors'),
     Config, {pTrainable=}true, FixturePath('tiny_dinov3_config.json'));
-  RefJson := TStringList.Create;
-  ImageInput := TNNetVolume.Create;
-  RefRoot := nil;
   try
-    AssertTrue('net built', NN <> nil);
-    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
-    AssertEquals('output depth = hidden_size', Config.HiddenSize,
-      NN.GetLastLayer().Output.Depth);
-
-    RefJson.LoadFromFile(FixturePath('tiny_dinov3_hidden.json'));
-    RefRoot := GetJSON(RefJson.Text);
-    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
-    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
-    NumTokens := TJSONObject(RefRoot).Get('num_tokens', 0);
-    AssertTrue('pixels present', Pixels <> nil);
-    AssertEquals('oracle token rows', NumTokens, HiddenArr.Count);
-    AssertEquals('output rows = num tokens (CLS + register + patches)',
-      NumTokens, NN.GetLastLayer().Output.SizeX);
-
-    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
-    for ChanCnt := 0 to Config.NumChannels - 1 do
-    begin
-      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
-      for YCnt := 0 to Config.ImageSize - 1 do
-      begin
-        ChanArr := TJSONArray(RowArr.Items[YCnt]);
-        for XCnt := 0 to Config.ImageSize - 1 do
-          ImageInput.FData[
-            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
-            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
-      end;
-    end;
-    NN.Compute(ImageInput);
-    MaxDiff := 0;
-    for TokCnt := 0 to NumTokens - 1 do
-    begin
-      TokRow := TJSONArray(HiddenArr.Items[TokCnt]);
-      for ColCnt := 0 to Config.HiddenSize - 1 do
-      begin
-        Diff := Abs(NN.GetLastLayer().Output.FData[
-          TokCnt * Config.HiddenSize + ColCnt] -
-          TokRow.Items[ColCnt].AsFloat);
-        if Diff > MaxDiff then MaxDiff := Diff;
-      end;
-    end;
+    MaxDiff := DINOHiddenParityMaxDiff(NN, 'tiny_dinov3_hidden.json',
+      Config.ImageSize, Config.NumChannels, Config.HiddenSize);
     AssertTrue('CLS+register+patch hidden states: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
-    RefRoot.Free;
-    ImageInput.Free;
-    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// tiny_dinov3_gated.*: tiny_dinov3 with use_gated_mlp and hidden_act "silu"
+// (down_proj(silu(gate_proj(x)) * up_proj(x))); < 1e-4 vs the float64 oracle.
+procedure TTestNeuralPretrained.TestDINOv3GatedMLPParity;
+var
+  NN: TNNet;
+  Config: TDINOv3Config;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildDINOv3FromSafeTensorsWithConfig(
+    FixturePath('tiny_dinov3_gated.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_dinov3_gated_config.json'));
+  try
+    AssertTrue('use_gated_mlp', Config.UseGatedMLP);
+    AssertEquals('hidden_act', 'silu', Config.HiddenActName);
+    MaxDiff := DINOHiddenParityMaxDiff(NN, 'tiny_dinov3_gated_hidden.json',
+      Config.ImageSize, Config.NumChannels, Config.HiddenSize);
+    WriteLn('  DINOv3 gated MLP hidden max|diff| = ', MaxDiff:0:9);
+    AssertTrue('gated-MLP hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
     NN.Free;
   end;
 end;

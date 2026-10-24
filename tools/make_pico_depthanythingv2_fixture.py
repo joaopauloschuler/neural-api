@@ -18,12 +18,18 @@ is the REAL transformers DepthAnythingForDepthEstimation (installed here); the
 test asserts the Pascal forward matches HF `predicted_depth` per-pixel at full
 input resolution (max |diff| < 1e-4).
 
+--variant swiglu writes tiny_depth_anything_v2_swiglu.*: the same stack on a
+use_swiglu_ffn DINOv2 backbone (the giant FFN). transformers cannot run a
+dinov2_with_registers backbone here (its reassemble stage drops only the CLS
+row), so there is no register variant.
+
 Coded by Claude (AI).
 
 Usage (from the repo root):
-  /home/bpsa/x/bin/python tools/make_pico_depthanythingv2_fixture.py
-writes tests/fixtures/tiny_depth_anything_v2{.safetensors,_config.json,_io.json}.
+  /home/bpsa/x/bin/python tools/make_pico_depthanythingv2_fixture.py [--variant base|swiglu]
+writes tests/fixtures/tiny_depth_anything_v2{,_swiglu}{.safetensors,_config.json,_io.json}.
 """
+import argparse
 import json
 import os
 
@@ -54,8 +60,16 @@ LAYER_NORM_EPS = 1e-6
 # NON-contiguous, NON-last-4 stage hooks (1-based) -> 0-based blocks [1,2,4,5].
 OUT_INDICES = [2, 3, 5, 6]
 
-torch.manual_seed(4242)
-np.random.seed(4242)
+parser = argparse.ArgumentParser()
+parser.add_argument('--variant', choices=('base', 'swiglu'), default='base')
+VARIANT = parser.parse_args().variant
+SWIGLU = VARIANT == 'swiglu'
+NAME = ('tiny_depth_anything_v2' if VARIANT == 'base'
+        else 'tiny_depth_anything_v2_' + VARIANT)
+SEED = 4343 if SWIGLU else 4242
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 bc = Dinov2Config(
     hidden_size=HIDDEN,
@@ -69,7 +83,7 @@ bc = Dinov2Config(
     out_indices=OUT_INDICES,
     apply_layernorm=True,
     reshape_hidden_states=False,
-    use_swiglu_ffn=False,
+    use_swiglu_ffn=SWIGLU,
 )
 cfg = DepthAnythingConfig(
     backbone_config=bc,
@@ -135,7 +149,7 @@ for k, v in state.items():
     if k.endswith("embeddings.mask_token"):
         continue
     tensors[k] = v.detach().cpu().numpy().astype(np.float32)
-save_file(tensors, os.path.join(fixtures, "tiny_depth_anything_v2.safetensors"))
+save_file(tensors, os.path.join(fixtures, NAME + ".safetensors"))
 
 config = {
     "model_type": "depth_anything",
@@ -162,13 +176,15 @@ config = {
         "out_indices": OUT_INDICES,
     },
 }
-with open(os.path.join(fixtures, "tiny_depth_anything_v2_config.json"), "w") as f:
+if SWIGLU:
+    config["backbone_config"]["use_swiglu_ffn"] = True
+with open(os.path.join(fixtures, NAME + "_config.json"), "w") as f:
     json.dump(config, f, indent=2)
 
-with open(os.path.join(fixtures, "tiny_depth_anything_v2_io.json"), "w") as f:
+with open(os.path.join(fixtures, NAME + "_io.json"), "w") as f:
     json.dump({"cases": cases}, f)
 
-print("wrote tiny_depth_anything_v2.{safetensors,_config.json,_io.json} to",
+print("wrote " + NAME + ".{safetensors,_config.json,_io.json} to",
       fixtures)
 print(f"  image={IMAGE} patch={PATCH} hidden={HIDDEN} layers={NUM_LAYERS} "
       f"out_indices={OUT_INDICES} neck={NECK_HIDDEN} fusion={FUSION_HIDDEN}")

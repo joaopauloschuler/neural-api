@@ -35,6 +35,15 @@ resized bicubically to the new patch grid, as transformers'
 their `DPTImageProcessor` keeps the aspect ratio (`keep_aspect_ratio`,
 `ensure_multiple_of` 14), which `DPTPreprocessImage` reproduces.
 
+## Backbones
+
+- **Planned (coded):** the DINOv2 S/B/L backbone (pico parity only; no real
+  checkpoint run yet) and the `use_swiglu_ffn` (giant) DINOv2 backbone (pico
+  parity `TestDepthAnythingV2SwiGLUParity`).
+- **Rejected:** a `dinov2_with_registers` backbone. transformers' own
+  `DepthAnythingForDepthEstimation` fails on it (its reassemble stage drops only
+  the CLS row), so there is no reference to match.
+
 ## Input
 
 Default is a **smoke run** on the committed pico fixture

@@ -416,8 +416,8 @@ rather than acted on.
       2-D AXIAL RoPE on patch tokens (TNNetVisionRoPE2D + AddMultiHeadVisionRoPE2DAttention),
       register tokens prepended after CLS, BERT-unfused q/k/v/o_proj with UNbiased key;
       parity < 1e-4 vs a float64 HF DINOv3ViTModel oracle, scalar + AVX2 green):
-  - [ ] use_gated_mlp (SwiGLU giant) variant rejected (only plain
-        up_proj/down_proj+gelu wired).
+  - [ ] use_gated_mlp (gate/up/down_proj; silu/gelu gate) coded with pico parity
+        TestDINOv3GatedMLPParity; no real vith16plus / 7B checkpoint run.
   - [ ] non-square / non-native image_size (dynamic RoPE grid) not yet plumbed —
         TNNetVisionRoPE2D is fixed to the build-time grid. DINOv3-backed
         dense prediction also needs the BuildDPT register-token item under
@@ -513,7 +513,12 @@ rather than acted on.
   - [ ] real-checkpoint parity not run (no weights downloaded).
   - [ ] metric-depth Depth-Anything-V2 (indoor/outdoor, depth_estimation_type
         "metric") untested on a real ckpt.
-  - [ ] register-token / SwiGLU DINOv2 backbones still rejected by BuildDPT.
+  - [ ] register-token DINOv2 backbones still rejected by BuildDPT:
+        transformers' DepthAnything/DPT reassemble stage drops only the CLS row,
+        so its own forward fails on a dinov2_with_registers backbone (no oracle).
+        Dropping CLS + registers (the facebookresearch get_intermediate_layers
+        behaviour) needs a user decision. The SwiGLU backbone is coded with pico
+        parity TestDepthAnythingV2SwiGLUParity.
   - [ ] real keep_aspect_ratio run (518, ensure_multiple_of 14) with
         DPTPreprocessImage on a photo; the example has no image input yet.
 - [ ] Video Depth Anything importer (temporally consistent depth for long videos;

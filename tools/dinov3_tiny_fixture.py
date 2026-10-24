@@ -28,13 +28,19 @@ The reference is computed by HF transformers in float64 (the oracle
 convention of the committed fixtures): the post-final-layernorm
 last_hidden_state for the pinned image.
 
+--variant gated writes tiny_dinov3_gated.*: use_gated_mlp with hidden_act
+"silu" (the vith16plus / 7B SwiGLU MLP, down_proj(silu(gate_proj(x)) *
+up_proj(x))).
+
 Coded by Claude (AI).
 
 Usage (from the repo root):
-  /home/bpsa/x/bin/python tools/dinov3_tiny_fixture.py
-writes tests/fixtures/tiny_dinov3{.safetensors,_config.json,_hidden.json}.
+  /home/bpsa/x/bin/python tools/dinov3_tiny_fixture.py [--variant base|gated]
+writes tests/fixtures/tiny_dinov3{,_gated}{.safetensors,_config.json,
+_hidden.json}.
 Needs torch + transformers (>=5.11, ships dinov3_vit) + safetensors.
 """
+import argparse
 import copy
 import json
 
@@ -51,15 +57,21 @@ INTERMEDIATE = 64             # mlp_ratio 4
 N_REGISTER = 2
 ROPE_THETA = 100.0
 
-torch.manual_seed(20260627)
+parser = argparse.ArgumentParser()
+parser.add_argument('--variant', choices=('base', 'gated'), default='base')
+VARIANT = parser.parse_args().variant
+GATED = VARIANT == 'gated'
+NAME = 'tiny_dinov3' if VARIANT == 'base' else 'tiny_dinov3_' + VARIANT
+
+torch.manual_seed(20261026 if GATED else 20260627)
 
 cfg = DINOv3ViTConfig(
     hidden_size=HIDDEN, intermediate_size=INTERMEDIATE,
     num_hidden_layers=N_LAYER, num_attention_heads=N_HEAD,
     image_size=IMAGE, patch_size=PATCH, num_channels=3,
-    hidden_act='gelu', layer_norm_eps=1e-6,
+    hidden_act='silu' if GATED else 'gelu', layer_norm_eps=1e-6,
     num_register_tokens=N_REGISTER, rope_theta=ROPE_THETA,
-    use_gated_mlp=False, layerscale_value=1.0,
+    use_gated_mlp=GATED, layerscale_value=1.0,
     query_bias=True, key_bias=False, value_bias=True, proj_bias=True,
     mlp_bias=True, attention_dropout=0.0, drop_path_rate=0.0,
 )
@@ -82,6 +94,9 @@ with torch.no_grad():
                 proj.bias.normal_(0.0, 0.2)
         layer.mlp.up_proj.weight.normal_(0.0, 0.5)
         layer.mlp.up_proj.bias.normal_(0.0, 0.3)
+        if GATED:
+            layer.mlp.gate_proj.weight.normal_(0.0, 0.5)
+            layer.mlp.gate_proj.bias.normal_(0.0, 0.3)
         layer.mlp.down_proj.weight.normal_(0.0, 0.3)
         layer.mlp.down_proj.bias.normal_(0.0, 0.2)
         for norm in (layer.norm1, layer.norm2):
@@ -109,14 +124,14 @@ sd = {k: v.to(torch.float32).clone().contiguous()
       for k, v in model.state_dict().items()
       if not k.endswith('position_ids') and not k.endswith('inv_freq')
       and not k.endswith('mask_token')}
-save_file(sd, 'tests/fixtures/tiny_dinov3.safetensors')
-with open('tests/fixtures/tiny_dinov3_config.json', 'w') as f:
+save_file(sd, 'tests/fixtures/' + NAME + '.safetensors')
+with open('tests/fixtures/' + NAME + '_config.json', 'w') as f:
     json.dump(cfg.to_dict(), f, indent=1, default=str)
 
 with torch.no_grad():
     hidden = model(pixel_values=pixels).last_hidden_state   # [1][N_TOK][HIDDEN]
 n_tok = hidden.shape[1]
-with open('tests/fixtures/tiny_dinov3_hidden.json', 'w') as f:
+with open('tests/fixtures/' + NAME + '_hidden.json', 'w') as f:
     json.dump({
         'pixels': pixels[0].tolist(),                    # [3][IMAGE][IMAGE]
         'hidden': hidden[0].tolist(),                    # [N_TOK][HIDDEN]
@@ -124,7 +139,7 @@ with open('tests/fixtures/tiny_dinov3_hidden.json', 'w') as f:
         'hidden_size': HIDDEN,
         'num_register_tokens': N_REGISTER,
     }, f)
-print(f'wrote tiny_dinov3.safetensors ({len(sd)} tensors) + config + oracle')
+print(f'wrote {NAME}.safetensors ({len(sd)} tensors) + config + oracle')
 print(f'  last_hidden_state shape = {list(hidden.shape)} (1 CLS + '
       f'{N_REGISTER} reg + 9 patch = {n_tok} tokens)')
 for k in sorted(sd):
@@ -134,7 +149,8 @@ for k in sorted(sd):
 with torch.no_grad():
     base = hidden
 
-    # 1. exact-erf "gelu" vs tanh-GELU / quick_gelu distinguishable > 1e-4.
+    # 1. the MLP activation must be distinguishable > 1e-4 from the wrong
+    # ones (exact-erf gelu for the plain MLP, silu for the gated one).
     class TanhGELU(torch.nn.Module):
         def forward(self, x):
             return torch.nn.functional.gelu(x, approximate='tanh')
@@ -142,14 +158,17 @@ with torch.no_grad():
     class QuickGELU(torch.nn.Module):
         def forward(self, x):
             return x * torch.sigmoid(1.702 * x)
-    for wrong, act in (('gelu_tanh', TanhGELU().double()),
-                       ('quick_gelu', QuickGELU().double())):
+    wrong_acts = [('gelu_tanh', TanhGELU().double()),
+                  ('quick_gelu', QuickGELU().double())]
+    if GATED:
+        wrong_acts = [('gelu', torch.nn.GELU().double())]
+    for wrong, act in wrong_acts:
         alt = copy.deepcopy(model)
         for layer in alt.model.layer:
             layer.mlp.act_fn = act
         d = (alt(pixel_values=pixels).last_hidden_state - base).abs().max()
-        assert d > 1.5e-4, f'exact-gelu vs {wrong} indistinguishable ({d})'
-        print(f'gelu-vs-{wrong}: max |diff| = {d:.4f}')
+        assert d > 1.5e-4, f'{cfg.hidden_act} vs {wrong} indistinguishable ({d})'
+        print(f'{cfg.hidden_act}-vs-{wrong}: max |diff| = {d:.4f}')
 
     # 2. LayerScale must matter.
     alt = copy.deepcopy(model)
@@ -188,4 +207,14 @@ with torch.no_grad():
     d = (alt(pixel_values=pixels).last_hidden_state - base).abs().max()
     assert d > 1e-3, f'patch projection bias had no effect ({d})'
     print(f'patch bias effect on hidden: max |diff| = {d:.4f}')
+
+    # 7. gated MLP: swapping gate_proj and up_proj must move the hidden states.
+    if GATED:
+        alt = copy.deepcopy(model)
+        for layer in alt.model.layer:
+            m = layer.mlp
+            m.gate_proj, m.up_proj = m.up_proj, m.gate_proj
+        d = (alt(pixel_values=pixels).last_hidden_state - base).abs().max()
+        assert d > 1e-3, f'gate/up order had no effect ({d})'
+        print(f'gate/up order effect on hidden: max |diff| = {d:.4f}')
 print('all fixture self-checks passed')
