@@ -79,7 +79,9 @@ Two parity targets are written, each asserted < 1e-4 by the Pascal test:
       the "vae_batched" cases (4, 5 and 7 latent frames) go through its
       frame-batched _decode (2 latent frames per batch, the odd one in the
       first, each causal conv carrying the last 2 input frames of the batch
-      before it).
+      before it); the "vae_tiled" cases go through its tiled_decode (small
+      enable_tiling tiles, each with its own frame-batched decode, blended by
+      blend_v / blend_h).
 
 The fixture writes RAW diffusers-style tensor names; the Pascal importer reads
 exactly these.
@@ -338,6 +340,14 @@ VAE_BATCHED_CASES = [
     ("tiny_cogvideox_vae_pq", 4, 2, 3),
     ("tiny_cogvideox_vae_pq", 7, 2, 3),
 ]
+# Latents wider or taller than one tile, decoded by diffusers' tiled_decode
+# after enable_tiling(...) on the VAEs above: (folder, latent frames, latent H,
+# latent W, tile_sample_min_height, tile_sample_min_width,
+# tile_overlap_factor_height, tile_overlap_factor_width).
+VAE_TILED_CASES = [
+    ("tiny_cogvideox_vae", 1, 3, 4, 16, 24, 1 / 2, 1 / 3),
+    ("tiny_cogvideox_vae_pq", 4, 8, 5, 12, 10, 1 / 6, 1 / 5),
+]
 
 
 def vae_io_case(vae, folder, scaling, lt, lh, lw):
@@ -353,6 +363,13 @@ def vae_io_case(vae, folder, scaling, lt, lh, lw):
             whole, _ = vae.decoder(z)
             print(f"  {folder}: batched vs whole-clip decode max |diff| = "
                   f"{(decoded - whole).abs().max().item():.3g}")
+    if vae.use_tiling:
+        vae.use_tiling = False
+        with torch.no_grad():
+            untiled = vae.decode(latent / scaling).sample
+        vae.use_tiling = True
+        print(f"  {folder}: tiled vs untiled decode max |diff| = "
+              f"{(decoded - untiled).abs().max().item():.3g}")
     print(f"  {folder}: latent {lt}x{lh}x{lw} -> decoded "
           f"{tuple(decoded.shape[2:])} x {decoded.shape[1]}")
     # Both stored as flat (t, h, w, c), the denoiser's token-major layout.
@@ -396,8 +413,23 @@ def write_vae_fixtures(fixtures):
     for (folder, lt, lh, lw) in VAE_BATCHED_CASES:
         vae, scaling = vaes[folder]
         batched_cases.append(vae_io_case(vae, folder, scaling, lt, lh, lw))
+    tiled_cases = []
+    for (folder, lt, lh, lw, tile_h, tile_w, factor_h, factor_w) in VAE_TILED_CASES:
+        vae, scaling = vaes[folder]
+        vae.enable_tiling(tile_sample_min_height=tile_h,
+                          tile_sample_min_width=tile_w,
+                          tile_overlap_factor_height=factor_h,
+                          tile_overlap_factor_width=factor_w)
+        case = vae_io_case(vae, folder, scaling, lt, lh, lw)
+        vae.disable_tiling()
+        case.update({"tile_sample_min_height": tile_h,
+                     "tile_sample_min_width": tile_w,
+                     "tile_overlap_factor_height": factor_h,
+                     "tile_overlap_factor_width": factor_w})
+        tiled_cases.append(case)
     with open(os.path.join(fixtures, "tiny_cogvideox_vae_io.json"), "w") as f:
-        json.dump({"vae": io_cases, "vae_batched": batched_cases}, f)
+        json.dump({"vae": io_cases, "vae_batched": batched_cases,
+                   "vae_tiled": tiled_cases}, f)
 
 
 # ---------------- write ----------------

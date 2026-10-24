@@ -63,9 +63,10 @@ type
     FSDStepLatents: TNNetVolumeList;
     function FixturePath(const FileName: string): string;
     // Decodes every case of tiny_cogvideox_vae_io.json's CasesKey array with
-    // TCogVideoXVaeDecoder; each must match diffusers < 1e-4.
+    // TCogVideoXVaeDecoder (tiled when the case has tile settings); each must
+    // match diffusers < 1e-4.
     procedure CheckCogVideoXVaeCases(const CasesKey: string;
-      CaseCount, BatchCountSum: integer);
+      CaseCount, BatchCountSum, TileCountSum: integer);
     // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
@@ -1615,6 +1616,7 @@ type
     procedure TestCogVideoXVaeDecoderParity;
     // 4/5/7-latent-frame clips vs diffusers' frame-batched _decode (conv cache).
     procedure TestCogVideoXVaeBatchedDecodeParity;
+    procedure TestCogVideoXVaeTiledDecodeParity;
     // TCogVideoXSampler's First-Block Cache vs plain loops on a 3-block copy
     // of the pico checkpoint: threshold 0 bit-identical, skips as a reference.
     procedure TestCogVideoXFirstBlockCacheReference;
@@ -56809,7 +56811,7 @@ begin
 end;
 
 procedure TTestNeuralPretrained.CheckCogVideoXVaeCases(const CasesKey: string;
-  CaseCount, BatchCountSum: integer);
+  CaseCount, BatchCountSum, TileCountSum: integer);
 var
   Decoder: TCogVideoXVaeDecoder;
   Latent, Frames: TNNetVolume;
@@ -56817,7 +56819,7 @@ var
   RefJson: TStringList;
   VaeArr, LatArr, DecArr: TJSONArray;
   CaseObj: TJSONObject;
-  CasePos, ValuePos, OutFrames, OutH, BatchCountTotal: integer;
+  CasePos, ValuePos, OutFrames, OutH, BatchCountTotal, TileCountTotal: integer;
   Diff, MaxDiff: double;
 begin
   RefJson := TStringList.Create;
@@ -56832,6 +56834,7 @@ begin
     AssertTrue(CasesKey + ' cases present', (VaeArr <> nil) and
       (VaeArr.Count = CaseCount));
     BatchCountTotal := 0;
+    TileCountTotal := 0;
     for CasePos := 0 to VaeArr.Count - 1 do
     begin
       CaseObj := TJSONObject(VaeArr.Items[CasePos]);
@@ -56843,8 +56846,11 @@ begin
           DirectorySeparator + 'config.json')), CaseObj.Get('latent_frames', 0),
         CaseObj.Get('latent_height', 0), CaseObj.Get('latent_width', 0));
       AssertEquals('output frame count', OutFrames, Decoder.OutputFrames);
-      AssertEquals('next-batch net iff more than one batch',
-        Decoder.BatchCount > 1, Decoder.NextNet <> nil);
+      if CaseObj.Find('tile_sample_min_height') <> nil then
+        Decoder.EnableTiling(CaseObj.Get('tile_sample_min_height', 0),
+          CaseObj.Get('tile_sample_min_width', 0),
+          CaseObj.Get('tile_overlap_factor_height', 0.0),
+          CaseObj.Get('tile_overlap_factor_width', 0.0));
       Inc(BatchCountTotal, Decoder.BatchCount);
       LatArr := TJSONArray(CaseObj.Find('latent'));
       DecArr := TJSONArray(CaseObj.Find('decoded'));
@@ -56852,6 +56858,9 @@ begin
       for ValuePos := 0 to LatArr.Count - 1 do
         Latent.FData[ValuePos] := LatArr.Items[ValuePos].AsFloat;
       Decoder.Decode(Latent, Frames);
+      AssertEquals('next-batch net iff more than one batch',
+        Decoder.BatchCount > 1, Decoder.NextNet <> nil);
+      Inc(TileCountTotal, Decoder.LastTileCount);
       AssertEquals('decoded width', CaseObj.Get('width', 0), Frames.SizeX);
       AssertEquals('decoded rows', OutH * OutFrames, Frames.SizeY);
       AssertEquals('decoded channels', CaseObj.Get('channels', 0), Frames.Depth);
@@ -56870,6 +56879,7 @@ begin
         FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
     end;
     AssertEquals(CasesKey + ' batches decoded', BatchCountSum, BatchCountTotal);
+    AssertEquals(CasesKey + ' tiles decoded', TileCountSum, TileCountTotal);
   finally
     Decoder.Free;
     RefRoot.Free;
@@ -56882,13 +56892,19 @@ end;
 procedure TTestNeuralPretrained.TestCogVideoXVaeDecoderParity;
 begin
   // 3 and 2 latent frames: one batch each.
-  CheckCogVideoXVaeCases('vae', 2, 2);
+  CheckCogVideoXVaeCases('vae', 2, 2, 2);
 end;
 
 procedure TTestNeuralPretrained.TestCogVideoXVaeBatchedDecodeParity;
 begin
   // 5 = 3 + 2, 4 = 2 + 2 and 7 = 3 + 2 + 2 latent frames.
-  CheckCogVideoXVaeCases('vae_batched', 3, 7);
+  CheckCogVideoXVaeCases('vae_batched', 3, 7, 3);
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXVaeTiledDecodeParity;
+begin
+  // 1 frame in 3x2 tiles of 4 shapes; 4 = 2 + 2 frames in 2x2 tiles.
+  CheckCogVideoXVaeCases('vae_tiled', 2, 3, 10);
 end;
 
 procedure TTestNeuralPretrained.TestCogVideoXFirstBlockCacheReference;

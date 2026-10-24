@@ -14842,6 +14842,13 @@ function ReadCogVideoXVaeConfig(const FileName: string): TCogVideoXVaeConfig;
 function CogVideoXVaeOutputFrames(const Config: TCogVideoXVaeConfig;
   LatentFrames: integer): integer;
 
+const
+  // diffusers AutoencoderKLCogVideoX tiling defaults (half of 480x720).
+  csCogVideoXVaeTileSampleMinHeight = 240;
+  csCogVideoXVaeTileSampleMinWidth = 360;
+  csCogVideoXVaeTileOverlapFactorHeight = 1 / 6;
+  csCogVideoXVaeTileOverlapFactorWidth = 1 / 5;
+
 type
   // The causal convs (time kernel > 1) of one decoder net, in build order: the
   // layer holding each padded input and, in a cached-pad net, its cache input.
@@ -14851,26 +14858,37 @@ type
     CacheChannels: array of TNeuralIntegerArray;
   end;
 
-  // diffusers AutoencoderKLCogVideoX._decode: 2 latent frames per batch (the
-  // first batch also takes an odd clip's extra frame), every causal conv
-  // padded with the last 2 input frames of the batch before. Each net holds
-  // one batch, so RAM follows the batch size, not the clip. Coded by Claude (AI).
+  // diffusers AutoencoderKLCogVideoX._decode / tiled_decode: 2 latent frames
+  // per batch with the conv cache; nets hold one batch of one tile, so RAM
+  // follows the tile, not the clip. Coded by Claude (AI).
   TCogVideoXVaeDecoder = class(TObject)
   private
     FConfig: TCogVideoXVaeConfig;
     FLatentFrames, FLatentH, FLatentW, FFirstBatchFrames: integer;
-    // FFirstNet (frame-0 repeat pad) owns the weights and decodes the first
-    // batch; FNextNet (cached pad) borrows them; nil for a one-batch clip.
+    // A 1x1-latent net that only holds the weights; every decoding net borrows.
+    FWeightOwner: TNNet;
+    // The nets of the current tile shape: FFirstNet (frame-0 repeat pad) for
+    // the first batch, FNextNet (cached pad) for the rest; nil for one batch.
     FFirstNet, FNextNet: TNNet;
+    FNetLatentW, FNetLatentH: integer;
     FFirstConvs, FNextConvs: TCogVideoXVaeCausalConvs;
-    FPackedLatent: TNNetVolume;
-    procedure BuildNets(Reader: TNNetSafeTensorsReader);
-    // Runs Net on latent frames [FirstFrame, FirstFrame + its batch) and
-    // writes its output frames into Frames from output frame OutFrame on.
-    procedure DecodeBatch(Net: TNNet; Latent: TNNetVolume;
-      FirstFrame: integer; Frames: TNNetVolume; var OutFrame: integer);
+    FPackedLatent, FBatchLatent: TNNetVolume;
+    FUseTiling: boolean;
+    FTileSampleMinHeight, FTileSampleMinWidth: integer;
+    FTileOverlapFactorHeight, FTileOverlapFactorWidth: double;
+    FLastTileCount: integer;
+    procedure LoadWeights(Reader: TNNetSafeTensorsReader);
+    procedure PrepareTileNets(TileW, TileH: integer);
+    // Frame-batched decode of a frame-packed latent tile (W, H, T*C) into a
+    // frame-packed TileFrames (W*s, H*s, OutputFrames*OutChannels).
+    procedure DecodeTile(LatentTile, TileFrames: TNNetVolume);
+    procedure DecodeBatch(Net: TNNet; LatentTile: TNNetVolume;
+      FirstFrame: integer; TileFrames: TNNetVolume; var OutFrame: integer);
     function GetBatchCount(): integer;
     function GetOutputFrames(): integer;
+    function GetSpatialScale(): integer;
+    function GetTileLatentMinHeight(): integer;
+    function GetTileLatentMinWidth(): integer;
   public
     // VaePath is a diffusers vae folder (config.json + diffusion_pytorch_model)
     // or a .safetensors file with a sibling config.json.
@@ -14880,6 +14898,14 @@ type
     constructor CreateFromReader(Reader: TNNetSafeTensorsReader;
       const Config: TCogVideoXVaeConfig; LatentFrames, LatentH, LatentW: integer);
     destructor Destroy(); override;
+    // diffusers enable_tiling: Decode tiles a latent wider or taller than one
+    // tile; the defaults suit 480x720 output.
+    procedure EnableTiling(
+      TileSampleMinHeight: integer = csCogVideoXVaeTileSampleMinHeight;
+      TileSampleMinWidth: integer = csCogVideoXVaeTileSampleMinWidth;
+      TileOverlapFactorHeight: double = csCogVideoXVaeTileOverlapFactorHeight;
+      TileOverlapFactorWidth: double = csCogVideoXVaeTileOverlapFactorWidth);
+    procedure DisableTiling();
     // Decodes the scaled latent (flat (t,h,w,c), the denoiser's layout) into
     // Frames = (W, H*OutputFrames, OutChannels), frame f at rows [f*H, f*H+H).
     procedure Decode(Latent, Frames: TNNetVolume);
@@ -14887,6 +14913,12 @@ type
     property LatentFrames: integer read FLatentFrames;
     property OutputFrames: integer read GetOutputFrames;
     property BatchCount: integer read GetBatchCount;
+    property UseTiling: boolean read FUseTiling;
+    property TileLatentMinHeight: integer read GetTileLatentMinHeight;
+    property TileLatentMinWidth: integer read GetTileLatentMinWidth;
+    // Tiles the last Decode ran (1 when it did not tile).
+    property LastTileCount: integer read FLastTileCount;
+    property WeightOwner: TNNet read FWeightOwner;
     property FirstNet: TNNet read FFirstNet;
     property NextNet: TNNet read FNextNet;
   end;
@@ -77703,7 +77735,7 @@ end;
 
 // diffusers blend_v: the first Extent rows of Tile ramp from Above's last
 // Extent rows (weight 1 - y/Extent) to Tile's own (weight y/Extent).
-procedure QwenImage21VaeBlendTileTop(Above, Tile: TNNetVolume;
+procedure VaeBlendTileTop(Above, Tile: TNNetVolume;
   Extent: integer);
 var
   RowPos, MaxRowPos, RowLength: integer;
@@ -77725,7 +77757,7 @@ end;
 
 // diffusers blend_h: the same ramp over the first Extent columns, from Left's
 // last Extent columns.
-procedure QwenImage21VaeBlendTileLeft(Left, Tile: TNNetVolume;
+procedure VaeBlendTileLeft(Left, Tile: TNNetVolume;
   Extent: integer);
 var
   RowPos, MaxRowPos, ColumnPos, MaxColumnPos, ChannelPos, MaxChannelPos: integer;
@@ -77744,7 +77776,7 @@ begin
     begin
       TileWeight := ColumnPos / Extent;
       LeftWeight := 1 - TileWeight;
-      // Depth is the few output channels: a bulk call per pixel costs more.
+      // One fused pass per value: Depth is short for an image VAE tile.
       for ChannelPos := 0 to MaxChannelPos do
         Tile.FData[TilePos + ChannelPos] :=
           Left.FData[LeftPos + ChannelPos] * LeftWeight +
@@ -77769,26 +77801,26 @@ begin
 end;
 
 type
-  TQwenImage21VaeTiles = array of TNNetVolume;
+  TVaeTiles = array of TNNetVolume;
   // PrepareNet of the decoder or encoder: (re)builds the net for one tile shape.
-  TQwenImage21VaeTileNetEvent = procedure(TileW, TileH: integer) of object;
+  TVaeTileNetEvent = procedure(TileW, TileH: integer) of object;
   // One forward of that net on SourceTile into TileResult.
-  TQwenImage21VaeTilePassEvent = procedure(SourceTile,
+  TVaeTilePassEvent = procedure(SourceTile,
     TileResult: TNNetVolume) of object;
 
-// diffusers tiled_encode / tiled_decode tile loop: a TileSize tile every
-// TileStride cells of Source (edge tiles smaller), one net per tile shape.
-procedure QwenImage21VaeComputeTiles(Source: TNNetVolume;
-  TileSize, TileStride: integer; PrepareTileNet: TQwenImage21VaeTileNetEvent;
-  RunTile: TQwenImage21VaeTilePassEvent; out ColumnCount: integer;
-  var Tiles: TQwenImage21VaeTiles);
+// diffusers tiled_encode / tiled_decode tile loop: a TileW x TileH tile every
+// StrideX / StrideY cells of Source (edge tiles smaller), one net per tile shape.
+procedure VaeComputeTiles(Source: TNNetVolume;
+  TileSizeX, TileSizeY, StrideX, StrideY: integer;
+  PrepareTileNet: TVaeTileNetEvent; RunTile: TVaeTilePassEvent;
+  out ColumnCount: integer; var Tiles: TVaeTiles);
 var
   RowCount, TileCount, TilePos, MaxTilePos, ShapeTilePos, TileW, TileH: integer;
   TileWidths, TileHeights: TNeuralIntegerArray;
   SourceTile: TNNetVolume;
 begin
-  RowCount := (Source.SizeY + TileStride - 1) div TileStride;
-  ColumnCount := (Source.SizeX + TileStride - 1) div TileStride;
+  RowCount := (Source.SizeY + StrideY - 1) div StrideY;
+  ColumnCount := (Source.SizeX + StrideX - 1) div StrideX;
   TileCount := RowCount * ColumnCount;
   MaxTilePos := TileCount - 1;
   SetLength(Tiles, TileCount);
@@ -77797,10 +77829,10 @@ begin
   for TilePos := 0 to MaxTilePos do
   begin
     Tiles[TilePos] := nil;
-    TileWidths[TilePos] := Min(TileSize,
-      Source.SizeX - (TilePos mod ColumnCount) * TileStride);
-    TileHeights[TilePos] := Min(TileSize,
-      Source.SizeY - (TilePos div ColumnCount) * TileStride);
+    TileWidths[TilePos] := Min(TileSizeX,
+      Source.SizeX - (TilePos mod ColumnCount) * StrideX);
+    TileHeights[TilePos] := Min(TileSizeY,
+      Source.SizeY - (TilePos div ColumnCount) * StrideY);
   end;
   SourceTile := TNNetVolume.Create();
   try
@@ -77815,8 +77847,8 @@ begin
         if (Tiles[ShapeTilePos] <> nil) or (TileWidths[ShapeTilePos] <> TileW) or
            (TileHeights[ShapeTilePos] <> TileH) then continue;
         SourceTile.CopyCropping(Source,
-          (ShapeTilePos mod ColumnCount) * TileStride,
-          (ShapeTilePos div ColumnCount) * TileStride, TileW, TileH);
+          (ShapeTilePos mod ColumnCount) * StrideX,
+          (ShapeTilePos div ColumnCount) * StrideY, TileW, TileH);
         Tiles[ShapeTilePos] := TNNetVolume.Create();
         RunTile(SourceTile, Tiles[ShapeTilePos]);
       end;
@@ -77826,28 +77858,46 @@ begin
   end;
 end;
 
-// diffusers' row-major in-place blend_v / blend_h of Tiles, each adding its
-// first Stride cells into Dest, which the caller sized to the whole output.
-procedure QwenImage21VaeAssembleTiles(const Tiles: TQwenImage21VaeTiles;
-  ColumnCount, BlendExtent, Stride: integer; Dest: TNNetVolume);
+// diffusers' row-major in-place blend_v / blend_h of Tiles, then Dest := the
+// concatenation of each tile's first KeepX x KeepY cells.
+procedure VaeAssembleTiles(const Tiles: TVaeTiles; ColumnCount, BlendExtentX,
+  BlendExtentY, KeepX, KeepY: integer; Dest: TNNetVolume);
 var
-  TilePos, MaxTilePos, RowPos, ColumnPos: integer;
+  TilePos, MaxTilePos, RowPos, ColumnPos, KeptW, KeptH, DestX, DestY: integer;
+  DestW, DestH: integer;
 begin
-  Dest.Fill(0);
   MaxTilePos := Length(Tiles) - 1;
+  DestW := 0;
+  DestH := 0;
+  for TilePos := 0 to MaxTilePos do
+  begin
+    if TilePos < ColumnCount then
+      Inc(DestW, Min(KeepX, Tiles[TilePos].SizeX));
+    if TilePos mod ColumnCount = 0 then
+      Inc(DestH, Min(KeepY, Tiles[TilePos].SizeY));
+  end;
+  Dest.ReSize(DestW, DestH, Tiles[0].Depth);
+  Dest.Fill(0);
+  DestX := 0;
+  DestY := 0;
   for TilePos := 0 to MaxTilePos do
   begin
     RowPos := TilePos div ColumnCount;
     ColumnPos := TilePos mod ColumnCount;
     if RowPos > 0 then
-      QwenImage21VaeBlendTileTop(Tiles[TilePos - ColumnCount], Tiles[TilePos],
-        BlendExtent);
+      VaeBlendTileTop(Tiles[TilePos - ColumnCount], Tiles[TilePos],
+        BlendExtentY);
     if ColumnPos > 0 then
-      QwenImage21VaeBlendTileLeft(Tiles[TilePos - 1], Tiles[TilePos],
-        BlendExtent);
-    Dest.AddArea(ColumnPos * Stride, RowPos * Stride, 0, 0,
-      Min(Stride, Tiles[TilePos].SizeX), Min(Stride, Tiles[TilePos].SizeY),
-      Tiles[TilePos]);
+      VaeBlendTileLeft(Tiles[TilePos - 1], Tiles[TilePos], BlendExtentX);
+    KeptW := Min(KeepX, Tiles[TilePos].SizeX);
+    KeptH := Min(KeepY, Tiles[TilePos].SizeY);
+    Dest.AddArea(DestX, DestY, 0, 0, KeptW, KeptH, Tiles[TilePos]);
+    Inc(DestX, KeptW);
+    if ColumnPos = ColumnCount - 1 then
+    begin
+      DestX := 0;
+      Inc(DestY, KeptH);
+    end;
   end;
 end;
 
@@ -77948,7 +77998,7 @@ procedure TQwenImage21VaeEncoder.EncodeTiled(Image, Latent: TNNetVolume;
   TileSampleSize, TileSampleStride: integer);
 var
   Scale, ColumnCount, TilePos: integer;
-  Tiles: TQwenImage21VaeTiles;
+  Tiles: TVaeTiles;
   TileProblem: string;
 begin
   Scale := FConfig.SpatialScale;
@@ -77969,15 +78019,15 @@ begin
   CheckQwenImage21VaeImageSize(FConfig, Image.SizeX, Image.SizeY);
   Tiles := nil;
   try
-    QwenImage21VaeComputeTiles(Image, TileSampleSize, TileSampleStride,
-      @PrepareNet, @EncodeTile, ColumnCount, Tiles);
+    VaeComputeTiles(Image, TileSampleSize, TileSampleSize, TileSampleStride,
+      TileSampleStride, @PrepareNet, @EncodeTile, ColumnCount, Tiles);
     FLastEncodeTileCount := Length(Tiles);
     // The net's quant_conv folds the latent normalization, an affine map per
     // channel, so blending normalized means equals diffusers' moment blend.
-    Latent.ReSize(Image.SizeX div Scale, Image.SizeY div Scale, FConfig.ZDim);
-    QwenImage21VaeAssembleTiles(Tiles, ColumnCount,
+    VaeAssembleTiles(Tiles, ColumnCount,
+      (TileSampleSize - TileSampleStride) div Scale,
       (TileSampleSize - TileSampleStride) div Scale, TileSampleStride div Scale,
-      Latent);
+      TileSampleStride div Scale, Latent);
   finally
     for TilePos := 0 to High(Tiles) do Tiles[TilePos].Free;
   end;
@@ -78428,7 +78478,7 @@ procedure TQwenImage21VaeDecoder.DecodeTiled(Latent, Image: TNNetVolume;
   TileSampleSize, TileSampleStride: integer);
 var
   Scale, ColumnCount, TilePos: integer;
-  Tiles: TQwenImage21VaeTiles;
+  Tiles: TVaeTiles;
   TileProblem: string;
   DecodeStart, AssemblyStart: TDateTime;
   ReleaseMsBefore: double;
@@ -78459,14 +78509,14 @@ begin
   FLastDecodeNetCount := 0;
   Tiles := nil;
   try
-    QwenImage21VaeComputeTiles(Latent, TileSampleSize div Scale,
+    VaeComputeTiles(Latent, TileSampleSize div Scale,
+      TileSampleSize div Scale, TileSampleStride div Scale,
       TileSampleStride div Scale, @PrepareNet, @DecodeTile, ColumnCount, Tiles);
     FLastDecodeTileCount := Length(Tiles);
     if FLayerProfiling then AssemblyStart := Now();
-    Image.ReSize(Latent.SizeX * Scale, Latent.SizeY * Scale,
-      FConfig.OutChannels);
-    QwenImage21VaeAssembleTiles(Tiles, ColumnCount,
-      TileSampleSize - TileSampleStride, TileSampleStride, Image);
+    VaeAssembleTiles(Tiles, ColumnCount, TileSampleSize - TileSampleStride,
+      TileSampleSize - TileSampleStride, TileSampleStride, TileSampleStride,
+      Image);
   finally
     for TilePos := 0 to High(Tiles) do Tiles[TilePos].Free;
   end;
@@ -115515,6 +115565,31 @@ begin
   end;
 end;
 
+// RunCount times: Move RunLength values from Source[SourcePos] to
+// Dest[DestPos], then step SourcePos by SourceStride and DestPos by DestStride.
+procedure CopyStridedRuns(Source: TNNetVolume; SourcePos, SourceStride: integer;
+  Dest: TNNetVolume; DestPos, DestStride, RunLength, RunCount: integer);
+var
+  RunPos, MaxRunPos, RunBytes: integer;
+begin
+  RunBytes := RunLength * csNeuralFloatSize;
+  MaxRunPos := RunCount - 1;
+  for RunPos := 0 to MaxRunPos do
+  begin
+    Move(Source.FData[SourcePos], Dest.FData[DestPos], RunBytes);
+    Inc(SourcePos, SourceStride);
+    Inc(DestPos, DestStride);
+  end;
+end;
+
+// diffusers int(tile_latent_min * (1 - tile_overlap_factor)): latent cells
+// from one tile's start to the next.
+function CogVideoXVaeTileStride(TileLatentMin: integer;
+  TileOverlapFactor: double): integer;
+begin
+  Result := Trunc(TileLatentMin * (1 - TileOverlapFactor));
+end;
+
 { TCogVideoXVaeDecoder }
 
 constructor TCogVideoXVaeDecoder.Create(const VaePath: string; LatentFrames,
@@ -115541,7 +115616,7 @@ begin
   FLatentW := LatentW;
   Reader := CreatePretrainedTensorReader(WeightsFile);
   try
-    BuildNets(Reader);
+    LoadWeights(Reader);
   finally
     Reader.Free;
   end;
@@ -115556,29 +115631,53 @@ begin
   FLatentFrames := LatentFrames;
   FLatentH := LatentH;
   FLatentW := LatentW;
-  BuildNets(Reader);
+  LoadWeights(Reader);
 end;
 
 destructor TCogVideoXVaeDecoder.Destroy();
 begin
-  // The borrower goes before the weight owner.
+  // The borrowers go before the weight owner.
   FNextNet.Free;
   FFirstNet.Free;
+  FWeightOwner.Free;
+  FBatchLatent.Free;
   FPackedLatent.Free;
   inherited Destroy();
 end;
 
-procedure TCogVideoXVaeDecoder.BuildNets(Reader: TNNetSafeTensorsReader);
+procedure TCogVideoXVaeDecoder.LoadWeights(Reader: TNNetSafeTensorsReader);
+var
+  OwnerConvs: TCogVideoXVaeCausalConvs;
 begin
+  if (FLatentFrames < 1) or (FLatentH < 1) or (FLatentW < 1) then
+    ImportError(csCogVideoXVaeImporter + ': empty latent clip ' +
+      IntToStr(FLatentFrames) + 'x' + IntToStr(FLatentH) + 'x' +
+      IntToStr(FLatentW) + '.');
   FFirstBatchFrames := Min(FLatentFrames,
     csCogVideoXVaeFrameBatch + FLatentFrames mod csCogVideoXVaeFrameBatch);
   FPackedLatent := TNNetVolume.Create();
-  FFirstNet := BuildCogVideoXVaeBatchNet(Reader, nil, FConfig,
-    FFirstBatchFrames, FLatentH, FLatentW, {CachedPad=}false, FFirstConvs);
+  FBatchLatent := TNNetVolume.Create();
+  FWeightOwner := BuildCogVideoXVaeBatchNet(Reader, nil, FConfig,
+    FFirstBatchFrames, 1, 1, {CachedPad=}false, OwnerConvs);
+  FTileSampleMinHeight := csCogVideoXVaeTileSampleMinHeight;
+  FTileSampleMinWidth := csCogVideoXVaeTileSampleMinWidth;
+  FTileOverlapFactorHeight := csCogVideoXVaeTileOverlapFactorHeight;
+  FTileOverlapFactorWidth := csCogVideoXVaeTileOverlapFactorWidth;
+end;
+
+procedure TCogVideoXVaeDecoder.PrepareTileNets(TileW, TileH: integer);
+begin
+  if Assigned(FFirstNet) and (TileW = FNetLatentW) and (TileH = FNetLatentH) then
+    exit;
+  FreeAndNil(FNextNet);
+  FreeAndNil(FFirstNet);
+  FFirstNet := BuildCogVideoXVaeBatchNet(nil, FWeightOwner, FConfig,
+    FFirstBatchFrames, TileH, TileW, {CachedPad=}false, FFirstConvs);
   if GetBatchCount() > 1 then
-    FNextNet := BuildCogVideoXVaeBatchNet(nil, FFirstNet, FConfig,
-      csCogVideoXVaeFrameBatch, FLatentH, FLatentW, {CachedPad=}true,
-      FNextConvs);
+    FNextNet := BuildCogVideoXVaeBatchNet(nil, FWeightOwner, FConfig,
+      csCogVideoXVaeFrameBatch, TileH, TileW, {CachedPad=}true, FNextConvs);
+  FNetLatentW := TileW;
+  FNetLatentH := TileH;
 end;
 
 function TCogVideoXVaeDecoder.GetBatchCount(): integer;
@@ -115591,83 +115690,150 @@ begin
   Result := CogVideoXVaeOutputFrames(FConfig, FLatentFrames);
 end;
 
-procedure TCogVideoXVaeDecoder.DecodeBatch(Net: TNNet; Latent: TNNetVolume;
-  FirstFrame: integer; Frames: TNNetVolume; var OutFrame: integer);
-var
-  BatchFrames, LatentCh, OutW, OutH, OutFrames, OutCh: integer;
-  FramePos, MaxFramePos, PixelPos, MaxPixelPos: integer;
-  SrcPos, DstPos, LatentBytes, OutBytes, PixelStride: integer;
-  Decoded: TNNetVolume;
+function TCogVideoXVaeDecoder.GetSpatialScale(): integer;
 begin
-  LatentCh := FConfig.LatentChannels;
-  BatchFrames := Net.Layers[0].Output.Depth div LatentCh;
-  // (t, h, w, c) -> frame-packed ((h*W + w)*T + t)*C + c: each (t, pixel) is a
-  // contiguous C-float run in both layouts.
-  FPackedLatent.ReSize(FLatentW, FLatentH, BatchFrames * LatentCh);
-  MaxFramePos := BatchFrames - 1;
-  MaxPixelPos := FLatentW * FLatentH - 1;
-  LatentBytes := LatentCh * csNeuralFloatSize;
-  PixelStride := BatchFrames * LatentCh;
-  SrcPos := FirstFrame * FLatentW * FLatentH * LatentCh;
-  for FramePos := 0 to MaxFramePos do
-  begin
-    DstPos := FramePos * LatentCh;
-    for PixelPos := 0 to MaxPixelPos do
-    begin
-      Move(Latent.FData[SrcPos], FPackedLatent.FData[DstPos], LatentBytes);
-      Inc(SrcPos, LatentCh);
-      Inc(DstPos, PixelStride);
-    end;
-  end;
-  FPackedLatent.Mul(1 / FConfig.ScalingFactor);
-  Net.Compute(FPackedLatent);
-  Decoded := Net.GetLastLayer().Output;
-  OutW := Decoded.SizeX;
-  OutH := Decoded.SizeY;
-  OutCh := FConfig.OutChannels;
-  OutFrames := Decoded.Depth div OutCh;
-  // Frame-packed output -> frames stacked along Y, frame f at rows [f*H, f*H+H).
-  MaxFramePos := OutFrames - 1;
-  MaxPixelPos := OutW * OutH - 1;
-  OutBytes := OutCh * csNeuralFloatSize;
-  PixelStride := OutFrames * OutCh;
-  DstPos := OutFrame * OutW * OutH * OutCh;
-  for FramePos := 0 to MaxFramePos do
-  begin
-    SrcPos := FramePos * OutCh;
-    for PixelPos := 0 to MaxPixelPos do
-    begin
-      Move(Decoded.FData[SrcPos], Frames.FData[DstPos], OutBytes);
-      Inc(SrcPos, PixelStride);
-      Inc(DstPos, OutCh);
-    end;
-  end;
-  Inc(OutFrame, OutFrames);
+  Result := 1 shl (Length(FConfig.BlockOutChannels) - 1);
 end;
 
-procedure TCogVideoXVaeDecoder.Decode(Latent, Frames: TNNetVolume);
+function TCogVideoXVaeDecoder.GetTileLatentMinHeight(): integer;
+begin
+  Result := FTileSampleMinHeight div GetSpatialScale();
+end;
+
+function TCogVideoXVaeDecoder.GetTileLatentMinWidth(): integer;
+begin
+  Result := FTileSampleMinWidth div GetSpatialScale();
+end;
+
+procedure TCogVideoXVaeDecoder.EnableTiling(TileSampleMinHeight,
+  TileSampleMinWidth: integer; TileOverlapFactorHeight,
+  TileOverlapFactorWidth: double);
+begin
+  FTileSampleMinHeight := TileSampleMinHeight;
+  FTileSampleMinWidth := TileSampleMinWidth;
+  FTileOverlapFactorHeight := TileOverlapFactorHeight;
+  FTileOverlapFactorWidth := TileOverlapFactorWidth;
+  if (TileOverlapFactorHeight < 0) or (TileOverlapFactorWidth < 0) or
+     (CogVideoXVaeTileStride(GetTileLatentMinHeight(),
+       TileOverlapFactorHeight) < 1) or
+     (CogVideoXVaeTileStride(GetTileLatentMinWidth(),
+       TileOverlapFactorWidth) < 1) then
+    ImportError(csCogVideoXVaeImporter + ': ' + IntToStr(TileSampleMinHeight) +
+      'x' + IntToStr(TileSampleMinWidth) + ' sample tiles with overlap ' +
+      'factors ' + FloatToStr(TileOverlapFactorHeight) + ' x ' +
+      FloatToStr(TileOverlapFactorWidth) + ' leave no latent stride (' +
+      IntToStr(GetSpatialScale()) + ' samples per latent cell).');
+  FUseTiling := true;
+end;
+
+procedure TCogVideoXVaeDecoder.DisableTiling();
+begin
+  FUseTiling := false;
+end;
+
+procedure TCogVideoXVaeDecoder.DecodeBatch(Net: TNNet; LatentTile: TNNetVolume;
+  FirstFrame: integer; TileFrames: TNNetVolume; var OutFrame: integer);
 var
-  LatentSize, BatchPos, MaxBatchPos, FirstFrame, OutFrame: integer;
+  BatchDepth: integer;
+  Decoded: TNNetVolume;
+begin
+  BatchDepth := Net.Layers[0].Output.Depth;
+  FBatchLatent.ReSize(LatentTile.SizeX, LatentTile.SizeY, BatchDepth);
+  CopyStridedRuns(LatentTile, FirstFrame * FConfig.LatentChannels,
+    LatentTile.Depth, FBatchLatent, 0, BatchDepth, BatchDepth,
+    LatentTile.SizeX * LatentTile.SizeY);
+  Net.Compute(FBatchLatent);
+  Net.GetLastLayer().ForceOutputOnRAM();
+  Decoded := Net.GetLastLayer().Output;
+  CopyStridedRuns(Decoded, 0, Decoded.Depth, TileFrames,
+    OutFrame * FConfig.OutChannels, TileFrames.Depth, Decoded.Depth,
+    Decoded.SizeX * Decoded.SizeY);
+  Inc(OutFrame, Decoded.Depth div FConfig.OutChannels);
+end;
+
+procedure TCogVideoXVaeDecoder.DecodeTile(LatentTile, TileFrames: TNNetVolume);
+var
+  BatchPos, MaxBatchPos, FirstFrame, OutFrame: integer;
   LastOutput: TNNetVolume;
 begin
-  LatentSize := FLatentW * FLatentH * FLatentFrames * FConfig.LatentChannels;
-  if Latent.Size <> LatentSize then
-    ImportError('TCogVideoXVaeDecoder.Decode: latent has ' +
-      IntToStr(Latent.Size) + ' values, the decoder takes ' +
-      IntToStr(LatentSize) + '.');
   LastOutput := FFirstNet.GetLastLayer().Output;
-  Frames.ReSize(LastOutput.SizeX, LastOutput.SizeY * GetOutputFrames(),
-    FConfig.OutChannels);
+  TileFrames.ReSize(LastOutput.SizeX, LastOutput.SizeY,
+    GetOutputFrames() * FConfig.OutChannels);
   OutFrame := 0;
-  DecodeBatch(FFirstNet, Latent, 0, Frames, OutFrame);
+  DecodeBatch(FFirstNet, LatentTile, 0, TileFrames, OutFrame);
   FirstFrame := FFirstBatchFrames;
   MaxBatchPos := GetBatchCount() - 1;
   for BatchPos := 1 to MaxBatchPos do
   begin
     if BatchPos = 1 then CopyCogVideoXVaeConvCaches(FFirstConvs, FNextConvs)
     else CopyCogVideoXVaeConvCaches(FNextConvs, FNextConvs);
-    DecodeBatch(FNextNet, Latent, FirstFrame, Frames, OutFrame);
+    DecodeBatch(FNextNet, LatentTile, FirstFrame, TileFrames, OutFrame);
     Inc(FirstFrame, csCogVideoXVaeFrameBatch);
+  end;
+end;
+
+procedure TCogVideoXVaeDecoder.Decode(Latent, Frames: TNNetVolume);
+var
+  LatentCh, LatentPixels, OutCh, OutPixels, FramePos, MaxFramePos: integer;
+  TileLatentW, TileLatentH, BlendExtentX, BlendExtentY: integer;
+  ColumnCount, TilePos, MaxTilePos: integer;
+  PackedFrames: TNNetVolume;
+  Tiles: TVaeTiles;
+begin
+  LatentCh := FConfig.LatentChannels;
+  LatentPixels := FLatentW * FLatentH;
+  if Latent.Size <> LatentPixels * FLatentFrames * LatentCh then
+    ImportError('TCogVideoXVaeDecoder.Decode: latent has ' +
+      IntToStr(Latent.Size) + ' values, the decoder takes ' +
+      IntToStr(LatentPixels * FLatentFrames * LatentCh) + '.');
+  // (t, h, w, c) -> frame-packed ((h*W + w)*T + t)*C + c.
+  FPackedLatent.ReSize(FLatentW, FLatentH, FLatentFrames * LatentCh);
+  MaxFramePos := FLatentFrames - 1;
+  for FramePos := 0 to MaxFramePos do
+    CopyStridedRuns(Latent, FramePos * LatentPixels * LatentCh, LatentCh,
+      FPackedLatent, FramePos * LatentCh, FPackedLatent.Depth, LatentCh,
+      LatentPixels);
+  FPackedLatent.Mul(1 / FConfig.ScalingFactor);
+  TileLatentW := GetTileLatentMinWidth();
+  TileLatentH := GetTileLatentMinHeight();
+  PackedFrames := TNNetVolume.Create();
+  try
+    if FUseTiling and ((FLatentW > TileLatentW) or (FLatentH > TileLatentH)) then
+    begin
+      BlendExtentX := Trunc(FTileSampleMinWidth * FTileOverlapFactorWidth);
+      BlendExtentY := Trunc(FTileSampleMinHeight * FTileOverlapFactorHeight);
+      Tiles := nil;
+      try
+        VaeComputeTiles(FPackedLatent, TileLatentW, TileLatentH,
+          CogVideoXVaeTileStride(TileLatentW, FTileOverlapFactorWidth),
+          CogVideoXVaeTileStride(TileLatentH, FTileOverlapFactorHeight),
+          @PrepareTileNets, @DecodeTile, ColumnCount, Tiles);
+        FLastTileCount := Length(Tiles);
+        VaeAssembleTiles(Tiles, ColumnCount, BlendExtentX, BlendExtentY,
+          FTileSampleMinWidth - BlendExtentX,
+          FTileSampleMinHeight - BlendExtentY, PackedFrames);
+      finally
+        MaxTilePos := High(Tiles);
+        for TilePos := 0 to MaxTilePos do Tiles[TilePos].Free;
+      end;
+    end
+    else
+    begin
+      PrepareTileNets(FLatentW, FLatentH);
+      DecodeTile(FPackedLatent, PackedFrames);
+      FLastTileCount := 1;
+    end;
+    // Frame-packed -> frames stacked along Y, frame f at rows [f*H, f*H+H).
+    OutCh := FConfig.OutChannels;
+    OutPixels := PackedFrames.SizeX * PackedFrames.SizeY;
+    MaxFramePos := PackedFrames.Depth div OutCh - 1;
+    Frames.ReSize(PackedFrames.SizeX, PackedFrames.SizeY * (MaxFramePos + 1),
+      OutCh);
+    for FramePos := 0 to MaxFramePos do
+      CopyStridedRuns(PackedFrames, FramePos * OutCh, PackedFrames.Depth,
+        Frames, FramePos * OutPixels * OutCh, OutCh, OutCh, OutPixels);
+  finally
+    PackedFrames.Free;
   end;
 end;
 

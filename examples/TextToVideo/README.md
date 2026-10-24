@@ -73,6 +73,7 @@ Optional trailing flags:
 | `--fps N` | GIF frame rate (default 8, the CogVideoX rate) |
 | `--png` | write `frame_<ii>.png` instead of `frame_<ii>.ppm` |
 | `--fbc-threshold X` | First-Block Cache: skip blocks 1..N-1 on steps where block 0 changed little (0 = off, the default; see below) |
+| `--vae-tiling` | decode in overlapping 240x360-sample tiles, as diffusers `enable_tiling()` (see below) |
 
 (Or compile the `.lpr` with `fpc -Fu../../neural`.)
 
@@ -113,15 +114,39 @@ ends with `First-Block Cache skipped k of N steps.`
 option. The step is `TCogVideoXSampler.PredictNoise` and the cache
 `TDiTFirstBlockCache`, both in `neural/neuralpretrained.pas`.
 
+### VAE tiling (`--vae-tiling`)
+
+`--vae-tiling` ports diffusers `AutoencoderKLCogVideoX.tiled_decode`. A latent
+wider than `tile_sample_min_width / 8` or taller than
+`tile_sample_min_height / 8` latent cells (defaults 360 and 240 samples, so
+45 x 30 cells; 480x720 output is a 60x90 latent) is cut into tiles that start
+every `int(tile_latent_min * (1 - overlap_factor))` cells (overlap factors
+1/6 in height, 1/5 in width: 3 x 3 tiles for 480x720). Each tile runs its own
+frame-batched decode with its own conv cache. The tiles are blended row-major
+with diffusers' `blend_v` / `blend_h` linear ramps over
+`int(tile_sample_min * overlap_factor)` samples (40 rows, 72 columns) and the
+first `tile_sample_min - blend` samples of each are kept.
+
+The decoder nets are sized to a tile shape, not to the frame, and borrow the
+weights of one 1x1-latent net, so the activation RAM follows the largest tile.
+A smaller latent is decoded in one piece, exactly as without the option (the
+pico fixture's 2x2 latent always is). In code:
+`TCogVideoXVaeDecoder.EnableTiling(TileSampleMinHeight, TileSampleMinWidth,
+TileOverlapFactorHeight, TileOverlapFactorWidth)` with the diffusers defaults;
+`TestCogVideoXVaeTiledDecodeParity` checks it against diffusers' own
+`enable_tiling()` decode on small tiles.
+
 ## Inputs / outputs
 
 - **Fixture (default):** `tests/fixtures/tiny_cogvideox.*` (denoiser) and
   `tests/fixtures/tiny_cogvideox_vae/` (VAE, 2 latent frames of 2x2 decode to
   8 frames of 16x16) — fully self-contained, no network access.
 - **Memory:** the decoder holds one batch (2-3 latent frames, 8-9 output
-  frames) at full resolution, not the whole clip. The pico fixture needs a few
-  MB. A real 480x720 batch still keeps every layer's activation of 8 frames, so
-  a real checkpoint needs the spatial tiling that is still a follow-up.
+  frames) of one tile, not the whole clip. The pico fixture needs a few MB.
+  Every layer's activation is still kept: measured on random weights of the
+  CogVideoX-2b VAE shape, the two batch nets keep about 95 MB per latent cell,
+  so even with `--vae-tiling` one 30x45-cell tile needs about 128 GB. A real
+  checkpoint needs activation sharing, a follow-up in `tasklist.md`.
 - **Text states:** deterministic synthetic values stand in for a real T5 tower.
 - **Output:** writes `frame_<ii>.ppm` (P6, or `.png` with `--png`) for each
   decoded frame, the `--gif` file when asked, and prints the config, the

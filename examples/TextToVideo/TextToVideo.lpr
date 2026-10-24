@@ -49,6 +49,9 @@ Optional trailing flags:
   --png          write frame_<ii>.png instead of frame_<ii>.ppm
   --fbc-threshold X  First-Block Cache: skip blocks 1..N-1 on steps whose
                  block 0 residual changed by at most X (0 = off, the default)
+  --vae-tiling   diffusers enable_tiling(): decode a latent wider or taller
+                 than one 240x360-sample tile in overlapping blended tiles, so
+                 the VAE RAM follows the tile, not the frame (for 480x720)
 
 OUTPUT
   Writes frame_<ii>.ppm (or .png) for each decoded frame, the --gif file if
@@ -174,7 +177,7 @@ var
   Method: TNNetSamplerMethod;
   NumSteps, StepCnt, T, TPrev, i, LV, ft: integer;
   FrameW, FrameH, FrameCount, FrameFloats: integer;
-  SmokeMode, LatentOk, DecodedOk, PngFrames: boolean;
+  SmokeMode, LatentOk, DecodedOk, PngFrames, VaeTiling: boolean;
   Arg: string;
 begin
   ST := cFixtureST; CfgPath := cFixtureCfg; VaePath := cFixtureVae;
@@ -182,6 +185,7 @@ begin
   Method := smDDIM;
   SmokeMode := false;
   PngFrames := false;
+  VaeTiling := false;
   GifFile := '';
   FramesPerSecond := 8;
   FirstBlockCacheThreshold := 0;
@@ -206,6 +210,7 @@ begin
     else if Arg = '--gif' then begin Inc(i); GifFile := ParamStr(i); end
     else if Arg = '--fps' then begin Inc(i); FramesPerSecond := StrToIntDef(ParamStr(i), FramesPerSecond); end
     else if Arg = '--png' then PngFrames := true
+    else if Arg = '--vae-tiling' then VaeTiling := true
     else if Arg = '--fbc-threshold' then
     begin
       Inc(i);
@@ -225,6 +230,7 @@ begin
       ' latent channels; the denoiser makes ', Cfg.InChannels, '.');
     Halt(1);
   end;
+  if VaeTiling then VaeDecoder.EnableTiling();
   Sampler := TCogVideoXSampler.Create(Net, Cfg);
   Sampler.FirstBlockCache.Threshold := FirstBlockCacheThreshold;
   Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
@@ -290,6 +296,10 @@ begin
     FrameFloats := FrameW * FrameH * Decoded.Depth;
     WriteLn('Decoded video ', FrameCount, ' frames of ', FrameW, 'x', FrameH,
       'x', Decoded.Depth, '  finite=', BoolToStr(DecodedOk, true));
+    if VaeTiling then
+      WriteLn('VAE tiling: ', VaeDecoder.LastTileCount, ' tile(s) of ',
+        VaeDecoder.TileLatentMinHeight, 'x', VaeDecoder.TileLatentMinWidth,
+        ' latent cells (1 = the latent fits one tile).');
 
     if SmokeMode then
     begin

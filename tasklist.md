@@ -1647,8 +1647,19 @@ rather than acted on.
         TestCogVideoXVaeBatchedDecodeParity (4/5/7 latent frames) < 1e-4. Left:
         the nets do not use ShareHostOutputsByLiveness (it would recycle the pad
         layers the cache copy reads after Compute).
-  - [ ] VAE follow-up: spatial tiling (diffusers tiled_decode, tile_sample_min
+  - [X] VAE follow-up: spatial tiling (diffusers tiled_decode, tile_sample_min
         240x360, overlap 1/6 x 1/5 with blend_v/blend_h) for 480x720 output.
+        DONE: TCogVideoXVaeDecoder.EnableTiling (diffusers defaults) runs the
+        frame-batched decode per tile on nets sized to the tile shape (a 1x1
+        weight-owner net, every decoding net borrows), blended by the shared
+        VaeComputeTiles / VaeAssembleTiles (QwenImage's); TextToVideo
+        --vae-tiling; TestCogVideoXVaeTiledDecodeParity < 1e-4.
+  - [ ] VAE follow-up: activation RAM. Measured on random CogVideoX-2b-shape
+        weights: the first-batch net keeps ~48.6 MB of activations per latent
+        cell and the cached-pad net ~46.0 MB, so one 30x45 tile pair is ~128 GB
+        (the untiled 60x90 latent ~511 GB). Needs ShareHostOutputsByLiveness
+        (keep the causal pad layers alive for the cache copy) and freeing the
+        first-batch net before the cached-pad net runs.
   - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (TCogVideoXVaeDecoder.Create
         on the downloaded vae folder, a 2-3 latent-frame low-res slice against
         diffusers decode) once the chunked path makes it fit; check the encoder
