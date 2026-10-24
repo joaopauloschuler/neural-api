@@ -542,11 +542,11 @@ rather than acted on.
       placement against the reference DPTHeadTemporal). Reuse: BuildDPT /
       BuildDepthAnythingV2 for the per-frame trunk, neuraltorchbin.pas to read the
       .pth directly, the landed SDPA over a (NumFrames,1,C) per-cell reshape for the
-      temporal block (share that block with the AnimateDiff motion-module task above
+      temporal block (share that block with the AnimateDiff motion-module task below
       instead of coding two). Inference driver: 32-frame windows with overlap and
       keyframes, per-window least-squares scale+shift alignment of the overlapping
-      frames, then linear blend (one reusable AlignDepthScaleShift routine; check
-      whether MarigoldEnsembleDepth already holds the solver). Pico parity vs the
+      frames, then linear blend (one reusable AlignDepthScaleShift routine; factor
+      the closed-form s*a+t solve out of MarigoldEnsembleDepth). Pico parity vs the
       reference float64 forward on a 4-frame clip; examples/VideoDepth reads a folder
       of frames (same input convention as examples/VideoMatting / ObjectTracking) and
       writes per-frame colour depth PPMs + an animated GIF via the landed GIF writer,
@@ -1452,7 +1452,7 @@ rather than acted on.
         + fixture yet).
 - [ ] Speaker diarization importer (`BuildPyannoteSegmentationFromSafeTensors[Ex]` +
       `TPyannoteConfig`/`ReadPyannoteConfigFromJSONFile`, model_type `pyannote`) — LANDED
-      (SincConv front-end + bidirectional `TNNetMinLSTM` trunk + per-frame powerset
+      (SincConv front-end + bidirectional `TNNetLSTMCell` trunk + per-frame powerset
       head + `PyannotePowersetDecode`; pico parity `TestPyannoteParity` vs a numpy
       float64 oracle, since the `pyannote.audio` python package is NOT installed
       here; examples/SpeakerDiarization). Open follow-ups:
@@ -1484,9 +1484,6 @@ rather than acted on.
         (tensor resize); the port matches the PIL backend (uint8 PIL bilinear).
         Measure the pixel_values gap on a real photo; add a torchvision-mode
         resize only if it changes masks.
-  - [x] Automatic mask generator: TSAMPredictor.GenerateMasks (point grid,
-        crop layers, IoU / stability filters, box NMS), parity vs the
-        transformers mask-generation pipeline; examples/SegmentAnything --everything.
   - [ ] Not exposed (the decoder lacks it): the input_masks prompt (previous
         low-res mask fed back).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
@@ -1560,58 +1557,25 @@ rather than acted on.
   - [ ] tensor-name mapping targets the transformers 5.11 layout
         (encoder.layers.N.attention.q_proj, decoder.model.decoder.*); add the published
         checkpoints' older DeiT naming if it differs (the fixture is the parity contract).
-- [ ] Text detection for whole pages and photos: DBNet (Liao et al., AAAI 2020,
-      arXiv:1911.08947, "Real-time Scene Text Detection with Differentiable
-      Binarization"; the detector in docTR, PaddleOCR and mmocr) + examples/DocumentOCR.
-      Today examples/OCRTranscribe reads ONE cropped text line; nothing in neural/ finds
-      the lines on a page or in a photo, so TrOCR cannot be used on a real document.
-  - [X] Importer + post-processing + pico parity. `TDBNetConfig`,
-        `DefaultDBNetConfig` / `ReadDBNetConfigFromJSONFile` (docTR config.json:
-        arch, mean, std, input_shape + optional bin_thresh, box_thresh, unclip_ratio,
-        preserve_aspect_ratio, symmetric_pad; docTR defaults when absent),
-        `InferDBNetConfigFromTensors`, `BuildDBNet` / `BuildDBNetFromSafeTensors[Ex]`
-        for docTR `db_mobilenet_v3_large` and `db_resnet50` over the shared
-        `AddMobileNetV3Trunk` / `AddResNetTrunk` (FPN with bilinear align_corners
-        upsampling, prob_head with two `TNNetDeconvolution` 2x2, sigmoid; the
-        training-only thresh_head is not built). `DBNetPrepareInput` (docTR
-        PreProcessor: aspect-preserving PIL-bilinear resize, symmetric zero pad,
-        normalize), `DecodeDBNetTextBoxes` (docTR DBPostProcessor, straight pages:
-        binarize, `LabelEightConnectedComponents` in neuralimageresize.pas, docTR
-        box_score over the bounding rectangle, size filter, unclip
-        offset = area * unclip_ratio / perimeter, boxes in input-image pixels) and
-        `DetectDBNetTextBoxes` (image -> boxes, optional probability map out).
-        Tests: TestDBNetMobileNetV3LargeParity / TestDBNetResNet50Parity
-        (probability map, net input and end to end < 1e-4 vs
-        tools/dbnet_tiny_fixture.py, measured 6e-8) and TestDBNetDecodeSyntheticMap.
-        The fixture script re-creates docTR's DBNet module tree over the real
-        torchvision backbones because docTR is not installed: its tensor names come
-        from docTR's source AS RECALLED and are NOT yet verified against a released
-        docTR checkpoint (feat_extractor.* IntermediateLayerGetter keys,
-        fpn.in_branches / out_branches, prob_head.0/.1/.3/.4/.6).
+- [ ] DBNet text detection (Liao et al., AAAI 2020, arXiv:1911.08947; the docTR /
+      PaddleOCR / mmocr detector) + examples/DocumentOCR follow-ups. LANDED: docTR
+      db_mobilenet_v3_large / db_resnet50 importer + DB post-processing (c71d2c74,
+      pico parity 6e-8) and examples/DocumentOCR (a1697f45, DBNet boxes -> reading
+      order -> TrOCR per box); CODED, not supported. Open:
   - [ ] Real docTR checkpoint: convert db_mobilenet_v3_large (and db_resnet50) to
-        .safetensors in the ~/x venv, confirm the tensor names above (fix the importer
-        if docTR's names differ), run `tools/dbnet_tiny_fixture.py --real CKPT` for a
+        .safetensors in the ~/x venv and confirm the tensor names, which were
+        recalled from docTR's source and never checked against a released checkpoint
+        (feat_extractor.* IntermediateLayerGetter keys, fpn.in_branches /
+        out_branches, prob_head.0/.1/.3/.4/.6); fix the importer if docTR's names
+        differ. Then run `tools/dbnet_tiny_fixture.py --real CKPT` for a
         probability-map parity < 1e-4 at 1024x1024, then a scanned page and a street
         photo before README.md lists it as supported. Also check docTR's PreProcessor
         resize against `DBNetPrepareInput` on a large downscale (the pico case only
         downscales 120x90 -> 85x64), and docTR's padding removal against
         `DecodeDBNetTextBoxes`'s pixel mapping.
-  - [X] examples/DocumentOCR (.lpr + .lpi + README.md, cthreads first): image in ->
-        `BuildDBNetFromSafeTensors` + `DetectDBNetTextBoxes` ->
-        `SortDBNetTextBoxesInReadingOrder` (lines by box centre vs the line's mean
-        bottom, then left to right) -> `TranscribeTrOCRImageRegion` (crop,
-        `ClipPreprocessImage` with the preprocessor_config.json or
-        `DefaultTrOCRImageProcessorConfig`, `DecodeTrOCRGreedy`) -> text, plus
-        `--boxes out.png` (`DrawRectangleOutline`, now also used by ObjectTracking and
-        PoseEstimation). The TrOCR decoder now holds the whole position table, so a
-        DecSeqLen=1 build decodes with the KV cache (DecodeSeq2SeqForcedPrefixCached).
-        `--smoke` runs the pico fixtures offline; `--gpu` / `--int8` as the other vision
-        examples. Tests: TestDBNetReadingOrder, TestTrOCRCachedDecodeAndRegion,
-        TestDrawRectangleOutline. CODED, not supported (open items below).
   - [ ] Real run: docTR db_mobilenet_v3_large + microsoft/trocr-small-printed on a
-        scanned page and a street photo. First verify the docTR state_dict names
-        (the fixture's naming is recalled from docTR's source; `tools/dbnet_tiny_fixture.py
-        --real CKPT` is ready) before README.md lists DocumentOCR as supported.
+        scanned page and a street photo, after the docTR checkpoint item above,
+        before README.md lists DocumentOCR as supported.
   - [ ] Tokenizer: check that the trocr-small `sentencepiece.bpe.model` (fairseq id
         layout, possibly offset by one) decodes correctly through `--tokenizer`, or
         that a tokenizer.json is available; fix the offset in the loader if not.
@@ -1675,21 +1639,6 @@ rather than acted on.
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states. Further gaps (audit 2026-10-02), which together mean
       the repo has NO usable video generator today:
-  - [X] VAE follow-up: frame-batched decode with the diffusers conv cache
-        (num_latent_frames_batch_size = 2). DONE: TCogVideoXVaeDecoder replaces
-        BuildCogVideoXVaeDecoder*/DecodeCogVideoXVae; a first-batch net (frame-0
-        pad, owns the weights) and a 2-frame cached-pad net (TNNetInput cache +
-        TNNetDeepConcat per causal conv, BuildWeightOwner) hold one batch each;
-        TestCogVideoXVaeBatchedDecodeParity (4/5/7 latent frames) < 1e-4. Left:
-        the nets do not use ShareHostOutputsByLiveness (it would recycle the pad
-        layers the cache copy reads after Compute).
-  - [X] VAE follow-up: spatial tiling (diffusers tiled_decode, tile_sample_min
-        240x360, overlap 1/6 x 1/5 with blend_v/blend_h) for 480x720 output.
-        DONE: TCogVideoXVaeDecoder.EnableTiling (diffusers defaults) runs the
-        frame-batched decode per tile on nets sized to the tile shape (a 1x1
-        weight-owner net, every decoding net borrows), blended by the shared
-        VaeComputeTiles / VaeAssembleTiles (QwenImage's); TextToVideo
-        --vae-tiling; TestCogVideoXVaeTiledDecodeParity < 1e-4.
   - [ ] VAE follow-up: activation RAM. Measured on random CogVideoX-2b-shape
         weights: the first-batch net keeps ~48.6 MB of activations per latent
         cell and the cached-pad net ~46.0 MB, so one 30x45 tile pair is ~128 GB
@@ -2472,7 +2421,7 @@ rather than acted on.
             (cv2 `INTER_LINEAR` rounds uint8 with fixed-point weights; the
             route resizes in float), only size and thickness tests.
 
-- [ ] Multi-object tracking follow-ups (after 013f18a8..31fccc90):
+- [ ] Multi-object tracking follow-ups (ByteTrack, 013f18a8..31fccc90):
       - [ ] Real yolov8n run of examples/ObjectTracking on a real clip (user
             box, also `--gpu` and `--int8`), then mark its README supported.
       - [ ] The pico YOLO fixture config has no `names`, so the example smoke
