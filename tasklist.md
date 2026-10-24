@@ -1607,11 +1607,19 @@ rather than acted on.
         DecSeqLen=1 build decodes with the KV cache (DecodeSeq2SeqForcedPrefixCached).
         `--smoke` runs the pico fixtures offline; `--gpu` / `--int8` as the other vision
         examples. Tests: TestDBNetReadingOrder, TestTrOCRCachedDecodeAndRegion,
-        TestDrawRectangleOutline. CODED, not supported: still open is a real run
-        (docTR db_mobilenet_v3_large + microsoft/trocr-small-printed on a scanned page
-        and a photo), checking that the trocr-small sentencepiece.bpe.model (fairseq id
-        layout) decodes correctly through `--tokenizer` or that a tokenizer.json is
-        available, and measuring TrOCR (trained on lines) on docTR's word boxes.
+        TestDrawRectangleOutline. CODED, not supported (open items below).
+  - [ ] Real run: docTR db_mobilenet_v3_large + microsoft/trocr-small-printed on a
+        scanned page and a street photo. First verify the docTR state_dict names
+        (the fixture's naming is recalled from docTR's source; `tools/dbnet_tiny_fixture.py
+        --real CKPT` is ready) before README.md lists DocumentOCR as supported.
+  - [ ] Tokenizer: check that the trocr-small `sentencepiece.bpe.model` (fairseq id
+        layout, possibly offset by one) decodes correctly through `--tokenizer`, or
+        that a tokenizer.json is available; fix the offset in the loader if not.
+  - [ ] Word boxes -> line crops: docTR detects WORDS, TrOCR is trained on whole
+        LINES. Add a `--merge-lines` mode that unions the boxes of one
+        `SortDBNetTextBoxesInReadingOrder` line (split at a horizontal gap larger
+        than ~2x the line height) into one crop, and compare character accuracy of
+        word-by-word vs line crops on the real page.
   - [ ] Rotated boxes (docTR assume_straight_pages=False): min-area rectangle of each
         component's contour + polygon unclip; `DecodeDBNetTextBoxes` is
         axis-aligned only. Also not ported: cv2.findContours RETR_EXTERNAL drops a
