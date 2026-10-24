@@ -676,6 +676,12 @@ type
     // AddSingleHeadSelfAttention(NoForward=true): both TNNetDotProducts (masked
     // Q.K, unmasked ValueT.W) run in OpenCL, binding Q and K. Coded by Claude (AI).
     procedure TestDotProductsOpenCLParity;
+    // TNNetMultiScaleDeformableAttention on OpenCL vs the CPU, box (cxcywh) and
+    // point (xy) references, two inputs, all three sources bound.
+    procedure TestMultiScaleDeformableAttentionOpenCLParity;
+    // TNNetTopKGatherTokens on OpenCL vs the CPU over two inputs with different
+    // top-K tokens; the gathered features are bound, not downloaded.
+    procedure TestTopKGatherTokensOpenCLParity;
     // TNNetAttentiveStatsPooling on OpenCL vs the CPU for (T, C) = (1, 3), (7, 5)
     // and (300, 6), one layer per source placement, plus a resident-output consumer.
     procedure TestAttentiveStatsPoolingOpenCLParity;
@@ -72968,6 +72974,223 @@ begin
     ScoresCPU.Free;
     OutCPU.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestMultiScaleDeformableAttentionOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csHeads = 2;
+  csPoints = 3;
+  csHeadDim = 6; // one full and one partial 4-channel group per head
+  csInputDepth = 8;
+  csLevelShapes: array[0..3] of integer = (3, 4, 2, 2);
+  csTokens = 3 * 4 + 2 * 2;
+  csQueryTokens: array[0..4] of integer = (0, 3, 7, 11, 15);
+var
+  NN: TNNet;
+  Inputs: array[0..1] of TNNetVolume;
+  OutCPU: array[0..1] of TNNetVolume;
+  InputLayer, Queries, Values, References, Offsets: TNNetLayer;
+  Deformable: TNNetMultiScaleDeformableAttention;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ReferenceDepth, InputPos, Pos, MaxPos, SentinelSurvivors, SentinelTotal: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for InputPos := 0 to 1 do
+  begin
+    Inputs[InputPos] := TNNetVolume.Create(csTokens, 1, csInputDepth);
+    OutCPU[InputPos] := TNNetVolume.Create();
+  end;
+  try
+    for ReferenceDepth := 2 to 4 do
+    begin
+      if ReferenceDepth = 3 then continue;
+      RandSeed := 20261024 + ReferenceDepth;
+      NN := TNNet.Create();
+      try
+        InputLayer := NN.AddLayer(TNNetInput.Create(csTokens, 1, csInputDepth));
+        Values := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+          csHeads * csHeadDim), InputLayer);
+        Queries := NN.AddLayerAfter(TNNetGatherTokens.Create(csQueryTokens),
+          InputLayer);
+        NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(ReferenceDepth), Queries);
+        References := NN.AddLayer(TNNetSigmoid.Create());
+        Offsets := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+          csHeads * 2 * csPoints * 3), Queries);
+        Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads, csPoints,
+          csLevelShapes, Values, References);
+        NN.AddLayerAfter(Deformable, Offsets);
+        NN.SetTrainable(False, False);
+        // Wide offsets push some samples across and past the level borders.
+        for InputPos := 0 to 1 do
+        begin
+          Inputs[InputPos].RandomizeGaussian();
+          Inputs[InputPos].Mul(3);
+          NN.Compute(Inputs[InputPos]);
+          OutCPU[InputPos].Copy(NN.GetLastLayer.Output);
+        end;
+        AssertEquals('deformable attention ran on the CPU before EnableOpenCL', 0,
+          Deformable.ForwardGPUCnt);
+
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        NN.ForceOpenCL(True);
+        MaxDiff := 0;
+        try
+          NN.Compute(Inputs[1]);
+          // Parity cannot tell a bind from a download: the second forward must
+          // leave the host copies of all three sources untouched.
+          Values.Output.Fill(csSentinel);
+          Offsets.Output.Fill(csSentinel);
+          References.Output.Fill(csSentinel);
+          for InputPos := 0 to 1 do
+          begin
+            NN.Compute(Inputs[InputPos]);
+            AssertEquals('output size match', OutCPU[InputPos].Size,
+              NN.GetLastLayer.Output.Size);
+            MaxPos := OutCPU[InputPos].Size - 1;
+            for Pos := 0 to MaxPos do
+              MaxDiff := Max(MaxDiff, Abs(OutCPU[InputPos].Raw[Pos] -
+                NN.GetLastLayer.Output.Raw[Pos]));
+          end;
+          SentinelSurvivors := 0;
+          SentinelTotal := Values.Output.Size + Offsets.Output.Size +
+            References.Output.Size;
+          for Pos := 0 to Values.Output.Size - 1 do
+            if Values.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          for Pos := 0 to Offsets.Output.Size - 1 do
+            if Offsets.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          for Pos := 0 to References.Output.Size - 1 do
+            if References.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+        finally
+          NN.ForceOpenCL(False);
+        end;
+        WriteLn('  MultiScaleDeformableAttention OpenCL parity (reference depth ',
+          ReferenceDepth, '): max|diff|=', MaxDiff:0:9,
+          ' gpu forwards=', Deformable.ForwardGPUCnt,
+          ' source sentinels=', SentinelSurvivors, '/', SentinelTotal);
+        AssertTrue('deformable attention must reach OpenCL',
+          Deformable.ForwardGPUCnt > 0);
+        AssertEquals('the three sources must be read in OpenCL memory',
+          SentinelTotal, SentinelSurvivors);
+        AssertTrue('deformable attention OpenCL vs CPU parity: max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    for InputPos := 0 to 1 do
+    begin
+      OutCPU[InputPos].Free;
+      Inputs[InputPos].Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestTopKGatherTokensOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csTokens = 12;
+  csK = 4;
+var
+  NN: TNNet;
+  Inputs: array[0..1] of TNNetVolume;
+  OutCPU: array[0..1] of TNNetVolume;
+  InputLayer, Features, Scores: TNNetLayer;
+  TopK: TNNetTopKGatherTokens;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InputPos, Pos, MaxPos, SentinelSurvivors, SelectionDiffers: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20261024;
+  NN := TNNet.Create();
+  for InputPos := 0 to 1 do
+  begin
+    Inputs[InputPos] := TNNetVolume.Create(csTokens, 1, 6);
+    OutCPU[InputPos] := TNNetVolume.Create();
+  end;
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(csTokens, 1, 6));
+    Features := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(5), InputLayer);
+    Scores := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(3), InputLayer);
+    TopK := TNNetTopKGatherTokens.Create(csK, Scores);
+    NN.AddLayerAfter(TopK, Features);
+    NN.SetTrainable(False, False);
+    for InputPos := 0 to 1 do
+    begin
+      Inputs[InputPos].RandomizeGaussian();
+      NN.Compute(Inputs[InputPos]);
+      OutCPU[InputPos].Copy(NN.GetLastLayer.Output);
+    end;
+    // Different selections prove the OpenCL plan follows the indices.
+    SelectionDiffers := 0;
+    for Pos := 0 to OutCPU[0].Size - 1 do
+      if OutCPU[0].Raw[Pos] <> OutCPU[1].Raw[Pos] then Inc(SelectionDiffers);
+    AssertTrue('the two inputs select different rows', SelectionDiffers > 0);
+    AssertEquals('top-K ran on the CPU before EnableOpenCL', 0, TopK.ForwardGPUCnt);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.ForceOpenCL(True);
+    MaxDiff := 0;
+    try
+      NN.Compute(Inputs[1]);
+      Features.Output.Fill(csSentinel);
+      for InputPos := 0 to 1 do
+      begin
+        NN.Compute(Inputs[InputPos]);
+        AssertEquals('output size match', OutCPU[InputPos].Size,
+          NN.GetLastLayer.Output.Size);
+        MaxPos := OutCPU[InputPos].Size - 1;
+        for Pos := 0 to MaxPos do
+          MaxDiff := Max(MaxDiff, Abs(OutCPU[InputPos].Raw[Pos] -
+            NN.GetLastLayer.Output.Raw[Pos]));
+      end;
+      SentinelSurvivors := 0;
+      for Pos := 0 to Features.Output.Size - 1 do
+        if Features.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  TopKGatherTokens OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', TopK.ForwardGPUCnt,
+      ' feature sentinels=', SentinelSurvivors, '/', Features.Output.Size);
+    AssertTrue('top-K gather must reach OpenCL', TopK.ForwardGPUCnt > 0);
+    AssertEquals('the features must be read in OpenCL memory, not downloaded',
+      Features.Output.Size, SentinelSurvivors);
+    AssertTrue('top-K gather OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    for InputPos := 0 to 1 do
+    begin
+      OutCPU[InputPos].Free;
+      Inputs[InputPos].Free;
+    end;
     NN.Free;
   end;
 end;

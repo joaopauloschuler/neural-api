@@ -5925,6 +5925,9 @@ type
       ChannelStride, XStride, YStride: integer);
     // Rebuilds and uploads the plan when Consumer's shapes differ from FPlanShape.
     procedure EnsurePlan(Consumer: TNNetLayer);
+    // Makes the next EnsurePlan rebuild and upload the plan: for a consumer whose
+    // source offsets change every forward (TNNetTopKGatherTokens).
+    procedure InvalidatePlan();
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
     function BufferBytes(): int64; override;
@@ -6312,6 +6315,27 @@ type
     // ResultBuffer := [mu (Channels) | sigma (Channels)] over SeqLen frames.
     procedure Pool(BufFeatures, BufLogits: cl_mem; SeqLen, Channels: integer;
       Eps: TNeuralFloat);
+  end;
+
+  /// OpenCL forward helper for TNNetMultiScaleDeformableAttention:
+  // cai_ms_deformable_attn. Source A is the offsets|logits, B the value maps.
+  TNNetMultiScaleDeformableAttentionCL = class(TNNetTwoSourceCL)
+  private
+    // The (H, W, first token) level table and the upload of a host-only reference.
+    FBufLevels, FBufReference: cl_mem;
+    FCapLevels, FCapReference: csize_t;
+    FLevelCount: integer;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // Uploads the per-level (H, W, first token) triples (blocking).
+    procedure UploadLevels(const LevelTable: TNeuralIntegerArray);
+    function ReferenceUploadBuffer(Source: TNNetVolume): cl_mem;
+    // ResultBuffer (Queries, Heads*HeadDim) := the deformable attention output.
+    procedure Sample(BufOffsets, BufValue, BufReference: cl_mem;
+      QueryCount, Heads, Points, HeadDim, ReferenceDepth: integer;
+      HalfOverPoints: TNeuralFloat);
+    function BufferBytes(): int64; override;
   end;
 
   /// OpenCL forward helper for TNNetConvGRUCell: the two elementwise steps around
@@ -7043,6 +7067,8 @@ type
   // Output (Queries, 1, D). The projections around it (value_proj, the
   // offsets/logits Linear, output_proj) are TNNetPointwiseConvLinear layers.
   // Backward writes the gradients of all three sources.
+  // The inference forward runs in OpenCL (cai_ms_deformable_attn); training
+  // runs on the host.
   // FStruct: [0] Heads, [1] Points, [2] Levels, [3..] (H_l shl 16) or W_l, so
   // at most 5 levels.
   // Coded by Claude (AI).
@@ -7056,6 +7082,12 @@ type
     FIsBoxReference: boolean;             // reference depth 4 (cxcywh)
     FAttnProbs: TNNetVolume;              // (Queries, 1, Heads*Levels*Points)
     FProbGrad: array of TNeuralFloat;     // dL/da for one (query, head)
+    {$IFDEF OpenCL}
+    FDeformableCL: TNNetMultiScaleDeformableAttentionCL;
+    // Binds (or uploads) the three sources and leaves the output in OpenCL
+    // memory. The caller checks WillOpenCL first.
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     // Sampling position (px, py) in pixels of level Level for the offset pair
     // at OffsetPtr and the reference at RefPtr; also d(loc)/d(offset).
@@ -7077,6 +7109,16 @@ type
     procedure AppendInputLayers(pList: TList); override;
     property ValueSource: TNNetLayer read FValueLayer;
     property ReferenceSource: TNNetLayer read FReferenceLayer;
+    {$IFDEF OpenCL}
+    // Inference only: Backpropagate reads FAttnProbs, which the OpenCL forward
+    // does not write.
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    function OpenCLBufferBytes(): int64; override;
+    {$ENDIF}
     property AttentionProbabilities: TNNetVolume read FAttnProbs;
   end;
 
@@ -14678,6 +14720,8 @@ type
   // ScoreSource are (SeqLen, 1, Depth) sequences of the same SeqLen. Backward
   // scatters the output error onto the selected input tokens (TNNetGatherTokens);
   // the selection itself is locally constant, so ScoreSource gets no gradient.
+  // With OpenCL the host picks the K tokens from the scores and cai_gather_copy
+  // gathers them from a resident PrevLayer.
   // K is stored in FStruct[0].
   // Coded by Claude (AI).
   TNNetTopKGatherTokens = class(TNNetGatherTokens)
@@ -14687,9 +14731,6 @@ type
       FKeptTokens: array of boolean;       // NeuralMarkTopK output
       FTopScores: array of TNeuralFloat;   // NeuralMarkTopK scratch
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-      {$IFDEF OpenCL}
-      function HasGatherCopyPlan(): boolean; override;
-      {$ENDIF}
     protected
       function IndexSegment(): string; override;
     public
@@ -42303,6 +42344,11 @@ begin
   FPlanShape[5] := Y.Depth;
 end;
 
+procedure TNNetGatherCopyCL.InvalidatePlan();
+begin
+  FPlanShape[0] := 0;
+end;
+
 function TNNetGatherCopyCL.ResultBuffer(): cl_mem;
 begin
   Result := FBufDst;
@@ -43540,6 +43586,81 @@ begin
   // __local scratch: max/exp sum, weighted sum, weighted sum of squares.
   clSetKernelArg(k, 6, 3 * LocalSize * csNeuralFloatSize, nil);
   FKernel.RunKernel2D(k, LocalSize * csize_t(Channels), 1, LocalSize, 1);
+end;
+
+{ TNNetMultiScaleDeformableAttentionCL }
+
+const
+  // Channels per cai_ms_deformable_attn work-item (CAI_DEFORM_GROUP in neural.cl).
+  csDeformableChannelGroup = 4;
+
+constructor TNNetMultiScaleDeformableAttentionCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_ms_deformable_attn');
+end;
+
+destructor TNNetMultiScaleDeformableAttentionCL.Destroy();
+begin
+  if Assigned(FBufLevels) then clReleaseMemObject(FBufLevels);
+  if Assigned(FBufReference) then clReleaseMemObject(FBufReference);
+  inherited Destroy();
+end;
+
+procedure TNNetMultiScaleDeformableAttentionCL.UploadLevels(
+  const LevelTable: TNeuralIntegerArray);
+var
+  TableBytes: csize_t;
+begin
+  FLevelCount := Length(LevelTable) div 3;
+  TableBytes := csize_t(Length(LevelTable)) * csLongintSize;
+  FKernel.EnsureBuffer(FBufLevels, FCapLevels, CL_MEM_READ_ONLY, TableBytes);
+  FKernel.WriteBuffer(FBufLevels, TableBytes, @LevelTable[0], CL_TRUE);
+end;
+
+function TNNetMultiScaleDeformableAttentionCL.ReferenceUploadBuffer(
+  Source: TNNetVolume): cl_mem;
+begin
+  Result := FKernel.EnsureBuffer(FBufReference, FCapReference,
+    CL_MEM_READ_WRITE, csize_t(Source.Size) * csNeuralFloatSize);
+end;
+
+procedure TNNetMultiScaleDeformableAttentionCL.Sample(BufOffsets, BufValue,
+  BufReference: cl_mem; QueryCount, Heads, Points, HeadDim,
+  ReferenceDepth: integer; HalfOverPoints: TNeuralFloat);
+var
+  k: cl_kernel;
+  iQueryCount, iHeads, iLevels, iPoints, iHeadDim, iReferenceDepth: longint;
+  fHalfOverPoints: single;
+  GroupCount: integer;
+begin
+  k := FKernel.Kernel;
+  iQueryCount := QueryCount;
+  iHeads := Heads;
+  iLevels := FLevelCount;
+  iPoints := Points;
+  iHeadDim := HeadDim;
+  iReferenceDepth := ReferenceDepth;
+  fHalfOverPoints := HalfOverPoints;
+  clSetKernelArg(k, 0, csLongintSize, @iQueryCount);
+  clSetKernelArg(k, 1, csLongintSize, @iHeads);
+  clSetKernelArg(k, 2, csLongintSize, @iLevels);
+  clSetKernelArg(k, 3, csLongintSize, @iPoints);
+  clSetKernelArg(k, 4, csLongintSize, @iHeadDim);
+  clSetKernelArg(k, 5, csLongintSize, @iReferenceDepth);
+  clSetKernelArg(k, 6, csNeuralFloatSize, @fHalfOverPoints);
+  clSetKernelArg(k, 7, csCLMemSize, @FBufLevels);
+  clSetKernelArg(k, 8, csCLMemSize, @BufOffsets);
+  clSetKernelArg(k, 9, csCLMemSize, @BufValue);
+  clSetKernelArg(k, 10, csCLMemSize, @BufReference);
+  clSetKernelArg(k, 11, csCLMemSize, @FBufY);
+  GroupCount := (HeadDim + csDeformableChannelGroup - 1) div csDeformableChannelGroup;
+  FKernel.RunKernel(k, QueryCount * Heads * GroupCount);
+end;
+
+function TNNetMultiScaleDeformableAttentionCL.BufferBytes(): int64;
+begin
+  Result := inherited BufferBytes() + OpenCLMemBytes(FBufLevels) +
+    OpenCLMemBytes(FBufReference);
 end;
 
 { TNNetConvGRUCellCL }
@@ -47264,6 +47385,9 @@ end;
 
 destructor TNNetMultiScaleDeformableAttention.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FDeformableCL) then FreeAndNil(FDeformableCL);
+  {$ENDIF}
   FAttnProbs.Free;
   inherited Destroy();
 end;
@@ -47362,9 +47486,19 @@ var
 begin
   StartTime := Now();
   {$IFDEF OpenCL}
+  // Runs BEFORE any ForceOutputOnRAM because those downloads are what it avoids.
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
   FPrevLayer.ForceOutputOnRAM();
   FValueLayer.ForceOutputOnRAM();
   FReferenceLayer.ForceOutputOnRAM();
+  MarkOutputWrittenOnRAM();
   {$ENDIF}
   Value := FValueLayer.Output;
   Offsets := FPrevLayer.Output;
@@ -47606,6 +47740,117 @@ begin
   if Assigned(FValueLayer) then pList.Add(FValueLayer);
   if Assigned(FReferenceLayer) then pList.Add(FReferenceLayer);
 end;
+
+{$IFDEF OpenCL}
+// No size verdict: an inference-only layer runs in OpenCL when forced, or when
+// any source is already resident (the others are uploaded).
+function TNNetMultiScaleDeformableAttention.WillOpenCL(): boolean;
+var
+  QueryCount, ValueDepth, ReferenceDepth: integer;
+begin
+  Result := false;
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FDeformableCL)) then exit;
+  if not Assigned(FPrevLayer) then exit;
+  // A source may have been resized since SetPrevLayer, so the shapes the kernel
+  // indexes are checked here.
+  QueryCount := FPrevLayer.FOutput.SizeX;
+  ValueDepth := FHeads * FHeadDim;
+  if FIsBoxReference then ReferenceDepth := 4 else ReferenceDepth := 2;
+  if (FHeadDim < 1) or
+     (FPrevLayer.FOutput.Size <> QueryCount * FHeads * FLevels * FPoints * 3) or
+     (FValueLayer.FOutput.Depth <> ValueDepth) or
+     (FValueLayer.FOutput.Size < (FLevelStart[FLevels - 1] +
+       FLevelHeight[FLevels - 1] * FLevelWidth[FLevels - 1]) * ValueDepth) or
+     (FReferenceLayer.FOutput.Size <> QueryCount * ReferenceDepth) or
+     (FOutput.Size <> QueryCount * ValueDepth) or
+     (csize_t(FOutput.Size) * csNeuralFloatSize > FDeformableCL.ResultBytes()) then exit;
+  Result := FForceOpenCL or FPrevLayer.OutputBindableOnOpenCL() or
+    FValueLayer.OutputBindableOnOpenCL() or FReferenceLayer.OutputBindableOnOpenCL();
+end;
+
+procedure TNNetMultiScaleDeformableAttention.ComputeOpenCL();
+var
+  OutputKernel: TNeuralKernel;
+  UploadOffsets, UploadValue, UploadReference: cl_mem;
+  BufferOffsets, BufferValue, BufferReference: cl_mem;
+begin
+  OutputKernel := FDeformableCL.OutputKernel();
+  UploadOffsets := nil;
+  UploadValue := nil;
+  UploadReference := nil;
+  if not FPrevLayer.OutputBindableOnOpenCL() then
+    UploadOffsets := FDeformableCL.UploadBuffer(FPrevLayer.FOutput, {pIsB=}false);
+  if not FValueLayer.OutputBindableOnOpenCL() then
+    UploadValue := FDeformableCL.UploadBuffer(FValueLayer.FOutput, {pIsB=}true);
+  if not FReferenceLayer.OutputBindableOnOpenCL() then
+    UploadReference := FDeformableCL.ReferenceUploadBuffer(FReferenceLayer.FOutput);
+  BufferOffsets := BindOrUploadOpenCLOperand(FPrevLayer, OutputKernel, UploadOffsets);
+  BufferValue := BindOrUploadOpenCLOperand(FValueLayer, OutputKernel, UploadValue);
+  BufferReference := BindOrUploadOpenCLOperand(FReferenceLayer, OutputKernel,
+    UploadReference);
+  FDeformableCL.Sample(BufferOffsets, BufferValue, BufferReference,
+    FPrevLayer.FOutput.SizeX, FHeads, FPoints, FHeadDim,
+    FReferenceLayer.FOutput.Depth, FHalfOverPoints);
+  // No read back: the result stays in OpenCL memory until a host reader calls
+  // ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+procedure TNNetMultiScaleDeformableAttention.EnableOpenCL(
+  DotProductKernel: TNeuralKernel);
+var
+  LevelTable: TNeuralIntegerArray;
+  Level, MaxLevel: integer;
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  if not Assigned(FNN) then exit;
+  if not Assigned(FDeformableCL) then
+    FDeformableCL := TNNetMultiScaleDeformableAttentionCL.Create(FNN)
+  else if FDeformableCL.ResultBytes() < csize_t(FOutput.Size) * csNeuralFloatSize then
+    // Growing replaces the result buffer, and the output it held goes with it.
+    FOutputOnOpenCL := false;
+  FDeformableCL.ReserveResult(FOutput);
+  LevelTable := nil;
+  SetLength(LevelTable, 3 * FLevels);
+  MaxLevel := FLevels - 1;
+  for Level := 0 to MaxLevel do
+  begin
+    LevelTable[3 * Level] := FLevelHeight[Level];
+    LevelTable[3 * Level + 1] := FLevelWidth[Level];
+    LevelTable[3 * Level + 2] := FLevelStart[Level];
+  end;
+  FDeformableCL.UploadLevels(LevelTable);
+end;
+
+procedure TNNetMultiScaleDeformableAttention.DisableOpenCL();
+begin
+  // FDeformableCL owns the buffer a kept output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FDeformableCL);
+end;
+
+function TNNetMultiScaleDeformableAttention.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FDeformableCL) then Result := FDeformableCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetMultiScaleDeformableAttention.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FDeformableCL) then Result := FDeformableCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetMultiScaleDeformableAttention.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FDeformableCL) then
+    Result := Result + FDeformableCL.BufferBytes();
+end;
+{$ENDIF}
 
 { TNNetFlowWarp }
 
@@ -60945,13 +61190,6 @@ begin
   SetLength(FTopScores, FStruct[0]);
 end;
 
-{$IFDEF OpenCL}
-function TNNetTopKGatherTokens.HasGatherCopyPlan(): boolean;
-begin
-  Result := false;
-end;
-{$ENDIF}
-
 function TNNetTopKGatherTokens.IndexSegment(): string;
 begin
   Result := IntToStr(FScoreLayer.LayerIdx);
@@ -60963,8 +61201,9 @@ var
   TokenPos, MaxTokenPos, ScoreDepth: integer;
 begin
   {$IFDEF OpenCL}
+  // Only the scores come to RAM; the inherited gather binds a resident source.
   FScoreLayer.ForceOutputOnRAM();
-  FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FGatherCopyCL) then FGatherCopyCL.InvalidatePlan();
   {$ENDIF}
   Scores := FScoreLayer.Output;
   ScoreDepth := Scores.Depth;

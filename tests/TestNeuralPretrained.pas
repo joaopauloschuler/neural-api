@@ -1676,6 +1676,9 @@ type
     procedure TestRtDetrConfigFromJSONFile;
     procedure TestRtDetrParity;
     procedure TestRtDetrR50Parity;
+    // Both fixtures with EnableOpenCL + ForceOpenCL: deformable attention and the
+    // top-K gather on OpenCL, parity with the oracle, residency counts printed.
+    procedure TestRtDetrOpenCL;
     procedure TestRtDetrRejectsInputSize;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
@@ -59068,7 +59071,62 @@ end;
 
 // Builds the pico RT-DETR of Name, runs the stored image and compares against
 // the transformers float64 logits, pred_boxes and post-processed detections.
-procedure RunRtDetrParity(ATest: TTestNeuralPretrained; const Name: string);
+{$IFDEF OpenCL}
+// Asserts both RT-DETR OpenCL layers ran there and prints their residency
+// counts plus the classes, from the top-K on, whose forward pulled a source to RAM.
+procedure ReportRtDetrResidency(ATest: TTestNeuralPretrained; NN: TNNet;
+  const Name: string);
+var
+  Layer, Source: TNNetLayer;
+  Sources: TList;
+  LayerPos, MaxLayerPos, SourcePos: integer;
+  InDecoder: boolean;
+  Pulled, SourceReport: string;
+begin
+  InDecoder := false;
+  Pulled := '';
+  MaxLayerPos := NN.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := NN.Layers[LayerPos];
+    if (Layer is TNNetMultiScaleDeformableAttention) or
+       (Layer is TNNetTopKGatherTokens) then
+    begin
+      InDecoder := true;
+      SourceReport := '';
+      Sources := TList.Create();
+      try
+        Layer.AppendInputLayers(Sources);
+        for SourcePos := 0 to Sources.Count - 1 do
+        begin
+          Source := TNNetLayer(Sources[SourcePos]);
+          SourceReport := SourceReport + ' ' + Source.ClassName + '#' +
+            IntToStr(Source.LayerIdx) + '(resident=' +
+            IntToStr(Source.ProfiledResidency.OutputResidentCnt) + ')';
+        end;
+      finally
+        Sources.Free;
+      end;
+      WriteLn('  ', Name, ' OpenCL ', Layer.ClassName, ' #', LayerPos,
+        ': gpu forwards=', Layer.ForwardGPUCnt,
+        ' sources bound=', Layer.ProfiledResidency.SourceBoundCnt,
+        ' sources pulled=', Layer.ProfiledResidency.SourcePulledToRAMCnt,
+        ' output resident=', Layer.ProfiledResidency.OutputResidentCnt,
+        '; sources:', SourceReport);
+      ATest.AssertTrue(Name + ' ' + Layer.ClassName + ' #' + IntToStr(LayerPos) +
+        ' must reach OpenCL', Layer.ForwardGPUCnt > 0);
+    end;
+    if InDecoder and (Layer.ProfiledResidency.SourcePulledToRAMCnt > 0) and
+       (Pos(' ' + Layer.ClassName + ' ', Pulled + ' ') = 0) then
+      Pulled := Pulled + ' ' + Layer.ClassName;
+  end;
+  WriteLn('  ', Name, ' OpenCL: layers from the top-K on that pulled a source to RAM:',
+    Pulled);
+end;
+{$ENDIF}
+
+procedure RunRtDetrParity(ATest: TTestNeuralPretrained; const Name: string;
+  OnOpenCL: boolean);
 var
   Config: TRtDetrConfig;
   NN: TNNet;
@@ -59078,6 +59136,10 @@ var
   Query, Channel, MaxQuery, NumLabels, DetectionPos, TargetW, TargetH: integer;
   LogitDiff, BoxDiff, ScoreDiff, CornerDiff: double;
   Corners: array[0..3] of double;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
 begin
   IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
   Image := TNNetVolume.Create;
@@ -59093,7 +59155,23 @@ begin
     NN := BuildRtDetrFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
       {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
       Image.SizeY);
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      if not ATest.AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+      begin
+        ATest.AssertTrue('no OpenCL device: SKIP', true);
+        exit;
+      end;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(true);
+      NN.LayerProfiling := true;
+    end;
+    {$ENDIF}
     NN.Compute(Image);
+    {$IFDEF OpenCL}
+    if OnOpenCL then ReportRtDetrResidency(ATest, NN, Name);
+    {$ENDIF}
     Output := NN.GetLastLayer.Output;
     NumLabels := Config.NumLabels;
     ATest.AssertEquals(Name + ' queries', Config.NumQueries, Output.SizeX);
@@ -59160,12 +59238,23 @@ end;
 
 procedure TTestNeuralPretrained.TestRtDetrParity;
 begin
-  RunRtDetrParity(Self, 'tiny_rtdetr');
+  RunRtDetrParity(Self, 'tiny_rtdetr', {OnOpenCL=}false);
+end;
+
+// The pico net on OpenCL (forced) against the same transformers oracle.
+procedure TTestNeuralPretrained.TestRtDetrOpenCL;
+begin
+  {$IFDEF OpenCL}
+  RunRtDetrParity(Self, 'tiny_rtdetr', {OnOpenCL=}true);
+  RunRtDetrParity(Self, 'tiny_rtdetr_r50', {OnOpenCL=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 procedure TTestNeuralPretrained.TestRtDetrR50Parity;
 begin
-  RunRtDetrParity(Self, 'tiny_rtdetr_r50');
+  RunRtDetrParity(Self, 'tiny_rtdetr_r50', {OnOpenCL=}false);
 end;
 
 procedure TTestNeuralPretrained.TestRtDetrRejectsInputSize;

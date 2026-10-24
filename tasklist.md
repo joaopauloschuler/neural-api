@@ -2015,9 +2015,25 @@ rather than acted on.
               ShareHostOutputsByLiveness on (80 MB of weights); profile which
               layers hold it (stem convs at 320 x 320, the valid-mask
               TNNetCellMul table of 8400 x 256) and trim.
-        - [ ] OpenCL paths for TNNetMultiScaleDeformableAttention and
+        - [X] OpenCL paths for TNNetMultiScaleDeformableAttention and
               TNNetTopKGatherTokens (CPU only; the gather forces its sources to
-              RAM), with PoCL parity tests in the opencl suite.
+              RAM), with PoCL parity tests in the opencl suite. Inference
+              forward only (training stays on the host): cai_ms_deformable_attn
+              binds all three sources and keeps its output resident; the top-K
+              reads only the scores to RAM, picks K on the host and gathers from
+              a resident source by cai_gather_copy (plan re-uploaded per
+              forward). Tests: TestMultiScaleDeformableAttentionOpenCLParity,
+              TestTopKGatherTokensOpenCLParity, TestRtDetrOpenCL (both pico
+              fixtures, forced OpenCL, residency counts printed).
+        - [ ] TNNetInverseSigmoid OpenCL forward: the box-refinement chain
+              (inverse_sigmoid -> TNNetSum -> TNNetSigmoid) runs on the host, so
+              from decoder layer 1 on the deformable attention uploads its
+              reference source (TestRtDetrOpenCL prints it).
+        - [ ] OpenCL top-K selection (per-token max + top-K in a kernel) so the
+              (tokens x classes) score map no longer comes to RAM each forward.
+        - [ ] GPU-box timing of the RT-DETR OpenCL forward (r18vd/r50vd at
+              640 x 640) against the CPU; PoCL on the 1-core VM is not
+              representative.
         - [ ] Training: contrastive denoising queries, the varifocal class loss
               and the auxiliary per-layer losses (inference-only now; the
               decoder computes only the last layer's class head).

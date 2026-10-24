@@ -4648,6 +4648,100 @@ __kernel void cai_row_dot_products
   FDst[g_id] = acc;
 }
 
+// CAI multi-scale deformable attention (TNNetMultiScaleDeformableAttention
+// forward). One work-item per (query, head, group of 4 channels): the softmax of
+// the head's Levels*Points logits, then grid_sample (align_corners=False, zero
+// padding) of each sampling location, weighted by its probability. FOffsets is
+// (Queries, Heads*Levels*Points*3) offsets|logits, FValue (Tokens, Heads*FHeadDim),
+// FRef (Queries, FRefDepth = 2 or 4), FLevelTable (H, W, first token) per level.
+// Coded by Claude (AI).
+#define CAI_DEFORM_GROUP 4
+__kernel void cai_ms_deformable_attn
+(
+  const int FQueryCount,
+  const int FHeads,
+  const int FLevels,
+  const int FPoints,
+  const int FHeadDim,
+  const int FRefDepth,
+  const float FHalfOverPoints,
+  __global const int* FLevelTable,
+  __global const float* FOffsets,
+  __global const float* FValue,
+  __global const float* FRef,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  const int GroupCount = (FHeadDim + CAI_DEFORM_GROUP - 1) / CAI_DEFORM_GROUP;
+  const int ItemsPerQuery = FHeads * GroupCount;
+  if (g_id >= FQueryCount * ItemsPerQuery) return;
+  const int q = g_id / ItemsPerQuery;
+  const int HeadGroup = g_id - q * ItemsPerQuery;
+  const int h = HeadGroup / GroupCount;
+  const int c0 = (HeadGroup - h * GroupCount) * CAI_DEFORM_GROUP;
+  const int ChannelCount = min(CAI_DEFORM_GROUP, FHeadDim - c0);
+  const int SampleCount = FLevels * FPoints;
+  const int ValueDepth = FHeads * FHeadDim;
+  __global const float* Row = FOffsets + q * FHeads * SampleCount * 3;
+  __global const float* Offs = Row + h * SampleCount * 2;
+  __global const float* Logits = Row + FHeads * SampleCount * 2 + h * SampleCount;
+  __global const float* Ref = FRef + q * FRefDepth;
+  float MaxLogit = Logits[0];
+  for (int s = 1; s < SampleCount; s++) MaxLogit = fmax(MaxLogit, Logits[s]);
+  float ProbSum = 0.0f;
+  // The max shift keeps the argument <= 0; the floor keeps PoCL's exp from trapping.
+  for (int s = 0; s < SampleCount; s++) ProbSum += cai_exp_floored(Logits[s] - MaxLogit);
+  const float InvProbSum = 1.0f / ProbSum;
+  const int HeadOffset = h * FHeadDim + c0;
+  float acc[CAI_DEFORM_GROUP];
+  for (int c = 0; c < CAI_DEFORM_GROUP; c++) acc[c] = 0.0f;
+  int s = 0;
+  for (int l = 0; l < FLevels; l++)
+  {
+    const int H = FLevelTable[3 * l];
+    const int W = FLevelTable[3 * l + 1];
+    const int Start = FLevelTable[3 * l + 2];
+    const float dLocX = (FRefDepth == 4) ? Ref[2] * FHalfOverPoints : 1.0f / W;
+    const float dLocY = (FRefDepth == 4) ? Ref[3] * FHalfOverPoints : 1.0f / H;
+    for (int p = 0; p < FPoints; p++, s++)
+    {
+      const float px = (Ref[0] + Offs[2 * s] * dLocX) * W - 0.5f;
+      const float py = (Ref[1] + Offs[2 * s + 1] * dLocY) * H - 0.5f;
+      // Every corner outside (also NaN): the sample is zero. Inside, the int
+      // conversions below are bounded.
+      if (!((px > -1.0f) && (px < (float)W) && (py > -1.0f) && (py < (float)H))) continue;
+      const float Prob = cai_exp_floored(Logits[s] - MaxLogit) * InvProbSum;
+      const float x0f = floor(px);
+      const float y0f = floor(py);
+      const int x0 = (int)x0f;
+      const int y0 = (int)y0f;
+      const float fx = px - x0f;
+      const float fy = py - y0f;
+      const int InX0 = x0 >= 0;
+      const int InX1 = x0 + 1 < W;
+      const int InY0 = y0 >= 0;
+      const int InY1 = y0 + 1 < H;
+      const int Base = (Start + y0 * W + x0) * ValueDepth + HeadOffset;
+      const float Wx0 = Prob * (1.0f - fx);
+      const float Wx1 = Prob * fx;
+      if (InY0)
+      {
+        if (InX0) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx0 * (1.0f - fy), FValue[Base + c], acc[c]);
+        if (InX1) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx1 * (1.0f - fy), FValue[Base + ValueDepth + c], acc[c]);
+      }
+      if (InY1)
+      {
+        const int RowBelow = Base + W * ValueDepth;
+        if (InX0) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx0 * fy, FValue[RowBelow + c], acc[c]);
+        if (InX1) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx1 * fy, FValue[RowBelow + ValueDepth + c], acc[c]);
+      }
+    }
+  }
+  __global float* Out = FDst + q * ValueDepth + HeadOffset;
+  for (int c = 0; c < ChannelCount; c++) Out[c] = acc[c];
+}
+
 // CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
 // source element (pos, FChannelIdx[d]), so one kernel covers both a contiguous
 // channel run and the arbitrary channel list of TNNetSplitChannelEvery. A
