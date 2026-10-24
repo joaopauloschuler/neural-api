@@ -168,14 +168,9 @@ rather than acted on.
         and 1.8B/7B widths); a streaming/int8 path for the 20B checkpoint and a
         live trust_remote_code parity run against a downloaded internlm2_5-* are
         left open.
-- [ ] IBM Granite 3.x importer follow-ups (`BuildGraniteFromSafeTensors[Ex]`
-      LANDED, model_type `granite`/`granitemoe`; four multipliers folded at
-      load on the Llama path — embedding/residual/attention multipliers + a
-      DIVIDING logits_scaling into the LM head, wired through the existing
-      QScale/W_q slot not hardcoded; granitemoe reuses the Mixtral MoE WIRING
-      with a dedicated LoadGraniteMoEExperts loader for its fused 3-D slabs;
-      pico parity TestGranite{Config,Logit,MoeLogit}Parity < 1e-4 vs float64
-      HF transformers):
+- [ ] IBM Granite 3.x importer follow-ups (`BuildGraniteFromSafeTensors[Ex]`,
+      model_type `granite`/`granitemoe`; pico parity
+      TestGranite{Config,Logit,MoeLogit}Parity < 1e-4 vs float64 HF transformers):
   - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
         a sliced ibm-granite/granite-3.1-* against the random pico fixture.
 - [ ] OLMoE real-checkpoint slicer follow-up (BuildOlmoeFromSafeTensors[Ex],
@@ -185,17 +180,9 @@ rather than acted on.
       OlmoeForCausalLM): the pico fixture is random-init only — add a real
       allenai/OLMoE-1B-0924 slicer (slice_llama.py reuse) to parity-check a
       sliced real checkpoint against the random pico fixture.
-- [ ] BitNet b1.58 importer follow-ups (`BuildBitNetFromSafeTensors[Ex]` LANDED,
-      model_type "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`; the
-      ternary-weight LLM mapped onto the Llama backbone with the SubLN
-      norm-before-quantized-linear RMSNorms (attn_sub_norm before o_proj,
-      ffn_sub_norm before down_proj via Config.BitNetSubLN, reusing
-      TNNetTokenRMSNorm), the relu2 gated FFN via the new TNNetReGLUSquared
-      activation (up*ReLU(gate)^2) on the separate-projection loader, and
-      rope_theta from the transformers-5.x rope_parameters dict; the FP "shadow"
-      checkpoint loads bit-for-bit since the absmean ternarize is a no-op on
-      already-ternary weights; pico parity TestBitNet{Config,Logit}Parity < 1e-4
-      vs float64 HF BitNetForCausalLM):
+- [ ] BitNet b1.58 importer follow-ups (`BuildBitNetFromSafeTensors[Ex]`,
+      model_type "bitnet"; loads the FP "shadow" checkpoint; pico parity
+      TestBitNet{Config,Logit}Parity < 1e-4 vs float64 HF BitNetForCausalLM):
   - [ ] native I2_S packed-ternary de-quant-at-load (2-bit unpack: 4 ternary
         values per byte + a separate weight_scale tensor). The shadow-weight
         (FP effective-weights) path is covered; the GGUF/bitnet.cpp-style I2_S
@@ -553,22 +540,16 @@ rather than acted on.
       with a README comparing the flicker of per-frame examples/DepthAnythingV2
       output against the temporal model.
 
-- [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex]
-      LANDED, commit a7870a1: diffusers AutoencoderKL decoder — post_quant_conv ->
-      mid block single self-attention over HxW -> up blocks of ResNet groups +
-      nearest upsample -> conv_out, latent scaled by 1/0.18215; reuse-only (nearest
-      upsample = TNNetDeMaxPool(2) FSpacing=0; mid attention flattens (H,W,C)->
-      (H*W,1,C) per-token SDPA; added GroupNormEpsilon to TNNetGroupNorm to pin
-      diffusers eps 1e-6); TestVaeDecoderParity <1e-4 vs a numpy float64 oracle):
+- [ ] Stable Diffusion VAE decoder importer follow-ups (BuildVaeDecoderFromSafeTensors[Ex],
+      diffusers AutoencoderKL decoder; TestVaeDecoderParity vs a numpy float64 oracle):
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity (diffusers is in the
         ~/x venv; not run yet); SDXL VAE uses different group counts / multi-head attention.
-  - [ ] SD UNet importer LANDED (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise,
-        UNet2DConditionModel v1; TestSDUNetParity 2.75e-6 < 1e-4). Open follow-ups:
-    - [ ] Real Stable Diffusion text-to-image from a diffusers folder (audit
-          2026-10-02). SD 1.x pipeline + CLI LANDED 2026-10-21 (8abce32d,
-          d7d07607, d55b7bfc, b764df66; pico parity vs a diffusers float64 run
-          on tests/fixtures/tiny_sd15 from tools/make_pico_sd_pipeline_fixture.py).
-          Open pieces:
+  - [ ] SD UNet importer follow-ups (BuildSDUNetFromSafeTensors[Ex] + SDUNetDenoise;
+        TestSDUNetParity):
+    - [ ] Real Stable Diffusion text-to-image from a diffusers folder. The SD 1.x
+          pipeline + CLI exist (TStableDiffusionPipeline, examples/StableDiffusion;
+          pico parity on tests/fixtures/tiny_sd15 from
+          tools/make_pico_sd_pipeline_fixture.py). Open pieces:
       - [ ] Real-checkpoint run of SD 1.5 (runwayml/stable-diffusion-v1-5 F32
             safetensors) on the user's GPU box with examples/StableDiffusion
             --gpu; FP32 UNet ~3.4 GB does not fit the dev box. Then
@@ -578,10 +559,9 @@ rather than acted on.
             are mapped with diffusers parity): UniPCMultistepScheduler (smUniPC
             has only a numpy oracle; diffusers takes N of N+1 points like DPM),
             PNDM PRK warm-up, DDPMScheduler (smDDPM ignores the stride).
-            Continuous sigmas for the 4-channel inpaint blend (AfterStep takes
-            an integer timestep, so those runs keep integer timesteps), Euler
-            sigma_min / sigma_max overrides and final_sigmas_type "sigma_min"
-            (noticed, not done).
+            Euler sigma_min / sigma_max overrides and final_sigmas_type
+            "sigma_min" (noticed, not done). Continuous sigmas for the 4-channel
+            inpaint blend: see the Differential Diffusion item below.
       - [ ] Latent Consistency Models follow-ups (LCM-LoRA sampling
             `--sampler lcm` on TNNetLCMScheduler, 1a31f710; LCM-distilled
             UNets via time_cond_proj_dim, 0bfbb06b):
@@ -771,14 +751,10 @@ rather than acted on.
             added-token match needs the lowercase to keep the byte length.
       - [ ] Old A1111 .pt embeddings saved before torch 1.6 (legacy non-zip
             pickle) are rejected by TNNetTorchBinReader.
-      - [ ] Prompt control in TStableDiffusionPipeline follow-ups. Long prompts
-            (75-token chunks, lpw_stable_diffusion layout, MaxPromptChunkCount /
-            `--max-prompt-chunks`, PromptNotice) and A1111 prompt weighting
-            (ParseSDPromptWeights, PromptWeighting / `--no-prompt-weighting`,
-            lpw whole-prompt mean restore) are DONE with pico parity vs a
-            float64 reimplementation of lpw's get_weighted_text_embeddings
-            (tools/make_pico_sd_prompt_weighting_fixture.py; the community
-            pipeline is not in the ~/x venv). Open:
+      - [ ] Prompt control in TStableDiffusionPipeline follow-ups (long prompts:
+            MaxPromptChunkCount / `--max-prompt-chunks`; A1111 weighting:
+            ParseSDPromptWeights / `--no-prompt-weighting`; pico parity vs a
+            float64 lpw reimplementation). Open:
         - [ ] Run a long weighted prompt on real SD 1.5 (pico only so far).
         - [ ] A1111 extras not done: moving a chunk split back to a nearby
               comma, per-chunk mean restore (lpw restores the whole prompt's
@@ -853,19 +829,16 @@ rather than acted on.
                 they now invert a TILED encode (a948d626). They refuse
                 panorama windows but not `VaeTileSize`; either refuse it too
                 or pin that the tiled latent inverts acceptably.
-- [ ] Differential Diffusion (Levin & Fried 2024, arXiv:2306.00950): the SD
-      1.x/2.x part is DONE (`TStableDiffusionDifferentialImg2Img`, standalone
-      `DifferentialDiffusionRegenerateMask` in neural/neuraldiffusion.pas,
-      examples/StableDiffusion `--change-map` / `--invert-change-map`; pico
-      parity vs exx8 SD2/diff_pipe.py's loop with DDIM, Euler, DPM++ 2M Karras,
-      Euler Karras). The convention is white = change most; the reference's
-      own maps are white = keep (its `map > i / N` keeps the image). Open:
-      - QwenImage DONE: `TQwenImage21Pipeline.EncodeChangeMap` /
-        `Denoise(..., ChangeLatents)`, examples/QwenImage `--change-map`,
-        `--invert-change-map`, `/change-map`, `/invert-change-map`; the
-        threshold index follows the Flux differential reference (after run
-        step i blend with 1 - change > i / N, never after the last step);
-        invariants in `TestQwenImage21ChangeMap`. Open:
+- [ ] Differential Diffusion (Levin & Fried 2024, arXiv:2306.00950) follow-ups
+      (SD: `TStableDiffusionDifferentialImg2Img`,
+      `DifferentialDiffusionRegenerateMask`, examples/StableDiffusion
+      `--change-map`; pico parity vs exx8 SD2/diff_pipe.py). The convention is
+      white = change most; the reference's own maps are white = keep (its
+      `map > i / N` keeps the image). Open:
+      - QwenImage (`TQwenImage21Pipeline.EncodeChangeMap`, examples/QwenImage
+        `--change-map`; threshold index follows the Flux differential
+        reference, blend with 1 - change > i / N after step i, never after the
+        last step; invariants in `TestQwenImage21ChangeMap`). Open:
         - [ ] Real Qwen-Image-2.1 run on the user's GPU box (horizontal
               gradient at strength 1 and 0.6).
         - [ ] Optional pico parity: an ad hoc ~/x venv loop of
@@ -1512,7 +1485,7 @@ rather than acted on.
 
 - [ ] End-to-end latent text-to-image generation example (examples/LatentTextToImage)
       that finally CHAINS the imported generative pieces into one pipeline on CPU.
-      NOW UNBLOCKED via the landed PixArt path (no SD-UNet needed): T5 text encoder
+      Chain via the PixArt path (no SD-UNet needed): T5 text encoder
       (BuildT5FromSafeTensors) -> PixArt latent denoiser (BuildPixArtFromSafeTensors,
       LANDED, parity < 1e-4) -> VAE decoder (BuildVaeDecoderFromSafeTensors, LANDED)
       -> RGB, driven by the existing TNNetDiffusionScheduler DDIM/DPM-Solver++ loop
@@ -1874,86 +1847,34 @@ rather than acted on.
       and global attention (tokens of all N frames), with frame 0 using its own
       camera/register token embeddings; (2) the camera head (4-block trunk with
       adaLN modulation, 4 refinement iterations, pose encoding = translation 3 +
-      quaternion 4 + FoV 2) and a PoseEncodingToExtriIntri helper; (3) a binary
-      PLY writer for coloured point clouds filtered by confidence percentile. The
+      quaternion 4 + FoV 2) and a PoseEncodingToExtriIntri helper; (3) coloured
+      point clouds filtered by confidence percentile, written through the
+      existing `TNNetPLYWriter` (neural/neuralply.pas). The
       track head is out of scope. The example takes a folder of images and writes
       scene.ply + per-frame depth PNGs + cameras.txt. Parity: pico fixture against
       the reference `vggt` package — needs a NEW Python oracle script in tools/,
       so ask the user before writing it; the PLY writer and pose-encoding
       conversion can be tested by hand-derived cases without it.
-- [ ] 3D Gaussian Splatting viewer: load a trained 3DGS scene and render novel
-      views (Kerbl et al., SIGGRAPH 2023, arXiv:2308.04079). Input: the INRIA
-      `point_cloud.ply` (binary_little_endian vertex list with x,y,z, nx,ny,nz,
-      f_dc_0..2, f_rest_0..44 stored channel-major (15 coefficients per colour),
-      opacity, scale_0..2, rot_0..3 as w,x,y,z). This file layout is shared by
-      most 3DGS trainers (INRIA, gsplat, nerfstudio splatfacto exports). Today
-      the tree has no 3D scene renderer (examples/TinyNeRF ray-marches a toy
-      field it trains itself). Work: (1) a small PLY reader/writer unit
-      (neural/neuralply.pas, header parse + typed binary properties), which the
-      VGGT task above should reuse for its point-cloud writer instead of a second
-      writer; (2) `TGaussianSplatScene` (load, activate: sigmoid opacity, exp
-      scale, normalized quaternion; degree 0-3 SH colour + 0.5, clamp at 0);
-      (3) a CPU tile rasterizer: per Gaussian, the 3D covariance R S S^T R^T,
-      the 2D covariance J W Sigma W^T J^T + 0.3 I, a 3-sigma radius, then 16x16
-      tile binning, depth sort per tile (key = tile id + depth), and
-      front-to-back blending with alpha = min(0.99, opacity * exp(-0.5 d^T
-      Sigma2D^-1 d)), skipping alpha < 1/255 and stopping at T < 1e-4. Output is
-      an RGB TNNetVolume; (4) an OpenCL path: one preprocess kernel per Gaussian
-      plus one blend kernel per tile (one work-group per tile, Gaussians staged
-      through local memory in batches as in the reference CUDA code). The sort
-      can stay on the host in v1. examples/GaussianSplatView (.lpr + .lpi +
-      README.md, cthreads first): `--ply FILE --orbit N --size WxH [--gpu]`
-      writes PNG frames and an animated GIF through TNNetAnimatedGIFWriter;
-      camera intrinsics come from `--fov` or the INRIA `cameras.json`. Tests,
-      all hand-derived (no Python oracle): one isotropic Gaussian at a known
-      depth (peak pixel value and footprint radius), the degree-0 SH colour, two
-      overlapping Gaussians (front-to-back order), a quaternion rotation of an
-      anisotropic Gaussian, a PLY round-trip, and CPU vs OpenCL agreement.
-      Memory: a real scene has 1-6 M Gaussians x 62 floats (~1.5 GB at 6 M), so
-      dev-box runs must use a small scene under the 2 GB cap; real scenes are a
-      user GPU-box check. Out of scope for v1: training (the differentiable
-      backward), which would be a follow-up that fits a scene from posed photos.
-      - Steps (1)-(4) and examples/GaussianSplatView (`--demo` on CPU and
-        PoCL) DONE; the OpenCL path is `TGaussianSplatRasterizerCL` with
-        BinTiles still on the host. neural/neuralply.pas (`TNNetPLYReader` /
-        `TNNetPLYWriter`, ascii + both binary byte orders, streamed rows, list
-        properties skipped on read), neural/neuralgaussiansplat.pas
-        (`TGaussianSplatScene` Load/SaveToPLY, `TGaussianSplatCamera` +
-        `InitGaussianSplatCamera` / `SetGaussianSplatCameraLookAt`,
-        `TGaussianSplatRasterizer` Preprocess / BinTiles / BlendTile / Render
-        with the per-Gaussian and per-tile results in flat public arrays for
-        the OpenCL upload); tests in tests/TestNeuralGaussianSplat.pas. Open:
+- [ ] 3D Gaussian Splatting viewer follow-ups (arXiv:2308.04079). Landed:
+      neural/neuralply.pas (`TNNetPLYReader` / `TNNetPLYWriter`),
+      neural/neuralgaussiansplat.pas (`TGaussianSplatScene`,
+      `TGaussianSplatRasterizer` Preprocess / BinTiles / BlendTile / Render,
+      OpenCL `TGaussianSplatRasterizerCL` with BinTiles still on the host),
+      examples/GaussianSplatView, tests/TestNeuralGaussianSplat.pas. A real
+      scene has 1-6 M Gaussians x 62 floats (~1.5 GB at 6 M), so dev-box runs
+      must use a small scene under the 2 GB cap. Out of scope: training (the
+      differentiable backward). Open:
         - [ ] Real INRIA scene check (small scene on the dev box, big ones on
               the user's GPU box), including a `--cameras cameras.json` run.
         - [ ] Device-side sort + binning (radix sort on (tile, depth) keys,
               then per-tile ranges) so a frame needs no host round-trip; time
               it against the host BinTiles on a real 1-6 M Gaussian scene first.
 
-- [X] RT-DETR real-time detection-transformer importer
-      (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
-      detection model family from the landed DETR (ResNet+sinusoidal+vanilla
-      transformer decoder, the slow NMS-free baseline): RT-DETR is the real-time
-      redesign — a CNN backbone (reuse the landed ResNet) feeding an EFFICIENT
-      HYBRID ENCODER (intra-scale single-layer self-attention "AIFI" on the top
-      feature map only + a CNN cross-scale fusion / PANet-style neck) and an
-      IoU-AWARE / uncertainty-minimal QUERY SELECTION that seeds the decoder from
-      the top-K encoder proposals instead of fixed learned object queries. The new
-      code is the hybrid-encoder neck (AIFI block + CCFM up/down conv fusion) and
-      the top-K query-selection head; the transformer decoder, box/class heads, and
-      the DETR-style post-process can be reused from the landed DETR. Real value:
-      the first real-time / production-grade detector importer (DETR is reference,
-      not deployable speed). Pico-fixture smoke + a real-checkpoint top-1/box
-      parity follow-up via the structured-vision detection eval harness.
-      DONE: BuildRtDetrFromSafeTensors[Ex] + ReadRtDetrConfigFromJSONFile +
-      DecodeRtDetrDetections (post_process_object_detection, no NMS); new
-      layers TNNetMultiScaleDeformableAttention (forward + backward of value,
-      offsets/logits and reference), TNNetTopKGatherTokens, TNNetInverseSigmoid;
-      ObjectDetection --rtdetr [--image]. Parity < 1e-4 on two pico fixtures
-      (tools/make_pico_rtdetr_fixture.py); agent run of PekingU/rtdetr_r18vd
-      at 640 x 640: logits 3.4e-5, boxes 2.7e-4 over all 300 queries, same 5
-      detections as transformers. Under OpenCL the query selection
-      (cai_token_max_score, cai_topk_token_rank) and its gather keep the score
-      map and the selected tokens in OpenCL memory.
+- [ ] RT-DETR importer follow-ups (BuildRtDetrFromSafeTensors[Ex],
+      ReadRtDetrConfigFromJSONFile, DecodeRtDetrDetections,
+      TNNetMultiScaleDeformableAttention, TNNetTopKGatherTokens,
+      TNNetInverseSigmoid, ObjectDetection --rtdetr; OpenCL forward included;
+      agent run of PekingU/rtdetr_r18vd matched transformers):
         - [ ] User run of a real checkpoint (r18vd and r50vd/r101vd; only r18vd
               was run, by the agent).
         - [ ] RAM: r18vd at 640 x 640 peaks at 1.86 GB RSS with
@@ -1974,23 +1895,10 @@ rather than acted on.
               new code is the discrete sampling method (shared with D-FINE's
               decoder_method "discrete") and the config reader.
 
-- [X] D-FINE detector importer (BuildDFineFromSafeTensors[Ex], transformers
-      model_type "d_fine", DFineForObjectDetection; Apache-2.0 checkpoints
-      ustc-community/dfine-{nano,small,medium,large,xlarge}-coco and the obj365
-      variants). DONE: HGNetV2 backbone (BuildHGNetV2Backbone), the hybrid
-      encoder + query selection on the shared TRtDetrNetBuilder
-      (BuildDFineEncoder), and the decoder in TDFineNetBuilder.AddDecoder:
-      DFineGate, per-level TNNetMultiScaleDeformableAttention on the decoder
-      memory (no value/output projection), pre_bbox_head initial box,
-      Fine-grained Distribution Refinement (bin softmax, DFineWeightingFunction
-      folded with distance2bbox into one fixed Linear, corners accumulated
-      across layers) and the LQE head (new TNNetTopKValues layer, OpenCL
-      forward cai_topk_values; the mean folded into the first Linear). Layers
-      after eval_idx are not built.
-      Post-process is DecodeRtDetrDetections. Parity on tiny_dfine and
-      tiny_dfine_perlevel, CPU and forced OpenCL: logits < 1.8e-6, boxes
-      < 1.5e-7, post-process scores and xyxy < 1.5e-7 (TestDFineParity,
-      TestDFineOpenCL). ObjectDetection --dfine [--image] [--size].
+- [ ] D-FINE importer follow-ups (BuildDFineFromSafeTensors[Ex], model_type
+      "d_fine": BuildHGNetV2Backbone, BuildDFineEncoder on the shared
+      TRtDetrNetBuilder, TDFineNetBuilder.AddDecoder, TNNetTopKValues;
+      TestDFineParity / TestDFineOpenCL; ObjectDetection --dfine):
         - [ ] Agent or user check on a real ustc-community/dfine-* checkpoint
               (dfine-nano-coco at 640 x 640 under the 2 GB cap): same
               detections as transformers. Not run on the dev box.
@@ -2501,10 +2409,9 @@ rather than acted on.
             `FOutputRaw` and `FBiasOutput` for the life of the net, and
             `ShareHostOutputsByLiveness` shares only `FOutput`. Candidate:
             one conv scratch shared by every layer of an inference-only net
-            (it must stay safe with the parallel layer scheduler). Done:
-            `CanShareHostOutput` overrides on `TNNetBilinearUpsample`,
-            `TNNetLeakyReLU` and `TNNetTokenLayerNorm` (pico 128 x 96 host
-            bytes after a forward 33.18 -> 31.17 MB). A 640 x 480 run fits
+            (it must stay safe with the parallel layer scheduler).
+            `TNNetBilinearUpsample`, `TNNetLeakyReLU` and `TNNetTokenLayerNorm`
+            already override `CanShareHostOutput`. A 640 x 480 run fits
             the dev box only after the conv part. The im2col part is the same
             library-wide question as "Decision for the user: inference-time
             release of the convolution im2col matrix" below; it now blocks
@@ -2512,10 +2419,6 @@ rather than acted on.
       - [ ] Real-checkpoint run at 640 x 480 on a real image pair, user-tested,
             with the transformers comparison (the 256 x 192 check used
             docs/park.jpg and a crop of it).
-      - [x] The backbone, attention and pyramid weights are loaded once: an
-            inference `BuildEfficientLoFTR` net links image 1's branch to
-            image 0's (`LinkWeightsFrom`), covered by
-            `TestEfficientLoFTRBranchesShareWeights`.
       - [ ] Speed: the coarse similarity (`DotProductsPacked`, 4800 x 4800 x
             256 at 640 x 480) and the per-match refinement run on one thread;
             no OpenCL path has been tested.
@@ -2896,7 +2799,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       paper's main systems contribution; v1 ships the exact per-token scan only) —
       gate behind an exact-vs-chunked equivalence assert (mirrors open
       DeltaNet/WKV chunked tasks).
-- [ ] TNNetMinGRU / TNNetMinLSTM follow-up (landed 2026-06-07, commit 69f8d53):
+- [ ] TNNetMinGRU / TNNetMinLSTM follow-up:
       Parallel-prefix-scan forward (the paper's main systems win) so training is
       not a strict per-token left-to-right loop; gate behind an exact-vs-parallel
       equivalence assert (mirrors the open DeltaNet/WKV chunked-forward tasks).
@@ -2904,10 +2807,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       gated behind an exact-vs-scan equivalence assert.
 - [ ] TNNetRetention chunkwise-recurrent hybrid form (a throughput optimisation
       skipped in v1 — the parallel and naive-recurrent forms both landed).
-- [ ] Mini-batch / chunked Test-Time Training — follow-up to the landed
-      TNNetTestTimeTraining (both TTT-Linear and TTT-MLP arms, with exact
-      second-order BPTT through the inner update, shipped with tests + the
-      examples/TestTimeTraining parity-binding recall demo). Apply ONE inner
+- [ ] Mini-batch / chunked Test-Time Training — follow-up to
+      TNNetTestTimeTraining (TTT-Linear and TTT-MLP arms, exact second-order
+      BPTT through the inner update). Apply ONE inner
       gradient-descent step per CHUNK of b tokens (mini-batch the inner SGD)
       instead of per token, for the same sub-quadratic-training motive as the
       open DeltaNet/WKV chunked-forward tasks. Optional second follow-up: a
