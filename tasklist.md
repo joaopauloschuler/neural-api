@@ -1990,11 +1990,13 @@ rather than acted on.
       an occlusion map, then trilinear sampling of the feature volume; (5) SPADE
       generator (SPADE ResBlocks + TNNetPixelShuffle up to 512x512);
       (6) stitching + eye/lip retargeting MLPs (small TNNetFullConnect chains).
-      New code, kept general rather than LivePortrait-only: a temporal padding
-      parameter on TNNetConvolution3D (time is VALID today, LivePortrait uses
-      3x3x3 with padding 1 on all axes; extend FStruct with a back-compat
-      default of 0); a trilinear 3-D grid sample (torch F.grid_sample on 5-D
-      input, align_corners=False, zeros padding) built on the TNNetGridSample
+      New code, kept general rather than LivePortrait-only: LANDED, the
+      trailing `pPaddingT` parameter of TNNetConvolution3D (temporal zero
+      padding, packed in the high half of FStruct[7], old nets load with 0;
+      PaddingT > 0 runs on the host because cai_conv_implicit has no depth
+      bounds check, so an OpenCL padded-time path is still open); a trilinear
+      3-D grid sample (torch F.grid_sample on 5-D input, align_corners=False,
+      zeros padding) built on the TNNetGridSample
       gather helpers, with OpenCL forward, since 16 x 64 x 64 x 32 samples per
       frame dominate the warp; a SPADE layer or builder (param-free
       InstanceNorm/BatchNorm + conv-predicted gamma/beta from a resized segmap)

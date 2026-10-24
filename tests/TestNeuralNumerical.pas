@@ -811,6 +811,8 @@ type
     // TNNetConvolution3D device forward (cai_conv_implicit with the output
     // frame in the column): vs CPU over strides, paddings and kernel extents.
     procedure TestConvolution3DOpenCLParity;
+    // TNNetConvolution3D with PaddingT > 0 stays on the host under ForceOpenCL.
+    procedure TestConvolution3DTemporalPaddingOpenCLFallback;
     // Device-side gated activation (cai_glu_gate) forward parity over an
     // already-resident source output: four gates x two depths x two input
     // scales, the large one covering the kernel's saturation clamps.
@@ -1702,6 +1704,9 @@ type
     procedure TestConvolution3DTemporalStrideForward;
     procedure TestConvolution3DTemporalStrideGradientCheck;
     procedure TestConvolution3DTemporalStrideSerialization;
+    procedure TestConvolution3DTemporalPaddingEquivalence;
+    procedure TestConvolution3DTemporalPaddingGradientCheck;
+    procedure TestConvolution3DTemporalPaddingSerialization;
     procedure TestDepthwiseConv1DInputGradientCheck;
     procedure TestDepthwiseConv1DWeightGradientCheck;
     procedure TestDepthwiseConv1DSerializationRoundTrip;
@@ -51186,6 +51191,321 @@ begin
     Input.Free;
   end;
 end;
+
+// Builds an input layer + one TNNetConvolution3D with error collection on the
+// input; the conv weights are seeded by RandSeed.
+function BuildConvolution3DPaddingNet(W, H, C, InT, NumFeat, KT, KXY, Padding,
+  Stride, StrideT, PaddingT: integer; out Conv: TNNetConvolution3D): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(W, H, InT * C, 1));
+  Conv := TNNetConvolution3D.Create(NumFeat, KT, KXY, Padding, Stride, C,
+    {pSuppressBias=}0, StrideT, PaddingT);
+  Result.AddLayer(Conv);
+  Result.SetLearningRate(1.0, 0.0);
+  Result.SetBatchUpdate(true);
+end;
+
+// PaddingT = P equals the unpadded conv on the input with P zero frames added
+// at each end: forward, input gradient (interior frames) and weight gradient.
+procedure TTestNeuralNumerical.TestConvolution3DTemporalPaddingEquivalence;
+const
+  // W, H, C, InT, NumFeat, KT, KXY, Padding, Stride, StrideT, PaddingT. The
+  // first is LivePortrait's 3x3x3 / padding 1; the last has taps wholly in padding.
+  csCases: array[0..3, 0..10] of integer = ((5, 4, 2, 3, 3, 3, 3, 1, 1, 1, 1),
+    (4, 4, 3, 4, 2, 2, 3, 1, 2, 2, 1), (4, 3, 2, 5, 4, 3, 1, 0, 1, 2, 2),
+    (3, 3, 2, 2, 2, 3, 2, 0, 1, 1, 3));
+var
+  NNPadded, NNRef: TNNet;
+  PaddedConv, RefConv: TNNetConvolution3D;
+  Input, PaddedInput, Desired: TNNetVolume;
+  CasePos, C, InT, PaddingT, Pos, MaxPos, x, y, FrameDepth, MaxX, MaxY: integer;
+  NeuronPos, MaxNeuronPos: integer;
+  MaxDiff, MaxGradDiff, MaxWeightDiff: TNeuralFloat;
+begin
+  for CasePos := 0 to High(csCases) do
+  begin
+    RandSeed := 20261024 + CasePos;
+    C := csCases[CasePos, 2];
+    InT := csCases[CasePos, 3];
+    PaddingT := csCases[CasePos, 10];
+    NNPadded := BuildConvolution3DPaddingNet(csCases[CasePos, 0],
+      csCases[CasePos, 1], C, InT, csCases[CasePos, 4], csCases[CasePos, 5],
+      csCases[CasePos, 6], csCases[CasePos, 7], csCases[CasePos, 8],
+      csCases[CasePos, 9], PaddingT, PaddedConv);
+    NNRef := BuildConvolution3DPaddingNet(csCases[CasePos, 0],
+      csCases[CasePos, 1], C, InT + 2 * PaddingT, csCases[CasePos, 4],
+      csCases[CasePos, 5], csCases[CasePos, 6], csCases[CasePos, 7],
+      csCases[CasePos, 8], csCases[CasePos, 9], 0, RefConv);
+    Input := TNNetVolume.Create(csCases[CasePos, 0], csCases[CasePos, 1], InT * C);
+    PaddedInput := TNNetVolume.Create(csCases[CasePos, 0], csCases[CasePos, 1],
+      (InT + 2 * PaddingT) * C);
+    Desired := TNNetVolume.Create();
+    try
+      MaxNeuronPos := PaddedConv.Neurons.Count - 1;
+      for NeuronPos := 0 to MaxNeuronPos do
+        PaddedConv.Neurons[NeuronPos].BiasWeight := 0.1 * NeuronPos - 0.15;
+      NNRef.CopyWeights(NNPadded);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := Sin(Pos * 0.53) + 0.3 * Cos(Pos * 1.7);
+      FrameDepth := InT * C;
+      MaxX := Input.SizeX - 1;
+      MaxY := Input.SizeY - 1;
+      PaddedInput.Fill(0);
+      for y := 0 to MaxY do
+        for x := 0 to MaxX do
+          Move(Input.GetRawPtr(x, y)^,
+            PaddedInput.GetRawPtr(x, y, PaddingT * C)^,
+            FrameDepth * SizeOf(TNeuralFloat));
+      NNPadded.Compute(Input);
+      NNRef.Compute(PaddedInput);
+      AssertEquals('OutputT, case ' + IntToStr(CasePos), RefConv.OutputT,
+        PaddedConv.OutputT);
+      AssertEquals('PaddingT property', PaddingT, PaddedConv.PaddingT);
+      AssertTrue('the reference is not degenerate', RefConv.Output.GetMaxAbs() > 0);
+      MaxDiff := 0;
+      MaxPos := RefConv.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+        MaxDiff := Max(MaxDiff, Abs(PaddedConv.Output.Raw[Pos] - RefConv.Output.Raw[Pos]));
+      AssertEquals('forward vs zero-padded input, case ' + IntToStr(CasePos),
+        0, MaxDiff, 1e-6);
+
+      Desired.ReSize(RefConv.Output);
+      MaxPos := Desired.Size - 1;
+      for Pos := 0 to MaxPos do Desired.Raw[Pos] := Cos(Pos * 0.4) * 0.7;
+      NNPadded.Layers[0].OutputError.Fill(0);
+      NNRef.Layers[0].OutputError.Fill(0);
+      NNPadded.Backpropagate(Desired);
+      NNRef.Backpropagate(Desired);
+      MaxGradDiff := 0;
+      for y := 0 to MaxY do
+        for x := 0 to MaxX do
+          for Pos := 0 to FrameDepth - 1 do
+            MaxGradDiff := Max(MaxGradDiff, Abs(
+              NNPadded.Layers[0].OutputError[x, y, Pos] -
+              NNRef.Layers[0].OutputError[x, y, PaddingT * C + Pos]));
+      AssertTrue('the reference input gradient is not degenerate',
+        NNRef.Layers[0].OutputError.GetMaxAbs() > 0);
+      AssertEquals('input gradient vs zero-padded input, case ' +
+        IntToStr(CasePos), 0, MaxGradDiff, 1e-5);
+      MaxWeightDiff := 0;
+      for NeuronPos := 0 to MaxNeuronPos do
+      begin
+        MaxPos := PaddedConv.Neurons[NeuronPos].Delta.Size - 1;
+        for Pos := 0 to MaxPos do
+          MaxWeightDiff := Max(MaxWeightDiff, Abs(
+            PaddedConv.Neurons[NeuronPos].Delta.Raw[Pos] -
+            RefConv.Neurons[NeuronPos].Delta.Raw[Pos]));
+        MaxWeightDiff := Max(MaxWeightDiff, Abs(
+          PaddedConv.Neurons[NeuronPos].BiasDelta -
+          RefConv.Neurons[NeuronPos].BiasDelta));
+      end;
+      AssertEquals('weight gradient vs zero-padded input, case ' +
+        IntToStr(CasePos), 0, MaxWeightDiff, 1e-5);
+    finally
+      Desired.Free;
+      PaddedInput.Free;
+      Input.Free;
+      NNRef.Free;
+      NNPadded.Free;
+    end;
+  end;
+end;
+
+// Finite-difference input and weight gradients of a 3x3x3 conv with spatial
+// and temporal padding 1 and StrideT 2.
+procedure TTestNeuralNumerical.TestConvolution3DTemporalPaddingGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  Epsilon, LossPlus, LossMinus, Numerical, Analytical: TNeuralFloat;
+  Pos, NeuronPos, MaxInputPos, MaxNeuronPos, MaxWeightPos: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    OutputPos, MaxOutputPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    MaxOutputPos := NN.GetLastLayer.Output.Size - 1;
+    for OutputPos := 0 to MaxOutputPos do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutputPos] - Desired.Raw[OutputPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424244;
+  // (W,H,InT,C)=(4,3,4,2); KT=3, KXY=3, pad=1, StrideT=2, PaddingT=1 -> OutT=2.
+  NN := BuildConvolution3DPaddingNet(4, 3, 2, 4, 2, 3, 3, 1, 1, 2, 1, LConv);
+  Input := TNNetVolume.Create(4, 3, 4 * 2);
+  InputPlus := TNNetVolume.Create(4, 3, 4 * 2);
+  Desired := TNNetVolume.Create();
+  Epsilon := 0.001;
+  try
+    AssertEquals('OutputT', 2, LConv.OutputT);
+    MaxInputPos := Input.Size - 1;
+    for Pos := 0 to MaxInputPos do
+      Input.Raw[Pos] := Sin(Pos * 0.6) * 1.1 + 0.2;
+    Desired.ReSize(LConv.Output);
+    for Pos := 0 to Desired.Size - 1 do
+      Desired.Raw[Pos] := Cos(Pos * 0.4) * 0.7;
+    for Pos := 0 to MaxInputPos do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[Pos] := Input.Raw[Pos] + Epsilon;
+      LossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[Pos] := Input.Raw[Pos] - Epsilon;
+      LossMinus := ComputeLoss(InputPlus);
+      Numerical := (LossPlus - LossMinus) / (2 * Epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      Analytical := NN.Layers[0].OutputError.Raw[Pos];
+      AssertTrue('PaddingT input gradient at ' + IntToStr(Pos) + ' num=' +
+        FloatToStr(Numerical) + ' ana=' + FloatToStr(Analytical),
+        Abs(Numerical - Analytical) < 0.01);
+    end;
+    MaxNeuronPos := LConv.Neurons.Count - 1;
+    for NeuronPos := 0 to MaxNeuronPos do
+    begin
+      MaxWeightPos := LConv.Neurons[NeuronPos].Weights.Size - 1;
+      for Pos := 0 to MaxWeightPos do
+      begin
+        LConv.Neurons[NeuronPos].Weights.Raw[Pos] := LConv.Neurons[NeuronPos].Weights.Raw[Pos] + Epsilon;
+        LossPlus := ComputeLoss(Input);
+        LConv.Neurons[NeuronPos].Weights.Raw[Pos] := LConv.Neurons[NeuronPos].Weights.Raw[Pos] - 2 * Epsilon;
+        LossMinus := ComputeLoss(Input);
+        LConv.Neurons[NeuronPos].Weights.Raw[Pos] := LConv.Neurons[NeuronPos].Weights.Raw[Pos] + Epsilon;
+        Numerical := (LossPlus - LossMinus) / (2 * Epsilon);
+        NN.Compute(Input);
+        LConv.Neurons[NeuronPos].ClearDelta;
+        NN.Backpropagate(Desired);
+        Analytical := -LConv.Neurons[NeuronPos].Delta.Raw[Pos];
+        AssertTrue('PaddingT weight gradient n=' + IntToStr(NeuronPos) + ' w=' +
+          IntToStr(Pos) + ' num=' + FloatToStr(Numerical) + ' ana=' +
+          FloatToStr(Analytical), Abs(Numerical - Analytical) < 0.01);
+      end;
+    end;
+  finally
+    Desired.Free;
+    InputPlus.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// PaddingT round-trips through the high half of FStruct[7]; a net saved before
+// PaddingT existed loads with PaddingT = 0.
+procedure TTestNeuralNumerical.TestConvolution3DTemporalPaddingSerialization;
+const
+  // StrideT 2 or (PaddingT 1 shl 16) = 65538.
+  csPaddedStruct = 'TNNetConvolution3D:3;3;1;1;0;3;2;65538::';
+  csLegacyStruct = 'TNNetConvolution3D:3;3;1;1;0;3;2;2::';
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  ValuePos, MaxPos: integer;
+begin
+  RandSeed := 424245;
+  Input := TNNetVolume.Create(5, 5, 4 * 2);
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    MaxPos := Input.Size - 1;
+    for ValuePos := 0 to MaxPos do
+      Input.Raw[ValuePos] := Sin(ValuePos * 0.41) * 0.7 + 0.1;
+    NN.AddLayer(TNNetInput.Create(5, 5, 4 * 2, 1));
+    NN.AddLayer(TNNetConvolution3D.Create(3, 3, 3, 1, 1, 2, 0, 2, 1));
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    AssertTrue('padded structure string', Pos(csPaddedStruct, Saved) > 0);
+    NN2.LoadFromString(Saved);
+    AssertTrue('class identity', NN2.GetLastLayer is TNNetConvolution3D);
+    AssertEquals('PaddingT after load', 1,
+      TNNetConvolution3D(NN2.GetLastLayer).PaddingT);
+    AssertEquals('StrideT after load', 2,
+      TNNetConvolution3D(NN2.GetLastLayer).StrideT);
+    AssertEquals('save->load->save string equality', Saved, NN2.SaveToString());
+    NN2.Compute(Input);
+    AssertEquals('output size after load', NN.GetLastLayer.Output.Size,
+      NN2.GetLastLayer.Output.Size);
+    MaxPos := NN.GetLastLayer.Output.Size - 1;
+    for ValuePos := 0 to MaxPos do
+      AssertEquals('round-trip output at ' + IntToStr(ValuePos),
+        NN.GetLastLayer.Output.Raw[ValuePos], NN2.GetLastLayer.Output.Raw[ValuePos], 1e-5);
+    NN2.Free;
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(StringReplace(Saved, csPaddedStruct, csLegacyStruct, []));
+    AssertEquals('legacy PaddingT', 0, TNNetConvolution3D(NN2.GetLastLayer).PaddingT);
+    AssertEquals('legacy StrideT', 2, TNNetConvolution3D(NN2.GetLastLayer).StrideT);
+    AssertEquals('legacy OutputT', 1, TNNetConvolution3D(NN2.GetLastLayer).OutputT);
+  finally
+    NN2.Free;
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// With PaddingT > 0 and ForceOpenCL the layer runs on the host and matches the
+// CPU-only net.
+procedure TTestNeuralNumerical.TestConvolution3DTemporalPaddingOpenCLFallback;
+{$IFDEF OpenCL}
+var
+  NN, NNCPU: TNNet;
+  Conv, ConvCPU: TNNetConvolution3D;
+  Input: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424246;
+  NN := BuildConvolution3DPaddingNet(6, 5, 3, 4, 8, 3, 3, 1, 1, 1, 1, Conv);
+  NNCPU := BuildConvolution3DPaddingNet(6, 5, 3, 4, 8, 3, 3, 1, 1, 1, 1, ConvCPU);
+  Input := TNNetVolume.Create(6, 5, 4 * 3);
+  try
+    NN.SetTrainable(False, False);
+    NNCPU.SetTrainable(False, False);
+    NNCPU.CopyWeights(NN);
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      Input.Raw[Pos] := Sin(Pos * 0.37) + 0.4 * Cos(Pos * 1.3);
+    NNCPU.Compute(Input);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    Conv.ForceOpenCL(true);
+    Conv.ForwardGPUCnt := 0;
+    Conv.ForwardCPUCnt := 0;
+    NN.Compute(Input);
+    Conv.ForceOutputOnRAM();
+    AssertEquals('padded layer never runs on OpenCL', 0, Conv.ForwardGPUCnt);
+    AssertEquals('padded layer runs on the host', 1, Conv.ForwardCPUCnt);
+    MaxDiff := 0;
+    MaxPos := ConvCPU.Output.Size - 1;
+    for Pos := 0 to MaxPos do
+      MaxDiff := Max(MaxDiff, Abs(Conv.Output.Raw[Pos] - ConvCPU.Output.Raw[Pos]));
+    AssertEquals('host fallback vs CPU-only net', 0, MaxDiff, 1e-6);
+  finally
+    Input.Free;
+    NNCPU.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 procedure TTestNeuralNumerical.TestPReLUChannelInputGradientCheck;
 var
