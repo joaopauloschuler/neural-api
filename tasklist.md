@@ -2018,6 +2018,18 @@ rather than acted on.
         axis order, colours match the analytic sigmoid). Open: torchmcubes
         face winding not compared (ours is CCW seen from the low-density
         side); no real-checkpoint parity (T3 + oracle).
+  - [ ] T6a. Backbone attention RAM (blocker for T6, see the RAM note in T6):
+        move attn1 onto one TNNetFusedSDPA (check that its full forward drops
+        the score matrix) and give attn2 a fused cross path or liveness-shared
+        score buffers; test that the pico backbone output is unchanged (1e-5)
+        and that the per-layer output RAM of the full-size build falls under
+        2 GB (count volume sizes after a pTrainable=false build; no forward).
+        The SD UNet uses the same shared block, so its tests must stay green.
+  - [ ] T6b. Density sweep speed: 61 us/point on one CPU core, so a 256^3
+        sweep takes ~17 min. Run the decoder net under OpenCL
+        (TNNetTriplaneSample already has `cai_triplane_sample`; the pointwise
+        convs ride the shared GEMM) with an OpenCL-vs-CPU density parity test
+        at R = 16, and split chunks over the thread pool on the CPU path.
   - [ ] T6. examples/ImageTo3D (+ README, examples/README.md row): background
         removal via the BiRefNet path, grey composite, centred 512 px resize,
         --mc-resolution / --threshold / --no-remove-bg / --gpu, mesh out as
