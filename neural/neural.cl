@@ -4889,9 +4889,11 @@ __kernel void cai_triplane_sample
   FDst[g_id] = acc;
 }
 
-// TNNetDeformableConv forward im2col: FPatch[(pos * FTapCount + tap) * FInDepth
-// + ci] = the zero-padded bilinear sample of input channel ci for tap
-// (fx, fy) of output position pos, shifted by its offset group's (dx, dy) and
+// TNNetDeformableConv forward im2col: FPatch[((pos * FWeightGroups + wg) *
+// FTapCount + tap) * FWeightGroupDepth + cl] = the zero-padded bilinear sample
+// of input channel ci = wg * FWeightGroupDepth + cl for tap (fx, fy) of output
+// position pos (weight-group-major, so each weight group's slice of a patch
+// row is contiguous), shifted by its offset group's (dx, dy) and
 // scaled by its mask. Offsets of group g sit at pos * FOffsetDepth + g *
 // FOffsetGroupStride + 2 * tap, (dx, dy) when FOffsetDxFirst != 0, else (dy, dx).
 // FMaskMode: 0 none, 1 FMask as given, 2 sigmoid(FMask), read at pos *
@@ -4911,6 +4913,8 @@ __kernel void cai_deformable_im2col
   const int FDilationX,
   const int FDilationY,
   const int FGroupDepth,
+  const int FWeightGroups,
+  const int FWeightGroupDepth,
   const int FOffsetDepth,
   const int FOffsetGroupStride,
   const int FOffsetDxFirst,
@@ -4926,10 +4930,12 @@ __kernel void cai_deformable_im2col
 {
   const int id = get_global_id(0);
   if (id >= FPatchCount) return;
-  const int cell = id / FInDepth;
-  const int ci = id - cell * FInDepth;
-  const int pos = cell / FTapCount;
-  const int tap = cell - pos * FTapCount;
+  const int cell = id / FWeightGroupDepth;
+  const int GroupTap = cell / FTapCount;
+  const int tap = cell - GroupTap * FTapCount;
+  const int pos = GroupTap / FWeightGroups;
+  const int ci = (GroupTap - pos * FWeightGroups) * FWeightGroupDepth +
+    (id - cell * FWeightGroupDepth);
   const int oy = pos / FOutSizeX;
   const int ox = pos - oy * FOutSizeX;
   const int fy = tap / FFeatureSizeX;

@@ -463,6 +463,7 @@ type
     procedure TestDeformableConvDilatedGroupedSerializationRoundTrip;
     procedure TestDeformableConvExternalOpenCLParity;
     procedure TestDeformableConvOpenCLResidency;
+    procedure TestDeformableConvOpenCLWeightGroups;
     procedure TestGroupConvP4OpenCLParity;
     // OpenCL per-output-pixel bilinear-gather forward offload parity (vs CPU)
     // for the bilinear resampler layers.
@@ -72038,6 +72039,125 @@ begin
         MaxDiff:0:9, ' sentinels kept: ', Sentinels, '/', SentinelTarget);
       AssertTrue(ModeMsg + ' CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
       AssertTrue(ModeMsg + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Weight groups 2 and 4 with dilation on the OpenCL forward, both modes,
+// inference (device im2col) and trainable (host gather), against the CPU.
+// The last case has a 1x1 output, so a dense block-diagonal weight matrix
+// alone would outweigh every device buffer the layer holds.
+procedure TTestNeuralNumerical.TestDeformableConvOpenCLWeightGroups;
+{$IFDEF OpenCL}
+const
+  // External mode, weight groups, dilation, padding, input width, input
+  // height, depth (= features), trainable.
+  csCases: array[0..6, 0..7] of integer = (
+    (0, 2, 2, 2, 8, 7, 8, 0),
+    (0, 4, 2, 2, 8, 7, 8, 0),
+    (0, 4, 2, 2, 8, 7, 8, 1),
+    (1, 2, 2, 2, 8, 7, 8, 0),
+    (1, 4, 3, 1, 8, 7, 8, 0),
+    (1, 4, 2, 2, 8, 7, 8, 1),
+    (1, 4, 2, 0, 5, 5, 16, 0));
+var
+  NN: TNNet;
+  ImgIn, OffIn, MaskIn: TNNetLayer;
+  DC: TNNetDeformableConv;
+  OutCPU, MaskVol: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, CaseIdx, InWidth, InHeight, Depth, Dilation, WeightGroups, Padding,
+    IsTrainable: integer;
+  BlockDiagonalBytes: int64;
+  Diff, MaxDiff: TNeuralFloat;
+  CaseMsg: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseIdx := Low(csCases) to High(csCases) do
+  begin
+    RandSeed := 424242;
+    WeightGroups := csCases[CaseIdx, 1];
+    Dilation := csCases[CaseIdx, 2];
+    Padding := csCases[CaseIdx, 3];
+    InWidth := csCases[CaseIdx, 4];
+    InHeight := csCases[CaseIdx, 5];
+    Depth := csCases[CaseIdx, 6];
+    IsTrainable := csCases[CaseIdx, 7];
+    CaseMsg := 'weight-grouped DeformableConv case ' + IntToStr(CaseIdx);
+    NN := TNNet.Create();
+    OutCPU := TNNetVolume.Create();
+    try
+      if csCases[CaseIdx, 0] = 1 then
+      begin
+        DC := BuildExternalDeformableNet(NN, InWidth, InHeight, Depth, Depth,
+          1, 2, true, ImgIn, OffIn, MaskIn, Padding, Dilation, WeightGroups);
+        if Assigned(MaskIn) then MaskVol := MaskIn.Output else MaskVol := nil;
+        FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskVol);
+      end
+      else
+      begin
+        ImgIn := NN.AddLayer(TNNetInput.Create(InWidth, InHeight, Depth, 1));
+        DC := TNNetDeformableConv.Create(Depth, 3, Padding, 1, 0, 1, Dilation,
+          WeightGroups);
+        NN.AddLayer(DC);
+        for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+          DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.013 * i;
+        for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+          DC.Neurons[2].Weights.Raw[i] := 0.015 * Sin(i * 0.7);
+        for i := 0 to ImgIn.Output.Size - 1 do
+          ImgIn.Output.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+      end;
+      if IsTrainable = 0 then DC.SetTrainable(False, False);
+      NN.Compute(ImgIn.Output);
+      OutCPU.Copy(DC.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        DC.ForwardGPUCnt := 0;
+        NN.Compute(ImgIn.Output);
+        NN.Compute(ImgIn.Output);
+        AssertEquals(CaseMsg + ' takes the OpenCL path', 2, DC.ForwardGPUCnt);
+        AssertEquals(CaseMsg + ' output stays in OpenCL memory only when inference',
+          IsTrainable = 0, DC.OutputBindableOnOpenCL());
+        if DC.Output.SizeX * DC.Output.SizeY = 1 then
+        begin
+          BlockDiagonalBytes := int64(Depth) * 9 * Depth * SizeOf(TNeuralFloat);
+          WriteLn('  ', CaseMsg, ' device bytes: ', DC.OpenCLBufferBytes(),
+            ' block-diagonal weights alone: ', BlockDiagonalBytes);
+          AssertTrue(CaseMsg + ' device bytes hold the grouped weights',
+            DC.OpenCLBufferBytes() >= BlockDiagonalBytes div WeightGroups);
+          AssertTrue(CaseMsg + ' device bytes ' + IntToStr(DC.OpenCLBufferBytes()) +
+            ' below a block-diagonal weight matrix ' + IntToStr(BlockDiagonalBytes),
+            DC.OpenCLBufferBytes() < BlockDiagonalBytes);
+        end;
+        DC.ForceOutputOnRAM();
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, DC.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - DC.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  ', CaseMsg, ' OpenCL vs CPU max-abs-diff: ', MaxDiff:0:9);
+      AssertTrue(CaseMsg + ' CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+      AssertTrue(CaseMsg + ' OpenCL vs CPU parity: max |diff| = ' +
         FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
     finally
       OutCPU.Free;

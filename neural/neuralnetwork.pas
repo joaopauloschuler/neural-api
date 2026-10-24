@@ -19160,8 +19160,8 @@ type
     // The upload buffer of source slot SourcePos (0 input, 1 offsets, 2 mask),
     // grown for Source; nothing is written.
     function SourceUploadBuffer(SourcePos: integer; Source: TNNetVolume): cl_mem;
-    // Fills PatchBuffer with Layer's patch matrix [pos][tap][ci] read from the
-    // input, offset and mask buffers (BufMask unused without a mask).
+    // Fills PatchBuffer with Layer's patch matrix [pos][weight group][tap][ci]
+    // from the input, offset and mask buffers (BufMask unused without a mask).
     procedure BuildPatch(Layer: TNNetDeformableConv; BufInput, BufOffsets,
       BufMask: cl_mem);
     function PatchBuffer(): cl_mem;
@@ -19287,15 +19287,17 @@ type
     FBwScol, FBwDSpx, FBwDSpy: TNNetVolume; // length FInDepth scratch columns
     FdOffMap: TNNetVolume;     // backprop scratch: dL/d(offset map) (OutX,OutY,FOffOut)
     {$IFDEF OpenCL}
-    // Main GEMM operands: interleaved weights (both OpenCL paths), and the
-    // host-gathered patch matrix and result of the training forward.
-    FGemmWInter, FGemmPatch, FGemmRes: TNNetVolume;
+    // Host-gathered patch matrix and result of the training forward; the GEMM
+    // reads mW in place (the [k*OutDepth + co] A layout, k local to the group).
+    FGemmPatch, FGemmRes: TNNetVolume;
     // Inference forward: cai_deformable_im2col builds the patch matrix and, in
     // the self-offset mode, FOffsetDotCL runs the offset head as an implicit conv.
     FDeformableCL: TNNetDeformableConvCL;
     FOffsetDotCL: TDotProductSharedKernel;
-    // Repacks mW into FGemmWInter when the weights changed; True if it did.
-    function RefreshGemmWeightsCL(): boolean;
+    // Main GEMM over the weight-group-major patch: dense with one weight group,
+    // grouped (only each group's block) otherwise. pPatch nil = FGemmPatch.
+    procedure ComputeMainGemmCL(pPatch: cl_mem; NewWeights: boolean;
+      Bias: TNNetVolume);
     // Inference only: offset head, gather and GEMM in OpenCL, sources bound
     // when resident, output left resident.
     function WillGatherOnOpenCL(): boolean;
@@ -104763,9 +104765,9 @@ procedure TNNetDeformableConvCL.BuildPatch(Layer: TNNetDeformableConv;
 var
   k: cl_kernel;
   PatchCount, OutSizeX, InSizeX, InSizeY, InDepth, FeatureSizeX, TapCount,
-    Stride, Padding, DilationX, DilationY, GroupDepth, OffsetDepth,
-    OffsetGroupStride, OffsetDxFirst, MaskMode, MaskDepth, MaskFirst,
-    MaskGroupStride: longint;
+    Stride, Padding, DilationX, DilationY, GroupDepth, WeightGroups,
+    WeightGroupDepth, OffsetDepth, OffsetGroupStride, OffsetDxFirst, MaskMode,
+    MaskDepth, MaskFirst, MaskGroupStride: longint;
   Input: TNNetVolume;
 begin
   k := FKernel.Kernel;
@@ -104781,6 +104783,8 @@ begin
   DilationX := Layer.FDilationX;
   DilationY := Layer.FDilationY;
   GroupDepth := Layer.FGroupDepth;
+  WeightGroups := Layer.FWeightGroups;
+  WeightGroupDepth := Layer.FWeightGroupDepth;
   PatchCount := Layer.FOutputSizeX * Layer.FOutputSizeY * TapCount * InDepth;
   if Layer.FHasOffsetSource then
   begin
@@ -104821,17 +104825,19 @@ begin
   clSetKernelArg(k, 9, csLongintSize, @DilationX);
   clSetKernelArg(k, 10, csLongintSize, @DilationY);
   clSetKernelArg(k, 11, csLongintSize, @GroupDepth);
-  clSetKernelArg(k, 12, csLongintSize, @OffsetDepth);
-  clSetKernelArg(k, 13, csLongintSize, @OffsetGroupStride);
-  clSetKernelArg(k, 14, csLongintSize, @OffsetDxFirst);
-  clSetKernelArg(k, 15, csLongintSize, @MaskMode);
-  clSetKernelArg(k, 16, csLongintSize, @MaskDepth);
-  clSetKernelArg(k, 17, csLongintSize, @MaskFirst);
-  clSetKernelArg(k, 18, csLongintSize, @MaskGroupStride);
-  clSetKernelArg(k, 19, csCLMemSize, @BufInput);
-  clSetKernelArg(k, 20, csCLMemSize, @BufOffsets);
-  clSetKernelArg(k, 21, csCLMemSize, @BufMask);
-  clSetKernelArg(k, 22, csCLMemSize, @FBufPatch);
+  clSetKernelArg(k, 12, csLongintSize, @WeightGroups);
+  clSetKernelArg(k, 13, csLongintSize, @WeightGroupDepth);
+  clSetKernelArg(k, 14, csLongintSize, @OffsetDepth);
+  clSetKernelArg(k, 15, csLongintSize, @OffsetGroupStride);
+  clSetKernelArg(k, 16, csLongintSize, @OffsetDxFirst);
+  clSetKernelArg(k, 17, csLongintSize, @MaskMode);
+  clSetKernelArg(k, 18, csLongintSize, @MaskDepth);
+  clSetKernelArg(k, 19, csLongintSize, @MaskFirst);
+  clSetKernelArg(k, 20, csLongintSize, @MaskGroupStride);
+  clSetKernelArg(k, 21, csCLMemSize, @BufInput);
+  clSetKernelArg(k, 22, csCLMemSize, @BufOffsets);
+  clSetKernelArg(k, 23, csCLMemSize, @BufMask);
+  clSetKernelArg(k, 24, csCLMemSize, @FBufPatch);
   FKernel.RunKernel(k, PatchCount);
 end;
 
@@ -104981,7 +104987,6 @@ begin
   FBwDSpy.Free;
   FdOffMap.Free;
   {$IFDEF OpenCL}
-  FGemmWInter.Free;
   FGemmPatch.Free;
   FGemmRes.Free;
   FreeAndNil(FDeformableCL);
@@ -105126,7 +105131,7 @@ begin
   FdOffMap.ReSize(FOutputSizeX, FOutputSizeY, Max(FOffOut, 1));
 
   {$IFDEF OpenCL}
-  FShouldOpenCL := (Int64(FOutDepth) * (FOutputSizeX * FOutputSizeY) * (FNumTaps * FInDepth) >= cNeuralOpenCLMinWork);
+  FShouldOpenCL := (Int64(FMainSize) * (FOutputSizeX * FOutputSizeY) >= cNeuralOpenCLMinWork);
   {$ENDIF}
   InitDefault();
   RefreshCalculatePrevLayerError();
@@ -105411,7 +105416,6 @@ begin
     FDotCL := NewDotProductCL(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
-  if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
   if not Assigned(FGemmPatch)  then FGemmPatch  := TNNetVolume.Create();
   if not Assigned(FGemmRes)    then FGemmRes    := TNNetVolume.Create();
   PositionCount := FOutputSizeX * FOutputSizeY;
@@ -105422,8 +105426,10 @@ begin
   // PrepareForCompute releases the result buffer a resident output lives in.
   ForceOutputOnRAM();
   FOutputOnOpenCL := false;
-  FGemmWInter.ReSize(FOutDepth * PatchSize, 1, 1);
-  FDotCL.PrepareForCompute(FGemmWInter, PositionCount, PatchSize);
+  // One weight group's reduction: A is mW itself, FOutDepth rows.
+  FDotCL.PrepareForCompute(FArrNeurons[0].FWeights, PositionCount,
+    FNumTaps * FWeightGroupDepth);
+  if FWeightGroups > 1 then FDotCL.PrepareTransposedConv();
   if not FHasOffsetSource then
   begin
     // The offset head is a plain conv: oW is already the implicit-conv A layout
@@ -105466,7 +105472,7 @@ function TNNetDeformableConv.WillGatherOnOpenCL(): boolean;
 begin
   Result := Assigned(FDeformableCL) and Assigned(FDotCL) and FHasOpenCL and
     (not FIsTrainable) and Assigned(FPrevLayer) and
-    (FGemmWInter.Size = FOutDepth * FNumTaps * FInDepth) and
+    ((FWeightGroups = 1) or FDotCL.TransposedConvReady()) and
     // cai_deformable_im2col indexes the patch matrix with int.
     (Int64(FOutputSizeX) * FOutputSizeY * FNumTaps * FInDepth <= High(longint)) and
     (FHasOffsetSource or
@@ -105479,47 +105485,25 @@ end;
 function TNNetDeformableConv.WillOpenCL(): boolean;
 begin
   Result := WillGatherOnOpenCL() or
-    (Assigned(FDotCL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL));
+    (Assigned(FDotCL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL) and
+     ((FWeightGroups = 1) or FDotCL.TransposedConvReady()));
 end;
 
-// The GEMM's A operand is [i*OutDepth + co], i = tap*InDepth + ci. With one
-// weight group that is mW verbatim; weight groups expand it block-diagonally.
-function TNNetDeformableConv.RefreshGemmWeightsCL(): boolean;
+// Res[t*OutDepth + co] = sum_k mW[k*OutDepth + co] * Patch[t*Sz + g*Sz_g + k],
+// g = co's weight group, Sz_g = KK*InDepth/WeightGroups, Sz = WeightGroups*Sz_g.
+procedure TNNetDeformableConv.ComputeMainGemmCL(pPatch: cl_mem;
+  NewWeights: boolean; Bias: TNNetVolume);
 var
-  tap, ci, MaxTapPos, MaxWeightGroupPos, MaxWeightGroupCIPos, WeightGroup: integer;
-  srcRow, dstRow, coOfs, PatchSize: integer;
-  mW: TNNetVolume;
+  HostPatch: TNNetVolume;
 begin
-  Result := FAfterWeightUpdateHasBeenCalled;
-  if not Result then exit;
-  mW := FArrNeurons[0].FWeights;
-  PatchSize := FNumTaps * FInDepth;
-  FGemmWInter.ReSize(FOutDepth * PatchSize, 1, 1);
+  if pPatch = nil then HostPatch := FGemmPatch else HostPatch := nil;
   if FWeightGroups = 1 then
-    // Verbatim contiguous weight copy (rule #13).
-    Move(mW.FData[0], FGemmWInter.FData[0], FOutDepth * PatchSize * csNeuralFloatSize)
+    FDotCL.Compute(FArrNeurons[0].FWeights, HostPatch, csActNone, NewWeights,
+      {NewVBs}pPatch = nil, Bias, NewWeights, pPatch)
   else
-  begin
-    // Each (tap, ci) row holds its group's contiguous co run and zeros elsewhere.
-    FGemmWInter.Fill(0);
-    MaxTapPos := FNumTaps - 1;
-    MaxWeightGroupPos := FWeightGroups - 1;
-    MaxWeightGroupCIPos := FWeightGroupDepth - 1;
-    dstRow := 0;
-    for tap := 0 to MaxTapPos do
-      for WeightGroup := 0 to MaxWeightGroupPos do
-      begin
-        srcRow := tap * FWeightGroupDepth * FOutDepth;
-        coOfs := WeightGroup * FWeightGroupOutDepth;
-        for ci := 0 to MaxWeightGroupCIPos do
-        begin
-          Move(mW.FData[srcRow + coOfs], FGemmWInter.FData[dstRow + coOfs],
-            FWeightGroupOutDepth * csNeuralFloatSize);
-          Inc(srcRow, FOutDepth);
-          Inc(dstRow, FOutDepth);
-        end;
-      end;
-  end;
+    FDotCL.ComputeGroupedGemm(FArrNeurons[0].FWeights, HostPatch,
+      FWeightGroups, csActNone, NewWeights, {NewVBs}pPatch = nil, Bias,
+      NewWeights, pPatch);
 end;
 
 // Offset head (self-offset mode, implicit conv) -> cai_deformable_im2col ->
@@ -105558,7 +105542,7 @@ begin
   GatherKernel := FDeformableCL.OutputKernel();
   // The previous forward's GEMM may still read the patch matrix rebuilt below.
   WaitIfAnotherQueue(GemmKernel, GatherKernel);
-  WeightsUpdated := RefreshGemmWeightsCL();
+  WeightsUpdated := FAfterWeightUpdateHasBeenCalled;
   InputBuffer := BindOrUploadSource(FPrevLayer, 0, not FHasOffsetSource);
   MaskBuffer := nil;
   if FHasOffsetSource then
@@ -105579,8 +105563,7 @@ begin
   FDeformableCL.BuildPatch(Self, InputBuffer, OffsetBuffer, MaskBuffer);
   WaitIfAnotherQueue(GatherKernel, GemmKernel);
   if FStruct[4] = 0 then Bias := FArrNeurons[1].FWeights else Bias := nil;
-  FDotCL.Compute(FGemmWInter, nil, csActNone, {NewVAs}WeightsUpdated,
-    {NewVBs}false, Bias, {NewVBias}WeightsUpdated, FDeformableCL.PatchBuffer());
+  ComputeMainGemmCL(FDeformableCL.PatchBuffer(), WeightsUpdated, Bias);
   FAfterWeightUpdateHasBeenCalled := false;
   // No read back: the result stays in OpenCL memory until a host reader calls
   // ForceOutputOnRAM.
@@ -105588,9 +105571,8 @@ begin
   FOutputOnRAM := false;
 end;
 
-// Output GEMM:  Out[co][t] = Bias[co] + sum_i A[i*OutDepth+co] * Patch_t[i]
-// with Patch_t[i] (i = tap*InDepth+ci) gathered on the CPU into the kernel's
-// contiguous B layout [t*Size + i]; read back as Res[t*OutDepth + co].
+// The ComputeMainGemmCL patch, weight-group-major [t*Sz + g*Sz_g + tap*GroupCI
+// + ci], gathered on the CPU; read back as Res[t*OutDepth + co] plus the bias.
 procedure TNNetDeformableConv.ComputeHostGatherOpenCL();
 var
   ox, oy, co, fx, fy, ci, tap, t: integer;
@@ -105600,7 +105582,8 @@ var
   PrevOut, mB, oW, oB: TNNetVolume;
   offv: TNeuralFloat;
   baseOut, offBase, maskBase, tSz, patchOfs, resBase: integer;
-  WeightsUpdated: boolean;
+  MaxWeightGroupPos, WeightGroup, WeightGroupPatchSize, colOfs: integer;
+  IsSingleWeightGroup, WeightsUpdated: boolean;
 begin
   FPrevLayer.ForceOutputOnRAM();
   PrevOut := FPrevLayer.FOutput;
@@ -105617,6 +105600,9 @@ begin
   MaxCO := FOutDepth - 1;
   NumPos := FOutputSizeX * FOutputSizeY;
   Sz := FNumTaps * FInDepth;
+  MaxWeightGroupPos := FWeightGroups - 1;
+  WeightGroupPatchSize := FNumTaps * FWeightGroupDepth;
+  IsSingleWeightGroup := (FWeightGroups = 1);
 
   // 1. Offset head: ordinary conv (same kernel/pad/stride) -> 2*KK offset maps.
   //    Identical to ComputeCPU step 1 (absent with an external offset source).
@@ -105643,11 +105629,10 @@ begin
       FOffMap[ox, oy, oc] := offv;
     end;
 
-  // 2. Interleaved weights, re-uploaded only when they changed (NewVAs below).
-  WeightsUpdated := RefreshGemmWeightsCL();
+  // 2. mW is re-uploaded only when it changed.
+  WeightsUpdated := FAfterWeightUpdateHasBeenCalled;
 
-  // 3. Gather the bilinear-sampled (+modulated) patch for every output position
-  //    into the kernel's contiguous B layout [t*Sz + i], i = tap*InDepth+ci.
+  // 3. Gather the bilinear-sampled (+modulated) patch for every output position.
   FGemmPatch.ReSize(NumPos * Sz, 1, 1);
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
@@ -105658,20 +105643,34 @@ begin
     for fy := 0 to MaxFY do
     for fx := 0 to MaxFX do
     begin
-      // The patch slot [t*Sz + tap*FInDepth .. +FInDepth) is contiguous over ci,
-      // so the sampled (+modulated) column is gathered straight into it.
+      // With one weight group the slot [t*Sz + tap*FInDepth .. +FInDepth) is
+      // contiguous over ci, so the column is gathered straight into it.
       tap := fy * FFeatureSizeX + fx;
-      patchOfs := tSz + tap * FInDepth;     // formed once (#4)
-      GatherTapColumn(PrevOut, offBase, maskBase, ox, oy, fx, fy,
-        @FGemmPatch.FData[patchOfs]);
+      if IsSingleWeightGroup then
+        GatherTapColumn(PrevOut, offBase, maskBase, ox, oy, fx, fy,
+          @FGemmPatch.FData[tSz + tap * FInDepth])
+      else
+      begin
+        GatherTapColumn(PrevOut, offBase, maskBase, ox, oy, fx, fy,
+          @FSampledCol.FData[0]);
+        patchOfs := tSz + tap * FWeightGroupDepth;
+        colOfs := 0;
+        for WeightGroup := 0 to MaxWeightGroupPos do
+        begin
+          Move(FSampledCol.FData[colOfs], FGemmPatch.FData[patchOfs],
+            FWeightGroupDepth * csNeuralFloatSize);
+          Inc(colOfs, FWeightGroupDepth);
+          Inc(patchOfs, WeightGroupPatchSize);
+        end;
+      end;
     end;
   end;
 
-  // 4. Device GEMM: Res[t*OutDepth + co] = sum_i A[i*OutDepth+co] * Patch[t*Sz+i].
+  // 4. Device GEMM (WillOpenCL armed the grouped one at EnableOpenCL).
   FGemmRes.ReSize(NumPos * FOutDepth, 1, 1);
-  FDotCL.ReallocateBuffersIfRequired(FGemmWInter, FGemmPatch, Sz);
-  FDotCL.Compute(FGemmWInter, FGemmPatch, {ActFN}0,
-    {NewVAs}WeightsUpdated, {NewVBs}true);
+  if IsSingleWeightGroup then
+    FDotCL.ReallocateBuffersIfRequired(FArrNeurons[0].FWeights, FGemmPatch, Sz);
+  ComputeMainGemmCL(nil, WeightsUpdated, nil);
   FDotCL.FinishAndLoadResult(FGemmRes, 0);
   FAfterWeightUpdateHasBeenCalled := false;
 

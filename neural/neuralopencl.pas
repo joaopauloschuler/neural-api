@@ -624,6 +624,12 @@ type
         pColsPerTile, pNumBs, pAxis2Groups: longint);
       /// Binds the 23 arguments of cai_conv_implicit(_tiled) and launches the
       /// tiled kernel when the shape allows; err accumulates failures.
+      /// Uploads VAs when NewVAs and launches cai_conv_transpose over SrcBuffer,
+      /// an InSizeX x InSizeY x InDepth source; reports its own failures.
+      procedure LaunchTransposedConv(VAs: TNNetVolume; NewVAs: boolean;
+        SrcBuffer: cl_mem; UseBias, InSizeX, InSizeY, InDepth, OutSizeX,
+        FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY, Groups,
+        pActFN: longint; err: integer);
       procedure LaunchImplicitConv(AsBuffer, SrcBuffer: cl_mem; NumBs,
         GemmSize, UseBias, OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
         Stride, PaddingX, PaddingY, DilationX, DilationY, PixelStride, OutFrames,
@@ -709,6 +715,11 @@ type
         OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY,
         Groups, pActFN: longint; NewVAs: boolean; VBias: TNNetVolume;
         NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
+      /// Grouped GEMM after PrepareTransposedConv: row a of group g = a div
+      /// (NumAs/Groups) dots A[a + k*NumAs] with B[b*Groups*FSize + g*FSize + k].
+      procedure ComputeGroupedGemm(VAs, VBs: TNNetVolume; Groups, pActFN: longint;
+        NewVAs, NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        pExternalVBs: cl_mem = nil);
       /// Allocates the phase slabs after PrepareImplicitConv on a 3x3 layout
       /// (FSize = 9 x depth); False when the device refused them.
       function PrepareUpsampleFold(): boolean;
@@ -2475,36 +2486,69 @@ procedure TDotProductSharedKernel.ComputeTransposedConv(VAs, SrcVol: TNNetVolume
   NewSrc: boolean; pExternalSrc: cl_mem);
 var
   err: integer;
-  UseBias, InSizeX, InSizeY, InDepth: longint;
+  UseBias: longint;
   SrcBuffer: cl_mem;
+begin
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  LaunchTransposedConv(VAs, NewVAs, SrcBuffer, UseBias, SrcVol.SizeX,
+    SrcVol.SizeY, SrcVol.Depth, OutSizeX, FeatureSizeX, FeatureSizeY, Stride,
+    PaddingX, PaddingY, Groups, pActFN, err);
+end;
+
+// A 1x1 stride-1 transposed conv over a NumBs x 1 source of Groups*FSize-float
+// pixels is exactly the grouped GEMM: row a reads only its group's FSize run.
+procedure TDotProductSharedKernel.ComputeGroupedGemm(VAs, VBs: TNNetVolume;
+  Groups, pActFN: longint; NewVAs, NewVBs: boolean; VBias: TNNetVolume;
+  NewVBias: boolean; pExternalVBs: cl_mem);
+var
+  err: integer;
+  UseBias: longint;
+  SrcBuffer: cl_mem;
+begin
+  if (Groups < 1) or (FNumAs mod Groups <> 0) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeGroupedGemm - ' +
+      IntToStr(FNumAs) + ' rows do not split into ' + IntToStr(Groups) +
+      ' groups.');
+    exit;
+  end;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(VBs, NewVBs, pExternalVBs, err);
+  LaunchTransposedConv(VAs, NewVAs, SrcBuffer, UseBias, {InSizeX}FNumBs,
+    {InSizeY}1, {InDepth}Groups * FSize, {OutSizeX}FNumBs, {FeatureSizeX}1,
+    {FeatureSizeY}1, {Stride}1, {PaddingX}0, {PaddingY}0, Groups, pActFN, err);
+end;
+
+procedure TDotProductSharedKernel.LaunchTransposedConv(VAs: TNNetVolume;
+  NewVAs: boolean; SrcBuffer: cl_mem; UseBias, InSizeX, InSizeY, InDepth,
+  OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY, Groups,
+  pActFN: longint; err: integer);
+var
   K: cl_kernel;
 begin
   K := FTransposedConvKernel;
   if not Assigned(K) then
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv without ' +
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv without ' +
       'PrepareTransposedConv.');
     exit;
   end;
   if VAs.Size <> FSize * FNumAs then
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv - VA size: ' +
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv - VA size: ' +
       IntToStr(VAs.Size) + ' FSize: ' + IntToStr(FSize) +
       ' NumAs:' + IntToStr(FNumAs));
     exit;
   end;
   FActFun := pActFN;
-  InSizeX := SrcVol.SizeX;
-  InSizeY := SrcVol.SizeY;
-  InDepth := SrcVol.Depth;
-  err := CL_SUCCESS;
-  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
-  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
   if NewVAs and not FWeightsBorrowed then
     err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
   if err <> CL_SUCCESS then
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv - failed ' +
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv - failed ' +
       'uploading: ' + IntToStr(err));
     exit;
   end;
@@ -2529,7 +2573,7 @@ begin
   if err = CL_SUCCESS then
     err := FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
   if err <> CL_SUCCESS then
-    ErrorProc('Error: TDotProductSharedKernel.ComputeTransposedConv - failed ' +
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv - failed ' +
       'launching: ' + IntToStr(err));
 end;
 

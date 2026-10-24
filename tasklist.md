@@ -2345,12 +2345,22 @@ rather than acted on.
       chunks under the 2 GB agent cap.
 - [ ] `TNNetDeformableConv` external-offset mode follow-ups:
       - [ ] The trainable OpenCL forward still gathers on the CPU (the CPU
-            backward reads FOffMap) and downloads its sources.
+            backward reads FOffMap) and downloads its sources. Evaluated, not
+            coded: the CPU backward needs the input, offset and mask sources
+            on RAM anyway, and it costs about OutDepth/WeightGroups times the
+            forward gather (its per-output-channel reductions over each
+            sampled column), so a device im2col in training only removes the host
+            gather and the patch upload, adds a blocking FOffMap download in
+            the self-offset mode, and makes a trainable output resident (the
+            parity tests pin it to RAM today). Worth doing together with the
+            OpenCL backward, not alone. Cheap partial if wanted: the
+            self-offset head in `ComputeHostGatherOpenCL` is a scalar `Get`
+            loop that `FOffsetDotCL` could run, downloading only FOffMap.
       - [ ] Not supported yet: OpenCL backward. Dilation > 1 and weight
             groups (deform_conv2d `groups` > 1) work in both modes, CPU forward
-            and backward; the OpenCL forward runs weight groups as a
-            block-diagonal dense GEMM (zeros between groups), so it does
-            WeightGroups times the needed multiply-adds.
+            and backward. The OpenCL forward runs weight groups as one grouped
+            GEMM on `cai_conv_transpose` (untiled); one weight group keeps the
+            tiled dense GEMM.
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on
