@@ -1407,6 +1407,11 @@ type
     procedure TestTripoSRBackbonePicoShapes;
     procedure TestTripoSRPostProcessorPlaneIndependence;
     procedure TestTripoSRBackboneLoadHandParity;
+    // TripoSR decoder: pico shapes, synthetic-checkpoint hand parity of the MLP,
+    // density exp/bias and colour sigmoid, and an analytic-sphere sweep.
+    procedure TestTripoSRDecoderPicoShapes;
+    procedure TestTripoSRDecoderLoadHandParity;
+    procedure TestTripoSRDensitySweepSphere;
     procedure TestMarigoldDenoiseSmoke;
     procedure TestMarigoldPreprocessPadsReplicate;
     procedure TestMarigoldPreprocessResizesLongSide;
@@ -1923,6 +1928,9 @@ type
   end;
 
 implementation
+
+uses
+  neuralmesh, TestNeuralMesh;
 
 type
   // Single-pass PixArt denoiser wrapper for the LCM smoke (TNNetLCMScheduler.
@@ -69037,8 +69045,8 @@ begin
   AssertTrue('stacked-bidirectional projection must be rejected', Raised);
 end;
 
-// A TripoSR backbone small enough to build and run in a test; Inner (16) differs
-// from TokenChannels (12) so proj_in / proj_out are not square.
+// A TripoSR backbone and decoder small enough to build and run in a test; Inner (16)
+// differs from TokenChannels (12) so proj_in / proj_out are not square.
 function TripoSRPicoConfig(): TTripoSRConfig;
 begin
   Result.PlaneSize := 4;
@@ -69050,6 +69058,10 @@ begin
   Result.NormNumGroups := 4;
   Result.ImageTokenCount := 5;
   Result.TriplaneChannels := 6;
+  Result.DecoderNeurons := 5;
+  Result.DecoderHiddenLayers := 2;
+  Result.DensityBias := -1.0;
+  Result.Radius := 0.87;
 end;
 
 procedure TTestNeuralPretrained.TestTripoSRBackbonePicoShapes;
@@ -69357,6 +69369,328 @@ begin
     ImageTokens.Free; Tokens.Free; Normed.Free; Hidden.Free; Planes.Free;
     Expected.Free;
     DeleteFile(Path);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestTripoSRDecoderPicoShapes;
+const
+  csPointCount = 7;
+var
+  Cfg: TTripoSRConfig;
+  Refs: TTripoSRDecoderLayers;
+  NN: TNNet;
+  Triplane, Output: TNNetVolume;
+  LinearPos, PointPos, ChannelPos: integer;
+  Value: TNeuralFloat;
+begin
+  RandSeed := 9034;
+  Cfg := TripoSRPicoConfig();
+  NN := BuildTripoSRDecoder(Cfg, csPointCount, {pTrainable=}true, Refs);
+  Triplane := TNNetVolume.Create(8, 24, Cfg.TriplaneChannels);
+  try
+    AssertTrue('input 0 is the triplane', NN.Layers[0] = Refs.Triplane);
+    AssertTrue('input 1 is the points', NN.Layers[1] = Refs.Points);
+    AssertTrue('last layer is the output', NN.GetLastLayer() = Refs.Output);
+    AssertEquals('triplane X', 8, Refs.Triplane.Output.SizeX);
+    AssertEquals('triplane Y', 24, Refs.Triplane.Output.SizeY);
+    AssertEquals('sample depth = 3 * Cp', 3 * Cfg.TriplaneChannels,
+      Refs.Sample.Output.Depth);
+    AssertEquals('linears', Cfg.DecoderHiddenLayers + 1, Length(Refs.Linears));
+    for LinearPos := 0 to Cfg.DecoderHiddenLayers - 1 do
+      AssertEquals('hidden width', Cfg.DecoderNeurons,
+        Refs.Linears[LinearPos].Output.Depth);
+    AssertEquals('head width', csTripoSRDecoderOutputs,
+      Refs.Linears[Cfg.DecoderHiddenLayers].Output.Depth);
+    Output := Refs.Output.Output;
+    AssertEquals('output X', csPointCount, Output.SizeX);
+    AssertEquals('output Y', 1, Output.SizeY);
+    AssertEquals('output depth', csTripoSRDecoderOutputs, Output.Depth);
+    Triplane.RandomizeGaussian();
+    Refs.Points.Output.RandomizeGaussian(0.5);
+    NN.Compute(Triplane);
+    for PointPos := 0 to csPointCount - 1 do
+    begin
+      AssertTrue('density_act > 0', Output[PointPos, 0, 0] > 0);
+      for ChannelPos := 1 to 3 do
+      begin
+        Value := Output[PointPos, 0, ChannelPos];
+        AssertTrue('colour in (0, 1)', (Value > 0) and (Value < 1));
+      end;
+    end;
+  finally
+    Triplane.Free;
+    NN.Free;
+  end;
+end;
+
+// Synthetic decoder.layers.* checkpoint; the MLP, exp(density + bias) and the
+// colour sigmoid are recomputed by hand from the sampled features.
+procedure TTestNeuralPretrained.TestTripoSRDecoderLoadHandParity;
+const
+  csPath = 'cai_triposr_decoder_pico.safetensors';
+  csPointCount = 6;
+var
+  Cfg: TTripoSRConfig;
+  Refs: TTripoSRDecoderLayers;
+  NN: TNNet;
+  Writer: TNNetSafeTensorsWriter;
+  Reader: TNNetSafeTensorsReader;
+  Path: string;
+  Weights, Biases: array of TNNetVolume;
+  Triplane, Features, Hidden, NextHidden, Output: TNNetVolume;
+  LinearPos, MaxLinearPos, InDim, OutDim, PointPos, OutPos, InPos: integer;
+  Acc: double;
+  Expected: TNeuralFloat;
+begin
+  RandSeed := 9035;
+  Cfg := TripoSRPicoConfig();
+  Path := GetTempDir(false) + csPath;
+  MaxLinearPos := Cfg.DecoderHiddenLayers;
+  SetLength(Weights, MaxLinearPos + 1);
+  SetLength(Biases, MaxLinearPos + 1);
+  for LinearPos := 0 to MaxLinearPos do
+  begin
+    Weights[LinearPos] := TNNetVolume.Create;
+    Biases[LinearPos] := TNNetVolume.Create;
+  end;
+  Triplane := TNNetVolume.Create(8, 24, Cfg.TriplaneChannels);
+  Hidden := TNNetVolume.Create;
+  NextHidden := TNNetVolume.Create;
+  NN := nil;
+  Reader := nil;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(Path);
+    try
+      InDim := 3 * Cfg.TriplaneChannels;
+      for LinearPos := 0 to MaxLinearPos do
+      begin
+        if LinearPos = MaxLinearPos then OutDim := 4 else OutDim := Cfg.DecoderNeurons;
+        Weights[LinearPos].ReSize(OutDim * InDim, 1, 1);
+        Weights[LinearPos].RandomizeGaussian(0.5);
+        Biases[LinearPos].ReSize(OutDim, 1, 1);
+        Biases[LinearPos].RandomizeGaussian(0.5);
+        Writer.AddTensorFlat('decoder.layers.' + IntToStr(2 * LinearPos) + '.weight',
+          [OutDim, InDim], Weights[LinearPos]);
+        Writer.AddTensorFlat('decoder.layers.' + IntToStr(2 * LinearPos) + '.bias',
+          [OutDim], Biases[LinearPos]);
+        InDim := Cfg.DecoderNeurons;
+      end;
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+    NN := BuildTripoSRDecoder(Cfg, csPointCount, {pTrainable=}false, Refs);
+    Reader := TNNetSafeTensorsReader.Create(Path);
+    LoadTripoSRDecoder(Reader, Refs, Cfg);
+    Triplane.RandomizeGaussian();
+    Refs.Points.Output.RandomizeGaussian(0.4);
+    NN.Compute(Triplane);
+    Features := Refs.Sample.Output;
+    Output := Refs.Output.Output;
+    for PointPos := 0 to csPointCount - 1 do
+    begin
+      Hidden.ReSize(3 * Cfg.TriplaneChannels, 1, 1);
+      for InPos := 0 to Hidden.Size - 1 do
+        Hidden.FData[InPos] := Features[PointPos, 0, InPos];
+      for LinearPos := 0 to MaxLinearPos do
+      begin
+        if LinearPos = MaxLinearPos then OutDim := 4 else OutDim := Cfg.DecoderNeurons;
+        NextHidden.ReSize(OutDim, 1, 1);
+        for OutPos := 0 to OutDim - 1 do
+        begin
+          Acc := Biases[LinearPos].FData[OutPos];
+          for InPos := 0 to Hidden.Size - 1 do
+            Acc := Acc + Weights[LinearPos].FData[OutPos * Hidden.Size + InPos] *
+              Hidden.FData[InPos];
+          // SiLU after every hidden linear, none after the head.
+          if LinearPos < MaxLinearPos then Acc := Acc / (1 + Exp(-Acc));
+          NextHidden.FData[OutPos] := Acc;
+        end;
+        Hidden.Copy(NextHidden);
+      end;
+      Expected := Exp(Hidden.FData[0] + Cfg.DensityBias);
+      AssertEquals('density_act point ' + IntToStr(PointPos), Expected,
+        Output[PointPos, 0, 0], 1e-4 * Max(1, Expected));
+      for OutPos := 1 to 3 do
+        AssertEquals('colour point ' + IntToStr(PointPos), 1 / (1 + Exp(-Hidden.FData[OutPos])),
+          Output[PointPos, 0, OutPos], 1e-5);
+    end;
+  finally
+    Reader.Free;
+    NN.Free;
+    for LinearPos := 0 to MaxLinearPos do
+    begin
+      Weights[LinearPos].Free;
+      Biases[LinearPos].Free;
+    end;
+    Triplane.Free;
+    Hidden.Free;
+    NextHidden.Free;
+    DeleteFile(Path);
+  end;
+end;
+
+// Planes XY, XZ, YZ hold (x-cx)^2, (z-cz)^2, (y-cy)^2; SiLU(s + 20) ~ s + 20 passes
+// the sum s on, and density_act = exp(A - B s - 1) makes the 25 iso level s = r0^2.
+procedure TTestNeuralPretrained.TestTripoSRDensitySweepSphere;
+const
+  csResolution = 24;
+  csSphereRadius = 0.45;
+  csSlope = 4.0;
+  csOffset = 20.0;
+  csCentre: array[0..2] of TNeuralFloat = (0.1, -0.05, 0.15);
+var
+  Cfg: TTripoSRConfig;
+  ChunkedRefs, WholeRefs: TTripoSRDecoderLayers;
+  ChunkedNet, WholeNet: TNNet;
+  Triplane, ChunkedDensity, WholeDensity: TNNetVolume;
+  ChunkedMesh, WholeMesh: TNNetTriangleMesh;
+  PlaneWidth, PlaneHeight, Cp, PlanePos, Col, Row, Axis, VertexPos: integer;
+  Intercept, Coord, X, Y, Z, Dist, S, MaxDistErr, MaxColorErr: TNeuralFloat;
+  BoxMin, BoxMax: array[0..2] of TNeuralFloat;
+  Volume: double;
+  // Plane k: (width axis, height axis) = (x, y), (x, z), (y, z); the encoded axis.
+  const csEncodedAxis: array[0..2] of integer = (0, 2, 1);
+  const csEncodedOnWidth: array[0..2] of boolean = (true, false, true);
+
+  procedure SetDecoderWeights(const Refs: TTripoSRDecoderLayers);
+  var
+    LinearPos, NeuronPos, PlaneK: integer;
+    Layer: TNNetLayer;
+  begin
+    for LinearPos := 0 to High(Refs.Linears) do
+    begin
+      Layer := Refs.Linears[LinearPos];
+      for NeuronPos := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Layer.Neurons[NeuronPos].Weights.Fill(0);
+        Layer.Neurons[NeuronPos].BiasWeight := 0;
+      end;
+    end;
+    for PlaneK := 0 to 2 do
+      Refs.Linears[0].Neurons[0].Weights.FData[PlaneK * Cp] := 1;
+    Refs.Linears[0].Neurons[0].BiasWeight := csOffset;
+    Refs.Linears[1].Neurons[0].Weights.FData[0] := 1;
+    Layer := Refs.Linears[2];
+    Layer.Neurons[0].Weights.FData[0] := -csSlope;
+    Layer.Neurons[0].BiasWeight := Intercept + csSlope * csOffset;
+    // rgb = sigmoid(s), sigmoid(0.3), sigmoid(-2 s).
+    Layer.Neurons[1].Weights.FData[0] := 1;
+    Layer.Neurons[1].BiasWeight := -csOffset;
+    Layer.Neurons[2].BiasWeight := 0.3;
+    Layer.Neurons[3].Weights.FData[0] := -2;
+    Layer.Neurons[3].BiasWeight := 2 * csOffset;
+    for LinearPos := 0 to High(Refs.Linears) do
+      Refs.Linears[LinearPos].FlushWeightCache();
+  end;
+
+begin
+  Cfg := TripoSRPicoConfig();
+  Cfg.PlaneSize := 16;
+  Cfg.TriplaneChannels := 2;
+  Cfg.DecoderNeurons := 3;
+  Cfg.Radius := 1.0;
+  Cp := Cfg.TriplaneChannels;
+  PlaneWidth := 2 * Cfg.PlaneSize;
+  PlaneHeight := 2 * Cfg.PlaneSize;
+  // exp(A - B r0^2 + DensityBias) = threshold.
+  Intercept := Ln(csTripoSRDefaultThreshold) - Cfg.DensityBias +
+    csSlope * Sqr(csSphereRadius);
+  Triplane := TNNetVolume.Create(PlaneWidth, 3 * PlaneHeight, Cp);
+  ChunkedDensity := TNNetVolume.Create;
+  WholeDensity := TNNetVolume.Create;
+  ChunkedMesh := TNNetTriangleMesh.Create;
+  WholeMesh := TNNetTriangleMesh.Create;
+  // 1000 does not divide 24^3, so the last density chunk is partial.
+  ChunkedNet := BuildTripoSRDecoder(Cfg, 1000, false, ChunkedRefs);
+  WholeNet := BuildTripoSRDecoder(Cfg, csResolution * csResolution * csResolution,
+    false, WholeRefs);
+  try
+    RandSeed := 9036;
+    Triplane.RandomizeGaussian();
+    // Texel centres sit at ((2 i + 1) / W - 1) * Radius (align_corners false).
+    for PlanePos := 0 to 2 do
+      for Row := 0 to PlaneHeight - 1 do
+        for Col := 0 to PlaneWidth - 1 do
+        begin
+          if csEncodedOnWidth[PlanePos]
+            then Coord := ((2 * Col + 1) / PlaneWidth - 1) * Cfg.Radius
+            else Coord := ((2 * Row + 1) / PlaneHeight - 1) * Cfg.Radius;
+          Triplane[Col, PlanePos * PlaneHeight + Row, 0] :=
+            Sqr(Coord - csCentre[csEncodedAxis[PlanePos]]);
+        end;
+    SetDecoderWeights(ChunkedRefs);
+    SetDecoderWeights(WholeRefs);
+    TripoSRExtractMesh(ChunkedNet, ChunkedRefs, Cfg, Triplane, csResolution,
+      csTripoSRDefaultThreshold, true, ChunkedDensity, ChunkedMesh);
+    TripoSRExtractMesh(WholeNet, WholeRefs, Cfg, Triplane, csResolution,
+      csTripoSRDefaultThreshold, true, WholeDensity, WholeMesh);
+    AssertEquals('density SizeX', csResolution, ChunkedDensity.SizeX);
+    AssertEquals('density Depth', csResolution, ChunkedDensity.Depth);
+    AssertEquals('chunked = single-chunk density', 0,
+      ChunkedDensity.SumDiff(WholeDensity), 0);
+    AssertTrue('a mesh came out', ChunkedMesh.VertexCount > 100);
+    AssertEquals('same vertex count', WholeMesh.VertexCount, ChunkedMesh.VertexCount);
+    AssertEquals('same face count', WholeMesh.FaceCount, ChunkedMesh.FaceCount);
+    AssertClosedOriented(Self, ChunkedMesh);
+    AssertEquals('Euler characteristic of a sphere', 2, ChunkedMesh.VertexCount -
+      ChunkedMesh.FaceCount * 3 div 2 + ChunkedMesh.FaceCount);
+    // Flat triangles at a 0.087 grid step sit inside the sphere: ~3% short.
+    Volume := MeshSignedVolume(ChunkedMesh);
+    AssertEquals('enclosed volume (outward faces)', 4 / 3 * Pi *
+      Power(csSphereRadius, 3), Volume, 0.06 * 4 / 3 * Pi * Power(csSphereRadius, 3));
+    for Axis := 0 to 2 do
+    begin
+      BoxMin[Axis] := 10;
+      BoxMax[Axis] := -10;
+    end;
+    MaxDistErr := 0;
+    MaxColorErr := 0;
+    AssertTrue('colours set', ChunkedMesh.HasColors);
+    for VertexPos := 0 to ChunkedMesh.VertexCount - 1 do
+    begin
+      ChunkedMesh.GetVertex(VertexPos, X, Y, Z);
+      BoxMin[0] := Min(BoxMin[0], X); BoxMax[0] := Max(BoxMax[0], X);
+      BoxMin[1] := Min(BoxMin[1], Y); BoxMax[1] := Max(BoxMax[1], Y);
+      BoxMin[2] := Min(BoxMin[2], Z); BoxMax[2] := Max(BoxMax[2], Z);
+      S := Sqr(X - csCentre[0]) + Sqr(Y - csCentre[1]) + Sqr(Z - csCentre[2]);
+      Dist := Sqrt(S);
+      MaxDistErr := Max(MaxDistErr, Abs(Dist - csSphereRadius));
+      for Axis := 0 to 2 do
+      begin
+        AssertTrue('colour in [0, 1]', (ChunkedMesh.Colors[VertexPos * 3 + Axis] >= 0) and
+          (ChunkedMesh.Colors[VertexPos * 3 + Axis] <= 1));
+        AssertEquals('chunked colour = single-chunk colour',
+          WholeMesh.Colors[VertexPos * 3 + Axis],
+          ChunkedMesh.Colors[VertexPos * 3 + Axis], 0);
+      end;
+      MaxColorErr := Max(MaxColorErr, Abs(ChunkedMesh.Colors[VertexPos * 3] -
+        1 / (1 + Exp(-S))));
+      MaxColorErr := Max(MaxColorErr, Abs(ChunkedMesh.Colors[VertexPos * 3 + 1] -
+        1 / (1 + Exp(-0.3))));
+      MaxColorErr := Max(MaxColorErr, Abs(ChunkedMesh.Colors[VertexPos * 3 + 2] -
+        1 / (1 + Exp(2 * S))));
+    end;
+    AssertTrue('vertices on the sphere, max |r - r0| ' + FloatToStr(MaxDistErr),
+      MaxDistErr < 0.01);
+    AssertTrue('colours match the analytic query, max |diff| ' +
+      FloatToStr(MaxColorErr), MaxColorErr < 2e-3);
+    // An off-centre sphere pins the axis order and the sign of every axis.
+    for Axis := 0 to 2 do
+    begin
+      AssertEquals('box min axis ' + IntToStr(Axis), csCentre[Axis] - csSphereRadius,
+        BoxMin[Axis], 0.02);
+      AssertEquals('box max axis ' + IntToStr(Axis), csCentre[Axis] + csSphereRadius,
+        BoxMax[Axis], 0.02);
+    end;
+  finally
+    ChunkedNet.Free;
+    WholeNet.Free;
+    Triplane.Free;
+    ChunkedDensity.Free;
+    WholeDensity.Free;
+    ChunkedMesh.Free;
+    WholeMesh.Free;
   end;
 end;
 

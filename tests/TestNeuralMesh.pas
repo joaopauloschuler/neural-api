@@ -36,6 +36,12 @@ type
     procedure TestOBJText;
   end;
 
+// Closed and consistently oriented: each directed edge occurs once and its
+// reverse occurs once. Returns the undirected edge count.
+function AssertClosedOriented(Test: TTestCase; Mesh: TNNetTriangleMesh): integer;
+// Signed volume enclosed by the mesh (divergence theorem).
+function MeshSignedVolume(Mesh: TNNetTriangleMesh): Double;
+
 implementation
 
 type
@@ -80,8 +86,6 @@ begin
   Result := false;
 end;
 
-// Closed and consistently oriented: each directed edge occurs once and its
-// reverse occurs once. Returns the undirected edge count.
 function AssertClosedOriented(Test: TTestCase; Mesh: TNNetTriangleMesh): integer;
 var
   DirectedEdges: TInt64DynArr;
@@ -115,7 +119,6 @@ begin
   Result := Length(DirectedEdges) div 2;
 end;
 
-// Signed volume enclosed by the mesh (divergence theorem).
 function MeshSignedVolume(Mesh: TNNetTriangleMesh): Double;
 var
   FacePos, MaxFacePos, A, B, C: integer;

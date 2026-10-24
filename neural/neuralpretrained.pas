@@ -537,7 +537,7 @@ uses
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralchat, neuralmxfp4, neuralnf4,
   neuralaudio, neuraldiffusion, neuralg2p, neuralplainops, neuralimageresize,
-  pascoremath32;
+  neuralmesh, pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -18732,6 +18732,10 @@ type
     NormNumGroups: integer;      // backbone.norm_num_groups (32)
     ImageTokenCount: integer;    // image tokenizer tokens incl. CLS (1025 at 512 px)
     TriplaneChannels: integer;   // post_processor.out_channels (40)
+    DecoderNeurons: integer;     // decoder.n_neurons (64)
+    DecoderHiddenLayers: integer; // decoder.n_hidden_layers (9), SiLU after each
+    DensityBias: TNeuralFloat;   // renderer.density_bias (-1.0), before exp
+    Radius: TNeuralFloat;        // renderer.radius (0.87): the point box half-width
   end;
 
   // Layer refs of AddTripoSRBackbone; LoadTripoSRBackbone fills them.
@@ -18760,6 +18764,52 @@ function BuildTripoSRBackbone(const Config: TTripoSRConfig; pTrainable: boolean;
 // Loads tokenizer.embeddings, backbone.* and post_processor.upsample.* into Refs.
 procedure LoadTripoSRBackbone(Reader: TNNetSafeTensorsReader;
   const Refs: TTripoSRBackboneLayers; const Config: TTripoSRConfig);
+
+const
+  // TripoSR NeRFMLP head width: density + 3 colour features.
+  csTripoSRDecoderOutputs = 4;
+  // TSR.extract_mesh defaults: density_act iso level and marching-cubes grid.
+  csTripoSRDefaultThreshold = 25.0;
+  csTripoSRDefaultMCResolution = 256;
+  // Decoder points per forward: about 0.25 GB of layer volumes at the default sizes.
+  csTripoSRDefaultChunkPoints = 16384;
+
+type
+  // Layer refs of AddTripoSRDecoder; LoadTripoSRDecoder fills Linears.
+  TTripoSRDecoderLayers = record
+    Triplane, Points: TNNetLayer;  // the triplane and the (N, 1, 3) points
+    Sample: TNNetLayer;            // TNNetTriplaneSample: (N, 1, 3 * TriplaneChannels)
+    // decoder.layers.{2k}: DecoderHiddenLayers hidden linears, then the 4-wide head.
+    Linears: array of TNNetLayer;
+    Output: TNNetLayer;            // (N, 1, 4): exp(density + DensityBias), sigmoid(rgb)
+  end;
+
+// NeRFMLP over TNNetTriplaneSample(Points) of Triplane; returns Refs.Output, channel 0
+// the activated density (renderer density_act), channels 1-3 the sigmoid colour.
+function AddTripoSRDecoder(NN: TNNet; const Config: TTripoSRConfig;
+  Triplane, Points: TNNetLayer; pTrainable: boolean;
+  out Refs: TTripoSRDecoderLayers): TNNetLayer;
+// A net with input 0 = the triplane, input 1 = PointsPerChunk points, last layer =
+// Refs.Output; TripoSRDensityGrid / TripoSRColorVertices run it. Caller owns it.
+function BuildTripoSRDecoder(const Config: TTripoSRConfig; PointsPerChunk: integer;
+  pTrainable: boolean; out Refs: TTripoSRDecoderLayers): TNNet;
+// Loads decoder.layers.{0, 2, ..., 2 * DecoderHiddenLayers}.weight / .bias.
+procedure LoadTripoSRDecoder(Reader: TNNetSafeTensorsReader;
+  const Refs: TTripoSRDecoderLayers; const Config: TTripoSRConfig);
+// Density (R, R, R): point (X, Y, D) holds density_act at world (x, y, z) =
+// -Radius + (X, Y, D) * 2 * Radius / (R - 1), queried one chunk per forward.
+procedure TripoSRDensityGrid(DecoderNet: TNNet; const Refs: TTripoSRDecoderLayers;
+  const Config: TTripoSRConfig; Triplane: TNNetVolume; Resolution: integer;
+  Density: TNNetVolume);
+// Sets every Mesh vertex colour to the decoder's sigmoid RGB at that vertex.
+procedure TripoSRColorVertices(DecoderNet: TNNet; const Refs: TTripoSRDecoderLayers;
+  Triplane: TNNetVolume; Mesh: TNNetTriangleMesh);
+// TSR.extract_mesh: density grid -> MarchingCubes at Threshold in world coordinates
+// -> optional vertex colours. Density is caller-owned scratch (R^3 floats).
+procedure TripoSRExtractMesh(DecoderNet: TNNet; const Refs: TTripoSRDecoderLayers;
+  const Config: TTripoSRConfig; Triplane: TNNetVolume; Resolution: integer;
+  Threshold: TNeuralFloat; HasVertexColor: boolean; Density: TNNetVolume;
+  Mesh: TNNetTriangleMesh);
 
 // NeuralAllowFusedAttention (the global fused-attention A/B toggle) lives in
 // neuralnetwork, next to TNNet.AddGQAAttentionFromSources which reads it, and
@@ -125459,6 +125509,10 @@ begin
   // facebook/dino-vitb16 at 512 px: 32 x 32 patches + CLS.
   Result.ImageTokenCount := 1025;
   Result.TriplaneChannels := 40;
+  Result.DecoderNeurons := 64;
+  Result.DecoderHiddenLayers := 9;
+  Result.DensityBias := -1.0;
+  Result.Radius := 0.87;
 end;
 
 procedure ValidateTripoSRConfig(const Config: TTripoSRConfig);
@@ -125468,8 +125522,10 @@ begin
       ' is below the upsample kernel ' + IntToStr(csTripoSRUpsampleKernel) + '.');
   if (Config.NumHeads < 1) or (Config.HeadDim < 1) or (Config.NumLayers < 1) or
      (Config.CrossAttentionDim < 1) or (Config.ImageTokenCount < 1) or
-     (Config.TriplaneChannels < 1) or (Config.TokenChannels < 1) then
-    ImportError('TripoSR: every size in the config must be positive.');
+     (Config.TriplaneChannels < 1) or (Config.TokenChannels < 1) or
+     (Config.DecoderNeurons < 1) or (Config.DecoderHiddenLayers < 1) or
+     not (Config.Radius > 0) then
+    ImportError('TripoSR: every size and the radius in the config must be positive.');
   if (Config.NormNumGroups < 1) or
      ((Config.TokenChannels mod Config.NormNumGroups) <> 0) then
     ImportError('TripoSR: TokenChannels ' + IntToStr(Config.TokenChannels) +
@@ -125602,6 +125658,209 @@ begin
   LoadConvTranspose2DFoldBN(Reader, Refs.Upsample,
     'post_processor.upsample.weight', 'post_processor.upsample.bias',
     Config.TokenChannels, Config.TriplaneChannels, csTripoSRUpsampleKernel);
+end;
+
+function AddTripoSRDecoder(NN: TNNet; const Config: TTripoSRConfig;
+  Triplane, Points: TNNetLayer; pTrainable: boolean;
+  out Refs: TTripoSRDecoderLayers): TNNetLayer;
+var
+  LinearPos, MaxHiddenPos: integer;
+  Head, Density, Color: TNNetLayer;
+begin
+  ValidateTripoSRConfig(Config);
+  Refs.Triplane := Triplane;
+  Refs.Points := Points;
+  // query_triplane's F.grid_sample: bilinear, zero padding, align_corners false.
+  Refs.Sample := NN.AddLayerAfter(TNNetTriplaneSample.Create(Points, Config.Radius,
+    gspZeros, {pAlignCorners=}false), Triplane);
+  SetLength(Refs.Linears, Config.DecoderHiddenLayers + 1);
+  MaxHiddenPos := Config.DecoderHiddenLayers - 1;
+  for LinearPos := 0 to MaxHiddenPos do
+  begin
+    Refs.Linears[LinearPos] := NN.AddLayer(TNNetPointwiseConvLinear.Create(
+      Config.DecoderNeurons).SetTrainable(pTrainable));
+    NN.AddLayer(TNNetSiLU.Create());
+  end;
+  Head := NN.AddLayer(TNNetPointwiseConvLinear.Create(
+    csTripoSRDecoderOutputs).SetTrainable(pTrainable));
+  Refs.Linears[Config.DecoderHiddenLayers] := Head;
+  // renderer density_activation "exp" (TNNetExp clips its input at 30).
+  NN.AddLayerAfter(TNNetSplitChannels.Create(0, 1), Head);
+  NN.AddLayer(TNNetAddConstant.Create(Config.DensityBias));
+  Density := NN.AddLayer(TNNetExp.Create());
+  NN.AddLayerAfter(TNNetSplitChannels.Create(1, csTripoSRDecoderOutputs - 1), Head);
+  Color := NN.AddLayer(TNNetSigmoid.Create());
+  Refs.Output := NN.AddLayer(TNNetDeepConcat.Create([Density, Color]));
+  Result := Refs.Output;
+end;
+
+function BuildTripoSRDecoder(const Config: TTripoSRConfig; PointsPerChunk: integer;
+  pTrainable: boolean; out Refs: TTripoSRDecoderLayers): TNNet;
+var
+  Triplane, Points: TNNetLayer;
+begin
+  // TNNetTriplaneSample's output holds PointsPerChunk * 3 * Cp values.
+  if (PointsPerChunk < 1) or (Int64(PointsPerChunk) * csTripoSRPlaneCount *
+    Config.TriplaneChannels >= High(integer)) then
+    ImportError('TripoSR: ' + IntToStr(PointsPerChunk) +
+      ' points per chunk is out of range.');
+  Result := TNNet.Create();
+  try
+    Triplane := Result.AddLayer(TNNetInput.Create(
+      csTripoSRUpsampleKernel * Config.PlaneSize,
+      csTripoSRUpsampleKernel * csTripoSRPlaneCount * Config.PlaneSize,
+      Config.TriplaneChannels));
+    Points := Result.AddLayerAfter(TNNetInput.Create(PointsPerChunk, 1, 3), 0);
+    AddTripoSRDecoder(Result, Config, Triplane, Points, pTrainable, Refs);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure LoadTripoSRDecoder(Reader: TNNetSafeTensorsReader;
+  const Refs: TTripoSRDecoderLayers; const Config: TTripoSRConfig);
+var
+  LinearPos, MaxLinearPos, InDim, OutDim: integer;
+  Prefix: string;
+begin
+  MaxLinearPos := High(Refs.Linears);
+  InDim := csTripoSRPlaneCount * Config.TriplaneChannels;
+  OutDim := Config.DecoderNeurons;
+  for LinearPos := 0 to MaxLinearPos do
+  begin
+    if LinearPos = MaxLinearPos then OutDim := csTripoSRDecoderOutputs;
+    // Assumed NeRFMLP nn.Sequential indices: Linear at 2k, activation at 2k + 1.
+    Prefix := 'decoder.layers.' + IntToStr(2 * LinearPos);
+    LoadLlamaLinearWeights(Reader, Refs.Linears[LinearPos], Prefix + '.weight',
+      InDim, OutDim, 0, -1, 0, Prefix + '.bias');
+    InDim := Config.DecoderNeurons;
+  end;
+end;
+
+// Copies Triplane into the decoder's triplane input once per sweep.
+procedure SetTripoSRDecoderTriplane(const Refs: TTripoSRDecoderLayers;
+  Triplane: TNNetVolume);
+begin
+  if Refs.Triplane.Output.Size <> Triplane.Size then
+    ImportError('TripoSR decoder: the triplane has ' + IntToStr(Triplane.Size) +
+      ' values; the decoder expects ' + IntToStr(Refs.Triplane.Output.Size) + '.');
+  Refs.Triplane.Output.CopyNoChecks(Triplane);
+end;
+
+procedure TripoSRDensityGrid(DecoderNet: TNNet; const Refs: TTripoSRDecoderLayers;
+  const Config: TTripoSRConfig; Triplane: TNNetVolume; Resolution: integer;
+  Density: TNNetVolume);
+var
+  PointsVolume, OutputVolume: TNNetVolume;
+  ChunkPoints, TotalPoints, ChunkStart, ChunkCount, PointPos, MaxPointPos: integer;
+  GridX, GridY, GridD, MaxGridPos, PointBase, OutputPos, DensityPos: integer;
+  GridStep, GridOrigin, CoordX, CoordY: TNeuralFloat;
+begin
+  if (Resolution < 2) or
+     (Int64(Resolution) * Resolution * Resolution >= High(integer)) then
+    ImportError('TripoSR: marching-cubes resolution ' + IntToStr(Resolution) +
+      ' is out of range.');
+  SetTripoSRDecoderTriplane(Refs, Triplane);
+  Density.ReSize(Resolution, Resolution, Resolution);
+  PointsVolume := Refs.Points.Output;
+  OutputVolume := Refs.Output.Output;
+  ChunkPoints := PointsVolume.SizeX * PointsVolume.SizeY;
+  TotalPoints := Density.Size;
+  MaxGridPos := Resolution - 1;
+  GridStep := 2 * Config.Radius / MaxGridPos;
+  GridOrigin := -Config.Radius;
+  GridX := 0;
+  GridY := 0;
+  GridD := 0;
+  CoordX := GridOrigin;
+  CoordY := GridOrigin;
+  ChunkStart := 0;
+  DensityPos := 0;
+  while ChunkStart < TotalPoints do
+  begin
+    ChunkCount := Min(ChunkPoints, TotalPoints - ChunkStart);
+    MaxPointPos := ChunkCount - 1;
+    PointBase := 0;
+    // Density raw position (GridY * R + GridX) * R + GridD: GridD fastest.
+    for PointPos := 0 to MaxPointPos do
+    begin
+      PointsVolume.FData[PointBase] := CoordX;
+      PointsVolume.FData[PointBase + 1] := CoordY;
+      PointsVolume.FData[PointBase + 2] := GridD * GridStep + GridOrigin;
+      Inc(PointBase, 3);
+      Inc(GridD);
+      if GridD > MaxGridPos then
+      begin
+        GridD := 0;
+        Inc(GridX);
+        if GridX > MaxGridPos then
+        begin
+          GridX := 0;
+          Inc(GridY);
+          CoordY := GridY * GridStep + GridOrigin;
+        end;
+        CoordX := GridX * GridStep + GridOrigin;
+      end;
+    end;
+    DecoderNet.ComputeFromFilledInput(0, {Parallel=}false, -1);
+    OutputPos := 0;
+    for PointPos := 0 to MaxPointPos do
+    begin
+      Density.FData[DensityPos] := OutputVolume.FData[OutputPos];
+      Inc(DensityPos);
+      Inc(OutputPos, csTripoSRDecoderOutputs);
+    end;
+    Inc(ChunkStart, ChunkCount);
+  end;
+end;
+
+procedure TripoSRColorVertices(DecoderNet: TNNet; const Refs: TTripoSRDecoderLayers;
+  Triplane: TNNetVolume; Mesh: TNNetTriangleMesh);
+var
+  PointsVolume, OutputVolume: TNNetVolume;
+  ChunkPoints, VertexCount, ChunkStart, ChunkCount, PointPos, MaxPointPos: integer;
+  OutputPos: integer;
+begin
+  SetTripoSRDecoderTriplane(Refs, Triplane);
+  PointsVolume := Refs.Points.Output;
+  OutputVolume := Refs.Output.Output;
+  ChunkPoints := PointsVolume.SizeX * PointsVolume.SizeY;
+  VertexCount := Mesh.VertexCount;
+  ChunkStart := 0;
+  while ChunkStart < VertexCount do
+  begin
+    ChunkCount := Min(ChunkPoints, VertexCount - ChunkStart);
+    // Mesh vertices are xyz interleaved, the (N, 1, 3) points layout.
+    Move(Mesh.Vertices[ChunkStart * 3], PointsVolume.FData[0],
+      ChunkCount * 3 * csNeuralFloatSize);
+    DecoderNet.ComputeFromFilledInput(0, {Parallel=}false, -1);
+    MaxPointPos := ChunkCount - 1;
+    OutputPos := 1;
+    for PointPos := 0 to MaxPointPos do
+    begin
+      Mesh.SetVertexColor(ChunkStart + PointPos, OutputVolume.FData[OutputPos],
+        OutputVolume.FData[OutputPos + 1], OutputVolume.FData[OutputPos + 2]);
+      Inc(OutputPos, csTripoSRDecoderOutputs);
+    end;
+    Inc(ChunkStart, ChunkCount);
+  end;
+end;
+
+procedure TripoSRExtractMesh(DecoderNet: TNNet; const Refs: TTripoSRDecoderLayers;
+  const Config: TTripoSRConfig; Triplane: TNNetVolume; Resolution: integer;
+  Threshold: TNeuralFloat; HasVertexColor: boolean; Density: TNNetVolume;
+  Mesh: TNNetTriangleMesh);
+var
+  GridStep: TNeuralFloat;
+begin
+  TripoSRDensityGrid(DecoderNet, Refs, Config, Triplane, Resolution, Density);
+  GridStep := 2 * Config.Radius / (Resolution - 1);
+  // TSR marches density_act - threshold; v_pos[..., [2, 1, 0]] undoes torchmcubes'
+  // (z, y, x) order, so grid (X, Y, D) is world (x, y, z) here too.
+  MarchingCubes(Density, Threshold, NNetPoint3D(-Config.Radius, -Config.Radius,
+    -Config.Radius), NNetPoint3D(GridStep, GridStep, GridStep), Mesh);
+  if HasVertexColor then TripoSRColorVertices(DecoderNet, Refs, Triplane, Mesh);
 end;
 
 {$IFDEF OpenCL}

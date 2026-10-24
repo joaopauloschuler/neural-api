@@ -1986,15 +1986,55 @@ rather than acted on.
         every per-head attention layer keeps its score matrix (3072 x 3072
         self, 3072 x 1025 cross: ~9.6 GB + ~3.2 GB over 16 blocks), so T6
         needs a fused/shared attention path or int8 before a full-size run.
-  - [ ] T5. NeRF decoder + density sweep: the per-point MLP after
+  - [X] T5. NeRF decoder + density sweep: the per-point MLP after
         TNNetTriplaneSample (pointwise convs, SiLU, density bias/activation,
         RGB sigmoid), queried over the marching grid in chunks so
         N * 3 * Cp < 2^31 and RAM stays under the 2 GB cap; MarchingCubes on
         the density, then a second query at the vertices for colours.
+        Landed: `TTripoSRConfig` gained DecoderNeurons (64),
+        DecoderHiddenLayers (9), DensityBias (-1.0) and Radius (0.87);
+        `AddTripoSRDecoder` / `BuildTripoSRDecoder(Config, PointsPerChunk)`
+        (input 0 = triplane, input 1 = (N, 1, 3) points; TNNetTriplaneSample
+        zero padding, align_corners false; DecoderHiddenLayers x
+        (TNNetPointwiseConvLinear + TNNetSiLU), a 4-wide head, then
+        exp(density + DensityBias) and sigmoid(rgb) concatenated to (N, 1, 4));
+        `LoadTripoSRDecoder` (decoder.layers.{0, 2, ..., 18}.weight / .bias,
+        ASSUMED from NeRFMLP's nn.Sequential with activations at odd indices,
+        not checked against model.ckpt); `TripoSRDensityGrid` (R^3 grid over
+        [-Radius, Radius]^3, grid point (X, Y, D) = world (x, y, z), one
+        chunk per forward on the same net, no per-chunk allocation),
+        `TripoSRColorVertices` and `TripoSRExtractMesh` (MarchingCubes at the
+        density_act threshold, 25.0 by default, with world Origin/Spacing).
+        csTripoSRDefaultChunkPoints = 16384 measured at ~0.25 GB peak RSS
+        for the full-size decoder (plain -O2 build, ~61 us/point on one core,
+        so a 256^3 sweep is ~17 min on CPU: the OpenCL forward or threading
+        is the next lever). Tests: TestTripoSRDecoderPicoShapes,
+        TestTripoSRDecoderLoadHandParity (synthetic checkpoint, MLP + exp
+        bias + sigmoid recomputed by hand), TestTripoSRDensitySweepSphere
+        (triplane planes encode (x-cx)^2, (z-cz)^2, (y-cy)^2 of an off-centre
+        sphere; chunked (1000, partial last chunk) and single-chunk sweeps
+        give bit-identical density and colours; closed oriented mesh, Euler
+        2, positive volume, vertices within 0.01 of r0, bounding box pins the
+        axis order, colours match the analytic sigmoid). Open: torchmcubes
+        face winding not compared (ours is CCW seen from the low-density
+        side); no real-checkpoint parity (T3 + oracle).
   - [ ] T6. examples/ImageTo3D (+ README, examples/README.md row): background
         removal via the BiRefNet path, grey composite, centred 512 px resize,
         --mc-resolution / --threshold / --no-remove-bg / --gpu, mesh out as
-        PLY and OBJ.
+        PLY and OBJ. Wiring: BuildTripoSRBackbone -> its triplane output is
+        the Triplane argument of TripoSRExtractMesh on a separate
+        BuildTripoSRDecoder net (no single BuildTripoSR wrapper yet; the
+        sweep must not rerun the backbone per chunk). RAM blocker from T4:
+        the shared SD block's attn1 (TNNet.AddMultiHeadSelfAttention) and
+        attn2 (per-head TNNetCrossAttention) keep one score matrix per head
+        (3072 x 3072 self ~9.6 GB + 3072 x 1025 cross ~3.2 GB over 16
+        blocks). Self-attention can move to ONE TNNetFusedSDPA through
+        TNNet.AddGQAAttentionFromSources (non-causal, NeuralAllowFusedAttention;
+        check its full forward does not keep the score matrix); that helper
+        needs Q/K/V on the same sequence grid, so cross-attention (K/V length
+        1025) needs either a fused cross path or host-output liveness sharing
+        (TNNet.ShareHostOutputsByLiveness) to reuse the per-block score
+        buffers. Without one of these the full-size forward exceeds the cap.
 - [ ] LivePortrait portrait animation importer + examples/PortraitAnimation
       (BuildLivePortraitFromCheckpoint[Ex], KwaiVGI/LivePortrait, MIT; the five
       `liveportrait/base_models/*.pth` + `retargeting_models/
