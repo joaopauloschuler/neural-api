@@ -1967,6 +1967,40 @@ rather than acted on.
       the reference `vggt` package — needs a NEW Python oracle script in tools/,
       so ask the user before writing it; the PLY writer and pose-encoding
       conversion can be tested by hand-derived cases without it.
+- [ ] TripoSR single-image-to-3D importer + examples/ImageTo3D
+      (BuildTripoSRFromCheckpoint[Ex], stabilityai/TripoSR, MIT; weights ship as
+      model.ckpt (torch pickle), so load them through `TNNetTorchBinReader`
+      (neural/neuraltorchbin.pas) and read config.yaml for the sizes). Input: one
+      photo of an object. Output: a vertex-coloured triangle mesh in about one
+      forward pass plus a marching-cubes sweep. Nothing in the tree turns an image
+      into a mesh today. Pipeline and reuse: (1) foreground cut + centred resize to
+      512px through the existing BiRefNet/RMBG path of examples/BackgroundRemoval,
+      composited on grey as TripoSR expects; (2) image tokenizer =
+      facebook/dino-vitb16 (DINO v1 ViT-B/16; try BuildViTFromSafeTensors first and
+      check whether the checkpoint's config enables the adaLN camera
+      modulation); (3) backbone "Transformer1D": learned triplane tokens
+      (3 x 32 x 32, 1024 wide), GroupNorm + proj_in, 16 blocks of self-attention
+      + cross-attention to the image tokens + GEGLU FFN (the same
+      BasicTransformerBlock shape as AddSDTransformer2D, so factor out a shared
+      helper rather than copy it), proj_out; (4) post-processor ConvTranspose2d
+      2x2 stride 2 (1024 -> 40 channels, 64 x 64 planes); (5) NeRF decoder MLP
+      (concatenated 3 x 40 features, SiLU, density + RGB heads with TripoSR's
+      density bias/activation). New code: a triplane query layer that projects
+      N 3-D points onto the XY/XZ/YZ planes and bilinearly samples them (build on
+      TNNetGridSample, OpenCL forward from day one, since the 256^3 marching
+      grid is 16.7M queries); a reusable marching-cubes routine
+      (density volume + iso level -> vertices/faces, standard 256-entry edge and
+      triangle tables); mesh export, by adding list-property (face) support to
+      `TNNetPLYWriter` and/or a small OBJ writer, with vertex colours from a
+      second decoder query at the vertices. Optional: render N orbit views with
+      the triplane NeRF renderer to a GIF through the existing GIF writer.
+      Tests: marching cubes on an analytic sphere (vertex count, every vertex
+      on the iso surface within tolerance, closed mesh); triplane sampling
+      against hand-derived bilinear cases; pico-fixture parity of
+      tokenizer -> backbone -> decoder against the reference `tsr` package needs
+      a NEW Python oracle script in tools/, so ask the user before writing it.
+      examples/ImageTo3D/README.md documents the download, flags
+      (--mc-resolution, --threshold, --no-remove-bg, --gpu) and RAM needs.
 - [ ] 3D Gaussian Splatting viewer follow-ups (arXiv:2308.04079). Landed:
       neural/neuralply.pas (`TNNetPLYReader` / `TNNetPLYWriter`),
       neural/neuralgaussiansplat.pas (`TGaussianSplatScene`,
