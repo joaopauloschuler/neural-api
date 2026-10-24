@@ -7,7 +7,7 @@ interface
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralnetwork, neuralvolume, neuralabfun, neuraldecode, neuralthread,
-  neuralpretrained, neuralaudio
+  neuralpretrained, neuralaudio, neuralsafetensors
   {$IFDEF OpenCL}
   , cl, ctypes, neuralopencl
   {$ENDIF}
@@ -447,7 +447,7 @@ type
     procedure TestDeformableConvOpenCLParity;
     // TNNetDeformableConv external offsets/mask (torchvision deform_conv2d form)
     procedure TestDeformableConvExternalOffsetOrder;
-    procedure TestDeformableConvExternalReferenceParity;
+    procedure TestDeformableConvExternalTorchvisionParity;
     procedure TestDeformableConvExternalGradientsOneGroup;
     procedure TestDeformableConvExternalGradientsOneGroupMask;
     procedure TestDeformableConvExternalGradientsTwoGroups;
@@ -71204,47 +71204,6 @@ begin
     for i := 0 to Mask.Size - 1 do Mask.Raw[i] := 0.3 + 0.5 * Cos(i * 0.41);
 end;
 
-// torchvision deform_conv2d CPU kernel transcribed for the test: weight
-// W[co,ci,i,j] is our neuron-0 entry ((i*3+j)*InD+ci)*OutD+co.
-function TorchvisionDeformConvReference(Img, Off, Mask: TNNetVolume;
-  DC: TNNetDeformableConv; Stride, Groups: integer; ox, oy, co: integer): double;
-var
-  ci, i, j, g, k, InD, OutD, ImgH, ImgW, hLow, wLow, hHigh, wHigh: integer;
-  hPos, wPos, lh, lw, v1, v2, v3, v4, Val, MaskVal: double;
-begin
-  InD := Img.Depth; OutD := DC.OutDepth; ImgH := Img.SizeY; ImgW := Img.SizeX;
-  Result := DC.Neurons[1].Weights.Raw[co];
-  for ci := 0 to InD - 1 do
-  begin
-    g := ci div (InD div Groups);
-    for i := 0 to 2 do
-    for j := 0 to 2 do
-    begin
-      k := i * 3 + j;
-      hPos := oy * Stride - 1 + i + Off.Get(ox, oy, g * 18 + 2 * k);
-      wPos := ox * Stride - 1 + j + Off.Get(ox, oy, g * 18 + 2 * k + 1);
-      if Assigned(Mask) then MaskVal := Mask.Get(ox, oy, g * 9 + k)
-      else MaskVal := 1;
-      Val := 0;
-      if not ((hPos <= -1) or (hPos >= ImgH) or (wPos <= -1) or (wPos >= ImgW)) then
-      begin
-        hLow := Floor(hPos); wLow := Floor(wPos);
-        hHigh := hLow + 1; wHigh := wLow + 1;
-        lh := hPos - hLow; lw := wPos - wLow;
-        v1 := 0; v2 := 0; v3 := 0; v4 := 0;
-        if (hLow >= 0) and (wLow >= 0) then v1 := Img.Get(wLow, hLow, ci);
-        if (hLow >= 0) and (wHigh <= ImgW - 1) then v2 := Img.Get(wHigh, hLow, ci);
-        if (hHigh <= ImgH - 1) and (wLow >= 0) then v3 := Img.Get(wLow, hHigh, ci);
-        if (hHigh <= ImgH - 1) and (wHigh <= ImgW - 1) then v4 := Img.Get(wHigh, hHigh, ci);
-        Val := (1 - lh) * (1 - lw) * v1 + (1 - lh) * lw * v2 +
-          lh * (1 - lw) * v3 + lh * lw * v4;
-      end;
-      Result := Result + DC.Neurons[0].Weights.Raw[(k * InD + ci) * OutD + co] *
-        MaskVal * Val;
-    end;
-  end;
-end;
-
 procedure TTestNeuralNumerical.TestDeformableConvExternalOffsetOrder;
 var
   NN: TNNet;
@@ -71285,52 +71244,71 @@ begin
   end;
 end;
 
-procedure TTestNeuralNumerical.TestDeformableConvExternalReferenceParity;
+// tests/fixtures/deform_conv2d_tiny.safetensors (tools/deform_conv2d_tiny_
+// fixture.py): torchvision.ops.deform_conv2d outputs, all tensors in CAI order.
+procedure TTestNeuralNumerical.TestDeformableConvExternalTorchvisionParity;
 var
   NN: TNNet;
   ImgIn, OffIn, MaskIn: TNNetLayer;
   DC: TNNetDeformableConv;
-  Stride, UseMaskInt, ox, oy, co, i: integer;
-  MaskVol: TNNetVolume;
-  Diff, MaxDiff: double;
-begin
-  // 7x6x4 input, 6 features, 3x3, padding 1, 2 offset groups, stride 1 and 2,
-  // with and without mask, against the transcribed torchvision kernel.
-  for Stride := 1 to 2 do
-  for UseMaskInt := 0 to 1 do
+  Reader: TNNetSafeTensorsReader;
+  Loaded: TNNetVolume;
+  FixtureFile, Tag, OutName: string;
+  Stride, UseMaskInt: integer;
+  MaxDiff: TNeuralFloat;
+
+  // Copies the flat fixture tensor into Dest, whose raw order it already has.
+  procedure LoadInto(const AName: string; Dest: TNNetVolume);
   begin
-    RandSeed := 424242;
-    NN := TNNet.Create();
-    try
-      DC := BuildExternalDeformableNet(NN, 7, 6, 4, 6, Stride, 2,
-        UseMaskInt = 1, ImgIn, OffIn, MaskIn);
-      for i := 0 to DC.Neurons[1].Weights.Size - 1 do
-        DC.Neurons[1].Weights.Raw[i] := 0.1 * i - 0.2;
-      if Assigned(MaskIn) then MaskVol := MaskIn.Output else MaskVol := nil;
-      FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskVol);
-      // Spread the offsets wider so taps also land fully outside the image.
-      for i := 0 to OffIn.Output.Size - 1 do
-        OffIn.Output.Raw[i] := 2.2 * Sin(i * 1.37);
-      NN.Compute(ImgIn.Output);
-      AssertEquals('output SizeX', (7 + 2 - 3) div Stride + 1, DC.Output.SizeX);
-      AssertEquals('output SizeY', (6 + 2 - 3) div Stride + 1, DC.Output.SizeY);
-      MaxDiff := 0;
-      for oy := 0 to DC.Output.SizeY - 1 do
-      for ox := 0 to DC.Output.SizeX - 1 do
-      for co := 0 to 5 do
-      begin
-        Diff := Abs(DC.Output.Get(ox, oy, co) - TorchvisionDeformConvReference(
-          ImgIn.Output, OffIn.Output, MaskVol, DC, Stride, 2, ox, oy, co));
-        if Diff > MaxDiff then MaxDiff := Diff;
+    Reader.LoadTensorFlat(AName, Loaded);
+    AssertEquals(AName + ' element count', Dest.Size, Loaded.Size);
+    Move(Loaded.FData[0], Dest.FData[0], Dest.Size * csNeuralFloatSize);
+  end;
+
+begin
+  FixtureFile := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim +
+    'deform_conv2d_tiny.safetensors';
+  AssertTrue('fixture missing: ' + FixtureFile +
+    ' (run tools/deform_conv2d_tiny_fixture.py)', FileExists(FixtureFile));
+  Reader := TNNetSafeTensorsReader.Create(FixtureFile);
+  Loaded := TNNetVolume.Create();
+  try
+    // 7x6x4 input, 6 features, 3x3, padding 1, 2 offset groups.
+    for Stride := 1 to 2 do
+    for UseMaskInt := 0 to 1 do
+    begin
+      NN := TNNet.Create();
+      try
+        DC := BuildExternalDeformableNet(NN, 7, 6, 4, 6, Stride, 2,
+          UseMaskInt = 1, ImgIn, OffIn, MaskIn);
+        Tag := 's' + IntToStr(Stride) + '.';
+        LoadInto('input', ImgIn.Output);
+        LoadInto('weight', DC.Neurons[0].Weights);
+        LoadInto('bias', DC.Neurons[1].Weights);
+        LoadInto(Tag + 'offset', OffIn.Output);
+        if UseMaskInt = 1 then
+        begin
+          LoadInto(Tag + 'mask', MaskIn.Output);
+          OutName := Tag + 'out_mask';
+        end
+        else
+          OutName := Tag + 'out_nomask';
+        NN.Compute(ImgIn.Output);
+        Reader.LoadTensorFlat(OutName, Loaded);
+        AssertEquals(OutName + ' element count', DC.Output.Size, Loaded.Size);
+        Loaded.Sub(DC.Output);
+        MaxDiff := Loaded.GetMaxAbs();
+        WriteLn('  DeformableConv vs torchvision deform_conv2d ', OutName,
+          ' max-abs-diff: ', MaxDiff:0:9);
+        AssertTrue('DeformableConv vs torchvision ' + OutName + ': max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+      finally
+        NN.Free;
       end;
-      WriteLn('  DeformableConv external parity stride=', Stride, ' mask=',
-        UseMaskInt, ' max-abs-diff: ', MaxDiff:0:9);
-      AssertTrue('external deformable conv vs torchvision reference, stride=' +
-        IntToStr(Stride) + ' mask=' + IntToStr(UseMaskInt) + ' max |diff| = ' +
-        FloatToStr(MaxDiff), MaxDiff < 1e-5);
-    finally
-      NN.Free;
     end;
+  finally
+    Loaded.Free;
+    Reader.Free;
   end;
 end;
 
