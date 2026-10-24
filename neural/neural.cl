@@ -7314,3 +7314,260 @@ __kernel void cai_moe_build_slot_map
   }
   FSlotCount[t] = slot;
 } // end of kernel
+
+// 3D Gaussian Splatting (TGaussianSplatRasterizerCL). CAI_GAUSSIAN_SPLAT_TILE
+// must equal GaussianSplatTileSize in neuralgaussiansplat.pas.
+#define CAI_GAUSSIAN_SPLAT_TILE 16
+#define CAI_GAUSSIAN_SPLAT_BATCH (CAI_GAUSSIAN_SPLAT_TILE * CAI_GAUSSIAN_SPLAT_TILE)
+
+static inline int cai_gaussian_splat_clamp_tile(const float FCoordinate, const int FTileCount)
+{
+  // Clamped in float before the conversion: a vectorized kernel may convert
+  // the coordinates of culled Gaussians too, and out-of-range ones trap.
+  return (int)fmax(0.0f, fmin(FCoordinate, (float)FTileCount));
+}
+
+// TGaussianSplatRasterizer.Preprocess, one work-item per Gaussian: view-space
+// mean, 2D conic (J W Sigma W^T J^T + 0.3 I inverted), 3-sigma radius, SH colour
+// and tile rect. FCamera: WorldToView[12], FocalX, FocalY, PrincipalX,
+// PrincipalY, camera centre xyz, near plane. FRadii[g] = 0 marks a culled one.
+__kernel void cai_gaussian_splat_preprocess
+(
+  const int FGaussianCount,
+  const int FSHDegree,
+  const int FSHCoefCount,
+  const int FWidth,
+  const int FHeight,
+  const int FTileCountX,
+  const int FTileCountY,
+  __global const float* FCamera,
+  __global const float* FPositions,
+  __global const float* FScales,
+  __global const float* FRotations,
+  __global const float* FOpacities,
+  __global const float* FSHCoefs,
+  __global float* FMeansImage,
+  __global float* FDepths,
+  __global int* FRadii,
+  __global float* FConicOpacity,
+  __global float* FColors,
+  __global int* FTileRects
+)
+{
+  const int g = get_global_id(0);
+  if (g >= FGaussianCount) return;
+  FRadii[g] = 0;
+  const float px = FPositions[3 * g];
+  const float py = FPositions[3 * g + 1];
+  const float pz = FPositions[3 * g + 2];
+  const float viewX = FCamera[0] * px + FCamera[1] * py + FCamera[2] * pz + FCamera[3];
+  const float viewY = FCamera[4] * px + FCamera[5] * py + FCamera[6] * pz + FCamera[7];
+  const float viewZ = FCamera[8] * px + FCamera[9] * py + FCamera[10] * pz + FCamera[11];
+  if (viewZ <= FCamera[19]) return;
+  const float focalX = FCamera[12];
+  const float focalY = FCamera[13];
+  const float invZ = 1.0f / viewZ;
+  const float limitX = 1.3f * (float)FWidth / (2.0f * focalX);
+  const float limitY = 1.3f * (float)FHeight / (2.0f * focalY);
+  const float clampedX = fmin(limitX, fmax(-limitX, viewX * invZ)) * viewZ;
+  const float clampedY = fmin(limitY, fmax(-limitY, viewY * invZ)) * viewZ;
+  const float j00 = focalX * invZ;
+  const float j02 = -focalX * clampedX * invZ * invZ;
+  const float j11 = focalY * invZ;
+  const float j12 = -focalY * clampedY * invZ * invZ;
+  const float a0 = j00 * FCamera[0] + j02 * FCamera[8];
+  const float a1 = j00 * FCamera[1] + j02 * FCamera[9];
+  const float a2 = j00 * FCamera[2] + j02 * FCamera[10];
+  const float b0 = j11 * FCamera[4] + j12 * FCamera[8];
+  const float b1 = j11 * FCamera[5] + j12 * FCamera[9];
+  const float b2 = j11 * FCamera[6] + j12 * FCamera[10];
+  const float qw = FRotations[4 * g];
+  const float qx = FRotations[4 * g + 1];
+  const float qy = FRotations[4 * g + 2];
+  const float qz = FRotations[4 * g + 3];
+  const float r00 = 1.0f - 2.0f * (qy * qy + qz * qz), r01 = 2.0f * (qx * qy - qw * qz), r02 = 2.0f * (qx * qz + qw * qy);
+  const float r10 = 2.0f * (qx * qy + qw * qz), r11 = 1.0f - 2.0f * (qx * qx + qz * qz), r12 = 2.0f * (qy * qz - qw * qx);
+  const float r20 = 2.0f * (qx * qz - qw * qy), r21 = 2.0f * (qy * qz + qw * qx), r22 = 1.0f - 2.0f * (qx * qx + qy * qy);
+  const float varX = FScales[3 * g] * FScales[3 * g];
+  const float varY = FScales[3 * g + 1] * FScales[3 * g + 1];
+  const float varZ = FScales[3 * g + 2] * FScales[3 * g + 2];
+  const float c0 = r00 * r00 * varX + r01 * r01 * varY + r02 * r02 * varZ;
+  const float c1 = r00 * r10 * varX + r01 * r11 * varY + r02 * r12 * varZ;
+  const float c2 = r00 * r20 * varX + r01 * r21 * varY + r02 * r22 * varZ;
+  const float c3 = r10 * r10 * varX + r11 * r11 * varY + r12 * r12 * varZ;
+  const float c4 = r10 * r20 * varX + r11 * r21 * varY + r12 * r22 * varZ;
+  const float c5 = r20 * r20 * varX + r21 * r21 * varY + r22 * r22 * varZ;
+  const float sa0 = c0 * a0 + c1 * a1 + c2 * a2;
+  const float sa1 = c1 * a0 + c3 * a1 + c4 * a2;
+  const float sa2 = c2 * a0 + c4 * a1 + c5 * a2;
+  const float covA = a0 * sa0 + a1 * sa1 + a2 * sa2 + 0.3f;
+  const float covB = b0 * sa0 + b1 * sa1 + b2 * sa2;
+  const float covC = b0 * (c0 * b0 + c1 * b1 + c2 * b2) +
+    b1 * (c1 * b0 + c3 * b1 + c4 * b2) + b2 * (c2 * b0 + c4 * b1 + c5 * b2) + 0.3f;
+  const float det = covA * covC - covB * covB;
+  if (det <= 0.0f) return;
+  const float invDet = 1.0f / det;
+  const float midValue = 0.5f * (covA + covC);
+  const float lambda1 = midValue + sqrt(fmax(0.1f, midValue * midValue - det));
+  const int radius = (int)fmin(ceil(3.0f * sqrt(lambda1)), 1e8f);
+  const float meanX = focalX * viewX * invZ + FCamera[14];
+  const float meanY = focalY * viewY * invZ + FCamera[15];
+  const float invTileSize = 1.0f / (float)CAI_GAUSSIAN_SPLAT_TILE;
+  const float tileExtent = (float)(CAI_GAUSSIAN_SPLAT_TILE - 1);
+  const int minTileX = cai_gaussian_splat_clamp_tile((meanX - radius) * invTileSize, FTileCountX);
+  const int minTileY = cai_gaussian_splat_clamp_tile((meanY - radius) * invTileSize, FTileCountY);
+  const int maxTileX = cai_gaussian_splat_clamp_tile((meanX + radius + tileExtent) * invTileSize, FTileCountX);
+  const int maxTileY = cai_gaussian_splat_clamp_tile((meanY + radius + tileExtent) * invTileSize, FTileCountY);
+  if ((maxTileX <= minTileX) || (maxTileY <= minTileY)) return;
+  float basis[16];
+  basis[0] = 0.28209479177387814f;
+  if (FSHDegree > 0)
+  {
+    float dirX = px - FCamera[16];
+    float dirY = py - FCamera[17];
+    float dirZ = pz - FCamera[18];
+    float invLength = dirX * dirX + dirY * dirY + dirZ * dirZ;
+    if (invLength > 0.0f) invLength = 1.0f / sqrt(invLength);
+    dirX *= invLength;
+    dirY *= invLength;
+    dirZ *= invLength;
+    basis[1] = -0.4886025119029199f * dirY;
+    basis[2] = 0.4886025119029199f * dirZ;
+    basis[3] = -0.4886025119029199f * dirX;
+    if (FSHDegree > 1)
+    {
+      const float xx = dirX * dirX, yy = dirY * dirY, zz = dirZ * dirZ;
+      const float xy = dirX * dirY, yz = dirY * dirZ, xz = dirX * dirZ;
+      basis[4] = 1.0925484305920792f * xy;
+      basis[5] = -1.0925484305920792f * yz;
+      basis[6] = 0.31539156525252005f * (2.0f * zz - xx - yy);
+      basis[7] = -1.0925484305920792f * xz;
+      basis[8] = 0.5462742152960396f * (xx - yy);
+      if (FSHDegree > 2)
+      {
+        basis[9] = -0.5900435899266435f * dirY * (3.0f * xx - yy);
+        basis[10] = 2.890611442640554f * xy * dirZ;
+        basis[11] = -0.4570457994644658f * dirY * (4.0f * zz - xx - yy);
+        basis[12] = 0.3731763325901154f * dirZ * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+        basis[13] = -0.4570457994644658f * dirX * (4.0f * zz - xx - yy);
+        basis[14] = 1.445305721320277f * dirZ * (xx - yy);
+        basis[15] = -0.5900435899266435f * dirX * (xx - 3.0f * yy);
+      }
+    }
+  }
+  const int shBase = 3 * FSHCoefCount * g;
+  for (int channel = 0; channel < 3; channel++)
+  {
+    float sum = 0.5f;
+    for (int coef = 0; coef < FSHCoefCount; coef++)
+      sum += basis[coef] * FSHCoefs[shBase + 3 * coef + channel];
+    FColors[3 * g + channel] = fmax(sum, 0.0f);
+  }
+  FRadii[g] = radius;
+  FDepths[g] = viewZ;
+  FMeansImage[2 * g] = meanX;
+  FMeansImage[2 * g + 1] = meanY;
+  FConicOpacity[4 * g] = covC * invDet;
+  FConicOpacity[4 * g + 1] = -covB * invDet;
+  FConicOpacity[4 * g + 2] = covA * invDet;
+  FConicOpacity[4 * g + 3] = FOpacities[g];
+  FTileRects[4 * g] = minTileX;
+  FTileRects[4 * g + 1] = minTileY;
+  FTileRects[4 * g + 2] = maxTileX;
+  FTileRects[4 * g + 3] = maxTileY;
+} // end of kernel
+
+// TGaussianSplatRasterizer.BlendTile with one 16x16 work-group per tile and one
+// work-item per pixel: the tile's depth-sorted list is staged through local
+// memory one batch at a time, and the group stops when every pixel is opaque.
+__kernel void cai_gaussian_splat_blend
+(
+  const int FWidth,
+  const int FHeight,
+  const int FTileCountX,
+  const float FBackgroundRed,
+  const float FBackgroundGreen,
+  const float FBackgroundBlue,
+  __global const int* FTileRanges,
+  __global const int* FTileGaussianList,
+  __global const float* FMeansImage,
+  __global const float* FConicOpacity,
+  __global const float* FColors,
+  __global float* FOutput
+)
+{
+  __local float stagedMean[2 * CAI_GAUSSIAN_SPLAT_BATCH];
+  __local float stagedConic[4 * CAI_GAUSSIAN_SPLAT_BATCH];
+  __local float stagedColor[3 * CAI_GAUSSIAN_SPLAT_BATCH];
+  __local int doneCount;
+  const int localX = get_local_id(0);
+  const int localY = get_local_id(1);
+  const int lid = localY * CAI_GAUSSIAN_SPLAT_TILE + localX;
+  const int pixelX = get_group_id(0) * CAI_GAUSSIAN_SPLAT_TILE + localX;
+  const int pixelY = get_group_id(1) * CAI_GAUSSIAN_SPLAT_TILE + localY;
+  const int tile = get_group_id(1) * FTileCountX + get_group_id(0);
+  const int firstListPos = FTileRanges[2 * tile];
+  const int endListPos = FTileRanges[2 * tile + 1];
+  const int inside = (pixelX < FWidth) && (pixelY < FHeight);
+  int done = !inside;
+  if (lid == 0) doneCount = 0;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (done) atomic_inc(&doneCount);
+  float transmittance = 1.0f;
+  float sumRed = 0.0f, sumGreen = 0.0f, sumBlue = 0.0f;
+  for (int batchStart = firstListPos; batchStart < endListPos; batchStart += CAI_GAUSSIAN_SPLAT_BATCH)
+  {
+    // doneCount only changes after the staging barrier below, so every
+    // work-item reads the same value here and the break is uniform.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (doneCount == CAI_GAUSSIAN_SPLAT_BATCH) break;
+    const int fetchPos = batchStart + lid;
+    if (fetchPos < endListPos)
+    {
+      const int g = FTileGaussianList[fetchPos];
+      stagedMean[2 * lid] = FMeansImage[2 * g];
+      stagedMean[2 * lid + 1] = FMeansImage[2 * g + 1];
+      stagedConic[4 * lid] = FConicOpacity[4 * g];
+      stagedConic[4 * lid + 1] = FConicOpacity[4 * g + 1];
+      stagedConic[4 * lid + 2] = FConicOpacity[4 * g + 2];
+      stagedConic[4 * lid + 3] = FConicOpacity[4 * g + 3];
+      stagedColor[3 * lid] = FColors[3 * g];
+      stagedColor[3 * lid + 1] = FColors[3 * g + 1];
+      stagedColor[3 * lid + 2] = FColors[3 * g + 2];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (!done)
+    {
+      const int batchCount = min(CAI_GAUSSIAN_SPLAT_BATCH, endListPos - batchStart);
+      for (int j = 0; j < batchCount; j++)
+      {
+        const float deltaX = stagedMean[2 * j] - (float)pixelX;
+        const float deltaY = stagedMean[2 * j + 1] - (float)pixelY;
+        const float power = -0.5f * (stagedConic[4 * j] * deltaX * deltaX +
+          stagedConic[4 * j + 2] * deltaY * deltaY) - stagedConic[4 * j + 1] * deltaX * deltaY;
+        if (power > 0.0f) continue;
+        const float alpha = fmin(0.99f, stagedConic[4 * j + 3] * cai_exp_floored(power));
+        if (alpha < 1.0f / 255.0f) continue;
+        const float nextTransmittance = transmittance * (1.0f - alpha);
+        if (nextTransmittance < 0.0001f)
+        {
+          done = 1;
+          atomic_inc(&doneCount);
+          break;
+        }
+        const float weight = alpha * transmittance;
+        sumRed += stagedColor[3 * j] * weight;
+        sumGreen += stagedColor[3 * j + 1] * weight;
+        sumBlue += stagedColor[3 * j + 2] * weight;
+        transmittance = nextTransmittance;
+      }
+    }
+  }
+  if (inside)
+  {
+    const int outputPos = (pixelY * FWidth + pixelX) * 3;
+    FOutput[outputPos] = sumRed + transmittance * FBackgroundRed;
+    FOutput[outputPos + 1] = sumGreen + transmittance * FBackgroundGreen;
+    FOutput[outputPos + 2] = sumBlue + transmittance * FBackgroundBlue;
+  }
+} // end of kernel

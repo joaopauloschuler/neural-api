@@ -12,7 +12,8 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry,
-  neuralvolume, neuralply, neuralgaussiansplat;
+  neuralvolume, neuralply, neuralgaussiansplat
+  {$IFDEF OpenCL}, cl, neuralopencl{$ENDIF};
 
 type
   TTestNeuralGaussianSplat = class(TTestCase)
@@ -32,6 +33,9 @@ type
     // A quaternion turns an x-elongated Gaussian onto y and onto the diagonal.
     procedure TestQuaternionRotatedAnisotropicGaussian;
     procedure TestLookAtCamera;
+    // TGaussianSplatRasterizerCL matches the CPU rasterizer on a random degree-3
+    // scene from two cameras, and renders an empty scene as background.
+    procedure TestOpenCLMatchesCPU;
   end;
 
 implementation
@@ -409,6 +413,91 @@ begin
   GetGaussianSplatCameraPosition(Camera, X, Y, Z);
   AssertEquals('camera x', 5, X, 1e-6);
 end;
+
+
+procedure TTestNeuralGaussianSplat.TestOpenCLMatchesCPU;
+{$IFDEF OpenCL}
+const
+  ImageTolerance = 1e-4;
+  Eyes: array[0..1, 0..2] of TNeuralFloat = ((0, 0, -4), (3, -1, -2.5));
+var
+  Devices: TEasyOpenCL;
+  PlatformPos, DevicePos, EyePos, GaussianPos, MaxGaussianPos, RadiusMismatches: integer;
+  ValuePos, MaxValuePos: integer;
+  OpenCLProblem: string;
+  Scene, EmptyScene: TGaussianSplatScene;
+  RasterizerCPU: TGaussianSplatRasterizer;
+  RasterizerCL: TGaussianSplatRasterizerCL;
+  Camera: TGaussianSplatCamera;
+  OutputCPU, OutputCL: TNNetVolume;
+  MaxDiff: TNeuralFloat;
+begin
+  Devices := TEasyOpenCL.Create();
+  PlatformPos := 0;
+  DevicePos := 0;
+  RasterizerCL := nil;
+  Scene := TGaussianSplatScene.Create;
+  EmptyScene := TGaussianSplatScene.Create;
+  RasterizerCPU := TGaussianSplatRasterizer.Create;
+  OutputCPU := TNNetVolume.Create;
+  OutputCL := TNNetVolume.Create;
+  try
+    if not Devices.SelectPlatformAndDevice(PlatformPos, DevicePos, OpenCLProblem) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RasterizerCL := TGaussianSplatRasterizerCL.Create(Devices.PlatformIds[PlatformPos],
+      Devices.Devices[DevicePos]);
+    RandSeed := 20231023;
+    Scene.FillRandom(400, 3, 1);
+    // 70 x 45 leaves partial tiles on the right and bottom edges.
+    InitGaussianSplatCamera(Camera, 70, 45, Pi / 3);
+    for EyePos := 0 to High(Eyes) do
+    begin
+      SetGaussianSplatCameraLookAt(Camera, Eyes[EyePos, 0], Eyes[EyePos, 1],
+        Eyes[EyePos, 2], 0, 0, 0, 0, -1, 0);
+      RasterizerCPU.Render(Scene, Camera, 0.1, 0.2, 0.3, OutputCPU);
+      RasterizerCL.Render(Scene, Camera, 0.1, 0.2, 0.3, OutputCL);
+      AssertTrue('some Gaussians visible', RasterizerCPU.VisibleCount > 100);
+      AssertEquals('visible count', RasterizerCPU.VisibleCount, RasterizerCL.VisibleCount);
+      RadiusMismatches := 0;
+      MaxGaussianPos := Scene.Count - 1;
+      for GaussianPos := 0 to MaxGaussianPos do
+      begin
+        if RasterizerCPU.Radii[GaussianPos] <> RasterizerCL.Radii[GaussianPos] then
+          Inc(RadiusMismatches)
+        else if RasterizerCPU.Radii[GaussianPos] > 0 then
+          AssertEquals('depth', RasterizerCPU.Depths[GaussianPos],
+            RasterizerCL.Depths[GaussianPos], 1e-5);
+      end;
+      AssertEquals('radius mismatches', 0, RadiusMismatches);
+      AssertEquals('output size', OutputCPU.Size, OutputCL.Size);
+      MaxDiff := 0;
+      MaxValuePos := OutputCPU.Size - 1;
+      for ValuePos := 0 to MaxValuePos do
+        MaxDiff := Max(MaxDiff, Abs(OutputCPU.FData[ValuePos] - OutputCL.FData[ValuePos]));
+      AssertTrue('max |CPU - OpenCL| = ' + FloatToStr(MaxDiff), MaxDiff < ImageTolerance);
+    end;
+    EmptyScene.Resize(0, 0);
+    RasterizerCL.Render(EmptyScene, Camera, 0.1, 0.2, 0.3, OutputCL);
+    AssertEquals('empty scene red', 0.1, OutputCL.FData[OutputCL.GetRawPos(69, 44, 0)], 1e-7);
+    AssertEquals('empty scene blue', 0.3, OutputCL.FData[OutputCL.GetRawPos(0, 0, 2)], 1e-7);
+  finally
+    OutputCL.Free;
+    OutputCPU.Free;
+    RasterizerCL.Free;
+    RasterizerCPU.Free;
+    EmptyScene.Free;
+    Scene.Free;
+    Devices.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 initialization
   RegisterTest(TTestNeuralGaussianSplat);

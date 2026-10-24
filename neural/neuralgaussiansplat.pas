@@ -6,10 +6,9 @@ unit neuralgaussiansplat;
 
   3D Gaussian Splatting viewer (Kerbl et al., SIGGRAPH 2023, arXiv:2308.04079):
   TGaussianSplatScene loads the INRIA point_cloud.ply layout and
-  TGaussianSplatRasterizer renders it with the reference tile rasterizer.
-  The rasterizer keeps its preprocess and tile-binning results in flat public
-  arrays so an OpenCL blend can upload them as they are.
-  Coded by Claude (AI).
+  TGaussianSplatRasterizer renders it with the reference tile rasterizer and
+  TGaussianSplatRasterizerCL (-dOpenCL) runs its preprocess and blend in
+  OpenCL kernels. Coded by Claude (AI).
 }
 
 {$mode objfpc}{$H+}
@@ -17,7 +16,8 @@ unit neuralgaussiansplat;
 interface
 
 uses
-  Classes, SysUtils, Math, neuralvolume, neuralply;
+  Classes, SysUtils, Math, neuralvolume, neuralply
+  {$IFDEF OpenCL}, cl, ctypes, neuralopencl{$ENDIF};
 
 const
   GaussianSplatTileSize = 16;
@@ -58,6 +58,9 @@ type
     // Sets activated values; the DC coefficients make the degree-0 colour RGB.
     procedure SetGaussian(Index: integer; X, Y, Z, ScaleX, ScaleY, ScaleZ,
       RotW, RotX, RotY, RotZ, Opacity, Red, Green, Blue: TNeuralFloat);
+    // Random Gaussians inside the cube [-Extent, Extent]^3 from the global
+    // Random generator (set RandSeed first for a repeatable scene).
+    procedure FillRandom(pCount, pSHDegree: integer; Extent: TNeuralFloat);
     procedure LoadFromPLY(const FileName: string);
     procedure LoadFromStream(Stream: TStream);
     // Writes the INRIA layout (raw logit opacity, log scale), all float32.
@@ -75,6 +78,9 @@ type
   TGaussianSplatRasterizer = class
   private
     FWidth, FHeight: integer;
+  protected
+    // Sets the image size, tile counts and Gaussian count of the next frame.
+    procedure PrepareFrame(pGaussianCount: integer; const Camera: TGaussianSplatCamera);
   public
     GaussianCount: integer;
     VisibleCount: integer;
@@ -89,18 +95,50 @@ type
     VisibleOrder: TNeuralIntegerArray;       // visible Gaussians, nearest first
     TileRanges: TNeuralIntegerArray;
     TileGaussianList: TNeuralIntegerArray;
-    procedure Preprocess(Scene: TGaussianSplatScene; const Camera: TGaussianSplatCamera);
+    procedure Preprocess(Scene: TGaussianSplatScene; const Camera: TGaussianSplatCamera); virtual;
     procedure BinTiles;
     procedure BlendTile(TileIndex: integer; BackgroundRed, BackgroundGreen,
       BackgroundBlue: TNeuralFloat; Output: TNNetVolume);
     // Resizes Output to (Width, Height, 3) and blends every tile.
     procedure Blend(BackgroundRed, BackgroundGreen, BackgroundBlue: TNeuralFloat;
-      Output: TNNetVolume);
+      Output: TNNetVolume); virtual;
     procedure Render(Scene: TGaussianSplatScene; const Camera: TGaussianSplatCamera;
       BackgroundRed, BackgroundGreen, BackgroundBlue: TNeuralFloat; Output: TNNetVolume);
     property Width: integer read FWidth;
     property Height: integer read FHeight;
   end;
+
+  {$IFDEF OpenCL}
+  // gsbCamera..gsbTileRects is the argument order of cai_gaussian_splat_preprocess.
+  TGaussianSplatBufferKind = (gsbCamera, gsbPositions, gsbScales, gsbRotations,
+    gsbOpacities, gsbSHCoefs, gsbMeansImage, gsbDepths, gsbRadii,
+    gsbConicOpacity, gsbColors, gsbTileRects, gsbTileRanges,
+    gsbTileGaussianList, gsbOutput);
+
+  // Preprocess and Blend run in OpenCL; BinTiles stays on the host. Only Radii,
+  // Depths and TileRects come back: MeansImage, ConicOpacity, Colors stay in OpenCL.
+  TGaussianSplatRasterizerCL = class(TGaussianSplatRasterizer)
+  private
+    FPreprocessKernel, FBlendKernel: TNeuralKernel;
+    FUploadedScene: TGaussianSplatScene;
+    FSHDegree, FSHCoefCount: integer;
+    FCameraParams: array[0..19] of TNeuralFloat;
+    FBuffers: array[TGaussianSplatBufferKind] of cl_mem;
+    FBufferBytes: array[TGaussianSplatBufferKind] of csize_t;
+    function EnsureBuffer(Kind: TGaussianSplatBufferKind; Bytes: csize_t): cl_mem;
+    procedure Upload(Kind: TGaussianSplatBufferKind; Bytes: csize_t; Source: Pointer;
+      Blocking: cl_bool);
+  public
+    constructor Create(pPlatform: cl_platform_id; pDevice: cl_device_id);
+    destructor Destroy; override;
+    // Copies the scene to OpenCL memory; Preprocess calls it for a new Scene
+    // object, the caller calls it again after editing a scene in place.
+    procedure UploadScene(Scene: TGaussianSplatScene);
+    procedure Preprocess(Scene: TGaussianSplatScene; const Camera: TGaussianSplatCamera); override;
+    procedure Blend(BackgroundRed, BackgroundGreen, BackgroundBlue: TNeuralFloat;
+      Output: TNNetVolume); override;
+  end;
+  {$ENDIF}
 
   // Identity view, square pixels from the horizontal field of view, centred principal point.
   procedure InitGaussianSplatCamera(out Camera: TGaussianSplatCamera;
@@ -237,6 +275,29 @@ begin
   SHCoefs[SHBase] := (Red - 0.5) / GaussianSplatSHC0;
   SHCoefs[SHBase + 1] := (Green - 0.5) / GaussianSplatSHC0;
   SHCoefs[SHBase + 2] := (Blue - 0.5) / GaussianSplatSHC0;
+end;
+
+procedure TGaussianSplatScene.FillRandom(pCount, pSHDegree: integer; Extent: TNeuralFloat);
+const
+  RestAmplitude = 0.4;
+var
+  GaussianPos, MaxGaussianPos, SHBase, RestPos, MaxRestPos: integer;
+begin
+  Resize(pCount, pSHDegree);
+  MaxGaussianPos := pCount - 1;
+  MaxRestPos := 3 * SHCoefCount - 1;
+  for GaussianPos := 0 to MaxGaussianPos do
+  begin
+    SetGaussian(GaussianPos,
+      Extent * (2 * Random - 1), Extent * (2 * Random - 1), Extent * (2 * Random - 1),
+      Extent * (0.02 + 0.1 * Random), Extent * (0.02 + 0.1 * Random),
+      Extent * (0.02 + 0.1 * Random),
+      Random + 0.1, 2 * Random - 1, 2 * Random - 1, 2 * Random - 1,
+      0.3 + 0.65 * Random, Random, Random, Random);
+    SHBase := 3 * SHCoefCount * GaussianPos;
+    for RestPos := 3 to MaxRestPos do
+      SHCoefs[SHBase + RestPos] := RestAmplitude * (Random - 0.5);
+  end;
 end;
 
 procedure TGaussianSplatScene.LoadFromPLY(const FileName: string);
@@ -514,6 +575,16 @@ end;
 
 { TGaussianSplatRasterizer }
 
+procedure TGaussianSplatRasterizer.PrepareFrame(pGaussianCount: integer;
+  const Camera: TGaussianSplatCamera);
+begin
+  FWidth := Camera.Width;
+  FHeight := Camera.Height;
+  TileCountX := (FWidth + GaussianSplatTileSize - 1) div GaussianSplatTileSize;
+  TileCountY := (FHeight + GaussianSplatTileSize - 1) div GaussianSplatTileSize;
+  GaussianCount := pGaussianCount;
+end;
+
 procedure TGaussianSplatRasterizer.Preprocess(Scene: TGaussianSplatScene;
   const Camera: TGaussianSplatCamera);
 var
@@ -530,11 +601,7 @@ var
   Cov3D: array[0..5] of TNeuralFloat;
   RGB: array[0..2] of TNeuralFloat;
 begin
-  FWidth := Camera.Width;
-  FHeight := Camera.Height;
-  TileCountX := (FWidth + GaussianSplatTileSize - 1) div GaussianSplatTileSize;
-  TileCountY := (FHeight + GaussianSplatTileSize - 1) div GaussianSplatTileSize;
-  GaussianCount := Scene.Count;
+  PrepareFrame(Scene.Count, Camera);
   EnsureFloatCapacity(MeansImage, 2 * GaussianCount);
   EnsureFloatCapacity(Depths, GaussianCount);
   EnsureIntegerCapacity(Radii, GaussianCount);
@@ -767,5 +834,159 @@ begin
   BinTiles;
   Blend(BackgroundRed, BackgroundGreen, BackgroundBlue, Output);
 end;
+
+{$IFDEF OpenCL}
+{ TGaussianSplatRasterizerCL }
+
+constructor TGaussianSplatRasterizerCL.Create(pPlatform: cl_platform_id;
+  pDevice: cl_device_id);
+var
+  BlendGroupSize: integer;
+begin
+  inherited Create;
+  FPreprocessKernel := TNeuralKernel.Create(pPlatform, pDevice,
+    'cai_gaussian_splat_preprocess', true);
+  FBlendKernel := TNeuralKernel.CreateFromProgram(FPreprocessKernel,
+    'cai_gaussian_splat_blend');
+  BlendGroupSize := FBlendKernel.KernelMaxWorkGroupSize(FBlendKernel.Kernel);
+  if BlendGroupSize < GaussianSplatTileSize * GaussianSplatTileSize then
+    raise Exception.CreateFmt('cai_gaussian_splat_blend needs %d work-items per ' +
+      'work-group; this OpenCL device allows %d',
+      [GaussianSplatTileSize * GaussianSplatTileSize, BlendGroupSize]);
+end;
+
+destructor TGaussianSplatRasterizerCL.Destroy;
+var
+  Kind: TGaussianSplatBufferKind;
+begin
+  for Kind := Low(TGaussianSplatBufferKind) to High(TGaussianSplatBufferKind) do
+    if Assigned(FBuffers[Kind]) then clReleaseMemObject(FBuffers[Kind]);
+  FBlendKernel.Free;
+  FPreprocessKernel.Free;
+  inherited Destroy;
+end;
+
+function TGaussianSplatRasterizerCL.EnsureBuffer(Kind: TGaussianSplatBufferKind;
+  Bytes: csize_t): cl_mem;
+begin
+  // OpenCL rejects 0-byte buffers; an empty scene or tile list binds 4 bytes.
+  Result := FPreprocessKernel.EnsureBuffer(FBuffers[Kind], FBufferBytes[Kind],
+    CL_MEM_READ_WRITE, Max(Bytes, 4));
+end;
+
+procedure TGaussianSplatRasterizerCL.Upload(Kind: TGaussianSplatBufferKind;
+  Bytes: csize_t; Source: Pointer; Blocking: cl_bool);
+begin
+  EnsureBuffer(Kind, Bytes);
+  if Bytes > 0 then FPreprocessKernel.WriteBuffer(FBuffers[Kind], Bytes, Source, Blocking);
+end;
+
+procedure TGaussianSplatRasterizerCL.UploadScene(Scene: TGaussianSplatScene);
+var
+  FloatCount: integer;
+begin
+  FloatCount := Scene.Count;
+  // Blocking: the caller may free or edit the scene arrays right after.
+  Upload(gsbPositions, 3 * FloatCount * csNeuralFloatSize, Pointer(Scene.Positions), CL_TRUE);
+  Upload(gsbScales, 3 * FloatCount * csNeuralFloatSize, Pointer(Scene.Scales), CL_TRUE);
+  Upload(gsbRotations, 4 * FloatCount * csNeuralFloatSize, Pointer(Scene.Rotations), CL_TRUE);
+  Upload(gsbOpacities, FloatCount * csNeuralFloatSize, Pointer(Scene.Opacities), CL_TRUE);
+  Upload(gsbSHCoefs, 3 * Scene.SHCoefCount * FloatCount * csNeuralFloatSize,
+    Pointer(Scene.SHCoefs), CL_TRUE);
+  FSHDegree := Scene.SHDegree;
+  FSHCoefCount := Scene.SHCoefCount;
+  FUploadedScene := Scene;
+end;
+
+procedure TGaussianSplatRasterizerCL.Preprocess(Scene: TGaussianSplatScene;
+  const Camera: TGaussianSplatCamera);
+var
+  Kernel: cl_kernel;
+  EntryPos, ArgPos: integer;
+  WidthArg, HeightArg: integer;
+  GaussianBytes: csize_t;
+  Kind: TGaussianSplatBufferKind;
+begin
+  if Scene <> FUploadedScene then UploadScene(Scene);
+  PrepareFrame(Scene.Count, Camera);
+  EnsureFloatCapacity(Depths, GaussianCount);
+  EnsureIntegerCapacity(Radii, GaussianCount);
+  EnsureIntegerCapacity(TileRects, 4 * GaussianCount);
+  for EntryPos := 0 to 11 do FCameraParams[EntryPos] := Camera.WorldToView[EntryPos];
+  FCameraParams[12] := Camera.FocalX;
+  FCameraParams[13] := Camera.FocalY;
+  FCameraParams[14] := Camera.PrincipalX;
+  FCameraParams[15] := Camera.PrincipalY;
+  GetGaussianSplatCameraPosition(Camera, FCameraParams[16], FCameraParams[17],
+    FCameraParams[18]);
+  FCameraParams[19] := GaussianSplatNearPlane;
+  Upload(gsbCamera, SizeOf(FCameraParams), @FCameraParams[0], CL_FALSE);
+  GaussianBytes := csize_t(GaussianCount) * csNeuralFloatSize;
+  EnsureBuffer(gsbMeansImage, 2 * GaussianBytes);
+  EnsureBuffer(gsbDepths, GaussianBytes);
+  EnsureBuffer(gsbRadii, GaussianBytes);
+  EnsureBuffer(gsbConicOpacity, 4 * GaussianBytes);
+  EnsureBuffer(gsbColors, 3 * GaussianBytes);
+  EnsureBuffer(gsbTileRects, 4 * GaussianBytes);
+  if GaussianCount = 0 then Exit;
+  WidthArg := Width;
+  HeightArg := Height;
+  Kernel := FPreprocessKernel.Kernel;
+  clSetKernelArg(Kernel, 0, csLongintSize, @GaussianCount);
+  clSetKernelArg(Kernel, 1, csLongintSize, @FSHDegree);
+  clSetKernelArg(Kernel, 2, csLongintSize, @FSHCoefCount);
+  clSetKernelArg(Kernel, 3, csLongintSize, @WidthArg);
+  clSetKernelArg(Kernel, 4, csLongintSize, @HeightArg);
+  clSetKernelArg(Kernel, 5, csLongintSize, @TileCountX);
+  clSetKernelArg(Kernel, 6, csLongintSize, @TileCountY);
+  ArgPos := 7;
+  for Kind := gsbCamera to gsbTileRects do
+  begin
+    clSetKernelArg(Kernel, ArgPos, csCLMemSize, @FBuffers[Kind]);
+    Inc(ArgPos);
+  end;
+  FPreprocessKernel.RunKernel(Kernel, GaussianCount);
+  FPreprocessKernel.ReadBuffer(FBuffers[gsbRadii], GaussianBytes, @Radii[0]);
+  FPreprocessKernel.ReadBuffer(FBuffers[gsbDepths], GaussianBytes, @Depths[0]);
+  FPreprocessKernel.ReadBuffer(FBuffers[gsbTileRects], 4 * GaussianBytes, @TileRects[0]);
+end;
+
+procedure TGaussianSplatRasterizerCL.Blend(BackgroundRed, BackgroundGreen,
+  BackgroundBlue: TNeuralFloat; Output: TNNetVolume);
+var
+  Kernel: cl_kernel;
+  WidthArg, HeightArg: integer;
+  RedArg, GreenArg, BlueArg: single;
+begin
+  Output.ReSize(Width, Height, 3);
+  // Fields, so the non-blocking uploads read memory that outlives this call.
+  Upload(gsbTileRanges, 2 * TileCountX * TileCountY * csLongintSize,
+    Pointer(TileRanges), CL_FALSE);
+  Upload(gsbTileGaussianList, TileListLength * csLongintSize,
+    Pointer(TileGaussianList), CL_FALSE);
+  EnsureBuffer(gsbOutput, Output.GetMemSize());
+  WidthArg := Width;
+  HeightArg := Height;
+  RedArg := BackgroundRed;
+  GreenArg := BackgroundGreen;
+  BlueArg := BackgroundBlue;
+  Kernel := FBlendKernel.Kernel;
+  clSetKernelArg(Kernel, 0, csLongintSize, @WidthArg);
+  clSetKernelArg(Kernel, 1, csLongintSize, @HeightArg);
+  clSetKernelArg(Kernel, 2, csLongintSize, @TileCountX);
+  clSetKernelArg(Kernel, 3, csNeuralFloatSize, @RedArg);
+  clSetKernelArg(Kernel, 4, csNeuralFloatSize, @GreenArg);
+  clSetKernelArg(Kernel, 5, csNeuralFloatSize, @BlueArg);
+  clSetKernelArg(Kernel, 6, csCLMemSize, @FBuffers[gsbTileRanges]);
+  clSetKernelArg(Kernel, 7, csCLMemSize, @FBuffers[gsbTileGaussianList]);
+  clSetKernelArg(Kernel, 8, csCLMemSize, @FBuffers[gsbMeansImage]);
+  clSetKernelArg(Kernel, 9, csCLMemSize, @FBuffers[gsbConicOpacity]);
+  clSetKernelArg(Kernel, 10, csCLMemSize, @FBuffers[gsbColors]);
+  clSetKernelArg(Kernel, 11, csCLMemSize, @FBuffers[gsbOutput]);
+  FBlendKernel.RunKernel2D(Kernel, TileCountX * GaussianSplatTileSize,
+    TileCountY * GaussianSplatTileSize, GaussianSplatTileSize, GaussianSplatTileSize);
+  FBlendKernel.ReadBuffer(FBuffers[gsbOutput], Output);
+end;
+{$ENDIF}
 
 end.
