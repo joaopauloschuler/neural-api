@@ -118,17 +118,6 @@ var
   // softmax head leaves, in shallow->deep order.
   HeadIdx: array[0..cBlocks-1] of integer;
 
-function RandNormal: TNeuralFloat;
-// Box-Muller.
-var
-  U1, U2: TNeuralFloat;
-begin
-  U1 := Random;
-  if U1 < 1e-12 then U1 := 1e-12;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure MakeSample(out S: TSample);
 // Difficulty-graded generator. EASY: a tight blob around the class center,
 // trivially separable (one block decides them). HARD: a point in the small
@@ -153,8 +142,8 @@ begin
     Sector := Random(cSectors);
     Angle := (Sector + Random) * (2 * Pi / cSectors);
     Radius := 0.8 + 0.7 * Random;                        // central annulus
-    S.X := Radius * Cos(Angle) + 0.06 * RandNormal;
-    S.Y := Radius * Sin(Angle) + 0.06 * RandNormal;
+    S.X := Radius * Cos(Angle) + 0.06 * RandomStdNormal();
+    S.Y := Radius * Sin(Angle) + 0.06 * RandomStdNormal();
     S.Cls := Sector mod cClasses;
     // Light label noise so the achievable ceiling is high but < 1.
     if Random < 0.05 then
@@ -164,8 +153,8 @@ begin
   begin
     S.Hard := False;
     S.Cls := Random(cClasses);
-    S.X := cCenters[S.Cls][0] + 0.30 * RandNormal;
-    S.Y := cCenters[S.Cls][1] + 0.30 * RandNormal;
+    S.X := cCenters[S.Cls][0] + 0.30 * RandomStdNormal();
+    S.Y := cCenters[S.Cls][1] + 0.30 * RandomStdNormal();
   end;
 end;
 

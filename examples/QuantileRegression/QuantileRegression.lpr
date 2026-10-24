@@ -61,17 +61,6 @@ const
     Result := 0.10 + 0.45 * X;
   end;
 
-  // Box-Muller standard normal sample.
-  function RandNormal(): TNeuralFloat;
-  var
-    U1, U2: TNeuralFloat;
-  begin
-    U1 := Random;
-    if U1 < 1e-12 then U1 := 1e-12;
-    U2 := Random;
-    Result := Sqrt(-2.0 * Ln(U1)) * Cos(2.0 * Pi * U2);
-  end;
-
   procedure BuildModel(out NN: TNNet; Quantile: TNeuralFloat);
   begin
     NN := TNNet.Create();
@@ -159,7 +148,7 @@ const
       Vx := TNNetVolume.Create(1, 1, 1);
       Vy := TNNetVolume.Create(1, 1, 1);
       Vx.Raw[0] := X;
-      Vy.Raw[0] := TrueMean(X) + NoiseStd(X) * RandNormal();
+      Vy.Raw[0] := TrueMean(X) + NoiseStd(X) * RandomStdNormal();
       Xs.Add(Vx);
       Ys.Add(Vy);
     end;

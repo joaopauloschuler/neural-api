@@ -79,6 +79,18 @@ The **FitLoading** method above needs to load pairs of images (16x16, 32x32) to 
     end;
   end;
 ```
+### Optional perceptual loss (`--perceptual-vgg`)
+By default SuperResolutionTrain minimises the pixel loss only. With `--perceptual-vgg FILE` it also trains against the perceptual (feature-reconstruction) loss of Johnson et al. 2016, *Perceptual Losses for Real-Time Style Transfer and Super-Resolution*: the upscaled image and the ground-truth image both go through a frozen VGG, and the training loss gets the squared distance between their `relu1_2` and `relu2_2` feature maps.
+```
+SuperResolutionTrain --perceptual-vgg vgg16.safetensors --perceptual-weight 1.0
+```
+* `--perceptual-vgg FILE`: torchvision VGG-16 weights (safetensors, or a `torch.save` zip `.pth`/`.bin`). The VGG importer (`BuildVGGFromSafeTensorsEx`) only needs the `features.*` tensors. When a `config.json` sits beside the file it is read, so for VGG-19 put `{"depth": 19}` there. Otherwise the canonical VGG-16 layout (`DefaultVGGConfig(16)`) is used.
+* `--perceptual-weight W` (default 1.0): the training loss is `0.5 * sum((out - target)^2) + W * perceptual`. That first term is the existing pixel loss, whose gradient is `out - target`. The pixel term is summed over all 32x32x3 values, while the perceptual term is a spatial mean, so tune `W` on your data.
+
+Getting the weights: download the timm port of the torchvision ImageNet VGG-16 weights, a plain safetensors file, from <https://huggingface.co/timm/vgg16.tv_in1k/resolve/main/model.safetensors> (VGG-19: `timm/vgg19.tv_in1k`). Its `features.*` keys match torchvision's. The original `https://download.pytorch.org/models/vgg16-397923af.pth` uses the pre-1.6 non-zip torch format, which the reader rejects.
+
+How it is wired: `TNeuralFit` has a general `OutputErrorFn` hook (`neuralfit.pas`). For every training sample the hook gets the last-layer error `out - target` and can edit it. Then `TNNet.BackpropagateFromOutputError` backpropagates the edited error. `TNNetPerceptualLoss` (`neuralpretrained.pas`) is that hook. It maps the net's pixels (CAI encoding, `x/64 - 2`) to ImageNet-normalised VGG input and calls `ComputePerceptualLossAndGradient`, which returns the loss and d(loss)/d(pixels) through the frozen VGG (`SetErrorOnlyBackprop`, so no VGG weight deltas are allocated). The hook then adds `W` times that gradient to the error. Training threads share one VGG and take turns using it. After each epoch the mean perceptual loss is printed. The chain rule and the training effect are tested on the pico VGG fixture (`TestPerceptualLossTrainingHook`). A real VGG run has not been measured yet.
+
 ## Cifar10ImageClassifierSuperResolution
 As noted in other experiments, by upscaling the image resolution we can get higher classification accuracy. This is exactly what this example does. Firstly, CIFAR-10 dataset is loaded. Then, its images are upscaled to 64x64 from 32x32 so we can run the image classification with 64x64 Images:
 ```

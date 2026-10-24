@@ -24,6 +24,10 @@ type
     function BuildTinyCausalLM(ContextLen: integer): TNNet;   // RoPE attention
     function BuildTinySSMLM(ContextLen: integer): TNNet;      // DiagonalSSM
     function BuildTinyHybridLM(ContextLen: integer): TNNet;   // SSM + attention
+    // Embedding -> Q|K|V projection -> AddMultiHeadSelfAttention(2 heads,
+    // causal, RoPE, Variant, 2 sinks) -> logit head.
+    function BuildTinyAttentionVariantLM(ContextLen: integer;
+      Variant: TNNetAttentionVariant): TNNet;
     function BuildTinyGQALM(ContextLen: integer): TNNet;      // grouped-query
     function BuildTinyLearnedPosLM(ContextLen: integer): TNNet; // GPT-2 wpe
     function BuildTinyMambaLM(ContextLen: integer): TNNet;    // conv+SelectiveSSM
@@ -211,6 +215,8 @@ type
     // TNNetStreamingDecoder: the reusable incremental-decode session.
     procedure TestStreamingDecoderTransformerMatchesFullForward;
     procedure TestStreamingDecoderGQAMatchesFullForward;
+    // TNNetSinkAttention / TNNetDifferentialAttention heads stream exactly.
+    procedure TestStreamingDecoderSinkAndDifferentialMatchFullForward;
     procedure TestStreamingDecoderLearnedPosMatchesFullForward;
     procedure TestStreamingDecoderSSMMatchesFullForward;
     // Whole recurrent BLOCKS through the session (TNNetRecurrentDecodeBase
@@ -2964,6 +2970,18 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
+function TTestNeuralDecode.BuildTinyAttentionVariantLM(ContextLen: integer;
+  Variant: TNNetAttentionVariant): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(3 * csStreamDim));
+  Result.AddMultiHeadSelfAttention({Heads=}2, {CausalMask=}true,
+    {UseRoPE=}true, Variant, {NumSinks=}2);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
 function TTestNeuralDecode.BuildTinyLearnedPosLM(ContextLen: integer): TNNet;
 begin
   // GPT-2 style: token embedding + LEARNED absolute positions (wpe), then a
@@ -3139,6 +3157,50 @@ begin
     Twin.Free;
     Full.Free;
   end;
+end;
+
+procedure TTestNeuralDecode.TestStreamingDecoderSinkAndDifferentialMatchFullForward;
+const
+  SeqLen = 7;
+  Toks: array[0..6] of integer = (3, 7, 1, 9, 4, 11, 2);
+
+  procedure RunVariant(Variant: TNNetAttentionVariant; const Tag: string);
+  var
+    Full, Twin: TNNet;
+    Session: TNNetStreamingDecoder;
+    LayerPos, MaxLayerPos, SlotPos, MaxSlotPos: integer;
+    Sink: TNNetSinkAttention;
+  begin
+    Full := BuildTinyAttentionVariantLM(SeqLen, Variant);
+    Twin := BuildTinyAttentionVariantLM(1, Variant);
+    Session := nil;
+    try
+      // Sink values start at zero; give them weight so the value slots count.
+      MaxLayerPos := Full.CountLayers() - 1;
+      for LayerPos := 0 to MaxLayerPos do
+        if Full.Layers[LayerPos] is TNNetSinkAttention then
+        begin
+          Sink := TNNetSinkAttention(Full.Layers[LayerPos]);
+          MaxSlotPos := 2 * Sink.NumSinks - 1;
+          for SlotPos := 0 to MaxSlotPos do
+            Sink.Neurons[SlotPos].Weights.RandomizeGaussian(1.0);
+        end;
+      Twin.CopyWeights(Full);
+      Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+      AssertEquals(Tag + ': one attention layer per head', 2, Session.SDPACount);
+      Session.Reset();
+      AssertStreamMatchesFull(Full, Session, Toks, Tag);
+    finally
+      Session.Free;
+      Twin.Free;
+      Full.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 20261021;
+  RunVariant(avSink, 'sink');
+  RunVariant(avDifferential, 'differential');
 end;
 
 // Grouped-Query Attention nets must stream exactly through the same KV-cache

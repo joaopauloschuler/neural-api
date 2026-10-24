@@ -1,0 +1,61 @@
+{
+  "architectures": [
+    "VitMatteForImageMatting"
+  ],
+  "backbone_config": {
+    "drop_path_rate": 0.0,
+    "dropout_prob": 0.0,
+    "hidden_act": "gelu",
+    "hidden_size": 16,
+    "image_size": 32,
+    "initializer_range": 0.02,
+    "layer_norm_eps": 1e-06,
+    "mlp_ratio": 2,
+    "model_type": "vitdet",
+    "num_attention_heads": 2,
+    "num_channels": 4,
+    "num_hidden_layers": 4,
+    "out_features": [
+      "stage4"
+    ],
+    "out_indices": [
+      4
+    ],
+    "patch_size": 8,
+    "pretrain_image_size": 40,
+    "qkv_bias": true,
+    "residual_block_indices": [
+      1,
+      2
+    ],
+    "stage_names": [
+      "stem",
+      "stage1",
+      "stage2",
+      "stage3",
+      "stage4"
+    ],
+    "use_absolute_position_embeddings": true,
+    "use_relative_position_embeddings": true,
+    "window_block_indices": [
+      0,
+      2
+    ],
+    "window_size": 3
+  },
+  "batch_norm_eps": 1e-05,
+  "convstream_hidden_sizes": [
+    4,
+    6
+  ],
+  "dtype": "float32",
+  "fusion_hidden_sizes": [
+    8,
+    6,
+    4
+  ],
+  "hidden_size": 16,
+  "initializer_range": 0.02,
+  "model_type": "vitmatte",
+  "transformers_version": "5.17.0"
+}

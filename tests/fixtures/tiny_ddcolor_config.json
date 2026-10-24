@@ -1,0 +1,15 @@
+{
+ "encoder_name": "convnext-t",
+ "decoder_name": "MultiScaleColorDecoder",
+ "input_size": [
+  64,
+  32
+ ],
+ "num_output_channels": 2,
+ "last_norm": "Weight",
+ "do_normalize": false,
+ "num_queries": 6,
+ "num_scales": 3,
+ "dec_layers": 4,
+ "nheads": 2
+}

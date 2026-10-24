@@ -26,20 +26,8 @@ const
   cEpochs = 1500;   // supervised denoising epochs
 
 var
-  RngState: cardinal;
-
-// Tiny deterministic LCG so the demo is reproducible across runs/platforms.
-function NextRand(): TNeuralFloat;
-begin
-  RngState := (RngState * 1103515245 + 12345) and $7FFFFFFF;
-  Result := RngState / 2147483647.0;  // in [0,1)
-end;
-
-function NextGauss(AStd: TNeuralFloat): TNeuralFloat;
-begin
-  // Box-Muller.
-  Result := Sqrt(-2 * Ln(NextRand() + 1e-12)) * Cos(2 * Pi * NextRand()) * AStd;
-end;
+  // Seeded private stream so the demo is reproducible across runs/platforms.
+  Rng: TStdNormalStream;
 
 procedure FillSignals(Clean, Noisy: TNNetVolume; AStd: TNeuralFloat);
 var
@@ -52,7 +40,7 @@ begin
   begin
     v := 0.9 * Sin(i * 0.07) + 0.012 * i - 0.5;
     Clean.Raw[i] := v;
-    Noisy.Raw[i] := v + NextGauss(AStd);
+    Noisy.Raw[i] := v + StdNormalStreamNext(Rng) * AStd;
   end;
 end;
 
@@ -95,7 +83,7 @@ begin
   // gain ratio can momentarily underflow/produce denormals during training).
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
                     exOverflow, exUnderflow, exPrecision]);
-  RngState := 424242;
+  StdNormalStreamInit(Rng, 424242);
   noiseStd := 0.45;
 
   Clean := TNNetVolume.Create(cSeqLen, 1, 1);

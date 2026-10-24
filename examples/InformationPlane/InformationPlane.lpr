@@ -68,15 +68,6 @@ type
   end;
   TInfoTrack = array of TInfoPoint;   // trajectory for one layer
 
-// Box-Muller N(0,1) -- no extra dependency.
-function RandomGauss(): TNeuralFloat;
-var U1, U2: TNeuralFloat;
-begin
-  repeat U1 := Random; until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Synthetic binary task: 12 noisy bits in {-1,+1}; label = parity-like majority
 // vote over a fixed informative subset (first 5 bits). The remaining 7 bits are
 // nuisance: relevant to X but NOT to Y, so a compressing layer should discard
@@ -93,7 +84,7 @@ begin
   begin
     Bit := Random(2) * 2 - 1;                 // -1 or +1
     if I < 5 then S := S + Bit;               // first 5 bits carry the label
-    X.FData[I] := Bit + RandomGauss() * 0.15; // jitter -> unique inputs
+    X.FData[I] := Bit + RandomStdNormal() * 0.15; // jitter -> unique inputs
   end;
   Y.Fill(0);
   if S > 0 then Y.FData[1] := 1.0 else Y.FData[0] := 1.0;

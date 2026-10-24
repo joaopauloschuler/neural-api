@@ -72,16 +72,6 @@ var
   Glow: TNNet;        // forward flow x -> z, couplings + learnable 1x1 conv
   Sampler: TNNet;     // inverse of Glow: z -> x (same weights, inverse=true)
 
-// Standard-normal draw (Box-Muller).
-function Gauss(): TNeuralFloat;
-var u1, u2: TNeuralFloat;
-begin
-  u1 := Random;
-  if u1 < 1e-12 then u1 := 1e-12;
-  u2 := Random;
-  Result := Sqrt(-2 * Ln(u1)) * Cos(2 * Pi * u2);
-end;
-
 // Draw one two-moons point into a (1,1,2) volume.
 procedure SampleTwoMoons(V: TNNetVolume);
 var
@@ -101,8 +91,8 @@ begin
     y := -Sin(ang) - 0.3;
   end;
   // Light Gaussian jitter; scaled so the manifold sits near the unit Gaussian.
-  V.Raw[0] := (x + Gauss() * 0.06) * 0.8;
-  V.Raw[1] := (y + Gauss() * 0.06) * 0.8;
+  V.Raw[0] := (x + RandomStdNormal() * 0.06) * 0.8;
+  V.Raw[1] := (y + RandomStdNormal() * 0.06) * 0.8;
 end;
 
 // Mean log-likelihood of Flow over N fresh samples (higher is better). Sums the
@@ -289,8 +279,8 @@ begin
   Target := TNNetVolume.Create(1, 1, cDim);
   for b := 0 to 1999 do
   begin
-    X.Raw[0] := Gauss();
-    X.Raw[1] := Gauss();
+    X.Raw[0] := RandomStdNormal();
+    X.Raw[1] := RandomStdNormal();
     Sampler.Compute(X);
     sx := sx + Sampler.GetLastLayer.Output.Raw[0];
     sy := sy + Sampler.GetLastLayer.Output.Raw[1];

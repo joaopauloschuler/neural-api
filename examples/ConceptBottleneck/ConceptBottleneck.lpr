@@ -141,15 +141,6 @@ var
   LabelHeadIdx: integer; // the linear label head
   SoftMaxIdx: integer;   // the softmax (label probabilities)
 
-function RandNormal: TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  U1 := Random; if U1 < 1e-12 then U1 := 1e-12;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure MakeSample(out S: TSample);
 // Three latent concept bits drive the raw features; the label is a fixed
 // boolean function of two of them (the third is a decoy). Feature j>=3 are
@@ -159,7 +150,7 @@ var
   J: integer;
 begin
   for J := 0 to cInDim - 1 do
-    S.X[J] := 0.6 * RandNormal;                 // noise everywhere
+    S.X[J] := 0.6 * RandomStdNormal();                 // noise everywhere
   // Concept bits, each pushing its own signal feature up or down.
   for J := 0 to cConcepts - 1 do
   begin

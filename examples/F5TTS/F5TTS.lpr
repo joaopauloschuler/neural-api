@@ -118,8 +118,7 @@ begin
         Time.FData[0] := t * 1000.0;
         NN.Compute([Xt, Cond, Text, Time]);
         NN.GetOutput(Vel);
-        for i := 0 to Xt.Size - 1 do
-          Xt.FData[i] := Xt.FData[i] + dt * Vel.FData[i];
+        Xt.MulAdd(dt, Vel); // x += dt * v
       end;
 
       // The integrated x_1 is the predicted MEL spectrogram (S x NMel).

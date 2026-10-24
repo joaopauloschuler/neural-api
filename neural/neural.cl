@@ -2,6 +2,72 @@
 // located at:
 // https://sourceforge.net/projects/cai/
 
+// The kernels build with -cl-fast-relaxed-math and PoCL runs them with the
+// host's FP traps unmasked, so the helpers below keep every intermediate finite.
+// Squares are taken of |x| capped here (or at CAI_SQUARE_CAP where a product
+// follows), so they stay finite.
+#define CAI_SQRT_FLT_MAX 1.8e19f
+#define CAI_SQUARE_CAP 1e15f
+
+// sqrt(x*x + 1), which is |x| in single precision once |x| > 1e4.
+static inline float cai_sqrt_square_plus1(const float x)
+{
+  const float a = fabs(x);
+  const float ac = fmin(a, CAI_SQUARE_CAP);
+  return (a > CAI_SQUARE_CAP) ? a : sqrt(ac * ac + 1.0f);
+}
+
+// ISRU: x / sqrt(1 + alpha*x^2). Past |x| = 1e15 the result is +-1/sqrt(alpha)
+// in single precision, so the clamp is exact for alpha > 1e-22.
+static inline float cai_isru(const float x, const float alpha)
+{
+  const float xc = clamp(x, -CAI_SQUARE_CAP, CAI_SQUARE_CAP);
+  return xc / sqrt(fmax(1.0f + alpha * xc * xc, FLT_MIN));
+}
+
+// exp with its argument floored at -87 (exp(-87) = 1.6e-38): PoCL's exp traps
+// on far-negative arguments under unmasked FP exceptions instead of underflowing.
+static inline float cai_exp_floored(const float x)
+{
+  return exp(fmax(x, -87.0f));
+}
+
+// erf with its argument clamped to [-10, 10], where it is already +-1.0f: PoCL's
+// erf traps on huge arguments.
+static inline float cai_erf(const float x)
+{
+  return erf(clamp(x, -10.0f, 10.0f));
+}
+
+// sin/cos with the argument clamped to +-1e8, past which float spacing exceeds
+// 2*pi and the result is noise anyway: PoCL's range reduction traps on huge ones.
+#define CAI_TRIG_ARG_CAP 1e8f
+static inline float cai_sin(const float x)
+{
+  return sin(clamp(x, -CAI_TRIG_ARG_CAP, CAI_TRIG_ARG_CAP));
+}
+static inline float cai_cos(const float x)
+{
+  return cos(clamp(x, -CAI_TRIG_ARG_CAP, CAI_TRIG_ARG_CAP));
+}
+
+// log of a positive x; above 1e18 it is taken of x*2^-64 plus 64*ln(2), since
+// PoCL's log traps on large arguments (its denormal rescale overflows).
+static inline float cai_log(const float x)
+{
+  const bool IsLarge = (x > 1e18f);
+  const float scaled = IsLarge ? x * 0x1p-64f : x;
+  return log(scaled) + (IsLarge ? 44.361419555836500f : 0.0f);
+}
+
+// tanh of x clamped to [-10, 10] (already +-1.0f there), from e = exp(-2|x|) so
+// every intermediate stays in [0, 1] and a reassociated x * tanh cannot overflow.
+static inline float cai_tanh(const float x)
+{
+  const float e = exp(-2.0f * fmin(fabs(x), 10.0f));
+  return copysign((1.0f - e) / (1.0f + e), x);
+}
+
 // The activation applied in-register by the GEMM kernels after their fused
 // bias-add, and by cai_activation for the same opcodes. Opcodes are the csAct*
 // constants: 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish/SiLU,
@@ -9,8 +75,11 @@
 // 0/other = pass-through. This is every parameterless opcode, which is what the
 // GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
 // TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
-// cai_activation keeps its own cases only for the parameterized activations
-// (9, 10, 15, 18-21, 24-28). Coded by Claude (AI).
+// cai_activation keeps its own cases for the parameterized activations
+// (9, 10, 15, 18-21, 24-28, 40, 41, 43-55, 59, 68-70) and for the
+// standalone-only ones that no GEMM fuses. PoCL if-converts the branches on v,
+// so both sides of every branch run: each must stay finite for any finite v.
+// Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -19,45 +88,40 @@ static inline float cai_fused_act(float v, const int ActFN)
   }
   else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
   {
-    if (v > 0.0f) return 1.0f / (1.0f + exp(-v));
-    const float s = exp(v);
-    return s / (1.0f + s);
+    const float e = cai_exp_floored(-fabs(v)); // exp(-v) above zero, exp(v) below
+    return (v > 0.0f) ? 1.0f / (1.0f + e) : e / (1.0f + e);
   }
-  else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+  else if (ActFN == 3) // HyperbolicTangent
   {
-    float xc = v;
-    if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-    const float e = exp(-2.0f * xc);
-    return (1.0f - e) / (1.0f + e);
+    return cai_tanh(v);
   }
   else if (ActFN == 4) // Swish / SiLU: x * sigmoid(x), sigmoid in the same two-branch form
   {
-    if (v > 0.0f) return v / (1.0f + exp(-v));
-    const float s = exp(v);
-    return v * s / (1.0f + s);
+    const float e = cai_exp_floored(-fabs(v));
+    return (v > 0.0f) ? v / (1.0f + e) : v * e / (1.0f + e);
   }
   else if (ActFN == 5) // GELU (tanh approximation): x * 0.5 * (1 + tanh(arg))
   {
     const float SQRT_2_OVER_PI = 0.7978845608f;
     const float GELU_CONST = 0.044715f;
     // The cubic term drives arg past 100 by |x| ~ 15, and tanh is already 1.0f
-    // in single precision by |arg| ~ 9, so the [-10,10] clamp changes no
-    // representable result and keeps exp(-2*arg) at exp(20).
-    float arg = SQRT_2_OVER_PI * (v + GELU_CONST * v * v * v);
-    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
-    const float e = exp(-2.0f * arg);
-    return v * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
+    // in single precision by |arg| ~ 9, so clamping x to [-10,10] for the cube
+    // changes no representable result.
+    const float vc = clamp(v, -10.0f, 10.0f);
+    const float arg = SQRT_2_OVER_PI * (vc + GELU_CONST * vc * vc * vc);
+    return v * 0.5f * (1.0f + cai_tanh(arg));
   }
   else if (ActFN == 6) // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
   {
     const float INV_SQRT_2 = 0.7071067811865476f;
-    return v * 0.5f * (1.0f + erf(v * INV_SQRT_2));
+    return v * 0.5f * (1.0f + cai_erf(v * INV_SQRT_2));
   }
   else if (ActFN == 7) // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
   {
+    const float vc = clamp(v, -3.0f, 3.0f); // keeps the speculated product finite
     if (v > 3.0f) return v;
     if (v < -3.0f) return 0.0f;
-    return v * (v + 3.0f) / 6.0f;
+    return vc * (vc + 3.0f) / 6.0f;
   }
   else if (ActFN == 8) // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
   {
@@ -818,13 +882,26 @@ static inline void cai_tiled_mad4(float* acc, __local const float* Bs,
   }
 }
 
+// Result column of GEMM column b: b itself, or under UpsampleFold (see
+// cai_conv_gather) the 2x output pixel of low-res pixel b in phase Phase.
+static inline int cai_conv_result_column(const int UpsampleFold,
+  const int OutSizeX, const int b, const int Phase)
+{
+  if (UpsampleFold == 0) return b;
+  const int LowResSizeX = max(OutSizeX, 1);
+  const int oy = b / LowResSizeX;
+  const int ox = b - oy * LowResSizeX;
+  return (2 * oy + (Phase >> 1)) * 2 * LowResSizeX + 2 * ox + (Phase & 1);
+}
+
 // Per-row scale, fused bias, fused activation and store of one row's
 // CAI_TILED_COLS results; a row past FNumAs-1 or a column past FNumBs-1 is
-// skipped.
+// skipped. Columns map through cai_conv_result_column.
 static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
   const int ActFN, const int UseBias, __global float* R,
   __global const float* Bias, const float RowScale,
-  const int row, const int b0, const float* acc)
+  const int row, const int b0, const float* acc, const int UpsampleFold,
+  const int OutSizeX, const int Phase)
 {
   if (row >= FNumAs) return;
   #pragma unroll
@@ -833,7 +910,8 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
     const int gb = b0 + b;
     if (gb < FNumBs)
     {
-      const int pos = gb * FNumAs + row;
+      const int pos = cai_conv_result_column(UpsampleFold, OutSizeX, gb,
+        Phase) * FNumAs + row;
       float v = acc[b] * RowScale;
       if (UseBias != 0) v += Bias[row];
       R[pos] = cai_fused_act(v, ActFN);
@@ -846,6 +924,14 @@ static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
 // + d - the im2col layout of cai_im2col - so the tile stage reads the
 // unpadded source directly and the column matrix never exists. Taps in the
 // zero padding stage 0, exactly as cai_im2col writes them.
+// A 3-D conv over frames packed along depth (TNNetConvolution3D) folds the
+// output frame into the column, b = pixel * OutFrames + frame: the tap window
+// is the InDepth floats at frame * FrameStep of a PixelStride-float pixel.
+// A 2-D conv has OutFrames 1, FrameStep 0 and PixelStride = InDepth.
+// UpsampleFold 1 is a 3x3 pad-1 conv over a nearest-2x upsample of the source:
+// axis 2 is the output phase py*2+px, whose 2x2 A slab (FNumAs*FSize floats
+// each, cai_conv_upsample_fold_weights) reads source rows y-1+py.. and
+// columns x-1+px..; column b = low-res pixel stores to pixel (2y+py, 2x+px).
 typedef struct
 {
   int OutSizeX;  // FOutput.SizeX
@@ -855,6 +941,11 @@ typedef struct
   int PaddingX;  // zero columns left and right of the source
   int PaddingY;  // zero rows above and below the source
   int DilationX; // spacing of the kernel taps along X
+  int DilationY; // spacing of the kernel taps along Y
+  int PixelStride; // source floats per pixel
+  int OutFrames;   // output frames per output pixel
+  int FrameStep;   // source depth offset between consecutive output frames
+  int UpsampleFold; // 0 or 1, see above
 } cai_conv_gather;
 
 // cai_tiled_stage_b gives a lane the fixed reduction slot lid % KSTEP and the
@@ -868,19 +959,23 @@ typedef struct
 #define CAI_TILED_B_COLS_PER_LANE (CAI_TILED_B_ELEMS / CAI_TILED_LANES)
 #define CAI_TILED_B_COL_STEP (CAI_TILED_LANES / CAI_TILED_KSTEP)
 
-// Top-left source tap of each column this lane stages, once per work-group;
-// a column past FNumBs gets a first row no tap can reach, so it stages zeros.
+// Top-left source tap and frame offset of each column this lane stages, once
+// per work-group; a column past FNumBs gets a first row no tap can reach.
 static inline void cai_conv_gather_columns(const cai_conv_gather G,
-  const int FNumBs, const int b0, const int lid, int* FirstY, int* FirstX)
+  const int FNumBs, const int b0, const int lid, int* FirstY, int* FirstX,
+  int* FirstD)
 {
   #pragma unroll
   for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
   {
     const int gb = b0 + lid / CAI_TILED_KSTEP + j * CAI_TILED_B_COL_STEP;
-    const int oy = gb / G.OutSizeX;
-    const int ox = gb - oy * G.OutSizeX;
+    const int pixel = gb / G.OutFrames;
+    const int frame = gb - pixel * G.OutFrames;
+    const int oy = pixel / G.OutSizeX;
+    const int ox = pixel - oy * G.OutSizeX;
     FirstY[j] = (gb < FNumBs) ? oy * G.Stride - G.PaddingY : G.InSizeY;
     FirstX[j] = ox * G.Stride - G.PaddingX;
+    FirstD[j] = frame * G.FrameStep;
   }
 }
 
@@ -888,7 +983,8 @@ static inline void cai_conv_gather_columns(const cai_conv_gather G,
 // layout and the same zeros, so the tile math after it is unchanged.
 static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
   const int FSize, const int k0, __global const float* Src,
-  __local float* Bs, const int lid, const int* FirstY, const int* FirstX)
+  __local float* Bs, const int lid, const int* FirstY, const int* FirstX,
+  const int* FirstD)
 {
   const int kLane = lid % CAI_TILED_KSTEP;
   const int bLane = lid / CAI_TILED_KSTEP;
@@ -899,14 +995,15 @@ static inline void cai_tiled_stage_b_conv(const cai_conv_gather G,
   const int kx = rem / G.InDepth;
   const int d = rem - kx * G.InDepth;
   const int TapX = kx * G.DilationX;
+  const int TapY = ky * G.DilationY;
   #pragma unroll
   for (int j = 0; j < CAI_TILED_B_COLS_PER_LANE; j++)
   {
-    const int y = FirstY[j] + ky;
+    const int y = FirstY[j] + TapY;
     const int x = FirstX[j] + TapX;
     float v = 0.0f;
     if ((y >= 0) && (y < G.InSizeY) && (x >= 0) && (x < G.InSizeX))
-      v = Src[(y * G.InSizeX + x) * G.InDepth + d];
+      v = Src[(y * G.InSizeX + x) * G.PixelStride + FirstD[j] + d];
     Bs[(bLane + j * CAI_TILED_B_COL_STEP) * CAI_TILED_KSTEP + kLane] = v;
   }
 }
@@ -921,6 +1018,12 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   __global float* FResultBuffer, const int UseBias,
   __global const float* FRowBias, __local float* Bs)
 {
+  // 0 on a 2-D launch; the output phase under G.UpsampleFold.
+  const int Phase = get_group_id(2);
+  cai_conv_gather PG = G;
+  PG.PaddingY -= Phase >> 1;
+  PG.PaddingX -= Phase & 1;
+  Af += Phase * FNumAs * FSize;
   const int lid = get_local_id(0);
   const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
   const int b0 = get_group_id(1) * CAI_TILED_COLS;
@@ -935,7 +1038,9 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
 
   int FirstY[CAI_TILED_B_COLS_PER_LANE];
   int FirstX[CAI_TILED_B_COLS_PER_LANE];
-  if (BIsConv) cai_conv_gather_columns(G, FNumBs, b0, lid, FirstY, FirstX);
+  int FirstD[CAI_TILED_B_COLS_PER_LANE];
+  if (BIsConv)
+    cai_conv_gather_columns(PG, FNumBs, b0, lid, FirstY, FirstX, FirstD);
 
   const int RowStep4 = 4 * FNumAs;
   for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
@@ -943,7 +1048,8 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
     // The previous step's reads must finish before the tile is overwritten.
     barrier(CLK_LOCAL_MEM_FENCE);
     if (BIsConv)
-      cai_tiled_stage_b_conv(G, FSize, k0, Bf, Bs, lid, FirstY, FirstX);
+      cai_tiled_stage_b_conv(PG, FSize, k0, Bf, Bs, lid, FirstY, FirstX,
+        FirstD);
     else
       cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, 0, 0, Bs, lid,
         CAI_TILED_LANES);
@@ -986,9 +1092,10 @@ static inline void cai_dot_product_tiled_body(const int FNumAs,
   }
 
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FRowBias, 1.0f, a0 + lid, b0, acc0);
+    FRowBias, 1.0f, a0 + lid, b0, acc0, G.UpsampleFold, G.OutSizeX, Phase);
   cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
-    FRowBias, 1.0f, a0 + lid + CAI_TILED_LANES, b0, acc1);
+    FRowBias, 1.0f, a0 + lid + CAI_TILED_LANES, b0, acc1, G.UpsampleFold,
+    G.OutSizeX, Phase);
 }
 
 // Tiled twin of cai_dot_product: FP32 weights in its [a + k*FNumAs] layout,
@@ -1009,7 +1116,7 @@ __kernel void cai_dot_product_tiled
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
-  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  const cai_conv_gather NoGather = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FInputBufferBs, 0, NoGather, FResultBuffer, UseBias, FRowBias, Bs);
 }
@@ -1289,18 +1396,24 @@ __kernel void cai_conv_implicit_tiled
   const int Stride,
   const int PaddingX,
   const int PaddingY,
-  const int DilationX
+  const int DilationX,
+  const int DilationY,
+  const int PixelStride,
+  const int OutFrames,
+  const int FrameStep,
+  const int UpsampleFold
 )
 {
   __local float Bs[CAI_TILED_B_ELEMS] __attribute__((aligned(16)));
   const cai_conv_gather G = {OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
-    Stride, PaddingX, PaddingY, DilationX};
+    Stride, PaddingX, PaddingY, DilationX, DilationY, PixelStride, OutFrames,
+    FrameStep, UpsampleFold};
   cai_dot_product_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
     FSrc, 1, G, FResultBuffer, UseBias, FRowBias, Bs);
 }
 
 // Untiled twin of cai_conv_implicit_tiled (same arguments), one work-item per
-// (row, position) as cai_dot_product; sums in k order. Coded by Claude (AI).
+// (row, position, phase) as cai_dot_product; sums in k order. Coded by Claude (AI).
 __kernel void cai_conv_implicit
 (
   const int FNumAs,
@@ -1320,32 +1433,40 @@ __kernel void cai_conv_implicit
   const int Stride,
   const int PaddingX,
   const int PaddingY,
-  const int DilationX
+  const int DilationX,
+  const int DilationY,
+  const int PixelStride,
+  const int OutFrames,
+  const int FrameStep,
+  const int UpsampleFold
 )
 {
   const int a_id = get_global_id(0);
   const int b_id = get_global_id(1);
+  const int Phase = get_global_id(2);
   if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
   const int FeatureSizeX = RowSpan / InDepth;
   const int FeatureSizeY = FSize / RowSpan;
-  const int oy = b_id / OutSizeX;
-  const int ox = b_id - oy * OutSizeX;
-  const int FirstY = oy * Stride - PaddingY;
-  const int FirstX = ox * Stride - PaddingX;
+  const int pixel = b_id / OutFrames;
+  const int FrameOffset = (b_id - pixel * OutFrames) * FrameStep;
+  const int oy = pixel / OutSizeX;
+  const int ox = pixel - oy * OutSizeX;
+  const int FirstY = oy * Stride - PaddingY + (Phase >> 1);
+  const int FirstX = ox * Stride - PaddingX + (Phase & 1);
   const int TapStep = InDepth * FNumAs;
-  // A element (a_id, k) sits at a_id + k * FNumAs.
-  int APos = a_id;
+  // A element (a_id, k) of the phase slab sits at a_id + k * FNumAs.
+  int APos = a_id + Phase * FNumAs * FSize;
   float acc = 0.0f;
   for (int ky = 0; ky < FeatureSizeY; ky++)
   {
-    const int y = FirstY + ky;
+    const int y = FirstY + ky * DilationY;
     const int RowInside = (y >= 0) && (y < InSizeY);
     for (int kx = 0; kx < FeatureSizeX; kx++)
     {
       const int x = FirstX + kx * DilationX;
       if (RowInside && (x >= 0) && (x < InSizeX))
       {
-        const int SrcPos = (y * InSizeX + x) * InDepth;
+        const int SrcPos = (y * InSizeX + x) * PixelStride + FrameOffset;
         int TapAPos = APos;
         for (int d = 0; d < InDepth; d++)
         {
@@ -1356,9 +1477,182 @@ __kernel void cai_conv_implicit
       APos += TapStep;
     }
   }
-  const int ResultPos = b_id * FNumAs + a_id;
+  const int ResultPos = cai_conv_result_column(UpsampleFold, OutSizeX, b_id,
+    Phase) * FNumAs + a_id;
   if (UseBias != 0) acc += FRowBias[a_id];
   FResultBuffer[ResultPos] = cai_fused_act(acc, ActFN);
+}
+
+// TRANSPOSED CONVOLUTION (TNNetDeconvolution) as a gather, no atomics: output
+// (ox, oy, row a) sums every tap (kx, ky) whose source pixel ((ox + PaddingX -
+// kx) / Stride, (oy + PaddingY - ky) / Stride) is whole and inside the source,
+// dotting A's tap column with row a's group slice of that pixel. A element
+// (a, k) sits at a + k * FNumAs, k = (ky * FeatureSizeX + kx) * GroupInDepth
+// + d (the neuron weight layout); row a belongs to group a / (FNumAs / Groups).
+// One work-item per (row, output position), launch (FNumAs, FNumBs).
+// Coded by Claude (AI).
+__kernel void cai_conv_transpose
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int ActFN,
+  __global const float* FInputBufferAs,
+  __global const float* FSrc,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FRowBias,
+  const int OutSizeX,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
+  const int FeatureSizeX,
+  const int FeatureSizeY,
+  const int Stride,
+  const int PaddingX,
+  const int PaddingY,
+  const int Groups
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  if ((a_id >= FNumAs) || (b_id >= FNumBs)) return;
+  const int GroupInDepth = InDepth / Groups;
+  const int SrcOffset = (a_id / (FNumAs / Groups)) * GroupInDepth;
+  const int oy = b_id / OutSizeX;
+  const int ox = b_id - oy * OutSizeX;
+  const int ShiftedY = oy + PaddingY;
+  const int ShiftedX = ox + PaddingX;
+  const int TapStep = GroupInDepth * FNumAs;
+  float acc = 0.0f;
+  // Only taps congruent to the shifted position modulo Stride land on a whole
+  // source pixel; the source index falls as the tap index rises.
+  for (int ky = ShiftedY % Stride; ky < FeatureSizeY; ky += Stride)
+  {
+    const int iy = (ShiftedY - ky) / Stride;
+    if (iy < 0) break;
+    if (iy >= InSizeY) continue;
+    for (int kx = ShiftedX % Stride; kx < FeatureSizeX; kx += Stride)
+    {
+      const int ix = (ShiftedX - kx) / Stride;
+      if (ix < 0) break;
+      if (ix < InSizeX)
+      {
+        const int SrcPos = (iy * InSizeX + ix) * InDepth + SrcOffset;
+        int APos = a_id + (ky * FeatureSizeX + kx) * TapStep;
+        for (int d = 0; d < GroupInDepth; d++)
+        {
+          acc = mad(FInputBufferAs[APos], FSrc[SrcPos + d], acc);
+          APos += FNumAs;
+        }
+      }
+    }
+  }
+  if (UseBias != 0) acc += FRowBias[a_id];
+  FResultBuffer[b_id * FNumAs + a_id] = cai_fused_act(acc, ActFN);
+}
+
+// Phase weights of a 3x3 conv over a nearest-2x upsample (UpsampleFold): tap
+// (r, c) of phase (py, px) sums the 3x3 taps ky in [r*(1+py), py+r*(2-py)]
+// (same for kx), i.e. the taps that land on one source pixel. Src is the
+// [a + k*NumAs] 3x3 layout, Dst four such 2x2 slabs. Launch (NumAs, InDepth, 16).
+__kernel void cai_conv_upsample_fold_weights
+(
+  const int NumAs,
+  const int InDepth,
+  __global const float* Src,
+  __global float* Dst
+)
+{
+  const int a = get_global_id(0);
+  const int d = get_global_id(1);
+  const int PhaseTap = get_global_id(2);
+  if ((a >= NumAs) || (d >= InDepth)) return;
+  const int Phase = PhaseTap >> 2;
+  const int py = Phase >> 1;
+  const int px = Phase & 1;
+  const int r = (PhaseTap >> 1) & 1;
+  const int c = PhaseTap & 1;
+  const int FirstKy = r * (1 + py);
+  const int LastKy = py + r * (2 - py);
+  const int FirstKx = c * (1 + px);
+  const int LastKx = px + c * (2 - px);
+  float Sum = 0.0f;
+  for (int ky = FirstKy; ky <= LastKy; ky++)
+    for (int kx = FirstKx; kx <= LastKx; kx++)
+      Sum += Src[a + ((ky * 3 + kx) * InDepth + d) * NumAs];
+  Dst[a + (Phase * 4 * InDepth + (r * 2 + c) * InDepth + d) * NumAs] = Sum;
+}
+
+// MODULATED CONVOLUTION (StyleGAN2): the slab cai_conv_implicit reads is
+// w''(a, k) = w(a, k) * Style[k mod InDepth] * RowScales[a], derived per
+// forward from the resident base kernel w in the [a + k*NumAs] layout.
+
+// SquareSums(a, d) = sum over the taps of w(a, tap*InDepth + d)^2, stored at
+// d*NumAs + a; it depends on w only. Launch (NumAs, InDepth).
+__kernel void cai_conv_weight_square_sums
+(
+  const int NumAs,
+  const int InDepth,
+  const int FSize,
+  __global const float* A,
+  __global float* SquareSums
+)
+{
+  const int a = get_global_id(0);
+  const int d = get_global_id(1);
+  if ((a >= NumAs) || (d >= InDepth)) return;
+  const int TapStep = InDepth * NumAs;
+  const int MaxPos = FSize * NumAs;
+  float Sum = 0.0f;
+  for (int Pos = a + d * NumAs; Pos < MaxPos; Pos += TapStep)
+    Sum = mad(A[Pos], A[Pos], Sum);
+  SquareSums[d * NumAs + a] = Sum;
+}
+
+// RowScales[a] = Gain / sqrt(sum_d SquareSums(a, d) * Style[d]^2 + Eps), the
+// demodulation factor, or Gain when Demodulate is 0. Launch (NumAs).
+__kernel void cai_conv_modulation_row_scales
+(
+  const int NumAs,
+  const int InDepth,
+  const int Demodulate,
+  const float Eps,
+  const float Gain,
+  __global const float* SquareSums,
+  __global const float* Style,
+  __global float* RowScales
+)
+{
+  const int a = get_global_id(0);
+  if (a >= NumAs) return;
+  float Sum = 0.0f;
+  for (int d = 0; d < InDepth; d++)
+  {
+    const float s = Style[d];
+    Sum = mad(SquareSums[d * NumAs + a], s * s, Sum);
+  }
+  // Sum + Eps > 0, so the division never traps even when Demodulate is 0.
+  RowScales[a] = (Demodulate != 0) ? Gain / sqrt(Sum + Eps) : Gain;
+}
+
+// Dst(a, k) = A(a, k) * Style[k mod InDepth] * RowScales[a], both in the
+// [a + k*NumAs] layout. Launch (NumAs, FSize).
+__kernel void cai_conv_modulate_weights
+(
+  const int NumAs,
+  const int FSize,
+  const int InDepth,
+  __global const float* A,
+  __global const float* Style,
+  __global const float* RowScales,
+  __global float* Dst
+)
+{
+  const int a = get_global_id(0);
+  const int k = get_global_id(1);
+  if ((a >= NumAs) || (k >= FSize)) return;
+  const int Pos = a + k * NumAs;
+  Dst[Pos] = (A[Pos] * Style[k % InDepth]) * RowScales[a];
 }
 
 // int4 body: the int8 lane map, one Q4_0 block per K-step (blocks [StepFirst,
@@ -2292,40 +2586,274 @@ __kernel void cai_bilinear_gather
   FDst[g_id] = acc;
 }
 
-// CAI upsample gather: the forward of the nearest-neighbour upsample and the
-// depth-to-space layers (TNNetDeMaxPool, TNNetUpsample, TNNetPixelShuffle).
-// Output pixel (OX, OY) copies from source pixel (OX / FFactor, OY / FFactor),
-// the channel picked by the output channel c and the pixel's offset (i, j)
-// inside its FFactor x FFactor block:
-//   src channel = c*FChannelStride + i*FXStride + j*FYStride
-// (nearest upsample: 1, 0, 0; PixelShuffle(r): r*r, r, 1;
-// TNNetUpsample: 4, 1, 2).
-// Raw layouts [(y*SizeX + x)*Depth + d]. One work-item per OUTPUT element.
-__kernel void cai_upsample_gather
+// CAI gather copy: the forward of the layers whose output elements each copy
+// one source element or read zero (crop, padding, transposes, space/depth,
+// nearest upsample, pixel shuffle and MobileViT reshuffles, token and channel
+// gathers; TNNetGatherCopyCL). The tables are per axis (sum of the extents,
+// not one entry per element), so they stay cached and add no memory traffic.
+// FPlan = [AxisCount, Extent[AxisCount], TableStart[AxisCount], tables]. The
+// output index splits into one coordinate per axis, outermost first, and each
+// coordinate's table entry is a source offset; the offsets add up, and a
+// negative entry makes the element zero. One work-item per OUTPUT element.
+__kernel void cai_gather_copy
 (
   const int FNumOut,
-  const int FOutSizeX,
-  const int FOutDepth,
-  const int FInSizeX,
-  const int FInDepth,
-  const int FFactor,
-  const int FChannelStride,
-  const int FXStride,
-  const int FYStride,
+  __global const int* FPlan,
   __global const float* FSrc,
   __global float* FDst
 )
 {
   const int g_id = get_global_id(0);
   if (g_id >= FNumOut) return;
-  const int pos = g_id / FOutDepth;
-  const int c = g_id - pos * FOutDepth;
-  const int OY = pos / FOutSizeX;
-  const int OX = pos - OY * FOutSizeX;
-  const int x = OX / FFactor;
-  const int y = OY / FFactor;
-  FDst[g_id] = FSrc[(y * FInSizeX + x) * FInDepth + c * FChannelStride +
-    (OX - x * FFactor) * FXStride + (OY - y * FFactor) * FYStride];
+  const int AxisCount = FPlan[0];
+  int Rest = g_id;
+  int SrcPos = 0;
+  int IsZero = 0;
+  for (int Axis = AxisCount - 1; Axis >= 0; Axis--)
+  {
+    const int Extent = FPlan[1 + Axis];
+    const int Next = Rest / Extent;
+    const int Offset = FPlan[FPlan[1 + AxisCount + Axis] + Rest - Next * Extent];
+    Rest = Next;
+    if (Offset < 0) IsZero = 1; else SrcPos += Offset;
+  }
+  FDst[g_id] = IsZero ? 0.0f : FSrc[SrcPos];
+}
+
+// TNNetTopKGatherTokens selection, step 1: FTokenMax[t] := the maximum of the
+// FDepth scores of token t. One work-item per token. Coded by Claude (AI).
+__kernel void cai_token_max_score
+(
+  const int FTokenCnt,
+  const int FDepth,
+  __global const float* FScores,
+  __global float* FTokenMax
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FTokenCnt) return;
+  const int base = t * FDepth;
+  float best = FScores[base];
+  for (int d = 1; d < FDepth; d++)
+  {
+    const float val = FScores[base + d];
+    if (val > best) best = val;
+  }
+  FTokenMax[t] = best;
+}
+
+// TNNetTopKGatherTokens selection, step 2: token t's rank in the order
+// (score DESCENDING, index ASCENDING) of the host NeuralMarkTopK is the count of
+// earlier tokens scoring >= and later tokens scoring >; a rank below FTopK
+// writes t * FTokenStride into the cai_gather_copy token table at
+// FPlan[FTableOffset + rank]. Counting stops at FTopK, so the cost is O(N^2)
+// at worst. Scores must be finite (a NaN breaks the total order). One
+// work-item per token. Coded by Claude (AI).
+__kernel void cai_topk_token_rank
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FTokenStride,
+  const int FTableOffset,
+  __global const float* FTokenMax,
+  __global int* FPlan
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FTokenCnt) return;
+  const float score = FTokenMax[t];
+  int rank = 0;
+  for (int j = 0; (j < t) && (rank < FTopK); j++)
+    if (FTokenMax[j] >= score) rank++;
+  for (int j = t + 1; (j < FTokenCnt) && (rank < FTopK); j++)
+    if (FTokenMax[j] > score) rank++;
+  if (rank < FTopK) FPlan[FTableOffset + rank] = t * FTokenStride;
+}
+
+// rfft2 / irfft2 (TNNetRealFFT2D / TNNetInverseRealFFT2D, TNNetRealFFT2DCL) as
+// direct DFTs, one work-item per output element, channel index fastest. Any
+// W and H: O(N) per element, O(N^2) per line. A real volume is (W, H, C) at
+// ((y*W + x)*C + c); a half spectrum is (HalfW, H, 2C) with Re at
+// 2*((y*HalfW + kw)*C + c) and Im right after it. FTwid holds cos|sin of
+// 2*pi*k/N for k < N, interleaved; the angle index (k*n) mod N is stepped
+// exactly, so no float phase accumulates.
+
+// Along W, real -> half spectrum: Dst[y, kw] = sum_x Src[y, x] * exp(-i*2*pi*kw*x/W).
+__kernel void cai_rfft2_rows_r2c
+(
+  const int FNumOut,
+  const int FW,
+  const int FHalfW,
+  const int FC,
+  __global const float* FTwid,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int t = g_id / FC;
+  const int c = g_id - t * FC;
+  const int y = t / FHalfW;
+  const int kw = t - y * FHalfW;
+  int SrcPos = y * FW * FC + c;
+  int Idx = 0;
+  float Re = 0.0f;
+  float Im = 0.0f;
+  for (int x = 0; x < FW; x++)
+  {
+    const float v = FSrc[SrcPos];
+    Re = mad(v, FTwid[2 * Idx], Re);
+    Im = mad(-v, FTwid[2 * Idx + 1], Im);
+    SrcPos += FC;
+    Idx += kw;
+    if (Idx >= FW) Idx -= FW;
+  }
+  FDst[2 * g_id] = Re;
+  FDst[2 * g_id + 1] = Im;
+}
+
+// Along H, half spectrum -> half spectrum:
+//   Dst[ky, kw] = s[kw] * sum_{y < FInRows} Src[y, kw] * exp(i*FSign*2*pi*ky*y/H),
+// FSign = -1 (forward) or +1 (unnormalised inverse); s = FBinScale when
+// FApplyBinScale != 0, else 1. FInRows < FH skips source rows known to be zero.
+// Output rows >= FOutGapRow and source rows >= FInGapRow sit FOutGap and FInGap
+// rows further along H, so ky and y above are those shifted positions.
+__kernel void cai_rfft2_cols_c2c
+(
+  const int FNumOut,
+  const int FH,
+  const int FInRows,
+  const int FHalfW,
+  const int FC,
+  const float FSign,
+  const int FApplyBinScale,
+  __global const float* FTwid,
+  __global const float* FBinScale,
+  __global const float* FSrc,
+  __global float* FDst,
+  const int FOutGapRow,
+  const int FOutGap,
+  const int FInGapRow,
+  const int FInGap
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int RowLen = FHalfW * FC;
+  const int OutRow = g_id / RowLen;
+  const int Col = g_id - OutRow * RowLen;
+  const int ky = (OutRow >= FOutGapRow) ? OutRow + FOutGap : OutRow;
+  const int GapStep = (int)(((long)FInGap * ky) % FH);
+  int SrcPos = 2 * Col;
+  const int SrcStride = 2 * RowLen;
+  int Idx = 0;
+  float Re = 0.0f;
+  float Im = 0.0f;
+  for (int y = 0; y < FInRows; y++)
+  {
+    if (y == FInGapRow)
+    {
+      Idx += GapStep;
+      if (Idx >= FH) Idx -= FH;
+    }
+    const float a = FSrc[SrcPos];
+    const float b = FSrc[SrcPos + 1];
+    const float co = FTwid[2 * Idx];
+    const float si = FSign * FTwid[2 * Idx + 1];
+    Re = mad(a, co, mad(-b, si, Re));
+    Im = mad(b, co, mad(a, si, Im));
+    SrcPos += SrcStride;
+    Idx += ky;
+    if (Idx >= FH) Idx -= FH;
+  }
+  if (FApplyBinScale != 0)
+  {
+    const float s = FBinScale[Col / FC];
+    Re *= s;
+    Im *= s;
+  }
+  FDst[2 * g_id] = Re;
+  FDst[2 * g_id + 1] = Im;
+}
+
+// Along W, half spectrum -> real (c2r): Dst[y, x] = sum_kw FBinScale[kw] *
+// Re(Src[y, kw] * exp(i*2*pi*kw*x/W)). FBinScale carries the Hermitian count
+// (1 for DC and an even W's Nyquist bin, 2 for the others) times the norm.
+__kernel void cai_irfft2_rows_c2r
+(
+  const int FNumOut,
+  const int FW,
+  const int FHalfW,
+  const int FC,
+  __global const float* FTwid,
+  __global const float* FBinScale,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int t = g_id / FC;
+  const int c = g_id - t * FC;
+  const int y = t / FW;
+  const int x = t - y * FW;
+  int SrcPos = 2 * (y * FHalfW * FC + c);
+  const int SrcStride = 2 * FC;
+  int Idx = 0;
+  float Sum = 0.0f;
+  for (int kw = 0; kw < FHalfW; kw++)
+  {
+    const float Term = mad(FSrc[SrcPos], FTwid[2 * Idx],
+      -FSrc[SrcPos + 1] * FTwid[2 * Idx + 1]);
+    Sum = mad(FBinScale[kw], Term, Sum);
+    SrcPos += SrcStride;
+    Idx += x;
+    if (Idx >= FW) Idx -= FW;
+  }
+  FDst[g_id] = Sum;
+}
+
+// TNNetSpectralConv2D per-mode channel mixing between the rfft2 kernels above:
+//   Dst[ky, mx, co] = sum_ci W[mx, ky, ci, co] * Src[ky, mx, ci]   (complex),
+// W at 2*(((mx*FModesY + ky)*FInDepth + ci)*FOutDepth + co), Re then Im. Src is
+// (FModesY, FModesX, FInDepth) and Dst (FModesY, FModesX, FOutDepth) complex.
+__kernel void cai_spectral_mode_mix
+(
+  const int FNumOut,
+  const int FModesX,
+  const int FModesY,
+  const int FInDepth,
+  const int FOutDepth,
+  __global const float* FWeights,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumOut) return;
+  const int Mode = g_id / FOutDepth;
+  const int co = g_id - Mode * FOutDepth;
+  const int ky = Mode / FModesX;
+  const int mx = Mode - ky * FModesX;
+  float Re = 0.0f;
+  float Im = 0.0f;
+  int SrcPos = 2 * Mode * FInDepth;
+  int WPos = 2 * ((mx * FModesY + ky) * FInDepth * FOutDepth + co);
+  const int WStride = 2 * FOutDepth;
+  for (int ci = 0; ci < FInDepth; ci++)
+  {
+    const float xr = FSrc[SrcPos];
+    const float xi = FSrc[SrcPos + 1];
+    const float wr = FWeights[WPos];
+    const float wi = FWeights[WPos + 1];
+    Re = mad(wr, xr, mad(-wi, xi, Re));
+    Im = mad(wr, xi, mad(wi, xr, Im));
+    SrcPos += 2;
+    WPos += WStride;
+  }
+  FDst[2 * g_id] = Re;
+  FDst[2 * g_id + 1] = Im;
 }
 
 // CAI Bicubic Gather (separable 4x4 weighted gather forward)
@@ -2456,7 +2984,9 @@ __kernel void cai_bicubic_scatter
 //     y[i]    = FGain[i] * ((x[i]-mean) * invStd) + FBias[i]
 // FGain/FBias are FSize long and shared by every segment (per channel for the
 // token layers, per element for the whole-volume ones); FBias is not read when
-// FUseMean == 0. Launch one work-group per segment (global size = segments x
+// FUseMean == 0. FUseMean == 2 centers the variance but not the output:
+// y[i] = FGain[i] * (x[i] * invStd) + FBias[i] (Restormer BiasFree).
+// Launch one work-group per segment (global size = segments x
 // local size) with a power-of-two local size, and pass FScratch as
 // get_local_size(0) floats of __local memory. The tree reduction differs from
 // the CPU's 8-wide AVX accumulation order only by float rounding (parity well
@@ -2512,11 +3042,12 @@ __kernel void cai_volume_norm
     barrier(CLK_LOCAL_MEM_FENCE);
   }
   const float invStd = 1.0f / sqrt(FScratch[0] / (float)FSize + FEps);
+  const float outCenter = (FUseMean == 2) ? 0.0f : mean;
 
   // ---- apply gain/bias in parallel ----
   for (int i = lid; i < FSize; i += lsize)
   {
-    const float xhat = (X[i] - mean) * invStd;
+    const float xhat = (X[i] - outCenter) * invStd;
     if (FUseMean != 0)
       Y[i] = mad(FGain[i], xhat, FBias[i]);
     else
@@ -2570,6 +3101,9 @@ __kernel void cai_l2norm_perdepth
 //   1 = swish       -> SwiGLU    (A * B * sigmoid(B))
 //   2 = gelu-tanh   -> GEGLU     (A * B * 0.5*(1+tanh(sqrt(2/pi)*(B+0.044715*B^3))))
 //   3 = gelu-erf    -> GEGLUErf  (A * B * 0.5*(1+erf(B/sqrt(2))))
+//   4 = relu on A   -> ReGLU     (ReLU(A) * B - the one flag that gates A)
+//   5 = relu^2      -> ReGLUSquared (A * ReLU(B)^2)
+//   6 = tanh        -> TanhGLU   (A * tanh(B))
 // One work-item per (token, output-channel). Forward-only; the formulas are the
 // exact analytic forms used by the scalar CPU Compute() so parity is < 1e-4.
 // The sigmoid and tanh here are cai_activation's stable forms, not the direct
@@ -2596,35 +3130,28 @@ __kernel void cai_glu_gate
   float gated;
   if (FActFlag <= 1)            // GLU: sigmoid(B) / SwiGLU: swish(B) = B*sigmoid(B)
   {
-    // Two-branch sigmoid: the negative side evaluates exp(b), which UNDERFLOWS
-    // to zero instead of overflowing, so no clamp is needed on either side.
-    float sig;
-    if (b > 0.0f)
-      sig = 1.0f / (1.0f + exp(-b));
-    else
-    {
-      const float s = exp(b);
-      sig = s / (1.0f + s);
-    }
+    const float sig = cai_fused_act(b, 2);
     if (FActFlag == 0) gated = sig; else gated = b * sig;
   }
   else if (FActFlag == 2)       // GEGLU: gelu_tanh(B)
-  {
-    const float SQRT_2_OVER_PI = 0.7978845608f;
-    const float GELU_CONST = 0.044715f;
-    // The cubic term drives arg past 100 by |B| ~ 15, and tanh is already 1.0f
-    // in single precision by |arg| ~ 9, so clamping to cai_activation's [-10,10]
-    // changes no representable result and keeps exp(-2*arg) at exp(20).
-    float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
-    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
-    const float e = exp(-2.0f * arg);
-    gated = b * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
-  }
-  else                          // GEGLUErf: gelu_erf(B)
+    gated = cai_fused_act(b, 5);
+  else if (FActFlag == 3)       // GEGLUErf: gelu_erf(B)
   {
     const float INV_SQRT_2 = 0.7071067811865476f;
-    gated = b * 0.5f * (1.0f + erf(b * INV_SQRT_2));
+    gated = b * 0.5f * (1.0f + cai_erf(b * INV_SQRT_2));
   }
+  else if (FActFlag == 4)       // ReGLU: the gate is on A, so ReLU(A) * B
+  {
+    FY[gid] = ((a > 0.0f) ? a : 0.0f) * b;
+    return;
+  }
+  else if (FActFlag == 5)       // ReGLUSquared: ReLU(B)^2
+  {
+    const float r = clamp(b, 0.0f, CAI_SQRT_FLT_MAX);
+    gated = r * r;
+  }
+  else                          // TanhGLU: tanh(B), cai_tanh's clamped form
+    gated = cai_tanh(b);
   FY[gid] = a * gated;
 }
 
@@ -2710,18 +3237,546 @@ __kernel void cai_group_norm
   }
 }
 
-// Windowed 2-D pooling forward (TNNetMaxPool / TNNetAvgPool). The input volume is
-// laid out depth-axis contiguous in the TVolume convention: element (x,y,d) lives
-// at FX[((FInW * y) + x) * FDepth + d], with row stride FInW*FDepth and x stride
-// FDepth. One work-item per OUTPUT (x,y,d) cell: it reduces its pooling window
-//   ix in [ox*FStride .. min(ox*FStride + FPoolSize - 1, FInW - 1)]
-//   iy in [oy*FStride .. min(oy*FStride + FPoolSize - 1, FInH - 1)]
-// (window edges are clipped to the input, exactly like the scalar loops). FReduce
-// selects the reduction:
-//   0 = MAX  : maximum over the actual (clipped) window cells. For TNNetMaxPool
-//              the host passes the post-CopyPadding input when padding>0 / strided
-//              so the zero-padded border cells are real window members, matching
-//              the scalar FInputCopy path. FStride is the layer stride.
+// Per-slice channel sums of one depth-contiguous volume: work-item (c, slice)
+// writes FPartial[slice * FDepth + c] = sum of x[p,c] (FSquare = 0) or of
+// x[p,c]^2 (FSquare = 1) over the positions [slice * FPositionsPerSlice,
+// +FPositionsPerSlice) clipped to FNumPositions. Launch (FDepth, slice count);
+// adjacent c read adjacent floats.
+__kernel void cai_channel_sums_partial
+(
+  const int FNumPositions,
+  const int FDepth,
+  const int FPositionsPerSlice,
+  const int FSquare,
+  __global const float* FX,
+  __global float* FPartial
+)
+{
+  const int c = get_global_id(0);
+  const int slice = get_global_id(1);
+  if (c >= FDepth) return;
+  const int firstPos = slice * FPositionsPerSlice;
+  const int lastPos = min(firstPos + FPositionsPerSlice, FNumPositions);
+  float ss = 0.0f;
+  for (int p = firstPos; p < lastPos; p++)
+  {
+    const float v = FX[p * FDepth + c];
+    ss = mad(v, FSquare ? v : 1.0f, ss);
+  }
+  FPartial[slice * FDepth + c] = ss;
+}
+
+// Global Response Normalization table (TNNetGRN forward, ConvNeXt-V2). From the
+// FNumSlices x FDepth partial sums of squares of cai_channel_sums_partial
+// it writes the cai_activation ChannelAffine table (opcode 46), 2*FDepth long:
+//   Gx[c]          = sqrt(sum_p x[p,c]^2 + FEps)
+//   FTable[c]      = 1 + gamma[c] * Gx[c] / mean_c(Gx)
+//   FTable[D + c]  = beta[c]
+// so cai_activation then computes y = x * FTable[c] + FTable[D + c]. FWeights is
+// gamma|beta packed (2*FDepth). ONE work-group (a power-of-two local size, with
+// FScratch = get_local_size(0) floats of __local memory): lane l owns channels
+// l, l+lsize, ..., so adjacent lanes read adjacent addresses. Gx >= sqrt(FEps) >
+// 0, so the channel mean is never zero. Forward-only.
+__kernel void cai_grn_table
+(
+  const int FNumSlices,
+  const int FDepth,
+  const float FEps,
+  __global const float* FWeights,
+  __global const float* FPartial,
+  __global float* FTable,
+  __local float* FScratch
+)
+{
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s;
+  float gxSum = 0.0f;
+  for (int c = lid; c < FDepth; c += lsize)
+  {
+    float ss = 0.0f;
+    for (int slice = 0; slice < FNumSlices; slice++)
+      ss += FPartial[slice * FDepth + c];
+    const float gx = sqrt(ss + FEps);
+    FTable[c] = gx;
+    gxSum += gx;
+  }
+  FScratch[lid] = gxSum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float invMean = (float)FDepth / FScratch[0];
+  // Each lane rewrites only the Gx entries it wrote above.
+  for (int c = lid; c < FDepth; c += lsize)
+  {
+    FTable[c] = mad(FWeights[c], FTable[c] * invMean, 1.0f);
+    FTable[FDepth + c] = FWeights[FDepth + c];
+  }
+}
+
+// Meta-ACON beta table (TNNetMetaAconC forward). FWeights is p1|p2|gamma|delta
+// packed (4*FDepth); FTable gets p1|p2|beta (3*FDepth) for cai_activation's
+// AconC opcode 52, with
+//   beta[c] = sigmoid(gamma[c] * mean_p(x[p,c]) + delta[c])
+// with the channel sums from the FNumSlices x FDepth partials of
+// cai_channel_sums_partial. One work-item per channel. Forward-only.
+__kernel void cai_meta_acon_table
+(
+  const int FNumSlices,
+  const int FDepth,
+  const float FInvNumPositions,
+  __global const float* FWeights,
+  __global const float* FPartial,
+  __global float* FTable
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FDepth) return;
+  float ChannelSum = 0.0f;
+  for (int slice = 0; slice < FNumSlices; slice++)
+    ChannelSum += FPartial[slice * FDepth + c];
+  const float BetaInput = mad(FWeights[2 * FDepth + c],
+    ChannelSum * FInvNumPositions, FWeights[3 * FDepth + c]);
+  FTable[c] = FWeights[c];
+  FTable[FDepth + c] = FWeights[FDepth + c];
+  FTable[2 * FDepth + c] = cai_fused_act(BetaInput, 2);
+}
+
+// Attentive statistics pooling (TNNetAttentiveStatsPooling forward, ECAPA-TDNN).
+// FH (features) and FE (attention logits) are (FSeqLen, 1, FChannels) volumes,
+// element [t, c] at t*FChannels + c. Per channel c, with a = softmax_t(FE[., c]):
+//   FY[c]             = mu    = sum_t a[t] * h[t]
+//   FY[FChannels + c] = sigma = sqrt(max(sum_t a[t] * h[t]^2 - mu^2, 0) + FEps)
+// One work-group per channel (a power-of-two local size, FScratch = 3 *
+// get_local_size(0) floats of __local memory): lanes stride over time, then a
+// tree reduction combines the max, the exp sum and the two weighted sums.
+// Forward-only. Coded by Claude (AI).
+__kernel void cai_attentive_stats_pooling
+(
+  const int FSeqLen,
+  const int FChannels,
+  const float FEps,
+  __global const float* FH,
+  __global const float* FE,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int c = get_group_id(0);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  __local float* SumH = FScratch + lsize;
+  __local float* SumHH = SumH + lsize;
+  int s;
+  float maxe = -1e30f;
+  for (int t = lid; t < FSeqLen; t += lsize) maxe = fmax(maxe, FE[t * FChannels + c]);
+  FScratch[lid] = maxe;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  maxe = FScratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+  float sumExp = 0.0f;
+  float sumH = 0.0f;
+  float sumHH = 0.0f;
+  for (int t = lid; t < FSeqLen; t += lsize)
+  {
+    const int idx = t * FChannels + c;
+    // The max shift keeps the argument <= 0; the floor keeps PoCL's exp from trapping.
+    const float e = cai_exp_floored(fmin(FE[idx] - maxe, 0.0f));
+    const float h = FH[idx];
+    const float eh = e * h;
+    sumExp += e;
+    sumH += eh;
+    sumHH = mad(eh, h, sumHH);
+  }
+  FScratch[lid] = sumExp;
+  SumH[lid] = sumH;
+  SumHH[lid] = sumHH;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s)
+    {
+      FScratch[lid] += FScratch[lid + s];
+      SumH[lid] += SumH[lid + s];
+      SumHH[lid] += SumHH[lid + s];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0)
+  {
+    // No fused multiply-add: m2 - mu^2 rounds both terms like the host, so a
+    // single frame gives a variance of exactly 0.
+    #pragma OPENCL FP_CONTRACT OFF
+    // The max element contributes exp(0) = 1, so the fallback mirrors a host guard only.
+    const float inv = 1.0f / ((FScratch[0] > 0.0f) ? FScratch[0] : 1.0f);
+    const float mu = SumH[0] * inv;
+    const float variance = fmax(SumHH[0] * inv - mu * mu, 0.0f);
+    FY[c] = mu;
+    FY[FChannels + c] = sqrt(variance + FEps);
+  }
+}
+
+// RoIAlign forward (TNNetRoIAlign, torchvision aligned=True). One work-item per
+// output (px,py,d) cell: the mean of FRatioX*FRatioY bilinear samples at the bin
+// sub-centers; out-of-bounds corners add 0. Raw layouts [(y*W + x)*Depth + d].
+// The host passes the box geometry (TNNetRoIAlign.SamplingGeometry).
+// Coded by Claude (AI).
+__kernel void cai_roi_align
+(
+  const int FInW,
+  const int FInH,
+  const int FDepth,
+  const int FPooledW,
+  const int FPooledH,
+  const int FRatioX,
+  const int FRatioY,
+  const float FRoiStartX,
+  const float FRoiStartY,
+  const float FBinW,
+  const float FBinH,
+  const float FCountInv,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FPooledW * FPooledH * FDepth) return;
+  const int cell = g_id / FDepth;
+  const int d = g_id - cell * FDepth;
+  const int py = cell / FPooledW;
+  const int px = cell - py * FPooledW;
+  float acc = 0.0f;
+  for (int iy = 0; iy < FRatioY; iy++)
+  {
+    const float sy = FRoiStartY + py * FBinH + (iy + 0.5f) * FBinH / FRatioY;
+    const float y0f = floor(sy);
+    const int y0 = (int)y0f;
+    const int y1 = y0 + 1;
+    const float fy = sy - y0f;
+    const int InY0 = (y0 >= 0) && (y0 < FInH);
+    const int InY1 = (y1 >= 0) && (y1 < FInH);
+    for (int ix = 0; ix < FRatioX; ix++)
+    {
+      const float sx = FRoiStartX + px * FBinW + (ix + 0.5f) * FBinW / FRatioX;
+      const float x0f = floor(sx);
+      const int x0 = (int)x0f;
+      const int x1 = x0 + 1;
+      const float fx = sx - x0f;
+      const int InX0 = (x0 >= 0) && (x0 < FInW);
+      const int InX1 = (x1 >= 0) && (x1 < FInW);
+      float v = 0.0f;
+      if (InX0 && InY0) v += (1.0f - fx) * (1.0f - fy) * FSrc[(y0 * FInW + x0) * FDepth + d];
+      if (InX1 && InY0) v += fx * (1.0f - fy) * FSrc[(y0 * FInW + x1) * FDepth + d];
+      if (InX0 && InY1) v += (1.0f - fx) * fy * FSrc[(y1 * FInW + x0) * FDepth + d];
+      if (InX1 && InY1) v += fx * fy * FSrc[(y1 * FInW + x1) * FDepth + d];
+      acc += v;
+    }
+  }
+  FDst[g_id] = acc * FCountInv;
+}
+
+// Transposed channel attention (TNNetTransposedChannelAttention, Restormer MDTA).
+// X is FNumPositions x 3*FC, [q|k|v] head-major. One work-group per dot product
+// over the positions: group g < FC*FCh is q[r].k[FC + h*FCh + j] with
+// g = r*FCh + j, h = r / FCh; group FC*FCh + s is the sum of squares of q|k
+// channel s (s < 2*FC). FScratch holds get_local_size(0) floats (a power of two).
+// Coded by Claude (AI).
+__kernel void cai_transposed_attn_dots
+(
+  const int FNumPositions,
+  const int FC,
+  const int FCh,
+  __global const float* FX,
+  __global float* FDots,
+  __local float* FScratch
+)
+{
+  const int g = get_group_id(0);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  const int GramCount = FC * FCh;
+  const int IsGram = g < GramCount;
+  const int Row = g / FCh;
+  const int Col = g - Row * FCh;
+  const int Head = Row / FCh;
+  const int SquareChannel = g - GramCount;
+  const int ChannelA = IsGram ? Row : SquareChannel;
+  const int ChannelB = IsGram ? (FC + Head * FCh + Col) : SquareChannel;
+  const int Stride = 3 * FC;
+  int s;
+  float acc = 0.0f;
+  for (int p = lid; p < FNumPositions; p += lsize)
+    acc = mad(FX[p * Stride + ChannelA], FX[p * Stride + ChannelB], acc);
+  FScratch[lid] = acc;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) FDots[g] = FScratch[0];
+}
+
+// One work-item per q row r (head h = r / FCh): FAttn[r*FCh + j] =
+// softmax_j(t[h] * G[r,j] / (max(|q_r|, eps) * max(|k_j|, eps))), G and the
+// squared norms read from cai_transposed_attn_dots. The sums of squares are
+// >= 0 and the exp arguments <= 0, so no branch can trap. Coded by Claude (AI).
+__kernel void cai_transposed_attn_softmax
+(
+  const int FC,
+  const int FCh,
+  const float FEps,
+  __global const float* FTemperature,
+  __global const float* FDots,
+  __global float* FAttn
+)
+{
+  const int Row = get_global_id(0);
+  if (Row >= FC) return;
+  const int Head = Row / FCh;
+  const int SquareBase = FC * FCh;
+  const int KeySquareBase = SquareBase + FC + Head * FCh;
+  const int RowBase = Row * FCh;
+  const float RowScale = FTemperature[Head] / fmax(sqrt(FDots[SquareBase + Row]), FEps);
+  float MaxLogit = -FLT_MAX;
+  float SumExp = 0.0f;
+  int j;
+  for (j = 0; j < FCh; j++)
+  {
+    const float Logit = FDots[RowBase + j] * RowScale /
+      fmax(sqrt(FDots[KeySquareBase + j]), FEps);
+    FAttn[RowBase + j] = Logit;
+    MaxLogit = fmax(MaxLogit, Logit);
+  }
+  for (j = 0; j < FCh; j++)
+  {
+    const float E = exp(FAttn[RowBase + j] - MaxLogit);
+    FAttn[RowBase + j] = E;
+    SumExp += E;
+  }
+  const float InvSum = 1.0f / SumExp;
+  for (j = 0; j < FCh; j++) FAttn[RowBase + j] *= InvSum;
+}
+
+// One work-item per output (p, c), h = c / FCh:
+// FY[p*FC + c] = sum_j FAttn[c*FCh + j] * v[p, h*FCh + j], v at depth 2*FC of X.
+// Coded by Claude (AI).
+__kernel void cai_transposed_attn_apply
+(
+  const int FNumPositions,
+  const int FC,
+  const int FCh,
+  __global const float* FAttn,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumPositions * FC) return;
+  const int p = g_id / FC;
+  const int c = g_id - p * FC;
+  const int Head = c / FCh;
+  const int ValueBase = p * 3 * FC + 2 * FC + Head * FCh;
+  const int RowBase = c * FCh;
+  float acc = 0.0f;
+  for (int j = 0; j < FCh; j++)
+    acc = mad(FAttn[RowBase + j], FX[ValueBase + j], acc);
+  FY[g_id] = acc;
+}
+
+// Local response normalization forward (TNNetLocalResponseNorm2D / Depth). One
+// work-item per (x,y,d): Dst = Src / (1 + FScale * sum Src^2)^FBeta, the sum over
+// the clamped box of half-widths FHalfX/FHalfY/FHalfD. The base is >= 1, so pow
+// sees no negative or zero argument. Raw layout [(y*W + x)*Depth + d].
+// Coded by Claude (AI).
+__kernel void cai_local_response_norm
+(
+  const int FSizeX,
+  const int FSizeY,
+  const int FDepth,
+  const int FHalfX,
+  const int FHalfY,
+  const int FHalfD,
+  const float FScale,
+  const float FBeta,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FSizeX * FSizeY * FDepth) return;
+  const int cell = g_id / FDepth;
+  const int d = g_id - cell * FDepth;
+  const int y = cell / FSizeX;
+  const int x = cell - y * FSizeX;
+  const int MinX = max(x - FHalfX, 0);
+  const int MaxX = min(x + FHalfX, FSizeX - 1);
+  const int MinY = max(y - FHalfY, 0);
+  const int MaxY = min(y + FHalfY, FSizeY - 1);
+  const int MinD = max(d - FHalfD, 0);
+  const int MaxD = min(d + FHalfD, FDepth - 1);
+  float SumSq = 0.0f;
+  for (int iy = MinY; iy <= MaxY; iy++)
+  {
+    for (int ix = MinX; ix <= MaxX; ix++)
+    {
+      const int Base = (iy * FSizeX + ix) * FDepth;
+      for (int id = MinD; id <= MaxD; id++)
+      {
+        const float v = FSrc[Base + id];
+        SumSq += v * v;
+      }
+    }
+  }
+  FDst[g_id] = FSrc[g_id] / pow(1.0f + FScale * SumSq, FBeta);
+}
+
+// FreeU skip filter forward (TNNetFreeUFourierFilter, diffusers fourier_filter
+// with threshold 1). One work-item per channel d: the cosine/sine sums of the
+// DC, (-1,0), (0,-1) and (-1,-1) bins, times FGain = (s - 1) / (H * W), are
+// added back on the same basis. A side of 1 has no -1 bin (mask, no branch).
+// Raw layout [(y*W + x)*Depth + d]. Coded by Claude (AI).
+__kernel void cai_freeu_fourier_filter
+(
+  const int FSizeX,
+  const int FSizeY,
+  const int FDepth,
+  const float FGain,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  if (d >= FDepth) return;
+  const float RowMask = (FSizeY >= 2) ? 1.0f : 0.0f;
+  const float ColMask = (FSizeX >= 2) ? 1.0f : 0.0f;
+  const float RowStep = 6.283185307179586f / (float)FSizeY;
+  const float ColStep = 6.283185307179586f / (float)FSizeX;
+  float SumDC = 0.0f;
+  float SumRowCos = 0.0f, SumRowSin = 0.0f;
+  float SumColCos = 0.0f, SumColSin = 0.0f;
+  float SumDiagCos = 0.0f, SumDiagSin = 0.0f;
+  int Offset = d;
+  for (int y = 0; y < FSizeY; y++)
+  {
+    float RowCos;
+    const float RowSin = sincos(RowStep * (float)y, &RowCos);
+    for (int x = 0; x < FSizeX; x++)
+    {
+      float ColCos;
+      const float ColSin = sincos(ColStep * (float)x, &ColCos);
+      const float v = FSrc[Offset];
+      SumDC += v;
+      SumRowCos = mad(v, RowCos, SumRowCos);
+      SumRowSin = mad(v, RowSin, SumRowSin);
+      SumColCos = mad(v, ColCos, SumColCos);
+      SumColSin = mad(v, ColSin, SumColSin);
+      SumDiagCos = mad(v, RowCos * ColCos - RowSin * ColSin, SumDiagCos);
+      SumDiagSin = mad(v, RowSin * ColCos + RowCos * ColSin, SumDiagSin);
+      Offset += FDepth;
+    }
+  }
+  const float RowGain = FGain * RowMask;
+  const float ColGain = FGain * ColMask;
+  const float DiagGain = RowGain * ColMask;
+  SumDC *= FGain;
+  SumRowCos *= RowGain;
+  SumRowSin *= RowGain;
+  SumColCos *= ColGain;
+  SumColSin *= ColGain;
+  SumDiagCos *= DiagGain;
+  SumDiagSin *= DiagGain;
+  Offset = d;
+  for (int y = 0; y < FSizeY; y++)
+  {
+    float RowCos;
+    const float RowSin = sincos(RowStep * (float)y, &RowCos);
+    for (int x = 0; x < FSizeX; x++)
+    {
+      float ColCos;
+      const float ColSin = sincos(ColStep * (float)x, &ColCos);
+      float Low = SumDC;
+      Low = mad(SumRowCos, RowCos, Low);
+      Low = mad(SumRowSin, RowSin, Low);
+      Low = mad(SumColCos, ColCos, Low);
+      Low = mad(SumColSin, ColSin, Low);
+      Low = mad(SumDiagCos, RowCos * ColCos - RowSin * ColSin, Low);
+      Low = mad(SumDiagSin, RowSin * ColCos + RowCos * ColSin, Low);
+      FDst[Offset] = FSrc[Offset] + Low;
+      Offset += FDepth;
+    }
+  }
+}
+
+// TNNetConvGRUCell reset step: FDst = [r*h ; x] per pixel, where h|x is the cell
+// input FSrc (FHiddenC + FInputC channels) and r is the second half of the fused
+// z|r gate map FGates (2*FHiddenC channels per pixel). One work-item per output float.
+// Coded by Claude (AI).
+__kernel void cai_conv_gru_reset_input
+(
+  const int FPixelCount,
+  const int FHiddenC,
+  const int FInputC,
+  __global const float* FGates,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  const int InDepth = FHiddenC + FInputC;
+  if (g_id >= FPixelCount * InDepth) return;
+  const int pixel = g_id / InDepth;
+  const int c = g_id - pixel * InDepth;
+  float v = FSrc[g_id];
+  if (c < FHiddenC) v = FGates[pixel * 2 * FHiddenC + FHiddenC + c] * v;
+  FDst[g_id] = v;
+}
+
+// TNNetConvGRUCell blend: FDst = (1 - z) * h + z * q, with z the first half of the
+// fused z|r gate map FGates, h the first FHiddenC channels of FSrc and q the
+// candidate map FCandidate (already tanh'd). One work-item per output float.
+// Coded by Claude (AI).
+__kernel void cai_conv_gru_blend
+(
+  const int FPixelCount,
+  const int FHiddenC,
+  const int FInputC,
+  __global const float* FGates,
+  __global const float* FSrc,
+  __global const float* FCandidate,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FPixelCount * FHiddenC) return;
+  const int pixel = g_id / FHiddenC;
+  const int c = g_id - pixel * FHiddenC;
+  const float z = FGates[pixel * 2 * FHiddenC + c];
+  const float h = FSrc[pixel * (FHiddenC + FInputC) + c];
+  FDst[g_id] = (1.0f - z) * h + z * FCandidate[g_id];
+}
+
+// Windowed 2-D pooling forward (TNNetMaxPool / TNNetMaxPoolPortable / TNNetAvgPool).
+// The input volume is laid out depth-axis contiguous in the TVolume convention:
+// element (x,y,d) lives at FX[((FInW * y) + x) * FDepth + d], with row stride
+// FInW*FDepth and x stride FDepth. FInW/FInH are the UNPADDED input sizes; the
+// input is read as if surrounded by FPadding zero cells, the host CopyPadding
+// convention. One work-item per OUTPUT (x,y,d) cell: in padded coordinates it
+// reduces the window
+//   px in [ox*FStride .. min(ox*FStride + FPoolSize - 1, FInW + 2*FPadding - 1)]
+//   py in [oy*FStride .. min(oy*FStride + FPoolSize - 1, FInH + 2*FPadding - 1)]
+// (window edges are clipped to the padded input, exactly like the scalar loops).
+// FReduce selects the reduction:
+//   0 = MAX  : maximum over the (clipped) window cells; a window that reaches
+//              into the padding also sees its zero cells.
 //   1 = AVG  : sum over the window divided by FDivisor (TNNetAvgPool divides by
 //              the FULL FPoolSize*FPoolSize, NOT the clipped cell count; the host
 //              passes FStride = FPoolSize and FDivisor = FPoolSize*FPoolSize).
@@ -2738,7 +3793,8 @@ __kernel void cai_pool2d
   const int FReduce,
   const float FDivisor,
   __global const float* FX,
-  __global float* FY
+  __global float* FY,
+  const int FPadding
 )
 {
   const int gid = get_global_id(0);
@@ -2750,15 +3806,23 @@ __kernel void cai_pool2d
   const int ox = t % FOutW;
   const int oy = t / FOutW;
 
-  const int ix0 = ox * FStride;
-  const int iy0 = oy * FStride;
-  int ixMax = ix0 + FPoolSize - 1; if (ixMax > FInW - 1) ixMax = FInW - 1;
-  int iyMax = iy0 + FPoolSize - 1; if (iyMax > FInH - 1) iyMax = FInH - 1;
+  // Window bounds in unpadded coordinates, clipped to the padded extent first.
+  int ix0 = ox * FStride - FPadding;
+  int iy0 = oy * FStride - FPadding;
+  int ixMax = ix0 + FPoolSize - 1; if (ixMax > FInW - 1 + FPadding) ixMax = FInW - 1 + FPadding;
+  int iyMax = iy0 + FPoolSize - 1; if (iyMax > FInH - 1 + FPadding) iyMax = FInH - 1 + FPadding;
+  // The padding cells are zeros: they join the reduction once, through its
+  // starting value, and the loops below visit only the real cells.
+  const int touchesPadding = (ix0 < 0) || (iy0 < 0) || (ixMax > FInW - 1) || (iyMax > FInH - 1);
+  if (ix0 < 0) ix0 = 0;
+  if (iy0 < 0) iy0 = 0;
+  if (ixMax > FInW - 1) ixMax = FInW - 1;
+  if (iyMax > FInH - 1) iyMax = FInH - 1;
 
   const int rowStride = FInW * FDepth;
   if (FReduce == 0)
   {
-    float m = -1e30f;
+    float m = touchesPadding ? 0.0f : -1e30f;
     for (int iy = iy0; iy <= iyMax; iy++)
     {
       const int rowBase = iy * rowStride + d;
@@ -2781,6 +3845,38 @@ __kernel void cai_pool2d
     }
     FY[gid] = s / FDivisor;
   }
+}
+
+// One pass of the separable TNNetBoxFilter (zero padding, fixed divisor): each
+// output cell sums its clipped (2r+1)-tap window along ONE axis and scales it.
+// The axis is given by its element stride and length in the depth-contiguous
+// volume: rows FAxisStride = Depth, FAxisLength = SizeX; columns FAxisStride =
+// SizeX*Depth, FAxisLength = SizeY. A direct sum (not a running sum) keeps every
+// work-item independent and free of float drift: 2(2r+1) taps per output for
+// the two passes against (2r+1)^2 for one 2-D window. Global size = FTotal.
+__kernel void cai_box_filter_pass
+(
+  const int FTotal,
+  const int FAxisStride,
+  const int FAxisLength,
+  const int FRadius,
+  const float FScale,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int gid = get_global_id(0);
+  if (gid >= FTotal) return;
+  const int pos = (gid / FAxisStride) % FAxisLength;
+  int firstTap = pos - FRadius;
+  if (firstTap < 0) firstTap = 0;
+  int lastTap = pos + FRadius;
+  if (lastTap > FAxisLength - 1) lastTap = FAxisLength - 1;
+  const int lineBase = gid - pos * FAxisStride;
+  float s = 0.0f;
+  for (int tap = firstTap; tap <= lastTap; tap++)
+    s += FSrc[lineBase + tap * FAxisStride];
+  FDst[gid] = s * FScale;
 }
 
 // Token-gather embedding forward (TNNetEmbedding). The weight table FW is laid out
@@ -2842,20 +3938,72 @@ __kernel void cai_embedding_gather_int8
     FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row];
 }
 
+// cai_embedding_gather plus the positional table FPos (TNNetTokenAndPositional-
+// Embedding), shaped like FY: a zero-padding token (row < 0) gets neither table.
+// Coded by Claude (AI).
+__kernel void cai_embedding_gather_pos
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const float* FW,
+  __global float* FY,
+  __global const float* FPos
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = FW[row * FEmbeddingSize + e] + FPos[gid];
+}
+
+// Int8 twin of cai_embedding_gather_pos; FScales then FPos close the argument
+// list. Coded by Claude (AI).
+__kernel void cai_embedding_gather_int8_pos
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const char* FCodes,
+  __global float* FY,
+  __global const float* FScales,
+  __global const float* FPos
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row]
+      + FPos[gid];
+}
+
 /* Device-side im2col, shared by cai_im2col and cai_im2col_h. One work-item per
    element of the convolution's FInputPrepared column matrix: a copy of one
    FInput element, or 0 for a tap in the zero padding, in the layout of the CPU
    PrepareInputForConvolutionFast ((SizeX*y)+x)*Depth+d, so the GEMM reads the
    same B operand. FInput is either unpadded (a bound resident source; the
    padding is applied here) or the host-padded FInputCopy with both paddings 0.
-   Kernel taps sit DilationX columns apart. Indices are int: N < 2^31.
+   Kernel taps sit DilationX columns and DilationY rows apart. Indices are
+   int: N < 2^31.
    Coded by Claude (AI). */
 // Index of the FInput element read by column element gid; -1 for a tap in the
 // zero padding.
 static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
   const int ColDepth, const int RowSpan, const int InSizeX, const int InSizeY,
   const int InDepth, const int Stride, const int PaddingX, const int PaddingY,
-  const int DilationX)
+  const int DilationX, const int DilationY)
 {
   const int col_elem = gid % ColDepth;
   const int pos      = gid / ColDepth;
@@ -2864,7 +4012,7 @@ static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
   const int yCount   = col_elem / RowSpan;
   const int rem      = col_elem % RowSpan;
   const int kx       = rem / InDepth;
-  const int y        = oy * Stride + yCount - PaddingY;
+  const int y        = oy * Stride + yCount * DilationY - PaddingY;
   const int x        = ox * Stride - PaddingX + kx * DilationX;
   if ((y < 0) || (y >= InSizeY) || (x < 0) || (x >= InSizeX)) return -1;
   return ((InSizeX * y) + x) * InDepth + (rem - kx * InDepth);
@@ -2884,6 +4032,7 @@ __kernel void cai_im2col
   const int PaddingX,   // zero columns added left and right of FInput
   const int PaddingY,   // zero rows added above and below FInput
   const int DilationX,  // spacing of the kernel taps along X
+  const int DilationY,  // spacing of the kernel taps along Y
   __global const float* FInput,
   __global float* FCols
 )
@@ -2891,7 +4040,8 @@ __kernel void cai_im2col
   const int gid = get_global_id(0);
   if (gid >= N) return;
   const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
-    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX);
+    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX,
+    DilationY);
   FCols[gid] = (src < 0) ? 0.0f : FInput[src];
 }
 
@@ -2910,6 +4060,7 @@ __kernel void cai_im2col_h
   const int PaddingX,
   const int PaddingY,
   const int DilationX,
+  const int DilationY,
   __global const float* FInput,
   __global half* FCols
 )
@@ -2917,7 +4068,8 @@ __kernel void cai_im2col_h
   const int gid = get_global_id(0);
   if (gid >= N) return;
   const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
-    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX);
+    InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX,
+    DilationY);
   vstore_half((src < 0) ? 0.0f : FInput[src], gid, FCols);
 }
 
@@ -2965,8 +4117,8 @@ __kernel void cai_rope
   const int k = gid % FHalfDepth;
   const int pos = gid / FHalfDepth;
   const float angle = (float)(pos + FPositionOffset) * FTheta[k];
-  const float s = sin(angle);
-  const float c = cos(angle);
+  const float s = cai_sin(angle);
+  const float c = cai_cos(angle);
   const int base = pos * FDepth + 2 * k;
   const float x0 = FX[base];
   const float x1 = FX[base + 1];
@@ -3003,8 +4155,8 @@ __kernel void cai_mrope
   const int k = gid % FHalfDepth;
   const int pos = gid / FHalfDepth;
   const float angle = FAngle[pos * FHalfTile + k % FHalfTile];
-  const float s = sin(angle);
-  const float c = cos(angle);
+  const float s = cai_sin(angle);
+  const float c = cai_cos(angle);
   const int base = pos * FDepth + 2 * k;
   const float x0 = FX[base];
   const float x1 = FX[base + 1];
@@ -3017,7 +4169,7 @@ __kernel void cai_mrope
 // normalization groups of FGroupLen elements; group g owns FX[g*FGroupLen ..
 // +FGroupLen). One work-item per group does the standard max-subtract -> exp ->
 // sum -> divide:
-//   m = max(x);  e_i = exp(clamp(x_i - m, 4000));  y_i = e_i / sum(e)
+//   m = max(x);  e_i = exp(max(x_i - m, -87));  y_i = e_i / sum(e)
 // FApplyMinScale selects the variant:
 //   0 = TNNetPointwiseSoftMax (FOutput.PointwiseSoftMax, GroupLen = Depth): no
 //       low-end rescaling.
@@ -3062,9 +4214,8 @@ __kernel void cai_softmax
   float total = 0.0f;
   for (int c = 0; c < FGroupLen; c++)
   {
-    float a = (FX[base + c] - shift) * scale;
-    if (a > 4000.0f) a = 4000.0f; else if (a < -4000.0f) a = -4000.0f;
-    const float e = exp(a);
+    // The max shift keeps the argument <= 0; the floor keeps PoCL's exp from trapping.
+    const float e = cai_exp_floored(fmin((FX[base + c] - shift) * scale, 0.0f));
     FY[base + c] = e;
     total += e;
   }
@@ -3080,7 +4231,12 @@ __kernel void cai_softmax
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
 // 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
 // 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
-// 24 = ReLUL, 25 = AddConstant.
+// 24 = ReLUL, 25 = AddConstant, 26 = MulConstant, 27/28 = Snake,
+// 29..43 = the transcendental activations (Erf through ISRU),
+// 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine),
+// 47 = SubMulConstant (TNNetMovingStdNormalization),
+// 48/49 = SwishBeta/MishAlpha, 50..55 = the per-channel learnable activations,
+// 56..73 = the remaining TNNetReLUBase activations (ArcSinh through InverseSigmoid).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -3091,7 +4247,9 @@ __kernel void cai_softmax
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
 // result tracks the host to ~1e-6 (exp here is more accurate than the CPU
-// polynomial pcr_expf, not less). Coded by Claude (AI).
+// polynomial pcr_expf, not less). PoCL may evaluate a case's math for every
+// opcode, with FP traps on, so no case may overflow or convert out of range.
+// Coded by Claude (AI).
 __kernel void cai_activation
 (
   const int FSize,
@@ -3126,14 +4284,13 @@ __kernel void cai_activation
       y = cai_fused_act(x, FOpcode);
       break;
     case 9: // ELU: x for x > 0, else alpha*(exp(x)-1). FParamA = alpha.
-      // exp is evaluated only on the negative branch, where it underflows
-      // towards zero rather than overflowing, so no clamp is needed.
-      if (x > 0.0f) y = x; else y = FParamA * (exp(x) - 1.0f);
+      // Both branches run, so exp's argument is capped at the branch point.
+      y = (x > 0.0f) ? x : FParamA * (cai_exp_floored(fmin(x, 0.0f)) - 1.0f);
       break;
     case 10: // SELU: scale*x for x > 0, else scale*alpha*exp(x) - scale*alpha.
       // FParamA = scale*alpha and FParamB = scale, both passed in from the layer
       // so the device uses the very floats the host multiplied.
-      if (x > 0.0f) y = FParamB * x; else y = FParamA * exp(x) - FParamA;
+      y = (x > 0.0f) ? FParamB * x : FParamA * cai_exp_floored(fmin(x, 0.0f)) - FParamA;
       break;
     case 11: // Abs
       y = fabs(x);
@@ -3142,11 +4299,17 @@ __kernel void cai_activation
       if (x > 0.0f) y = 1.0f; else if (x < 0.0f) y = -1.0f; else y = 0.0f;
       break;
     case 13: // Square
-      y = x * x;
+    {
+      const float a = fmin(fabs(x), CAI_SQRT_FLT_MAX);
+      y = a * a;
       break;
+    }
     case 14: // SquaredReLU: x*x for x > 0, else 0
-      y = (x > 0.0f) ? x * x : 0.0f;
+    {
+      const float r = clamp(x, 0.0f, CAI_SQRT_FLT_MAX);
+      y = r * r;
       break;
+    }
     case 15: // LeakyReLU: x for x > 0, else slope*x. FParamA = slope.
       y = (x > 0.0f) ? x : FParamA * x;
       break;
@@ -3176,7 +4339,7 @@ __kernel void cai_activation
       y = x / (1.0f + fabs(x));
       break;
     case 23: // BentIdentity: (sqrt(x^2 + 1) - 1)/2 + x
-      y = (sqrt(x * x + 1.0f) - 1.0f) * 0.5f + x;
+      y = (cai_sqrt_square_plus1(x) - 1.0f) * 0.5f + x;
       break;
     case 24: // ReLUL: leaky clamp into [FParamA, FParamB]. FParamC = slope.
       if (x > FParamB) y = FParamB + (x - FParamB) * FParamC;
@@ -3191,15 +4354,281 @@ __kernel void cai_activation
       break;
     case 27: // Snake: x + sin(alpha*x)^2 / alpha. FParamA = alpha, FParamB = 1/alpha.
     {
-      const float s = sin(FParamA * x);
+      const float s = cai_sin(FParamA * x);
       y = mad(FParamB * s, s, x);
       break;
     }
     case 28: // Snake with alpha = FChannelParam[channel].
     {
       const float a = FChannelParam[i % FChannels];
-      const float s = sin(a * x);
+      const float s = cai_sin(a * x);
       y = mad(s / a, s, x);
+      break;
+    }
+    // 29..43 mirror the host Compute forms, including their input clamps and
+    // saturation thresholds. tanh is cai_tanh's clamped form throughout.
+    case 29: // Erf
+      y = cai_erf(x);
+      break;
+    case 30: // Exp: exp(min(x, 30))
+      y = cai_exp_floored(fmin(x, 30.0f));
+      break;
+    case 31: // Log: ln(max(x, 1e-8))
+      y = cai_log(fmax(x, 1e-8f));
+      break;
+    case 32: // Sqrt: sqrt(max(x, 1e-6))
+      y = sqrt((x < 1e-6f) ? 1e-6f : x);
+      break;
+    case 33: // Sin
+      y = cai_sin(x);
+      break;
+    case 34: // Cos
+      y = cai_cos(x);
+      break;
+    case 35: // Mish: x * tanh(softplus(x)), softplus saturated beyond +-20
+    {
+      const float e = cai_exp_floored(fmin(x, 20.0f));
+      float sp;
+      if (x > 20.0f) sp = x;
+      else if (x < -20.0f) sp = e;
+      else sp = log1p(e);
+      y = x * cai_tanh(sp);
+      break;
+    }
+    case 36: // SoftPlus: ln(1 + exp(x)), x itself beyond 30
+      y = (x > 30.0f) ? x : log1p(cai_exp_floored(fmin(x, 30.0f)));
+      break;
+    case 37: // LogSigmoid: -softplus(-x), the exp argument kept non-positive
+    {
+      const float e = cai_exp_floored(-fabs(x));
+      y = (x >= 0.0f) ? -log1p(e) : x - log1p(e);
+      break;
+    }
+    case 38: // TanhShrink: x - tanh(x)
+      y = x - cai_tanh(x);
+      break;
+    case 39: // LiSHT: x * tanh(x)
+      y = x * cai_tanh(x);
+      break;
+    case 40: // SoftPlusBeta: ln(1 + exp(beta*x))/beta, x beyond beta*x > 30.
+    {        // FParamA = beta, FParamB = 1/beta.
+      const float bx = FParamA * x;
+      y = (bx > 30.0f) ? x : FParamB * log(1.0f + cai_exp_floored(fmin(bx, 30.0f)));
+      break;
+    }
+    case 41: // CELU: x for x > 0, else alpha*(exp(x/alpha)-1).
+      // FParamA = alpha, FParamB = 1/alpha.
+      y = (x > 0.0f) ? x : FParamA * (cai_exp_floored(fmin(x * FParamB, 0.0f)) - 1.0f);
+      break;
+    case 42: // GaussianActivation: exp(-x^2)
+    {
+      const float a = fmin(fabs(x), CAI_SQUARE_CAP);
+      y = cai_exp_floored(-a * a);
+      break;
+    }
+    case 43: // ISRU: x / sqrt(1 + alpha*x^2). FParamA = alpha.
+      y = cai_isru(x, FParamA);
+      break;
+    // 44..46 read FChannelParam as a table of FChannels entries: one per
+    // channel, or one per element when FChannels = FSize (TNNetCellBias).
+    case 44: // AddChannel: x + c
+      y = x + FChannelParam[i % FChannels];
+      break;
+    case 45: // MulChannel: x * c
+      y = x * FChannelParam[i % FChannels];
+      break;
+    case 46: // ChannelAffine (FiLM): x * gamma + beta, gamma|beta packed 2*FChannels long.
+    {        // -cl-mad-enable may fuse this, so it can differ from the host by 1 ulp.
+      const int c = i % FChannels;
+      y = x * FChannelParam[c] + FChannelParam[FChannels + c];
+      break;
+    }
+    case 47: // SubMulConstant: (x - FParamA) * FParamB, the host Sub then Mul
+      y = (x - FParamA) * FParamB;
+      break;
+    case 48: // SwishBeta: x * sigmoid(beta*x). FParamA = beta.
+      y = x * cai_fused_act(FParamA * x, 2);
+      break;
+    case 49: // MishAlpha: x * tanh(softplus(alpha*x)), saturated beyond +-30. FParamA = alpha.
+    {
+      const float ax = FParamA * x;
+      const float ExpAx = cai_exp_floored(fmin(ax, 30.0f)); // capped: never overflows if speculated
+      float sp;
+      if (ax > 30.0f) sp = ax;
+      else if (ax < -30.0f) sp = ExpAx;
+      else sp = log(1.0f + ExpAx);
+      y = x * cai_tanh(sp);
+      break;
+    }
+    // 50..55 read FChannelParam as packed per-channel tables, table k at k*FChannels.
+    case 50: // PReLUChannel: x >= 0 ? x : alpha[c]*x
+      y = (x >= 0.0f) ? x : FChannelParam[i % FChannels] * x;
+      break;
+    case 51: // SReLU, tables t_r|a_r|t_l|a_l
+    {
+      const int c = i % FChannels;
+      const float tr = FChannelParam[c];
+      const float tl = FChannelParam[2 * FChannels + c];
+      if (x >= tr) y = tr + FChannelParam[FChannels + c] * (x - tr);
+      else if (x <= tl) y = tl + FChannelParam[3 * FChannels + c] * (x - tl);
+      else y = x;
+      break;
+    }
+    case 52: // AconC, tables p1|p2|beta: d*sigmoid(beta*d) + p2*x, d = (p1-p2)*x
+    {
+      const int c = i % FChannels;
+      const float p2 = FChannelParam[FChannels + c];
+      const float gain = FChannelParam[c] - p2;
+      const float BetaGain = FChannelParam[2 * FChannels + c] * gain;
+      y = gain * x * cai_fused_act(BetaGain * x, 2) + p2 * x;
+      break;
+    }
+    case 53: // Polynomial, tables a|b|c0: (a*x + b)*x + c0
+    {
+      const int c = i % FChannels;
+      const float xc = clamp(x, -CAI_SQUARE_CAP, CAI_SQUARE_CAP); // saturates past 1e15
+      y = (FChannelParam[c] * xc + FChannelParam[FChannels + c]) * xc +
+        FChannelParam[2 * FChannels + c];
+      break;
+    }
+    // The float-to-int conversions below are clamped first: PoCL may evaluate
+    // them speculatively for other opcodes, where an out-of-range one traps.
+    case 54: // APL, tables a[0..S-1]|b[0..S-1]: max(0,x) + sum a*max(0, b-x). FParamA = S.
+    {
+      const int HingeCount = (int)clamp(FParamA, 0.0f, 65536.0f);
+      const int c = i % FChannels;
+      float acc = (x > 0.0f) ? x : 0.0f;
+      for (int s = 0; s < HingeCount; s++)
+      {
+        const float b = FChannelParam[(HingeCount + s) * FChannels + c];
+        if (x < b) acc += FChannelParam[s * FChannels + c] * (b - x);
+      }
+      y = acc;
+      break;
+    }
+    case 55: // Spline, tables y[0..K] at knots -R + dt*k, boundary segments extrapolate.
+    {        // FParamA = R, FParamB = 1/dt, FParamC = K.
+      const int c = i % FChannels;
+      const float SegmentPos = (x + FParamA) * FParamB;
+      const int seg = (int)clamp(SegmentPos, 0.0f, fmax(FParamC - 1.0f, 0.0f));
+      const float y0 = FChannelParam[seg * FChannels + c];
+      const float y1 = FChannelParam[(seg + 1) * FChannels + c];
+      y = y0 + (SegmentPos - (float)seg) * (y1 - y0);
+      break;
+    }
+    // 56..73 mirror the host Compute forms, thresholds included.
+    case 56: // ArcSinh: sign(x) * ln(|x| + sqrt(x^2 + 1)), |x| saturating at 2^125
+    {
+      const float a = fmin(fabs(x), 0x1p125f);
+      y = copysign(cai_log(a + cai_sqrt_square_plus1(a)), x);
+      break;
+    }
+    case 57: // SinhAct: sinh(clamp(x, -88, 88)), from e = exp(|x|) >= 1 so 1/e is finite
+    {
+      const float xc = clamp(x, -88.0f, 88.0f);
+      const float e = exp(fabs(xc));
+      y = copysign((e - 1.0f / e) * 0.5f, xc);
+      break;
+    }
+    case 58: // Reciprocal: 1 / (sign(x) * max(|x|, 1e-6)), sign(0) = +1
+    {
+      const float a = fmax(fabs(x), 1e-6f);
+      y = 1.0f / ((x < 0.0f) ? -a : a);
+      break;
+    }
+    case 59: // Power: x^n by squaring, n = FParamA. |x| is capped (n > 0) or floored
+    {        // (n < 0) at 2^(126/|n|), which keeps every product finite.
+      const int n = (int)clamp(FParamA, -65536.0f, 65536.0f);
+      int RemainingExponent = abs(n);
+      const float bound = exp2(126.0f / (float)max(RemainingExponent, 1));
+      const float magnitude = (n >= 0) ? fmin(fabs(x), bound) :
+        1.0f / fmax(fabs(x), 1.0f / bound);
+      float base = copysign(magnitude, x);
+      float result = 1.0f;
+      while (RemainingExponent > 0)
+      {
+        if ((RemainingExponent & 1) != 0) result *= base;
+        RemainingExponent >>= 1;
+        if (RemainingExponent > 0) base *= base;
+      }
+      y = result;
+      break;
+    }
+    case 60: // Serf: x * erf(softplus(x)), softplus saturated beyond +-30
+    {
+      const float e = cai_exp_floored(fmin(x, 30.0f));
+      float sp;
+      if (x > 30.0f) sp = x;
+      else if (x < -30.0f) sp = e;
+      else sp = log1p(e);
+      y = x * cai_erf(sp);
+      break;
+    }
+    case 61: // Smish: x * tanh(ln(1 + sigmoid(x)))
+      y = x * cai_tanh(log(1.0f + cai_fused_act(x, 2)));
+      break;
+    case 62: // Phish: x * tanh(GELU(x))
+      y = x * cai_tanh(cai_fused_act(x, 5));
+      break;
+    case 63: // Sinc: sin(x)/x, and 1 for |x| < 1e-6
+    {
+      const bool IsNearZero = (fabs(x) < 1e-6f);
+      y = IsNearZero ? 1.0f : cai_sin(x) / (IsNearZero ? 1.0f : x);
+      break;
+    }
+    case 64: // LogCoshActivation: |x| + ln(1 + exp(-2|x|)) - ln 2, and |x| - ln 2 beyond 15
+    {
+      const float LN2 = 0.6931471805599453f;
+      const float a = fabs(x);
+      const float e = exp(-2.0f * fmin(a, 15.0f));
+      y = (a > 15.0f) ? a - LN2 : a + log1p(e) - LN2;
+      break;
+    }
+    case 65: // TanhExp: x * tanh(exp(x)), x beyond 20 and 0 below -20
+    {
+      const float e = cai_exp_floored(fmin(x, 20.0f));
+      if (x > 20.0f) y = x;
+      else if (x < -20.0f) y = 0.0f;
+      else y = x * cai_tanh(e);
+      break;
+    }
+    case 66: // LeCunTanh: 1.7159 * tanh(2x/3)
+      y = 1.7159f * cai_tanh(x * (2.0f / 3.0f));
+      break;
+    case 67: // PenalizedTanh: tanh(x) above zero, 0.25 * tanh(x) otherwise
+    {
+      const float t = cai_tanh(x);
+      y = (x > 0.0f) ? t : 0.25f * t;
+      break;
+    }
+    case 68: // SoftExponential, FParamA = alpha, FParamB = 1/alpha: x when alpha = 0,
+    {        // (exp(alpha*x) - 1)/alpha + alpha above, -ln(1 - alpha*(x + alpha))/alpha below.
+      // The exponent cap keeps (e - 1)/alpha finite for alpha < 1.
+      const float MaxExponent = 88.0f + fmin(0.0f, cai_log(fmax(FParamA, 1e-30f)));
+      const float e = cai_exp_floored(fmin(FParamA * x, MaxExponent));
+      const float LogArg = fmax(1.0f - FParamA * (x + FParamA), FLT_MIN);
+      if (FParamA == 0.0f) y = x;
+      else if (FParamA > 0.0f) y = (e - 1.0f) * FParamB + FParamA;
+      else y = -cai_log(LogArg) * FParamB;
+      break;
+    }
+    case 69: // ISRLU: x at or above zero, else x / sqrt(1 + alpha*x^2). FParamA = alpha.
+      y = (x >= 0.0f) ? x : cai_isru(x, FParamA);
+      break;
+    case 70: // ESwish: beta * x * sigmoid(beta*x). FParamA = beta.
+      y = FParamA * x * cai_fused_act(FParamA * x, 2);
+      break;
+    case 71: // Swish6: min(x * sigmoid(x), 6)
+      y = fmin(x * cai_fused_act(x, 2), 6.0f);
+      break;
+    case 72: // ReLUSqrt: sqrt(max(x, 0))
+      y = sqrt(fmax(x, 0.0f));
+      break;
+    case 73: // InverseSigmoid: ln(max(c, eps) / max(1 - c, eps)), c = clamp(x, 0, 1).
+    {        // FParamA = eps; FLT_MIN keeps the divide finite when eps = 0 is speculated.
+      const float c = clamp(x, 0.0f, 1.0f);
+      const float EpsFloor = fmax(FParamA, FLT_MIN);
+      y = cai_log(fmax(c, EpsFloor) / fmax(1.0f - c, EpsFloor));
       break;
     }
     default: // csActNone / unknown: pass through
@@ -3261,6 +4690,382 @@ __kernel void cai_cell_mul
   const int j = (FBSize == FSize) ? i : (i % FBSize);
   FDst[i] = FA[i] * FB[j];
 }
+
+// CAI row dot products (TNNetDotProducts forward): FDst[b*FNumAs + a] is row a
+// of FA dotted with row b of FB, both row-major with FVectorSize floats per row.
+// FNoForward != 0 writes 0 where a > b (the causal mask). One work-item per
+// output element; consecutive work-items share the B row. Coded by Claude (AI).
+__kernel void cai_row_dot_products
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FVectorSize,
+  const int FNoForward,
+  __global const float* FA,
+  __global const float* FB,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FNumAs * FNumBs) return;
+  const int b = g_id / FNumAs;
+  const int a = g_id - b * FNumAs;
+  const int Length = ((FNoForward != 0) && (a > b)) ? 0 : FVectorSize;
+  __global const float* RowA = FA + a * FVectorSize;
+  __global const float* RowB = FB + b * FVectorSize;
+  float acc = 0.0f;
+  for (int i = 0; i < Length; i++) acc = mad(RowA[i], RowB[i], acc);
+  FDst[g_id] = acc;
+}
+
+// CAI multi-scale deformable attention (TNNetMultiScaleDeformableAttention
+// forward). One work-item per (query, head, group of 4 channels): the softmax of
+// the head's FSampleCount = sum_l P_l logits, then grid_sample (align_corners=False,
+// zero padding) of each sampling location, weighted by its probability. FOffsets is
+// (Queries, Heads*FSampleCount*3) offsets|logits, FValue (Tokens, Heads*FHeadDim),
+// FRef (Queries, FRefDepth = 2 or 4), FLevelTable (H, W, first token, P_l) per level.
+// A box reference scales an offset by (w, h) * FOffsetScale / P_l.
+// FIsDiscrete != 0 reads the one cell trunc(loc * (W, H) + 0.5) clamped to the map
+// (transformers decoder_method "discrete") instead of the bilinear sample.
+// Coded by Claude (AI).
+#define CAI_DEFORM_GROUP 4
+__kernel void cai_ms_deformable_attn
+(
+  const int FQueryCount,
+  const int FHeads,
+  const int FLevels,
+  const int FSampleCount,
+  const int FHeadDim,
+  const int FRefDepth,
+  const float FOffsetScale,
+  __global const int* FLevelTable,
+  __global const float* FOffsets,
+  __global const float* FValue,
+  __global const float* FRef,
+  __global float* FDst,
+  const int FIsDiscrete
+)
+{
+  const int g_id = get_global_id(0);
+  const int GroupCount = (FHeadDim + CAI_DEFORM_GROUP - 1) / CAI_DEFORM_GROUP;
+  const int ItemsPerQuery = FHeads * GroupCount;
+  if (g_id >= FQueryCount * ItemsPerQuery) return;
+  const int q = g_id / ItemsPerQuery;
+  const int HeadGroup = g_id - q * ItemsPerQuery;
+  const int h = HeadGroup / GroupCount;
+  const int c0 = (HeadGroup - h * GroupCount) * CAI_DEFORM_GROUP;
+  const int ChannelCount = min(CAI_DEFORM_GROUP, FHeadDim - c0);
+  const int SampleCount = FSampleCount;
+  const int ValueDepth = FHeads * FHeadDim;
+  __global const float* Row = FOffsets + q * FHeads * SampleCount * 3;
+  __global const float* Offs = Row + h * SampleCount * 2;
+  __global const float* Logits = Row + FHeads * SampleCount * 2 + h * SampleCount;
+  __global const float* Ref = FRef + q * FRefDepth;
+  float MaxLogit = Logits[0];
+  for (int s = 1; s < SampleCount; s++) MaxLogit = fmax(MaxLogit, Logits[s]);
+  float ProbSum = 0.0f;
+  // The max shift keeps the argument <= 0; the floor keeps PoCL's exp from trapping.
+  for (int s = 0; s < SampleCount; s++) ProbSum += cai_exp_floored(Logits[s] - MaxLogit);
+  const float InvProbSum = 1.0f / ProbSum;
+  const int HeadOffset = h * FHeadDim + c0;
+  float acc[CAI_DEFORM_GROUP];
+  for (int c = 0; c < CAI_DEFORM_GROUP; c++) acc[c] = 0.0f;
+  int s = 0;
+  for (int l = 0; l < FLevels; l++)
+  {
+    const int H = FLevelTable[4 * l];
+    const int W = FLevelTable[4 * l + 1];
+    const int Start = FLevelTable[4 * l + 2];
+    const int Points = FLevelTable[4 * l + 3];
+    const float LevelOffsetScale = FOffsetScale / (float)Points;
+    const float dLocX = (FRefDepth == 4) ? Ref[2] * LevelOffsetScale : 1.0f / W;
+    const float dLocY = (FRefDepth == 4) ? Ref[3] * LevelOffsetScale : 1.0f / H;
+    for (int p = 0; p < Points; p++, s++)
+    {
+      if (FIsDiscrete)
+      {
+        const float sx = (Ref[0] + Offs[2 * s] * dLocX) * W + 0.5f;
+        const float sy = (Ref[1] + Offs[2 * s + 1] * dLocY) * H + 0.5f;
+        // !(v >= 1) also maps NaN to cell 0; the float tests bound the int conversion.
+        const int cx = !(sx >= 1.0f) ? 0 : ((sx >= (float)W) ? W - 1 : (int)sx);
+        const int cy = !(sy >= 1.0f) ? 0 : ((sy >= (float)H) ? H - 1 : (int)sy);
+        const float Prob = cai_exp_floored(Logits[s] - MaxLogit) * InvProbSum;
+        const int Cell = (Start + cy * W + cx) * ValueDepth + HeadOffset;
+        for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Prob, FValue[Cell + c], acc[c]);
+        continue;
+      }
+      const float px = (Ref[0] + Offs[2 * s] * dLocX) * W - 0.5f;
+      const float py = (Ref[1] + Offs[2 * s + 1] * dLocY) * H - 0.5f;
+      // Every corner outside (also NaN): the sample is zero. Inside, the int
+      // conversions below are bounded.
+      if (!((px > -1.0f) && (px < (float)W) && (py > -1.0f) && (py < (float)H))) continue;
+      const float Prob = cai_exp_floored(Logits[s] - MaxLogit) * InvProbSum;
+      const float x0f = floor(px);
+      const float y0f = floor(py);
+      const int x0 = (int)x0f;
+      const int y0 = (int)y0f;
+      const float fx = px - x0f;
+      const float fy = py - y0f;
+      const int InX0 = x0 >= 0;
+      const int InX1 = x0 + 1 < W;
+      const int InY0 = y0 >= 0;
+      const int InY1 = y0 + 1 < H;
+      const int Base = (Start + y0 * W + x0) * ValueDepth + HeadOffset;
+      const float Wx0 = Prob * (1.0f - fx);
+      const float Wx1 = Prob * fx;
+      if (InY0)
+      {
+        if (InX0) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx0 * (1.0f - fy), FValue[Base + c], acc[c]);
+        if (InX1) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx1 * (1.0f - fy), FValue[Base + ValueDepth + c], acc[c]);
+      }
+      if (InY1)
+      {
+        const int RowBelow = Base + W * ValueDepth;
+        if (InX0) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx0 * fy, FValue[RowBelow + c], acc[c]);
+        if (InX1) for (int c = 0; c < ChannelCount; c++) acc[c] = mad(Wx1 * fy, FValue[RowBelow + ValueDepth + c], acc[c]);
+      }
+    }
+  }
+  __global float* Out = FDst + q * ValueDepth + HeadOffset;
+  for (int c = 0; c < ChannelCount; c++) Out[c] = acc[c];
+}
+
+// torch grid_sampler_compute_source_index: normalized c in [-1, 1] -> pixel
+// coordinate along Dim pixels; BorderPad clips it to [0, Dim-1].
+static inline float cai_grid_source_index(const float c, const int Dim,
+  const int AlignCorners, const int BorderPad)
+{
+  float p = AlignCorners ? (c + 1.0f) * 0.5f * (float)(Dim - 1)
+                         : ((c + 1.0f) * (float)Dim - 1.0f) * 0.5f;
+  if (BorderPad) p = (p < 0.0f) ? 0.0f : ((p > (float)(Dim - 1)) ? (float)(Dim - 1) : p);
+  return p;
+}
+
+// CAI triplane sample (TNNetTriplaneSample forward, TripoSR query_triplane):
+// FDst[(point*3 + plane)*FChannels + c] = torch grid_sample (bilinear) of channel
+// c of plane `plane` at the point's (x, y), (x, z) or (y, z) times FInvRadius.
+// FPlanes is (FWidth, 3*FHeight, FChannels), plane k on rows [k*FHeight,
+// (k+1)*FHeight); FPoints is (FPointCount, 3). FBorderPad != 0 clips the pixel
+// coordinate (padding_mode='border'), else zero padding. One work-item per
+// output float. Coded by Claude (AI).
+__kernel void cai_triplane_sample
+(
+  const int FPointCount,
+  const int FWidth,
+  const int FHeight,
+  const int FChannels,
+  const float FInvRadius,
+  const int FAlignCorners,
+  const int FBorderPad,
+  __global const float* FPlanes,
+  __global const float* FPoints,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  const int FeatureDepth = 3 * FChannels;
+  if (g_id >= FPointCount * FeatureDepth) return;
+  const int Point = g_id / FeatureDepth;
+  const int Feature = g_id - Point * FeatureDepth;
+  const int Plane = Feature / FChannels;
+  const int Channel = Feature - Plane * FChannels;
+  __global const float* P = FPoints + Point * 3;
+  const float px = cai_grid_source_index(P[(Plane == 2) ? 1 : 0] * FInvRadius,
+    FWidth, FAlignCorners, FBorderPad);
+  const float py = cai_grid_source_index(P[(Plane == 0) ? 1 : 2] * FInvRadius,
+    FHeight, FAlignCorners, FBorderPad);
+  float acc = 0.0f;
+  // Every corner outside (also NaN): the sample is zero. Inside, the int
+  // conversions below are bounded.
+  if ((px > -1.0f) && (px < (float)FWidth) && (py > -1.0f) && (py < (float)FHeight))
+  {
+    const float x0f = floor(px);
+    const float y0f = floor(py);
+    const int x0 = (int)x0f;
+    const int y0 = (int)y0f;
+    const float fx = px - x0f;
+    const float fy = py - y0f;
+    const int InX0 = x0 >= 0;
+    const int InX1 = x0 + 1 < FWidth;
+    const int InY0 = y0 >= 0;
+    const int InY1 = y0 + 1 < FHeight;
+    const int Base = ((Plane * FHeight + y0) * FWidth + x0) * FChannels + Channel;
+    const int RowBelow = Base + FWidth * FChannels;
+    if (InX0 && InY0) acc += ((1.0f - fx) * (1.0f - fy)) * FPlanes[Base];
+    if (InX1 && InY0) acc += (fx * (1.0f - fy)) * FPlanes[Base + FChannels];
+    if (InX0 && InY1) acc += ((1.0f - fx) * fy) * FPlanes[RowBelow];
+    if (InX1 && InY1) acc += (fx * fy) * FPlanes[RowBelow + FChannels];
+  }
+  FDst[g_id] = acc;
+}
+
+// CAI 3-D grid sample (TNNetGridSample3D forward, torch F.grid_sample on 5-D
+// input): FDst[point*FChannels + c] = the trilinear (FNearest: nearest, rint is
+// half-to-even like torch nearbyint) sample of channel c at the point's
+// normalized (x, y, z) in FGrid[point*3..]. FFeatures is (FWidth, FHeight,
+// FFrames*FChannels), frame z on depth [z*FChannels, (z+1)*FChannels).
+// FBorderPad != 0 clips the coordinate, else zero padding. One work-item per
+// output float. Coded by Claude (AI).
+__kernel void cai_grid_sample_3d
+(
+  const int FPointCount,
+  const int FWidth,
+  const int FHeight,
+  const int FFrames,
+  const int FChannels,
+  const int FNearest,
+  const int FAlignCorners,
+  const int FBorderPad,
+  __global const float* FFeatures,
+  __global const float* FGrid,
+  __global float* FDst
+)
+{
+  const int g_id = get_global_id(0);
+  if (g_id >= FPointCount * FChannels) return;
+  const int Point = g_id / FChannels;
+  const int Channel = g_id - Point * FChannels;
+  __global const float* G = FGrid + Point * 3;
+  const float px = cai_grid_source_index(G[0], FWidth, FAlignCorners, FBorderPad);
+  const float py = cai_grid_source_index(G[1], FHeight, FAlignCorners, FBorderPad);
+  const float pz = cai_grid_source_index(G[2], FFrames, FAlignCorners, FBorderPad);
+  const int FrameStride = FChannels;
+  const int ColumnStride = FFrames * FChannels;
+  const int RowStride = FWidth * ColumnStride;
+  float acc = 0.0f;
+  // Every corner outside (also NaN): the sample is zero. Inside, the int
+  // conversions below are bounded.
+  if ((px > -1.0f) && (px < (float)FWidth) && (py > -1.0f) && (py < (float)FHeight) &&
+      (pz > -1.0f) && (pz < (float)FFrames))
+  {
+    if (FNearest)
+    {
+      const int nx = (int)rint(px);
+      const int ny = (int)rint(py);
+      const int nz = (int)rint(pz);
+      if ((nx >= 0) && (nx < FWidth) && (ny >= 0) && (ny < FHeight) &&
+          (nz >= 0) && (nz < FFrames))
+        acc = FFeatures[ny * RowStride + nx * ColumnStride + nz * FrameStride + Channel];
+    }
+    else
+    {
+      const float x0f = floor(px);
+      const float y0f = floor(py);
+      const float z0f = floor(pz);
+      const int x0 = (int)x0f;
+      const int y0 = (int)y0f;
+      const int z0 = (int)z0f;
+      const float fx = px - x0f;
+      const float fy = py - y0f;
+      const float fz = pz - z0f;
+      const int InX0 = x0 >= 0;
+      const int InX1 = x0 + 1 < FWidth;
+      const int InY0 = y0 >= 0;
+      const int InY1 = y0 + 1 < FHeight;
+      const int InZ0 = z0 >= 0;
+      const int InZ1 = z0 + 1 < FFrames;
+      const int Base = y0 * RowStride + x0 * ColumnStride + z0 * FrameStride + Channel;
+      for (int k = 0; k < 2; k++)
+      {
+        if (!(k ? InZ1 : InZ0)) continue;
+        const float wz = k ? fz : 1.0f - fz;
+        const int B = Base + k * FrameStride;
+        const int BelowB = B + RowStride;
+        if (InX0 && InY0) acc += (wz * (1.0f - fx) * (1.0f - fy)) * FFeatures[B];
+        if (InX1 && InY0) acc += (wz * fx * (1.0f - fy)) * FFeatures[B + ColumnStride];
+        if (InX0 && InY1) acc += (wz * (1.0f - fx) * fy) * FFeatures[BelowB];
+        if (InX1 && InY1) acc += (wz * fx * fy) * FFeatures[BelowB + ColumnStride];
+      }
+    }
+  }
+  FDst[g_id] = acc;
+}
+
+// TNNetDeformableConv forward im2col: FPatch[((pos * FWeightGroups + wg) *
+// FTapCount + tap) * FWeightGroupDepth + cl] = the zero-padded bilinear sample
+// of input channel ci = wg * FWeightGroupDepth + cl for tap (fx, fy) of output
+// position pos (weight-group-major, so each weight group's slice of a patch
+// row is contiguous), shifted by its offset group's (dx, dy) and
+// scaled by its mask. Offsets of group g sit at pos * FOffsetDepth + g *
+// FOffsetGroupStride + 2 * tap, (dx, dy) when FOffsetDxFirst != 0, else (dy, dx).
+// FMaskMode: 0 none, 1 FMask as given, 2 sigmoid(FMask), read at pos *
+// FMaskDepth + FMaskFirst + g * FMaskGroupStride + tap. One work-item per
+// patch element. Coded by Claude (AI).
+__kernel void cai_deformable_im2col
+(
+  const int FPatchCount,
+  const int FOutSizeX,
+  const int FInSizeX,
+  const int FInSizeY,
+  const int FInDepth,
+  const int FFeatureSizeX,
+  const int FTapCount,
+  const int FStride,
+  const int FPadding,
+  const int FDilationX,
+  const int FDilationY,
+  const int FGroupDepth,
+  const int FWeightGroups,
+  const int FWeightGroupDepth,
+  const int FOffsetDepth,
+  const int FOffsetGroupStride,
+  const int FOffsetDxFirst,
+  const int FMaskMode,
+  const int FMaskDepth,
+  const int FMaskFirst,
+  const int FMaskGroupStride,
+  __global const float* FSrc,
+  __global const float* FOffsets,
+  __global const float* FMask,
+  __global float* FPatch
+)
+{
+  const int id = get_global_id(0);
+  if (id >= FPatchCount) return;
+  const int cell = id / FWeightGroupDepth;
+  const int GroupTap = cell / FTapCount;
+  const int tap = cell - GroupTap * FTapCount;
+  const int pos = GroupTap / FWeightGroups;
+  const int ci = (GroupTap - pos * FWeightGroups) * FWeightGroupDepth +
+    (id - cell * FWeightGroupDepth);
+  const int oy = pos / FOutSizeX;
+  const int ox = pos - oy * FOutSizeX;
+  const int fy = tap / FFeatureSizeX;
+  const int fx = tap - fy * FFeatureSizeX;
+  const int group = ci / FGroupDepth;
+  const int offPos = pos * FOffsetDepth + group * FOffsetGroupStride + 2 * tap;
+  const float first = FOffsets[offPos];
+  const float second = FOffsets[offPos + 1];
+  const float dx = FOffsetDxFirst ? first : second;
+  const float dy = FOffsetDxFirst ? second : first;
+  const float px = (float)(ox * FStride + fx * FDilationX - FPadding) + dx;
+  const float py = (float)(oy * FStride + fy * FDilationY - FPadding) + dy;
+  const float x0f = floor(px);
+  const float y0f = floor(py);
+  const int x0 = (int)x0f;
+  const int y0 = (int)y0f;
+  const int x1 = x0 + 1;
+  const int y1 = y0 + 1;
+  const float wx = px - x0f;
+  const float wy = py - y0f;
+  const int inX0 = (x0 >= 0) && (x0 < FInSizeX);
+  const int inX1 = (x1 >= 0) && (x1 < FInSizeX);
+  const int inY0 = (y0 >= 0) && (y0 < FInSizeY);
+  const int inY1 = (y1 >= 0) && (y1 < FInSizeY);
+  float v = 0.0f;
+  // Same corner order as NeuralBilinearGatherColumn.
+  if (inX0 && inY0) v += (1.0f - wx) * (1.0f - wy) * FSrc[(y0 * FInSizeX + x0) * FInDepth + ci];
+  if (inX1 && inY0) v += wx * (1.0f - wy) * FSrc[(y0 * FInSizeX + x1) * FInDepth + ci];
+  if (inX0 && inY1) v += (1.0f - wx) * wy * FSrc[(y1 * FInSizeX + x0) * FInDepth + ci];
+  if (inX1 && inY1) v += wx * wy * FSrc[(y1 * FInSizeX + x1) * FInDepth + ci];
+  if (FMaskMode != 0)
+  {
+    float m = FMask[pos * FMaskDepth + FMaskFirst + group * FMaskGroupStride + tap];
+    if (FMaskMode == 2) m = 1.0f / (1.0f + exp(-m));
+    v *= m;
+  }
+  FPatch[id] = v;
+} // end of kernel
 
 // CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
 // source element (pos, FChannelIdx[d]), so one kernel covers both a contiguous
@@ -3419,7 +5224,7 @@ __kernel void cai_deep_concat4
 // -- an InDepth-fold compute overspend that made the device path far slower than
 // the CPU. Here each work-item does exactly its own FFx*FFy MACs, zero waste.
 //   Raw[ox,oy, n*InDepth + d] =
-//       sum_{cy,cx} FW[n][cy,cx,d] * FX[ox*S+cx, oy*S+cy, d]
+//       sum_{cy,cx} FW[n][cy,cx,d] * FX[ox*S+cx*Dil, oy*S+cy*Dil, d]
 // FX is the host-padded input copy (SizeX = FInW, depth = FInDepth), so no bounds
 // checks are needed (output extents were sized to fit). FW is the Mult neurons'
 // weight volumes concatenated, each in its native depth-contiguous raw layout
@@ -3438,6 +5243,7 @@ __kernel void cai_depthwise_conv2d
   const int FFx,
   const int FFy,
   const int FStride,
+  const int FDilation,
   __global const float* FW,
   __global const float* FX,
   __global float* FY
@@ -3456,14 +5262,15 @@ __kernel void cai_depthwise_conv2d
   const int ix0 = ox * FStride;
   const int iy0 = oy * FStride;
   const int wBase = n * (FFx * FFy) * FInDepth + d; // + tap*FInDepth below
+  const int xTapStep = FDilation * FInDepth;
   float acc = 0.0f;
   for (int cy = 0; cy < FFy; cy++)
   {
-    const int iy = iy0 + cy;
+    const int iy = iy0 + cy * FDilation;
     const int xRow = ((FInW * iy) + ix0) * FInDepth + d;
     const int wRow = wBase + (FFx * cy) * FInDepth;
     for (int cx = 0; cx < FFx; cx++)
-      acc = mad(FW[wRow + cx * FInDepth], FX[xRow + cx * FInDepth], acc);
+      acc = mad(FW[wRow + cx * FInDepth], FX[xRow + cx * xTapStep], acc);
   }
   FY[gid] = acc;
 }
@@ -3636,7 +5443,7 @@ __kernel void cai_gated_delta_net
 
   __global float* S = FS + (h * Dk) * Dv;
   // ea is invariant across t.
-  const float ea = exp(fmin(FALog[h], 30.0f));
+  const float ea = cai_exp_floored(fmin(FALog[h], 30.0f));
   const int qBase = FQOff + kh * Dk;
   const int kBase = FKOff + kh * Dk;
   const int vBase = FVOff + h * Dv;
@@ -3689,16 +5496,13 @@ __kernel void cai_gated_delta_net
     }
 
     // ---- per-head scalar gates: every lane computes them, so no reduction ----
-    const float bv = FX[xRow + FBOff + h];
-    float beta;
-    if (bv > 0.0f) beta = 1.0f / (1.0f + exp(-bv));
-    else { const float sb = exp(bv); beta = sb / (1.0f + sb); }
+    // Both sides of each select run, so every exp is floored and capped. One
+    // exp serves both softplus branches; sp is capped so ea * sp stays finite.
+    const float beta = cai_fused_act(FX[xRow + FBOff + h], 2);
     const float pre = FX[xRow + FAOff + h] + FDtBias[h];
-    float sp;
-    if (pre > 30.0f) sp = pre;
-    else if (pre < -30.0f) sp = exp(pre);
-    else sp = log(1.0f + exp(pre));
-    const float decay = exp(-ea * sp);
+    const float ep = cai_exp_floored(fmin(pre, 30.0f));
+    const float sp = (pre > 30.0f) ? pre : ((pre < -30.0f) ? ep : log(1.0f + ep));
+    const float decay = cai_exp_floored(-ea * fmin(sp, 1e20f));
     // S_{-1} = 0 only at the very first step of a scan that starts from zero.
     const int hasPrev = (t > 0) || (FResetState == 0);
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -3737,9 +5541,396 @@ __kernel void cai_gated_delta_net
     for (e = lid; e < Dv; e += lsize)
     {
       const float zv = FX[xRow + zBase + e];
-      FY[yRow + e] = oloc[e] * rinv * FNormW[e] * (zv / (1.0f + exp(-zv)));
+      FY[yRow + e] = oloc[e] * rinv * FNormW[e] * cai_fused_act(zv, 4);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
+
+// SELECTIVE-SCAN PROJECTIONS (TNNetSelectiveSSM). ONE WORK-GROUP PER (ROW,
+// TOKEN): group (r, t) reduces row r of the stacked [FW0 | FW1 | FW2] matrices
+// (FRows0, FRows1, then the rest of dimension 0) against token row t of FX, the
+// lanes striding over the FK-long row so a work-group reads its weight row
+// contiguously. FScratch is one float per lane; the local size must be a power
+// of two. With FSoftplus = 1 the FRows0 rows of FW0 add FBias[r] and return
+// softplus(.) - the per-channel step delta. Out row t starts at t*FOutStride.
+// Coded by Claude (AI).
+__kernel void cai_selective_ssm_project
+(
+  const int FK,
+  const int FRows0,
+  const int FRows1,
+  const int FInStride,
+  const int FOutStride,
+  const int FSoftplus,
+  __global const float* FW0,
+  __global const float* FW1,
+  __global const float* FW2,
+  __global const float* FBias,
+  __global const float* FX,
+  __global float* FOut,
+  __local float* FScratch
+)
+{
+  const int r = get_group_id(0);
+  const int t = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  __global const float* W;
+  if (r < FRows0) W = FW0 + r * FK;
+  else if (r < FRows0 + FRows1) W = FW1 + (r - FRows0) * FK;
+  else W = FW2 + (r - FRows0 - FRows1) * FK;
+  __global const float* X = FX + t * FInStride;
+  float partial = 0.0f;
+  for (int i = lid; i < FK; i += lsize) partial = mad(W[i], X[i], partial);
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0)
+  {
+    float acc = FScratch[0];
+    if ((FSoftplus != 0) && (r < FRows0))
+    {
+      // Both sides of each select run, so the exp is capped and floored.
+      const float pre = acc + FBias[r];
+      const float ep = cai_exp_floored(fmin(pre, 30.0f));
+      acc = (pre > 30.0f) ? pre : ((pre < -30.0f) ? ep : log(1.0f + ep));
+    }
+    FOut[t * FOutStride + r] = acc;
+  }
+}
+
+// JAMBA INNER RMSNORMS (TNNetSelectiveSSM Jamba / falcon_mamba mode). Row t of
+// FRaw is [ ts (FDtRank) | B (FNS) | C (FNS) ], FStride floats apart; work-item
+// (seg, t) of a (3, SeqLen) launch rewrites segment seg in place as
+// v * rsqrt(mean(v^2) + eps) * gain, gain = FGDt / FGB / FGC.
+// Coded by Claude (AI).
+__kernel void cai_selective_ssm_inner_norm
+(
+  const int FDtRank,
+  const int FNS,
+  const int FStride,
+  const float FEps,
+  __global const float* FGDt,
+  __global const float* FGB,
+  __global const float* FGC,
+  __global float* FRaw
+)
+{
+  const int seg = get_global_id(0);
+  const int t = get_global_id(1);
+  if (seg > 2) return;
+  int n = FNS;
+  __global const float* gain = FGB;
+  __global float* v = FRaw + t * FStride;
+  if (seg == 0) { n = FDtRank; gain = FGDt; }
+  else if (seg == 1) v += FDtRank;
+  else { v += FDtRank + FNS; gain = FGC; }
+  float ss = 0.0f;
+  for (int i = 0; i < n; i++) ss = mad(v[i], v[i], ss);
+  const float inv = 1.0f / sqrt(ss / (float)n + FEps);
+  for (int i = 0; i < n; i++) v[i] = (v[i] * inv) * gain[i];
+}
+
+// SELECTIVE SCAN (TNNetSelectiveSSM, Mamba-1 / S6). ONE WORK-ITEM PER CHANNEL
+// d: the recurrence is independent across channels and the read-out sums only
+// over the channel's own FNS states, so a work-item carries its channel through
+// the whole sequence with no barrier and no cross-item reduction. Per t, s:
+//   h[d,s] = exp(-delta[t,d]*FExpA[d,s]) * h[d,s] + delta[t,d]*B[t,s']*x[t,d]
+//   y[t,d] = sum_s C[t,s']*h[d,s] + FE[d]*x[t,d]
+// with s' = d + s when FBCPerChannel (the DState = 1 per-channel gains) and
+// s' = s otherwise (B/C shared across channels). delta row t starts at
+// t*FDeltaStride, B and C at t*FBCStride + FBOff / FCOff. FH is the (Depth, NS)
+// state, read and rewritten in place; FResetState = 1 starts it from zero.
+// Coded by Claude (AI).
+__kernel void cai_selective_ssm_scan
+(
+  const int FSeqLen,
+  const int FDepth,
+  const int FNS,
+  const int FBCPerChannel,
+  const int FDeltaStride,
+  const int FBCStride,
+  const int FBOff,
+  const int FCOff,
+  const int FResetState,
+  __global const float* FExpA,
+  __global const float* FE,
+  __global const float* FDelta,
+  __global const float* FBC,
+  __global const float* FX,
+  __global float* FH,
+  __global float* FY
+)
+{
+  const int d = get_global_id(0);
+  if (d >= FDepth) return;
+  __global float* h = FH + d * FNS;
+  __global const float* ea = FExpA + d * FNS;
+  const int bcChannel = (FBCPerChannel != 0) ? d : 0;
+  const float e = FE[d];
+  int s, t;
+  if (FResetState != 0)
+    for (s = 0; s < FNS; s++) h[s] = 0.0f;
+  for (t = 0; t < FSeqLen; t++)
+  {
+    // sp is capped so sp * ea stays finite (ea <= exp(10)).
+    const float sp = fmin(FDelta[t * FDeltaStride + d], 1e20f);
+    const float xd = FX[t * FDepth + d];
+    const float spxd = sp * xd;
+    __global const float* b = FBC + t * FBCStride + FBOff + bcChannel;
+    __global const float* c = FBC + t * FBCStride + FCOff + bcChannel;
+    float acc = 0.0f;
+    for (s = 0; s < FNS; s++)
+    {
+      const float a = cai_exp_floored(-sp * ea[s]);
+      const float hn = mad(a, h[s], spxd * b[s]);
+      h[s] = hn;
+      acc = mad(c[s], hn, acc);
+    }
+    FY[t * FDepth + d] = mad(e, xd, acc);
+  }
+}
+
+// MAMBA-2 SSD SCAN (TNNetMamba2). ONE WORK-ITEM PER d_inner CHANNEL ch for the
+// whole sequence: head h = ch / FHeadDim, group g = h / FHeadsPerGroup. Row t of
+// FX is [ x (FDInner) | B | C | dt (heads) | gate ], FInDepth floats apart. Per t:
+//   dt = softplus(dt_in[h] + dt_bias[h]);  a = exp(-dt * exp(min(A_log[h],30)))
+//   h[ch,s] = a * h[ch,s] + dt * B[g,s] * x[ch];  y = sum_s C[g,s]*h[ch,s] + D[h]*x[ch]
+// FH is the (FDInner, FNS) state, read and rewritten in place; FResetState = 1
+// starts it from zero. y lands in FY (FDInner per token) for the gated norm.
+// Coded by Claude (AI).
+__kernel void cai_mamba2_scan
+(
+  const int FSeqLen,
+  const int FDInner,
+  const int FHeadDim,
+  const int FNS,
+  const int FHeadsPerGroup,
+  const int FInDepth,
+  const int FBOff,
+  const int FCOff,
+  const int FDtOff,
+  const int FResetState,
+  __global const float* FALog,
+  __global const float* FD,
+  __global const float* FDtBias,
+  __global const float* FX,
+  __global float* FH,
+  __global float* FY
+)
+{
+  const int ch = get_global_id(0);
+  if (ch >= FDInner) return;
+  const int h = ch / FHeadDim;
+  const int gOff = (h / FHeadsPerGroup) * FNS;
+  __global float* st = FH + ch * FNS;
+  // A = -exp(A_log) is at most exp(30) in magnitude and dt is capped at 1e20,
+  // so dt * A stays finite; PoCL evaluates both sides of every select.
+  const float ar = -cai_exp_floored(fmin(FALog[h], 30.0f));
+  const float dtBias = FDtBias[h];
+  const float dd = FD[h];
+  int s, t;
+  if (FResetState != 0)
+    for (s = 0; s < FNS; s++) st[s] = 0.0f;
+  for (t = 0; t < FSeqLen; t++)
+  {
+    __global const float* row = FX + t * FInDepth;
+    const float pre = row[FDtOff + h] + dtBias;
+    const float ep = cai_exp_floored(fmin(pre, 30.0f));
+    const float dt = fmin((pre > 30.0f) ? pre : ((pre < -30.0f) ? ep : log(1.0f + ep)), 1e20f);
+    const float a = cai_exp_floored(dt * ar);
+    const float xv = row[ch];
+    const float dtxv = dt * xv;
+    __global const float* b = row + FBOff + gOff;
+    __global const float* c = row + FCOff + gOff;
+    float acc = 0.0f;
+    for (s = 0; s < FNS; s++)
+    {
+      const float hn = mad(a, st[s], dtxv * b[s]);
+      st[s] = hn;
+      acc = mad(c[s], hn, acc);
+    }
+    FY[t * FDInner + ch] = mad(dd, xv, acc);
+  }
+}
+
+// MAMBA-2 GATED RMSNORM READ-OUT (TNNetMamba2), in place over FY. ONE
+// WORK-GROUP PER TOKEN t (group id 1), lanes striding over the FDInner channels:
+//   z = y * silu(gate);  y = (z * rsqrt(mean(z^2) + eps)) * FNormW
+// A lane rewrites the same channels in both passes, so in place is safe.
+// FScratch is one float per lane; the local size must be a power of two.
+// Coded by Claude (AI).
+__kernel void cai_mamba2_gated_norm
+(
+  const int FDInner,
+  const int FInDepth,
+  const int FGateOff,
+  const float FEps,
+  __global const float* FNormW,
+  __global const float* FX,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int t = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  __global const float* gate = FX + t * FInDepth + FGateOff;
+  __global float* y = FY + t * FDInner;
+  float partial = 0.0f;
+  int i;
+  for (i = lid; i < FDInner; i += lsize)
+  {
+    const float z = y[i] * cai_fused_act(gate[i], 4);
+    y[i] = z;
+    partial = mad(z, z, partial);
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float rstd = 1.0f / sqrt(FScratch[0] / (float)FDInner + FEps);
+  for (i = lid; i < FDInner; i += lsize) y[i] = (y[i] * rstd) * FNormW[i];
+}
+
+// PER-CHANNEL SCANS (TNNetTokenShift, TNNetDiagonalSSM, TNNetWKV, driven by
+// TNNetChannelScanCL). ONE WORK-ITEM PER CHANNEL c for the whole sequence: the
+// recurrence never mixes channels. FY row t starts at t*FChannels. FState is the
+// channel's carried decode state, read and rewritten in place; FResetState = 1
+// starts it from the fresh-sequence value instead. Coded by Claude (AI).
+
+// y[t] = mix*x[t] + (1-mix)*x[t-1]; the state is x[t-1] (0 for a fresh sequence).
+__kernel void cai_token_shift_scan
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FResetState,
+  __global const float* FMix,
+  __global const float* FX,
+  __global float* FState,
+  __global float* FY
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FChannels) return;
+  const float mix = FMix[c];
+  const float oneMinusMix = 1.0f - mix;
+  float prev = (FResetState != 0) ? 0.0f : FState[c];
+  for (int t = 0; t < FSeqLen; t++)
+  {
+    const float x = FX[t * FChannels + c];
+    FY[t * FChannels + c] = mix * x + oneMinusMix * prev;
+    prev = x;
+  }
+  FState[c] = prev;
+}
+
+// h = a*h + b*x;  y = c*h + e*x, with a = sigmoid(a_raw) built on the host.
+__kernel void cai_diagonal_ssm_scan
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FResetState,
+  __global const float* FA,
+  __global const float* FB,
+  __global const float* FC,
+  __global const float* FE,
+  __global const float* FX,
+  __global float* FState,
+  __global float* FY
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FChannels) return;
+  const float a = FA[c];
+  const float b = FB[c];
+  const float cc = FC[c];
+  const float e = FE[c];
+  float h = (FResetState != 0) ? 0.0f : FState[c];
+  for (int t = 0; t < FSeqLen; t++)
+  {
+    const float x = FX[t * FChannels + c];
+    h = a * h + b * x;
+    FY[t * FChannels + c] = cc * h + e * x;
+  }
+  FState[c] = h;
+}
+
+// RWKV-4 WKV with the running-max stabiliser (TNNetWKV / TNNetCrossWKV). Row t
+// of FX is [ k | v ], FChannels each; w = softplus(w_raw) is built on the host.
+// FState is [ A | B | Q ], FChannels each; a fresh sequence is A = B = 0,
+// Q = -1e30. One of each exp pair is exp(0) = 1, so no denominator reaches 0.
+// FGateMode: 0 = FY is wkv_t (FR unread); 1 = FY is sigmoid(r_t) * wkv_t;
+// 2 = after the scan, query row i of FY (FQueryLen rows) is sigmoid(r_i) * A/B.
+__kernel void cai_wkv_scan
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FResetState,
+  __global const float* FW,
+  __global const float* FU,
+  __global const float* FX,
+  __global float* FState,
+  __global float* FY,
+  __global const float* FR,
+  const int FGateMode,
+  const int FQueryLen
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FChannels) return;
+  const float w = FW[c];
+  const float u = FU[c];
+  const int inDepth = 2 * FChannels;
+  float aa = 0.0f;
+  float bb = 0.0f;
+  float pp = -1e30f;
+  if (FResetState == 0)
+  {
+    aa = FState[c];
+    bb = FState[FChannels + c];
+    pp = FState[2 * FChannels + c];
+  }
+  for (int t = 0; t < FSeqLen; t++)
+  {
+    const float k = FX[t * inDepth + c];
+    const float v = FX[t * inDepth + FChannels + c];
+    const int outPos = t * FChannels + c;
+    const float ww1 = u + k;
+    const float q1 = fmax(pp, ww1);
+    const float e1 = cai_exp_floored(pp - q1);
+    const float e2 = cai_exp_floored(ww1 - q1);
+    const float wkv = (e1 * aa + e2 * v) / (e1 * bb + e2);
+    if (FGateMode == 0) FY[outPos] = wkv;
+    else if (FGateMode == 1) FY[outPos] = cai_fused_act(FR[outPos], 2) * wkv;
+    const float ww2 = pp - w;
+    const float q2 = fmax(ww2, k);
+    const float e3 = cai_exp_floored(ww2 - q2);
+    const float e4 = cai_exp_floored(k - q2);
+    aa = e3 * aa + e4 * v;
+    bb = e3 * bb + e4;
+    pp = q2;
+  }
+  FState[c] = aa;
+  FState[FChannels + c] = bb;
+  FState[2 * FChannels + c] = pp;
+  if (FGateMode == 2)
+  {
+    // bb > 0 once a key row went in: the scan's last e4 or e3 * bb is positive.
+    const float summary = aa / bb;
+    for (int i = 0; i < FQueryLen; i++)
+    {
+      const int outPos = i * FChannels + c;
+      FY[outPos] = cai_fused_act(FR[outPos], 2) * summary;
+    }
   }
 }
 
@@ -3793,6 +5984,83 @@ __kernel void cai_sdpa_append_kv
     FKCache[dst + d] = FX[kSrc + d];
     FVCache[dst + d] = FX[vSrc + d];
   }
+}
+
+// Cosine-attention pre-pass for TNNetSwinV2WindowAttention: copies the packed
+// [ Q | K | V ] rows of FX into FY with the Q and K slices scaled to unit L2
+// norm, qn = q / sqrt(sum(q^2) + FEps), and V unchanged. One work-item per
+// (token row, slice): global id p carries t*3 + slice. FEps > 0 keeps the
+// reciprocal finite on an all-zero row. Shares the flash kernels' queue.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_qk_l2norm_packed
+(
+  const int FTokenCnt,
+  const int FDk,
+  const float FEps,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  if (p >= FTokenCnt * 3) return;
+  const int slice = p % 3;
+  const int base = p * FDk;
+  float invN = 1.0f;
+  if (slice < 2)
+  {
+    float ss = 0.0f;
+    for (int d = 0; d < FDk; d++)
+    {
+      const float v = FX[base + d];
+      ss = mad(v, v, ss);
+    }
+    invN = 1.0f / sqrt(ss + FEps);
+  }
+  for (int d = 0; d < FDk; d++)
+    FY[base + d] = FX[base + d] * invN;
+}
+
+// Query pre-pass for TNNetDifferentialAttention: row t of FY is the two query
+// heads [Q1, 0 | 0, Q2] (2*FDk floats) built from the [Q | K | V] row of FX,
+// so one flash launch with two heads per KV head scores Q1.K1 and Q2.K2.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_diff_pack_q
+(
+  const int FTokenCnt,
+  const int FDk,
+  const int FXStride,
+  __global const float* FX,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  const int TwoDk = 2 * FDk;
+  if (p >= FTokenCnt * TwoDk) return;
+  const int t = p / TwoDk;
+  const int c = p - t * TwoDk;
+  const int HalfDk = FDk >> 1;
+  // Column c of head 0 keeps Q[c] below HalfDk; head 1 keeps Q[c - FDk] from HalfDk on.
+  const int d = (c < FDk) ? c : (c - FDk);
+  const int Keep = (c < FDk) ? (d < HalfDk) : (d >= HalfDk);
+  FY[p] = Keep ? FX[t * FXStride + d] : 0.0f;
+}
+
+// Differential attention epilogue: FY[t, d] = FPair[t, d] - FLambda *
+// FPair[t, FDk + d] over the two-head flash result. Coded by Claude (AI).
+__kernel void cai_sdpa_diff_combine
+(
+  const int FTokenCnt,
+  const int FDk,
+  const float FLambda,
+  __global const float* FPair,
+  __global float* FY
+)
+{
+  const int p = get_global_id(0);
+  if (p >= FTokenCnt * FDk) return;
+  const int t = p / FDk;
+  const int PairPos = p + t * FDk;
+  FY[p] = FPair[PairPos] - FLambda * FPair[PairPos + FDk];
 }
 
 // Query heads a lane scores against one K row at a time in the split-row
@@ -3967,7 +6235,7 @@ __kernel void cai_sdpa_decode_split
         {
           float sc = acc[i] * FInvSqrtDk;
           if (FScoreSoftCap > 0.0f)
-            sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+            sc = FScoreSoftCap * cai_tanh(sc * FInvScoreSoftCap);
           tile[(qBase + i) * FChunkRows + r] = sc;
         }
     }
@@ -3990,7 +6258,8 @@ __kernel void cai_sdpa_decode_split
   {
     __local float* row = tile + q * FChunkRows;
     const float RowMax = headMax[q];
-    for (r = lid; r < ChunkLive; r += lsize) row[r] = exp(row[r] - RowMax);
+    for (r = lid; r < ChunkLive; r += lsize)
+      row[r] = exp(fmax(row[r] - RowMax, -80.0f));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   CAI_SDPA_HEAD_REDUCE(1, headSum)
@@ -4035,7 +6304,9 @@ __kernel void cai_sdpa_decode_split
 // pass 1 wrote for (h, t) - layout as cai_sdpa_decode_split states - by
 // log-sum-exp: M = max of the chunk maxima, w_c = exp(m_c - M) or 0 for a
 // chunk with l_c = 0, L = sum of l_c*w_c, and Y[t][h*FDk + d] =
-// sum of w_c*acc_c[d] / L, zero when L = 0 as the host path does.
+// sum of w_c*acc_c[d] / L, zero when L = 0 as the host path does. FHasSinks
+// adds head h's sink logit s = FSinkLogits[h] once: M also covers s and L
+// gains exp(s - M), with no value row (gpt-oss attention sinks).
 // Launch 2-D with global (LocalSize, FQHeads*FTokenCnt) and local
 // (LocalSize, 1); LocalSize a power of two. FScratch is LocalSize + FSplits
 // floats of __local memory: the reduction scratch, then the chunk weights.
@@ -4049,6 +6320,8 @@ __kernel void cai_sdpa_decode_merge
   const int FYStride,
   __global const float* FPartials,
   __global float* FY,
+  __global const float* FSinkLogits,
+  const int FHasSinks,
   __local float* FScratch
 )
 {
@@ -4073,7 +6346,8 @@ __kernel void cai_sdpa_decode_merge
     if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  const float MaxScore = FScratch[0];
+  const float SinkLogit = FHasSinks ? FSinkLogits[h] : -1e30f;
+  const float MaxScore = fmax(FScratch[0], SinkLogit);
   barrier(CLK_LOCAL_MEM_FENCE);
 
   float partial = 0.0f;
@@ -4094,7 +6368,8 @@ __kernel void cai_sdpa_decode_merge
     if (lid < s) FScratch[lid] += FScratch[lid + s];
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  const float SumExp = FScratch[0];
+  const float SumExp = FScratch[0]
+    + (FHasSinks ? exp(fmax(SinkLogit - MaxScore, -80.0f)) : 0.0f);
   const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
 
   const int yBase = t * FYStride + h * FDk;
@@ -4118,7 +6393,13 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
 // FLASH ATTENTION OVER THE KV CACHE (TNNetFusedSDPA): the arguments of
 // cai_sdpa_flash and cai_sdpa_flash_int8 before and after their cache
 // arguments (FColChunk: output columns per work-group, a multiple of 4 up to
-// 256; FKeySplits > 1 writes partials).
+// 256; FKeySplits > 1 writes partials; FBiasLen > 0, which needs FGroupSize 1,
+// adds FScoreBias[FBiasBase + g*FBiasHeadStride + t*FBiasRowStride + key]
+// to each score of head g, or with FBiasKeyWidth W > 0 the decomposed bias of
+// key = kh*W + kw: entries kh and FBiasRowStride - W + kw of that bias row;
+// FHasBiasPlaneBase replaces g*FBiasHeadStride by FBiasPlaneBase[g], so
+// planes can share tables; FHasSinks adds exp(FSinkLogits[h]) to head h's
+// normalizer, in the merge when FKeySplits > 1).
 #define CAI_FLASH_LEADING_PARAMS \
   const int FKVHeads, const int FGroupSize, const int FTokenCnt, \
   const int FDk, const int FCacheMax, const int FKeyBase, \
@@ -4128,7 +6409,12 @@ static inline float cai_flash_mad_dot4(const float4 a, const float4 b,
   const float FScoreSoftCap, const float FInvScoreSoftCap, \
   __global const float* FX, __global const int* FRowKeyEnds
 #define CAI_FLASH_TRAILING_PARAMS \
-  __global float* FY, __global float* FPartials, __local float4* FScratch
+  __global float* FY, __global float* FPartials, __local float4* FScratch, \
+  __global const float* FScoreBias, const int FBiasBase, \
+  const int FBiasRowStride, const int FBiasLen, const int FBiasHeadStride, \
+  const int FBiasKeyWidth, __global const float* FSinkLogits, \
+  const int FHasSinks, __global const int* FBiasPlaneBase, \
+  const int FHasBiasPlaneBase
 
 // Key lane 0..15 and row lane: a warp spans 8 key by 4 row lanes. Shifts
 // only: PoCL miscompiles a lane id divided by a run-time value.
@@ -4146,13 +6432,10 @@ static inline int2 cai_flash_key_range(const int t, const int FTokenCnt,
   return (int2)((FWindow > 0) ? max(0, KeyHi - FWindow) : 0, KeyHi);
 }
 
-// Writes row r (packed row Row0 + r = t*FGroupSize + q) of the X offset, out
-// offset (Y, or split Split's partial acc[0]), lo and hi tables; dead: -1, -1, 0, 0.
-static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
-  const int r, const int Row0, const int g, const int Split,
-  const int FKeySplits, const int FGroupSize, const int FTokenCnt,
-  const int FDk, const int FXStride, const int FYStride, const int FKeyBase,
-  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
+// Token row t and group head q of packed row Row0 + r = t*FGroupSize + q;
+// Row0 is uniform, so no lane-derived value is divided.
+static inline int2 cai_flash_row_token_head(const int Row0, const int r,
+  const int FGroupSize)
 {
   int t = Row0 / FGroupSize;
   int q = Row0 - t * FGroupSize + r;
@@ -4161,6 +6444,20 @@ static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
     q -= FGroupSize;
     t++;
   }
+  return (int2)(t, q);
+}
+
+// Writes row r (packed row Row0 + r = t*FGroupSize + q) of the X offset, out
+// offset (Y, or split Split's partial acc[0]), lo and hi tables; dead: -1, -1, 0, 0.
+static inline void cai_flash_row_entry(__local int* RowTable, const int Br,
+  const int r, const int Row0, const int g, const int Split,
+  const int FKeySplits, const int FGroupSize, const int FTokenCnt,
+  const int FDk, const int FXStride, const int FYStride, const int FKeyBase,
+  const int FMaskMode, const int FWindow, __global const int* FRowKeyEnds)
+{
+  const int2 TokenHead = cai_flash_row_token_head(Row0, r, FGroupSize);
+  const int t = TokenHead.x;
+  const int q = TokenHead.y;
   int XOffset = -1, YOffset = -1;
   int2 KeyRange = (int2)(0, 0);
   if (t < FTokenCnt)
@@ -4286,14 +6583,55 @@ static inline float cai_flash_score(const float Dot, const int Key,
   const float FInvScoreSoftCap)
 {
   float sc = Dot * ScoreScale;
-  if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+  if (FScoreSoftCap > 0.0f) sc = FScoreSoftCap * cai_tanh(sc * FInvScoreSoftCap);
   return (Interior || ((Key >= KeyLo) && (Key < KeyHi))) ? sc : -1e30f;
+}
+
+// Score plus the bias of tile key KeyInTile (bias row BiasRow, tile start
+// (KtH, KtW) in key rows/columns), indices clamped into the table, when FBiasLen > 0.
+static inline float cai_flash_add_bias(const float Score,
+  __global const float* FScoreBias, const int BiasRow, const int Kt,
+  const int KeyInTile, const int KtH, const int KtW, const float InvKeyWidth,
+  const int FBiasRowStride, const int FBiasLen, const int FBiasKeyWidth)
+{
+  if (FBiasLen <= 0) return Score;
+  const int MaxBiasPos = max(FBiasLen - 1, 0);
+  float Bias;
+  if (FBiasKeyWidth > 0)
+  {
+    /* Shifts and a float quotient only: no lane value is divided. */
+    int KeyCol = KtW + KeyInTile;
+    int KeyRow = (int)((float)KeyCol * InvKeyWidth);
+    KeyCol -= KeyRow * FBiasKeyWidth;
+    if (KeyCol >= FBiasKeyWidth) { KeyCol -= FBiasKeyWidth; KeyRow++; }
+    if (KeyCol < 0) { KeyCol += FBiasKeyWidth; KeyRow--; }
+    Bias = FScoreBias[clamp(BiasRow + KtH + KeyRow, 0, MaxBiasPos)]
+      + FScoreBias[clamp(BiasRow + FBiasRowStride - FBiasKeyWidth + KeyCol, 0,
+        MaxBiasPos)];
+  }
+  else Bias = FScoreBias[clamp(BiasRow + Kt + KeyInTile, 0, MaxBiasPos)];
+  /* A biased score at or below -1e8 is a masked key, as on the host. */
+  const float Biased = Score + Bias;
+  return (Biased > -1e8f) ? Biased : -1e30f;
 }
 
 // exp(Score - RowMax) in [exp(-80), 1], and exactly 0 for a masked key.
 static inline float cai_flash_prob(const float Score, const float RowMax)
 {
   return (Score > -1e29f) ? exp(clamp(Score - RowMax, -80.0f, 0.0f)) : 0.0f;
+}
+
+// 1 / the normalizer of a row with sum l = RowTotal at max m = RowMaxScore:
+// with a sink logit s, (l + exp(s - m)) rescaled to max(m, s); 0 for l = 0
+// without one.
+static inline float cai_flash_inv_row_total(const float RowTotal,
+  const float RowMaxScore, const int FHasSinks, const float SinkLogit)
+{
+  if (!FHasSinks) return (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f;
+  const float MaxScore = fmax(RowMaxScore, SinkLogit);
+  const float Rescale = exp(fmax(RowMaxScore - MaxScore, -80.0f));
+  return Rescale /
+    (RowTotal * Rescale + exp(fmax(SinkLogit - MaxScore, -80.0f)));
 }
 
 // The largest of a row's 16 partials and Running.
@@ -4450,6 +6788,10 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   const int MaxRowPos = FTokenCnt * FGroupSize - 1 - Row0; \
   const int KAligned = (FDk & 3) == 0; \
   const int QAligned = KAligned && ((FXStride & 3) == 0); \
+  const int BiasKeyDivisor = max(FBiasKeyWidth, 1); \
+  const int BiasPlaneOfs = FHasBiasPlaneBase ? FBiasPlaneBase[g] \
+    : g * FBiasHeadStride; \
+  const float InvKeyWidth = 1.0f / (float)BiasKeyDivisor; \
   const int Slices = (Dk4 + Ds - 1) / Ds; \
   __global const KVType* KPlane = KSrc + g * FCacheMax * FDk; \
   __global const KVType* VPlane = VSrc + g * FCacheMax * FDk; \
@@ -4459,6 +6801,8 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
     const int KeysLive = min(CAI_FLASH_KEY_TILE, LoopHi - kt); \
     const int Interior = (kt >= TileMaxLo) \
       && (kt + CAI_FLASH_KEY_TILE <= InteriorHi); \
+    const int KtH = kt / BiasKeyDivisor; \
+    const int KtW = kt - KtH * BiasKeyDivisor; \
     float s[CAI_FLASH_SLOTS][4]; \
     _Pragma("unroll") \
     for (i = 0; i < CAI_FLASH_SLOTS; i++) \
@@ -4501,6 +6845,9 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
         const int row = sy + RowLanes * i; \
         const int KeyLo = RowTable[2 * Br + row]; \
         const int KeyHi = min(RowTable[3 * Br + row], LoopHi); \
+        /* The bias row of token row t = Row0 + row of head g (FGroupSize 1). */ \
+        const int BiasRow = FBiasBase + BiasPlaneOfs \
+          + min(Row0 + row, FTokenCnt - 1) * FBiasRowStride; \
         float PartMax = -1e30f; \
         _Pragma("unroll") \
         for (j = 0; j < 4; j++) \
@@ -4508,6 +6855,9 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
           s[i][j] = cai_flash_score(s[i][j], kt + sx + 16 * j, KeyLo, \
             KeyHi, Interior, KScaleAt(sx + 16 * j) * FInvSqrtDk, \
             FScoreSoftCap, FInvScoreSoftCap); \
+          s[i][j] = cai_flash_add_bias(s[i][j], FScoreBias, BiasRow, kt, \
+            sx + 16 * j, KtH, KtW, InvKeyWidth, FBiasRowStride, FBiasLen, \
+            FBiasKeyWidth); \
           PartMax = fmax(PartMax, s[i][j]); \
         } \
         RowPartF[row * 16 + sx] = PartMax; \
@@ -4608,8 +6958,11 @@ static inline void cai_flash_copy_out(__local const float4* Tile,
   { \
     const int row = oy + OutRowLanes * i; \
     const float RowTotal = cai_flash_sum16(RowPart + row * 4); \
+    const float SinkLogit = FHasSinks ? FSinkLogits[g * FGroupSize \
+      + cai_flash_row_token_head(Row0, row, FGroupSize).y] : 0.0f; \
     const float InvRowTotal = (FKeySplits > 1) ? 1.0f \
-      : ((RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f); \
+      : cai_flash_inv_row_total(RowTotal, RowMax[row], FHasSinks, \
+        SinkLogit); \
     RegionA[row * VStride4 + min(ox, MaxCol4Pos + 1)] = o[i][0] * InvRowTotal; \
     RegionA[row * VStride4 + min(ox + OutColLanes, MaxCol4Pos + 1)] = \
       o[i][1] * InvRowTotal; \
@@ -4637,6 +6990,95 @@ void cai_sdpa_flash_int8(CAI_FLASH_LEADING_PARAMS,
   CAI_FLASH_TRAILING_PARAMS)
 CAI_FLASH_BODY(char, FKCodes, FVCodes, cai_flash_stage_codes,
   CAI_FLASH_STAGE_INT8_SCALES, CAI_FLASH_K_SCALE, CAI_FLASH_V_SCALE)
+
+// SAM WINDOW ATTENTION (TNNetSAMVisionAttention). Windows are FWinH x FWinW
+// tokens (a global block is one window over the grid), FWindowsX per row of
+// windows, and plane g = w*FHeads + h is head h of window w. Flash query row t
+// of plane g sits at FQ[t*FPlanes*FDk + g*FDk]; key/value row t at
+// FK/FV[(g*FWinTok + t)*FDk].
+
+// The token-major qkv projection FQKV ((FGridH*FGridW) x 3C) plus FQKVBias
+// into the window planes; a padded token's input row is zero (bias only).
+__kernel void cai_sam_window_partition(
+  const int FGridH, const int FGridW, const int FWinH, const int FWinW,
+  const int FWindowsX, const int FWindows, const int FHeads, const int FDk,
+  __global const float* FQKV, __global const float* FQKVBias,
+  __global float* FQ, __global float* FK, __global float* FV)
+{
+  const int Channels = FHeads * FDk;
+  const int QKVDepth = 3 * Channels;
+  const int WinTok = FWinH * FWinW;
+  const int Planes = FWindows * FHeads;
+  const int id = get_global_id(0);
+  if (id >= FWindows * WinTok * QKVDepth) return;
+  const int o = id % QKVDepth;
+  const int WindowToken = id / QKVDepth;
+  const int t = WindowToken % WinTok;
+  const int w = WindowToken / WinTok;
+  const int wy = w / FWindowsX;
+  const int ty = t / FWinW;
+  const int gy = wy * FWinH + ty;
+  const int gx = (w - wy * FWindowsX) * FWinW + (t - ty * FWinW);
+  const int InGrid = (gy < FGridH) && (gx < FGridW);
+  const float Projected = FQKV[InGrid ? ((gy * FGridW + gx) * QKVDepth + o) : 0];
+  const float Value = FQKVBias[o] + (InGrid ? Projected : 0.0f);
+  const int Part = o / Channels;
+  const int c = o - Part * Channels;
+  const int h = c / FDk;
+  const int d = c - h * FDk;
+  const int g = w * FHeads + h;
+  __global float* Dst = (Part == 0) ? FQ : ((Part == 1) ? FK : FV);
+  Dst[(Part == 0) ? (t * Planes * FDk + g * FDk + d)
+    : ((g * WinTok + t) * FDk + d)] = Value;
+}
+
+// FTables[(g*WinTok + t)*(FWinH + FWinW) + c]: plane g's query t (row qi, column
+// qj) . FRelPos[qi - c + FWinH - 1] for key row c < FWinH, else
+// . FRelPos[FRelHRows + qj - kj + FWinW - 1] for key column kj = c - FWinH.
+__kernel void cai_sam_rel_pos_tables(
+  const int FWinH, const int FWinW, const int FPlanes, const int FDk,
+  const int FRelHRows, __global const float* FQ,
+  __global const float* FRelPos, __global float* FTables)
+{
+  const int WinTok = FWinH * FWinW;
+  const int TableCols = FWinH + FWinW;
+  const int id = get_global_id(0);
+  if (id >= FPlanes * WinTok * TableCols) return;
+  const int c = id % TableCols;
+  const int PlaneToken = id / TableCols;
+  const int t = PlaneToken % WinTok;
+  const int g = PlaneToken / WinTok;
+  const int qi = t / FWinW;
+  const int qj = t - qi * FWinW;
+  const int RelRow = (c < FWinH) ? (qi - c + FWinH - 1)
+    : (FRelHRows + qj - (c - FWinH) + FWinW - 1);
+  __global const float* Query = FQ + t * FPlanes * FDk + g * FDk;
+  __global const float* Rel = FRelPos + RelRow * FDk;
+  float Dot = 0.0f;
+  for (int d = 0; d < FDk; d++) Dot = mad(Query[d], Rel[d], Dot);
+  FTables[id] = Dot;
+}
+
+// FY ((FGridH*FGridW) x C, token-major) = the out projection FProj, row
+// t*FWindows + w per window token, plus FProjBias; padded tokens are dropped.
+__kernel void cai_sam_window_merge(
+  const int FGridH, const int FGridW, const int FWinH, const int FWinW,
+  const int FWindowsX, const int FWindows, const int FChannels,
+  __global const float* FProj, __global const float* FProjBias,
+  __global float* FY)
+{
+  const int id = get_global_id(0);
+  if (id >= FGridH * FGridW * FChannels) return;
+  const int o = id % FChannels;
+  const int Token = id / FChannels;
+  const int gy = Token / FGridW;
+  const int gx = Token - gy * FGridW;
+  const int wy = gy / FWinH;
+  const int wx = gx / FWinW;
+  const int t = (gy - wy * FWinH) * FWinW + (gx - wx * FWinW);
+  const int w = wy * FWindowsX + wx;
+  FY[id] = FProj[(t * FWindows + w) * FChannels + o] + FProjBias[o];
+}
 
 // INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the step's K
 // and V slices into the resident int8 cache at slots FCacheSlot ..
@@ -4850,7 +7292,7 @@ __kernel void cai_sdpa_decode_split_int8
         {
           float sc = acc[i] * RowScale;
           if (FScoreSoftCap > 0.0f)
-            sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+            sc = FScoreSoftCap * cai_tanh(sc * FInvScoreSoftCap);
           tile[(qBase + i) * FChunkRows + r] = sc;
         }
     }
@@ -4873,7 +7315,8 @@ __kernel void cai_sdpa_decode_split_int8
   {
     __local float* row = tile + q * FChunkRows;
     const float RowMax = headMax[q];
-    for (r = lid; r < ChunkLive; r += lsize) row[r] = exp(row[r] - RowMax);
+    for (r = lid; r < ChunkLive; r += lsize)
+      row[r] = exp(fmax(row[r] - RowMax, -80.0f));
   }
   barrier(CLK_LOCAL_MEM_FENCE);
   CAI_SDPA_HEAD_REDUCE(1, headSum)
@@ -5031,4 +7474,557 @@ __kernel void cai_moe_expert_down_int8
   }
 
   FOut[t * FHiddenSize + h] = acc;
+} // end of kernel
+
+// Gate|up half of a fused MoE block in a single launch: for every (token,
+// slot) pair the router filled, the SwiGLU'd hidden of that slot's expert
+//
+//   Out[t,j,w] = up * (g * sigmoid(g)),   up = s * (W[e*2I + w]     . x[t]) + b
+//                                          g = s * (W[e*2I + I + w] . x[t]) + b
+//
+// with e = SlotExpert[t,j] and s = SlotGate[t,j] when FScaleInput (Llama-4
+// routing scales the expert INPUT; the projection is linear in x) else 1.
+// Rows 0..I-1 of an expert are UP, rows I..2I-1 are GATE, the half-swap order
+// of TNNetMoEExpertBankGateUp. Slots a token did not fill are written as 0.
+// The slot map is built on the host and shared with cai_moe_expert_down, so the
+// result can stay in OpenCL memory for the down bank.
+// One work-item per output element; global size = (FExpertWidth,
+// FTokenCnt*FTopK). The sigmoid is trap-free: exp(-g) may reach +inf, which
+// makes g/(1+inf) a signed zero.
+// Coded by Claude (AI).
+__kernel void cai_moe_expert_gateup
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FExpertWidth,
+  const int FVectorSize,
+  const int FScaleInput,
+  const int FUseBias,
+  __global const int*   FSlotExpert,
+  __global const float* FSlotGate,
+  __global const int*   FSlotCount,
+  __global const float* FSource,
+  __global const float* FWeights,
+  __global const float* FBias,
+  __global float* FOut
+)
+{
+  const int w = get_global_id(0);
+  const int pair = get_global_id(1);
+  if ((w >= FExpertWidth) || (pair >= FTokenCnt * FTopK)) return;
+
+  const int t = pair / FTopK;
+  const int j = pair - t * FTopK;
+  float result = 0.0f;
+  if (j < FSlotCount[t])
+  {
+    const int e = FSlotExpert[pair];
+    const float s = (FScaleInput != 0) ? FSlotGate[pair] : 1.0f;
+    const int upRow = e * 2 * FExpertWidth + w;
+    const int gateRow = upRow + FExpertWidth;
+    // 64-bit offsets: a whole bank can exceed 2^31 weights.
+    const long upBase = (long)upRow * FVectorSize;
+    const long gateBase = (long)gateRow * FVectorSize;
+    const int srcBase = t * FVectorSize;
+    float up = 0.0f;
+    float g = 0.0f;
+    for (int i = 0; i < FVectorSize; i++)
+    {
+      const float x = FSource[srcBase + i];
+      up = mad(FWeights[upBase + i], x, up);
+      g = mad(FWeights[gateBase + i], x, g);
+    }
+    up *= s;
+    g *= s;
+    if (FUseBias != 0)
+    {
+      up += FBias[upRow];
+      g += FBias[gateRow];
+    }
+    result = up * (g * (1.0f / (1.0f + exp(-g))));
+  }
+  FOut[pair * FExpertWidth + w] = result;
+} // end of kernel
+
+// Int8-weight twin of cai_moe_expert_gateup over the layer's per-row symmetric
+// int8 codes in the same row-major order. The per-row scale (times the input
+// gate s) is applied ONCE to the raw code sum and BEFORE the FP32 bias,
+// mirroring TNNetMoEExpertBankGateUp.ComputeExpertsQuantizedInt8.
+// Coded by Claude (AI).
+__kernel void cai_moe_expert_gateup_int8
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FExpertWidth,
+  const int FVectorSize,
+  const int FScaleInput,
+  const int FUseBias,
+  __global const int*   FSlotExpert,
+  __global const float* FSlotGate,
+  __global const int*   FSlotCount,
+  __global const float* FSource,
+  __global const char*  FCodes,
+  __global const float* FBias,
+  __global float* FOut,
+  __global const float* FScales
+)
+{
+  const int w = get_global_id(0);
+  const int pair = get_global_id(1);
+  if ((w >= FExpertWidth) || (pair >= FTokenCnt * FTopK)) return;
+
+  const int t = pair / FTopK;
+  const int j = pair - t * FTopK;
+  float result = 0.0f;
+  if (j < FSlotCount[t])
+  {
+    const int e = FSlotExpert[pair];
+    const float s = (FScaleInput != 0) ? FSlotGate[pair] : 1.0f;
+    const int upRow = e * 2 * FExpertWidth + w;
+    const int gateRow = upRow + FExpertWidth;
+    const long upBase = (long)upRow * FVectorSize;
+    const long gateBase = (long)gateRow * FVectorSize;
+    const int srcBase = t * FVectorSize;
+    float up = 0.0f;
+    float g = 0.0f;
+    for (int i = 0; i < FVectorSize; i++)
+    {
+      const float x = FSource[srcBase + i];
+      up = mad(convert_float(FCodes[upBase + i]), x, up);
+      g = mad(convert_float(FCodes[gateBase + i]), x, g);
+    }
+    up *= FScales[upRow] * s;
+    g *= FScales[gateRow] * s;
+    if (FUseBias != 0)
+    {
+      up += FBias[upRow];
+      g += FBias[gateRow];
+    }
+    result = up * (g * (1.0f / (1.0f + exp(-g))));
+  }
+  FOut[pair * FExpertWidth + w] = result;
+} // end of kernel
+
+// Upper bound on the k of cai_topk_gate (its private selection buffers). The
+// host checks it before launching and keeps a larger k on the CPU.
+#define CAI_TOPK_GATE_MAX_K 32
+
+// Hard top-k MoE routing gate (TNNetTopKGate / TNNetBiasBalancedTopKGate), one
+// work-item per cell over its FDepth expert weights.
+//
+// Selection is the insertion scan of the host NeuralMarkTopK, step for step: a
+// value enters a full buffer only when STRICTLY greater than the worst kept
+// one, and is inserted after every kept value it does not beat. On equal values
+// the lower expert index therefore wins, and the kept set is the CPU's.
+// FUseBias ranks by g + b (the selection bias of the bias-balanced gate); the
+// output always carries the unbiased g. FRenormalize divides the survivors by
+// their sum, accumulated in ascending expert order as on the host (a zero sum
+// divides by 1); else the survivors keep g. Non-survivors are written as 0.
+// FTopK >= FDepth is the host's identity copy (no renormalization). FCountLoad
+// adds one per kept expert to FLoadCount, the bias-balanced load accumulator.
+// Coded by Claude (AI).
+__kernel void cai_topk_gate
+(
+  const int FCellCnt,
+  const int FDepth,
+  const int FTopK,
+  const int FRenormalize,
+  const int FUseBias,
+  const int FCountLoad,
+  __global const float* FSource,
+  __global const float* FBias,
+  __global float* FOut,
+  __global int* FLoadCount
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FCellCnt) return;
+  const int base = c * FDepth;
+  if (FTopK >= FDepth)
+  {
+    for (int d = 0; d < FDepth; d++)
+    {
+      FOut[base + d] = FSource[base + d];
+      if (FCountLoad != 0) atomic_inc(&FLoadCount[d]);
+    }
+    return;
+  }
+  float topVal[CAI_TOPK_GATE_MAX_K];
+  int topIdx[CAI_TOPK_GATE_MAX_K];
+  int kept = 0;
+  const int lastK = FTopK - 1;
+  for (int d = 0; d < FDepth; d++)
+  {
+    float val = FSource[base + d];
+    if (FUseBias != 0) val += FBias[d];
+    if ((kept == FTopK) && !(val > topVal[lastK])) continue;
+    if (kept < FTopK) kept++;
+    int ins = kept - 1;
+    while ((ins > 0) && (val > topVal[ins - 1]))
+    {
+      topVal[ins] = topVal[ins - 1];
+      topIdx[ins] = topIdx[ins - 1];
+      ins--;
+    }
+    topVal[ins] = val;
+    topIdx[ins] = d;
+  }
+  // Survivors back into ascending expert order: the order of the host's sum.
+  for (int i = 1; i < kept; i++)
+  {
+    const int idx = topIdx[i];
+    int j = i;
+    while ((j > 0) && (topIdx[j - 1] > idx))
+    {
+      topIdx[j] = topIdx[j - 1];
+      j--;
+    }
+    topIdx[j] = idx;
+  }
+  float survSum = 1.0f;
+  if (FRenormalize != 0)
+  {
+    survSum = 0.0f;
+    for (int i = 0; i < kept; i++) survSum += FSource[base + topIdx[i]];
+    if (survSum == 0.0f) survSum = 1.0f;
+  }
+  for (int d = 0; d < FDepth; d++) FOut[base + d] = 0.0f;
+  for (int i = 0; i < kept; i++)
+  {
+    const int d = topIdx[i];
+    const float g = FSource[base + d];
+    FOut[base + d] = (FRenormalize != 0) ? (g / survSum) : g;
+    if (FCountLoad != 0) atomic_inc(&FLoadCount[d]);
+  }
+} // end of kernel
+
+// TNNetTopKValues forward: the FTopK largest of each cell's FDepth values,
+// largest first, written to FOut[cell * FTopK + i]. One work-item per cell runs
+// the host NeuralMarkTopK insertion scan, so a value enters a full buffer only
+// when STRICTLY greater than the worst kept one and equal values keep the lower
+// index first, as on the CPU. The host keeps FTopK <= CAI_TOPK_GATE_MAX_K and
+// FTopK <= FDepth. Coded by Claude (AI).
+__kernel void cai_topk_values
+(
+  const int FCellCnt,
+  const int FDepth,
+  const int FTopK,
+  __global const float* FSource,
+  __global float* FOut
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FCellCnt) return;
+  const int base = c * FDepth;
+  float topVal[CAI_TOPK_GATE_MAX_K];
+  int kept = 0;
+  const int lastK = FTopK - 1;
+  for (int d = 0; d < FDepth; d++)
+  {
+    const float val = FSource[base + d];
+    if ((kept == FTopK) && !(val > topVal[lastK])) continue;
+    if (kept < FTopK) kept++;
+    int ins = kept - 1;
+    while ((ins > 0) && (val > topVal[ins - 1]))
+    {
+      topVal[ins] = topVal[ins - 1];
+      ins--;
+    }
+    topVal[ins] = val;
+  }
+  const int outBase = c * FTopK;
+  for (int i = 0; i < kept; i++) FOut[outBase + i] = topVal[i];
+} // end of kernel
+
+// Device twin of TNNetMoEExpertBankGateUp.BuildSlotMap over a router output
+// left in OpenCL memory (FTokenCnt rows of FNumExperts gate weights): a token's
+// slots take its non-zero gates in ascending expert order, at most FTopK. A
+// TNNetTopKGate router never exceeds FTopK, so the break only mirrors the host.
+// Slots past FSlotCount[t] keep stale values; every reader stops at the count.
+// One work-item per token. Coded by Claude (AI).
+__kernel void cai_moe_build_slot_map
+(
+  const int FTokenCnt,
+  const int FNumExperts,
+  const int FTopK,
+  __global const float* FGate,
+  __global int*   FSlotExpert,
+  __global float* FSlotGate,
+  __global int*   FSlotCount
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FTokenCnt) return;
+  const int gateBase = t * FNumExperts;
+  const int pairBase = t * FTopK;
+  int slot = 0;
+  for (int e = 0; e < FNumExperts; e++)
+  {
+    const float g = FGate[gateBase + e];
+    if (g != 0.0f)
+    {
+      if (slot >= FTopK) break;
+      FSlotExpert[pairBase + slot] = e;
+      FSlotGate[pairBase + slot] = g;
+      slot++;
+    }
+  }
+  FSlotCount[t] = slot;
+} // end of kernel
+
+// 3D Gaussian Splatting (TGaussianSplatRasterizerCL). CAI_GAUSSIAN_SPLAT_TILE
+// must equal GaussianSplatTileSize in neuralgaussiansplat.pas.
+#define CAI_GAUSSIAN_SPLAT_TILE 16
+#define CAI_GAUSSIAN_SPLAT_BATCH (CAI_GAUSSIAN_SPLAT_TILE * CAI_GAUSSIAN_SPLAT_TILE)
+
+static inline int cai_gaussian_splat_clamp_tile(const float FCoordinate, const int FTileCount)
+{
+  // Clamped in float before the conversion: a vectorized kernel may convert
+  // the coordinates of culled Gaussians too, and out-of-range ones trap.
+  return (int)fmax(0.0f, fmin(FCoordinate, (float)FTileCount));
+}
+
+// TGaussianSplatRasterizer.Preprocess, one work-item per Gaussian: view-space
+// mean, 2D conic (J W Sigma W^T J^T + 0.3 I inverted), 3-sigma radius, SH colour
+// and tile rect. FCamera: WorldToView[12], FocalX, FocalY, PrincipalX,
+// PrincipalY, camera centre xyz, near plane. FRadii[g] = 0 marks a culled one.
+__kernel void cai_gaussian_splat_preprocess
+(
+  const int FGaussianCount,
+  const int FSHDegree,
+  const int FSHCoefCount,
+  const int FWidth,
+  const int FHeight,
+  const int FTileCountX,
+  const int FTileCountY,
+  __global const float* FCamera,
+  __global const float* FPositions,
+  __global const float* FScales,
+  __global const float* FRotations,
+  __global const float* FOpacities,
+  __global const float* FSHCoefs,
+  __global float* FMeansImage,
+  __global float* FDepths,
+  __global int* FRadii,
+  __global float* FConicOpacity,
+  __global float* FColors,
+  __global int* FTileRects
+)
+{
+  const int g = get_global_id(0);
+  if (g >= FGaussianCount) return;
+  FRadii[g] = 0;
+  const float px = FPositions[3 * g];
+  const float py = FPositions[3 * g + 1];
+  const float pz = FPositions[3 * g + 2];
+  const float viewX = FCamera[0] * px + FCamera[1] * py + FCamera[2] * pz + FCamera[3];
+  const float viewY = FCamera[4] * px + FCamera[5] * py + FCamera[6] * pz + FCamera[7];
+  const float viewZ = FCamera[8] * px + FCamera[9] * py + FCamera[10] * pz + FCamera[11];
+  if (viewZ <= FCamera[19]) return;
+  const float focalX = FCamera[12];
+  const float focalY = FCamera[13];
+  const float invZ = 1.0f / viewZ;
+  const float limitX = 1.3f * (float)FWidth / (2.0f * focalX);
+  const float limitY = 1.3f * (float)FHeight / (2.0f * focalY);
+  const float clampedX = fmin(limitX, fmax(-limitX, viewX * invZ)) * viewZ;
+  const float clampedY = fmin(limitY, fmax(-limitY, viewY * invZ)) * viewZ;
+  const float j00 = focalX * invZ;
+  const float j02 = -focalX * clampedX * invZ * invZ;
+  const float j11 = focalY * invZ;
+  const float j12 = -focalY * clampedY * invZ * invZ;
+  const float a0 = j00 * FCamera[0] + j02 * FCamera[8];
+  const float a1 = j00 * FCamera[1] + j02 * FCamera[9];
+  const float a2 = j00 * FCamera[2] + j02 * FCamera[10];
+  const float b0 = j11 * FCamera[4] + j12 * FCamera[8];
+  const float b1 = j11 * FCamera[5] + j12 * FCamera[9];
+  const float b2 = j11 * FCamera[6] + j12 * FCamera[10];
+  const float qw = FRotations[4 * g];
+  const float qx = FRotations[4 * g + 1];
+  const float qy = FRotations[4 * g + 2];
+  const float qz = FRotations[4 * g + 3];
+  const float r00 = 1.0f - 2.0f * (qy * qy + qz * qz), r01 = 2.0f * (qx * qy - qw * qz), r02 = 2.0f * (qx * qz + qw * qy);
+  const float r10 = 2.0f * (qx * qy + qw * qz), r11 = 1.0f - 2.0f * (qx * qx + qz * qz), r12 = 2.0f * (qy * qz - qw * qx);
+  const float r20 = 2.0f * (qx * qz - qw * qy), r21 = 2.0f * (qy * qz + qw * qx), r22 = 1.0f - 2.0f * (qx * qx + qy * qy);
+  const float varX = FScales[3 * g] * FScales[3 * g];
+  const float varY = FScales[3 * g + 1] * FScales[3 * g + 1];
+  const float varZ = FScales[3 * g + 2] * FScales[3 * g + 2];
+  const float c0 = r00 * r00 * varX + r01 * r01 * varY + r02 * r02 * varZ;
+  const float c1 = r00 * r10 * varX + r01 * r11 * varY + r02 * r12 * varZ;
+  const float c2 = r00 * r20 * varX + r01 * r21 * varY + r02 * r22 * varZ;
+  const float c3 = r10 * r10 * varX + r11 * r11 * varY + r12 * r12 * varZ;
+  const float c4 = r10 * r20 * varX + r11 * r21 * varY + r12 * r22 * varZ;
+  const float c5 = r20 * r20 * varX + r21 * r21 * varY + r22 * r22 * varZ;
+  const float sa0 = c0 * a0 + c1 * a1 + c2 * a2;
+  const float sa1 = c1 * a0 + c3 * a1 + c4 * a2;
+  const float sa2 = c2 * a0 + c4 * a1 + c5 * a2;
+  const float covA = a0 * sa0 + a1 * sa1 + a2 * sa2 + 0.3f;
+  const float covB = b0 * sa0 + b1 * sa1 + b2 * sa2;
+  const float covC = b0 * (c0 * b0 + c1 * b1 + c2 * b2) +
+    b1 * (c1 * b0 + c3 * b1 + c4 * b2) + b2 * (c2 * b0 + c4 * b1 + c5 * b2) + 0.3f;
+  const float det = covA * covC - covB * covB;
+  if (det <= 0.0f) return;
+  const float invDet = 1.0f / det;
+  const float midValue = 0.5f * (covA + covC);
+  const float lambda1 = midValue + sqrt(fmax(0.1f, midValue * midValue - det));
+  const int radius = (int)fmin(ceil(3.0f * sqrt(lambda1)), 1e8f);
+  const float meanX = focalX * viewX * invZ + FCamera[14];
+  const float meanY = focalY * viewY * invZ + FCamera[15];
+  const float invTileSize = 1.0f / (float)CAI_GAUSSIAN_SPLAT_TILE;
+  const float tileExtent = (float)(CAI_GAUSSIAN_SPLAT_TILE - 1);
+  const int minTileX = cai_gaussian_splat_clamp_tile((meanX - radius) * invTileSize, FTileCountX);
+  const int minTileY = cai_gaussian_splat_clamp_tile((meanY - radius) * invTileSize, FTileCountY);
+  const int maxTileX = cai_gaussian_splat_clamp_tile((meanX + radius + tileExtent) * invTileSize, FTileCountX);
+  const int maxTileY = cai_gaussian_splat_clamp_tile((meanY + radius + tileExtent) * invTileSize, FTileCountY);
+  if ((maxTileX <= minTileX) || (maxTileY <= minTileY)) return;
+  float basis[16];
+  basis[0] = 0.28209479177387814f;
+  if (FSHDegree > 0)
+  {
+    float dirX = px - FCamera[16];
+    float dirY = py - FCamera[17];
+    float dirZ = pz - FCamera[18];
+    float invLength = dirX * dirX + dirY * dirY + dirZ * dirZ;
+    if (invLength > 0.0f) invLength = 1.0f / sqrt(invLength);
+    dirX *= invLength;
+    dirY *= invLength;
+    dirZ *= invLength;
+    basis[1] = -0.4886025119029199f * dirY;
+    basis[2] = 0.4886025119029199f * dirZ;
+    basis[3] = -0.4886025119029199f * dirX;
+    if (FSHDegree > 1)
+    {
+      const float xx = dirX * dirX, yy = dirY * dirY, zz = dirZ * dirZ;
+      const float xy = dirX * dirY, yz = dirY * dirZ, xz = dirX * dirZ;
+      basis[4] = 1.0925484305920792f * xy;
+      basis[5] = -1.0925484305920792f * yz;
+      basis[6] = 0.31539156525252005f * (2.0f * zz - xx - yy);
+      basis[7] = -1.0925484305920792f * xz;
+      basis[8] = 0.5462742152960396f * (xx - yy);
+      if (FSHDegree > 2)
+      {
+        basis[9] = -0.5900435899266435f * dirY * (3.0f * xx - yy);
+        basis[10] = 2.890611442640554f * xy * dirZ;
+        basis[11] = -0.4570457994644658f * dirY * (4.0f * zz - xx - yy);
+        basis[12] = 0.3731763325901154f * dirZ * (2.0f * zz - 3.0f * xx - 3.0f * yy);
+        basis[13] = -0.4570457994644658f * dirX * (4.0f * zz - xx - yy);
+        basis[14] = 1.445305721320277f * dirZ * (xx - yy);
+        basis[15] = -0.5900435899266435f * dirX * (xx - 3.0f * yy);
+      }
+    }
+  }
+  const int shBase = 3 * FSHCoefCount * g;
+  for (int channel = 0; channel < 3; channel++)
+  {
+    float sum = 0.5f;
+    for (int coef = 0; coef < FSHCoefCount; coef++)
+      sum += basis[coef] * FSHCoefs[shBase + 3 * coef + channel];
+    FColors[3 * g + channel] = fmax(sum, 0.0f);
+  }
+  FRadii[g] = radius;
+  FDepths[g] = viewZ;
+  FMeansImage[2 * g] = meanX;
+  FMeansImage[2 * g + 1] = meanY;
+  FConicOpacity[4 * g] = covC * invDet;
+  FConicOpacity[4 * g + 1] = -covB * invDet;
+  FConicOpacity[4 * g + 2] = covA * invDet;
+  FConicOpacity[4 * g + 3] = FOpacities[g];
+  FTileRects[4 * g] = minTileX;
+  FTileRects[4 * g + 1] = minTileY;
+  FTileRects[4 * g + 2] = maxTileX;
+  FTileRects[4 * g + 3] = maxTileY;
+} // end of kernel
+
+// TGaussianSplatRasterizer.BlendTile with one 16x16 work-group per tile and one
+// work-item per pixel: the tile's depth-sorted list is staged through local
+// memory one batch at a time, and the group stops when every pixel is opaque.
+__kernel void cai_gaussian_splat_blend
+(
+  const int FWidth,
+  const int FHeight,
+  const int FTileCountX,
+  const float FBackgroundRed,
+  const float FBackgroundGreen,
+  const float FBackgroundBlue,
+  __global const int* FTileRanges,
+  __global const int* FTileGaussianList,
+  __global const float* FMeansImage,
+  __global const float* FConicOpacity,
+  __global const float* FColors,
+  __global float* FOutput
+)
+{
+  __local float stagedMean[2 * CAI_GAUSSIAN_SPLAT_BATCH];
+  __local float stagedConic[4 * CAI_GAUSSIAN_SPLAT_BATCH];
+  __local float stagedColor[3 * CAI_GAUSSIAN_SPLAT_BATCH];
+  __local int doneCount;
+  const int localX = get_local_id(0);
+  const int localY = get_local_id(1);
+  const int lid = localY * CAI_GAUSSIAN_SPLAT_TILE + localX;
+  const int pixelX = get_group_id(0) * CAI_GAUSSIAN_SPLAT_TILE + localX;
+  const int pixelY = get_group_id(1) * CAI_GAUSSIAN_SPLAT_TILE + localY;
+  const int tile = get_group_id(1) * FTileCountX + get_group_id(0);
+  const int firstListPos = FTileRanges[2 * tile];
+  const int endListPos = FTileRanges[2 * tile + 1];
+  const int inside = (pixelX < FWidth) && (pixelY < FHeight);
+  int done = !inside;
+  if (lid == 0) doneCount = 0;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (done) atomic_inc(&doneCount);
+  float transmittance = 1.0f;
+  float sumRed = 0.0f, sumGreen = 0.0f, sumBlue = 0.0f;
+  for (int batchStart = firstListPos; batchStart < endListPos; batchStart += CAI_GAUSSIAN_SPLAT_BATCH)
+  {
+    // doneCount only changes after the staging barrier below, so every
+    // work-item reads the same value here and the break is uniform.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (doneCount == CAI_GAUSSIAN_SPLAT_BATCH) break;
+    const int fetchPos = batchStart + lid;
+    if (fetchPos < endListPos)
+    {
+      const int g = FTileGaussianList[fetchPos];
+      stagedMean[2 * lid] = FMeansImage[2 * g];
+      stagedMean[2 * lid + 1] = FMeansImage[2 * g + 1];
+      stagedConic[4 * lid] = FConicOpacity[4 * g];
+      stagedConic[4 * lid + 1] = FConicOpacity[4 * g + 1];
+      stagedConic[4 * lid + 2] = FConicOpacity[4 * g + 2];
+      stagedConic[4 * lid + 3] = FConicOpacity[4 * g + 3];
+      stagedColor[3 * lid] = FColors[3 * g];
+      stagedColor[3 * lid + 1] = FColors[3 * g + 1];
+      stagedColor[3 * lid + 2] = FColors[3 * g + 2];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (!done)
+    {
+      const int batchCount = min(CAI_GAUSSIAN_SPLAT_BATCH, endListPos - batchStart);
+      for (int j = 0; j < batchCount; j++)
+      {
+        const float deltaX = stagedMean[2 * j] - (float)pixelX;
+        const float deltaY = stagedMean[2 * j + 1] - (float)pixelY;
+        const float power = -0.5f * (stagedConic[4 * j] * deltaX * deltaX +
+          stagedConic[4 * j + 2] * deltaY * deltaY) - stagedConic[4 * j + 1] * deltaX * deltaY;
+        if (power > 0.0f) continue;
+        const float alpha = fmin(0.99f, stagedConic[4 * j + 3] * cai_exp_floored(power));
+        if (alpha < 1.0f / 255.0f) continue;
+        const float nextTransmittance = transmittance * (1.0f - alpha);
+        if (nextTransmittance < 0.0001f)
+        {
+          done = 1;
+          atomic_inc(&doneCount);
+          break;
+        }
+        const float weight = alpha * transmittance;
+        sumRed += stagedColor[3 * j] * weight;
+        sumGreen += stagedColor[3 * j + 1] * weight;
+        sumBlue += stagedColor[3 * j + 2] * weight;
+        transmittance = nextTransmittance;
+      }
+    }
+  }
+  if (inside)
+  {
+    const int outputPos = (pixelY * FWidth + pixelX) * 3;
+    FOutput[outputPos] = sumRed + transmittance * FBackgroundRed;
+    FOutput[outputPos + 1] = sumGreen + transmittance * FBackgroundGreen;
+    FOutput[outputPos + 2] = sumBlue + transmittance * FBackgroundBlue;
+  }
 } // end of kernel

@@ -86,7 +86,7 @@ The run is deterministic (`RandSeed` is fixed), pure CPU, and finishes in
 TverskySweep: alpha/beta knob study on TNNetTverskyLoss
 grid=12x12  features=6  train=192  test=96  epochs=24  lr=0.040  noise=0.85
 
-Held-out class balance: foreground 2048 / 13824 pixels (14.8%),  background 11776 (85.2%)
+Held-out class balance: foreground 1840 / 13824 pixels (13.3%),  background 11984 (86.7%)
 => foreground is a deliberate minority (class-imbalanced mask).
 
 Training (alpha=0.5, beta=0.5)  [= Dice] ...
@@ -95,15 +95,15 @@ Training (alpha=0.7, beta=0.3) ...
 
 Held-out results (threshold 0.5, counts summed over all test pixels)
   (alpha,beta)   note      precision   recall      F1/Dice      FP      FN
-  (0.5, 0.5)   Dice        0.7225     0.8872     0.7964     698     231
-  (0.3, 0.7)               0.6780     0.9160     0.7792     891     172
-  (0.7, 0.3)               0.7745     0.8335     0.8029     497     341
+  (0.5, 0.5)   Dice        0.7524     0.8255     0.7873     500     321
+  (0.3, 0.7)               0.7136     0.8696     0.7839     642     240
+  (0.7, 0.3)               0.8370     0.7451     0.7884     267     469
 
 Trend as beta rises relative to alpha (beta-alpha: -0.4 -> 0 -> +0.4):
-  recall:  0.8335 -> 0.8872 -> 0.9160
-  FN:        341 ->   231 ->   172
-  precision:0.7745 -> 0.7225 -> 0.6780
-  FP:        497 ->   698 ->   891
+  recall:  0.7451 -> 0.8255 -> 0.8696
+  FN:        469 ->   321 ->   240
+  precision:0.8370 -> 0.7524 -> 0.7136
+  FP:        267 ->   500 ->   642
 
 => CONFIRMED: beta>alpha raises RECALL and lowers FN (it trades precision/FP for recall).
 ```
@@ -114,12 +114,12 @@ Order the three runs by `beta - alpha` (`-0.4 -> 0 -> +0.4`, i.e.
 `(0.7,0.3) -> (0.5,0.5) -> (0.3,0.7)`) and the headline trade is monotone and
 clear:
 
-- **Recall rises**: `0.8335 -> 0.8872 -> 0.9160`. As `beta` grows the model is
+- **Recall rises**: `0.7451 -> 0.8255 -> 0.8696`. As `beta` grows the model is
   penalised more for missing foreground, so it labels more pixels foreground.
-- **False negatives fall**: `341 -> 231 -> 172`. Fewer true-foreground pixels
+- **False negatives fall**: `469 -> 321 -> 240`. Fewer true-foreground pixels
   are missed — exactly what a higher `beta` rewards.
-- **Precision drops / false positives rise**: precision `0.7745 -> 0.7225 ->
-  0.6780`, FP `497 -> 698 -> 891`. The extra recall is bought with more
+- **Precision drops / false positives rise**: precision `0.8370 -> 0.7524 ->
+  0.7136`, FP `267 -> 500 -> 642`. The extra recall is bought with more
   spurious foreground calls.
 
 `(0.5, 0.5)` sits in the middle and is identical to `TNNetDiceLoss`. So the

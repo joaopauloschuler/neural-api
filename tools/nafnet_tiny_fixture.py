@@ -5,8 +5,8 @@ tests/TestNeuralPretrained.pas.
 NAFNet (Chen et al. 2022, "Simple Baselines for Image Restoration",
 https://arxiv.org/abs/2204.04676) is a U-Net of NAFBlocks. There is NO official
 tiny checkpoint, so the reference forward is a self-contained numpy float64
-oracle that mirrors the CAI importer's forward path EXACTLY (same idiom as
-tools/rrdbnet_tiny_fixture.py). Weights use the canonical NAFNet state_dict key
+oracle of the official forward (torch nn.PixelShuffle channel order; same idiom
+as tools/rrdbnet_tiny_fixture.py). Weights use the canonical NAFNet state_dict key
 scheme so the importer is exercised on a realistic key layout.
 
 NAFBlock(C):
@@ -157,21 +157,11 @@ def simple_gate(x):
 
 
 def pixel_shuffle(x, r):
-    # CAI TNNetDepthToSpace mapping (the importer uses this, NOT nn.PixelShuffle):
-    #   out[X=ix*r+sx, Y=iy*r+sy, ic] = in[X=ix, Y=iy, (sx*r+sy)*C + ic]
-    # In the (C, H=Y, W=X) oracle layout the X offset is sx and the Y offset sy:
-    #   out[ic, iy*r+sy, ix*r+sx] = in[(sx*r+sy)*C + ic, iy, ix]
+    # torch nn.PixelShuffle: out[c, iy*r+sy, ix*r+sx] = in[c*r*r + sy*r + sx, iy, ix]
     C2, H, Wd = x.shape
     C = C2 // (r * r)
-    out = np.zeros((C, H * r, Wd * r), dtype=np.float64)
-    for iy in range(H):
-        for ix in range(Wd):
-            for sx in range(r):
-                for sy in range(r):
-                    for ic in range(C):
-                        out[ic, iy * r + sy, ix * r + sx] = \
-                            x[(sx * r + sy) * C + ic, iy, ix]
-    return out
+    return x.reshape(C, r, r, H, Wd).transpose(0, 3, 1, 4, 2).reshape(
+        C, H * r, Wd * r)
 
 
 def nafblock(inp, sd, prefix):

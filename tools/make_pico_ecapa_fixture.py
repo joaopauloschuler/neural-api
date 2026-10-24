@@ -95,11 +95,7 @@ def fc(x, Wt, b):
 def se_block(mix, w_down, b_down, w_up, b_up):
     # mix: (T, C). Global average over time -> reduce(ReLU) -> expand(Sigmoid)
     # -> per-channel multiply broadcast over time.
-    # NOTE: the Pascal SE block uses TNNetAvgChannel, which on an (T,1,C) volume
-    # returns sum / T^2 (NOT sum / T) -- see the avgchannel-pool-scaling memo.
-    # Match that exactly so the parity oracle equals the Pascal forward.
-    T = mix.shape[0]
-    desc = mix.sum(axis=0) / (T * T)        # (C,)
+    desc = mix.mean(axis=0)                 # (C,)
     red = relu(w_down @ desc + b_down)      # (bottleneck,)
     gate = sigmoid(w_up @ red + b_up)       # (C,)
     return mix * gate[None, :]

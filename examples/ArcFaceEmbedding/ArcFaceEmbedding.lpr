@@ -92,18 +92,6 @@ type
   end;
   TSampleArray = array of TSample;
 
-// Why: Box-Muller gives N(0,1) samples without an extra dependency.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Builds the synthetic dataset: cSamplesPerCls 2D Gaussian points per class.
 procedure BuildDataset(out Data: TSampleArray);
 var
@@ -114,8 +102,8 @@ begin
   for C := 0 to cNumClasses - 1 do
     for I := 1 to cSamplesPerCls do
     begin
-      Data[Idx].X := cCenters[C][0] + RandomGauss() * cSigma;
-      Data[Idx].Y := cCenters[C][1] + RandomGauss() * cSigma;
+      Data[Idx].X := cCenters[C][0] + RandomStdNormal() * cSigma;
+      Data[Idx].Y := cCenters[C][1] + RandomStdNormal() * cSigma;
       Data[Idx].Cls := C;
       Inc(Idx);
     end;

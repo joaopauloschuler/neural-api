@@ -96,16 +96,6 @@ var
   gLearnRate:    TNeuralFloat = 0.02;
   gFull:         boolean = false;
 
-// Box-Muller N(0,1) sample.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat U1 := Random; until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Stamps a filled circle into Mask (value 1).
 procedure StampCircle(Mask: TNNetVolume);
 var
@@ -148,7 +138,7 @@ begin
   // Input: foreground ~1, background ~0, both corrupted by Gaussian noise.
   for Y := 0 to cGrid - 1 do
     for X := 0 to cGrid - 1 do
-      Img[X, Y, 0] := Mask[X, Y, 0] + RandomGauss() * cNoise;
+      Img[X, Y, 0] := Mask[X, Y, 0] + RandomStdNormal() * cNoise;
 end;
 
 procedure BuildDataset(out Imgs, Masks: TVolArray; N: integer);

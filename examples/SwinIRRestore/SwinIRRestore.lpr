@@ -6,15 +6,20 @@ neuralpretrained.pas) -- a TRANSFORMER restoration import.
 SwinIR (Liang et al. 2021, "SwinIR: Image Restoration Using Swin Transformer",
 arXiv:2108.10257) stacks Residual Swin Transformer Blocks (RSTB = a few Swin
 window/shifted-window attention layers + a 3x3 conv + a residual over the block)
-on a shallow conv stem, then a pixel-shuffle upsample tail for classical
-super-resolution.
+on a shallow conv stem, then one of four reconstruction tails (the official
+`upsampler` argument): 'pixelshuffle' (classical SR), 'pixelshuffledirect'
+(lightweight SR: one conv + pixel shuffle), 'nearest+conv' (real-world SR:
+nearest x2 + conv steps) or '' (upscale 1 denoise / JPEG: input + conv_last).
+The importer detects the tail from the checkpoint keys (conv_up1 ->
+nearest+conv, conv_before_upsample -> pixelshuffle, upsample.0 alone ->
+pixelshuffledirect, none -> denoise) when config.json has no "upsampler" field.
 
 Architecturally distinct from the CNN-only RRDBNet/ESRGAN SR path and the
 SimpleGate-CNN NAFNet denoiser: this is transformer restoration. The window /
 shifted-window attention REUSES the landed Swin building blocks
 (TNNetWindowAttention + relative_position_bias + cyclic-shift mask,
 TNNetGatherTokens partition/reverse); the new pieces are the conv stem, the RSTB
-residual conv, and the TNNetDepthToSpace pixel-shuffle upsample.
+residual conv, and the TNNetPixelShuffle pixel-shuffle upsample.
 
 NO NETWORK ACCESS / SELF-CONTAINED: the official SwinIR checkpoints are large and
 not obtainable offline, so -- exactly like the repo's RRDBNet / NAFNet pico
@@ -27,12 +32,15 @@ on a deterministic synthetic image, and reports the upscaled shape. Pass a real
 .safetensors (+ config.json sibling) to upscale with your own trained checkpoint.
 
 USAGE
-  ./SwinIRRestore                 use the committed pico fixture
+  ./SwinIRRestore                 use the committed pico fixture (pixelshuffle x2)
+  ./SwinIRRestore --fixture x4|direct|nearest|denoise
+                                  use the pixelshuffle x4, pixelshuffledirect x3,
+                                  nearest+conv x4 or denoise pico fixture
   ./SwinIRRestore model.safetensors [config.json]
                                   use a real checkpoint
 
 OUTPUT
-  Writes swinir_input.ppm and swinir_upscaled.ppm (P6 color images) and prints
+  Writes swinir_input.ppm and swinir_upscaled.ppm (restored image) (P6 color images) and prints
   the config plus a small ASCII intensity preview of input / upscaled.
 
 Coded by Claude (AI).
@@ -51,8 +59,7 @@ uses
   neuralnetwork, neuralvolume, neuralpretrained;
 
 const
-  cFixtureST  = '../../tests/fixtures/tiny_swinir.safetensors';
-  cFixtureCfg = '../../tests/fixtures/tiny_swinir_config.json';
+  cFixtureDir = '../../tests/fixtures/';
   cInputFile  = 'swinir_input.ppm';
   cOutFile    = 'swinir_upscaled.ppm';
 
@@ -127,9 +134,9 @@ var
   NN: TNNet;
   Config: TSwinIRConfig;
   LowRes: TNNetVolume;
-  STPath, CfgPath: string;
+  STPath, CfgPath, FixtureStem: string;
 begin
-  if ParamCount >= 1 then
+  if (ParamCount >= 1) and (ParamStr(1) <> '--fixture') then
   begin
     STPath := ParamStr(1);
     if ParamCount >= 2 then CfgPath := ParamStr(2)
@@ -138,8 +145,22 @@ begin
   end
   else
   begin
-    STPath := cFixtureST;
-    CfgPath := cFixtureCfg;
+    FixtureStem := 'tiny_swinir';
+    if ParamCount >= 2 then
+    begin
+      if ParamStr(2) = 'nearest' then FixtureStem := 'tiny_swinir_nearest'
+      else if ParamStr(2) = 'denoise' then FixtureStem := 'tiny_swinir_denoise'
+      else if ParamStr(2) = 'x4' then FixtureStem := 'tiny_swinir_x4'
+      else if ParamStr(2) = 'direct' then FixtureStem := 'tiny_swinir_direct'
+      else if ParamStr(2) <> 'pixelshuffle' then
+      begin
+        WriteLn('Unknown --fixture "', ParamStr(2),
+          '" (pixelshuffle, x4, direct, nearest or denoise).');
+        Halt(1);
+      end;
+    end;
+    STPath := cFixtureDir + FixtureStem + '.safetensors';
+    CfgPath := cFixtureDir + FixtureStem + '_config.json';
     WriteLn('No checkpoint passed; using the committed pico fixture ' +
       '(random weights -- wiring SMOKE demo).');
   end;
@@ -154,17 +175,21 @@ begin
       WriteLn('Input: ', LowRes.SizeX, 'x', LowRes.SizeY, 'x', LowRes.Depth);
 
       NN.Compute(LowRes);
-      WriteLn('Upscaled image: ', NN.GetLastLayer().Output.SizeX, 'x',
+      Write('Restored image: ', NN.GetLastLayer().Output.SizeX, 'x',
         NN.GetLastLayer().Output.SizeY, 'x',
-        NN.GetLastLayer().Output.Depth, ' (',
-        Config.Upscale, 'x super-resolution).');
+        NN.GetLastLayer().Output.Depth);
+      if Config.Upsampler = '' then
+        WriteLn(' (same-resolution denoise tail).')
+      else
+        WriteLn(' (', Config.Upscale, 'x super-resolution, ',
+          Config.Upsampler, ' tail).');
 
       WriteColorPPM(LowRes, cInputFile);
       WriteColorPPM(NN.GetLastLayer().Output, cOutFile);
       WriteLn('Wrote ', cInputFile, ' and ', cOutFile, '.');
 
       WriteLn; WriteLn('input (low-res):'); AsciiPreview(LowRes);
-      WriteLn; WriteLn('upscaled:');        AsciiPreview(NN.GetLastLayer().Output);
+      WriteLn; WriteLn('restored:');        AsciiPreview(NN.GetLastLayer().Output);
     finally
       LowRes.Free;
     end;

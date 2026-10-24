@@ -40,17 +40,6 @@ const
   NOISESD = 0.30;   // standard deviation of the added Gaussian noise
   MAWIN   = 9;      // moving-average window of the low-pass baseline
 
-// Standard-normal sample via Box-Muller (avoids needing a TNNetVolume just for
-// noise generation).
-function GaussNoise(): TNeuralFloat;
-var
-  u1, u2: TNeuralFloat;
-begin
-  u1 := Random; u2 := Random;
-  if u1 < 1e-12 then u1 := 1e-12;
-  Result := Sqrt(-2.0 * Ln(u1)) * Cos(2 * Pi * u2);
-end;
-
 // Donoho-Johnstone "Blocks" signal: a canonical PIECEWISE-CONSTANT test signal
 // built from a sum of shifted, signed step (Heaviside) functions. It is sparse
 // in the wavelet domain (energy concentrates in a handful of large detail
@@ -270,7 +259,7 @@ begin
 
   MakeClean(clean);
   for i := 0 to N - 1 do
-    noisy[i] := clean[i] + NOISESD * GaussNoise();
+    noisy[i] := clean[i] + NOISESD * RandomStdNormal();
 
   WaveletDenoise(noisy, wRec);
   MovingAverageDenoise(noisy, mRec);

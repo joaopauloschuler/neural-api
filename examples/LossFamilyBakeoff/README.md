@@ -54,11 +54,11 @@ fpc -B -Fu../../neural -Mobjfpc -Sh -O2 LossFamilyBakeoff.lpr
 ```
 === Results (clean-test error, original units) ===
 loss_head        clean_test_MSE  clean_test_MAE  final_train_loss
-MSE-baseline             4.8608          1.5731          0.278998
-HuberLoss                1.7227          1.0270          0.272648
-SmoothL1Loss             1.7227          1.0270          0.272648
-CharbonnierLoss          0.3388          0.4521          0.269356
-LogCoshLoss              1.4571          0.9431          0.272347
+MSE-baseline             3.6401          1.4843          0.342391
+HuberLoss                2.3151          1.1976          0.326892
+SmoothL1Loss             2.3151          1.1976          0.326892
+CharbonnierLoss          0.6231          0.5474          0.318615
+LogCoshLoss              2.6907          1.2847          0.328001
 ```
 
 ## Takeaway

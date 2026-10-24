@@ -3,19 +3,17 @@
 exercises the PER-BLOCK attention-head path for tests/TestNeuralPretrained.pas
 (TestSDUNetPerBlockHeadsParity).
 
-The diffusers config "attention_head_dim" can be a LIST (one head DIM per
-resolution block; SDXL-style) rather than a scalar. HF semantics: the per-head
-channel DIM is given, and a block's num_heads = (that block's channel width) /
-its head dim. With a list of DIFFERENT dims over different block widths the head
-COUNT varies per block.
+The diffusers config "attention_head_dim" can be a LIST (one entry per
+resolution block; SDXL-style) rather than a scalar. diffusers semantics: despite
+the name each entry is the block's head COUNT (num_attention_heads or
+attention_head_dim); the head dim is the block's channel width / that count.
 
 Here both resolutions are attended (CrossAttnDown/Up on every block) so the
 per-block head count is actually exercised:
 
   block_out_channels = [8, 16]
-  attention_head_dim  = [2, 8]    (a LIST)
-  -> heads[0] = 8 // 2 = 4
-     heads[1] = 16 // 8 = 2       (DIFFERENT from block 0)
+  attention_head_dim  = [4, 2]    (a LIST of head counts)
+  -> head dims 8 // 4 = 2 and 16 // 2 = 8 (DIFFERENT per block)
 
 Everything else mirrors tools/sd_unet_tiny_fixture.py / the SDXL fixture
 EXACTLY (same numpy float64 oracle, same key scheme). diffusers is NOT
@@ -416,7 +414,7 @@ def main():
         'up_block_types': UP_TYPES,
         'layers_per_block': LAYERS_PER_BLOCK,
         'cross_attention_dim': CROSS_DIM,
-        'attention_head_dim': ATTN_HEAD_DIM,     # a LIST (per-block head dims)
+        'attention_head_dim': HEADS,     # a LIST (diffusers: per-block head COUNTS)
         'norm_num_groups': NORM_GROUPS,
         'flip_sin_to_cos': True,
         'freq_shift': 0,

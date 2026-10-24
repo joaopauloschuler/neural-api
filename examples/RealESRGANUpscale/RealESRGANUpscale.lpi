@@ -53,7 +53,8 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dDebug
--dAVX2"/>
+-dAVX2
+-dOpenCL"/>
             <OtherDefines Count="2">
               <Define0 Value="Debug"/>
               <Define1 Value="AVX2"/>
@@ -87,7 +88,8 @@
           </Linking>
           <Other>
             <CustomOptions Value="-dRelease
--dAVX2"/>
+-dAVX2
+-dOpenCL"/>
             <OtherDefines Count="4">
               <Define0 Value="Release"/>
               <Define1 Value="Debug"/>
@@ -137,7 +139,8 @@
     </Linking>
     <Other>
       <CustomOptions Value="-dAVX2
--dRelease"/>
+-dRelease
+-dOpenCL"/>
       <OtherDefines Count="2">
         <Define0 Value="AVX2"/>
         <Define1 Value="Release"/>

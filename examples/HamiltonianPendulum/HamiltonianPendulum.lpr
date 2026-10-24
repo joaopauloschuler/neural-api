@@ -41,19 +41,8 @@ const
   cNoise   = 0.02;    // observation noise std on the (next) phase samples
 
 var
-  RngState: cardinal;
-
-// Tiny deterministic LCG so the demo is reproducible across runs/platforms.
-function NextRand(): TNeuralFloat;
-begin
-  RngState := (RngState * 1103515245 + 12345) and $7FFFFFFF;
-  Result := RngState / 2147483647.0;  // in [0,1)
-end;
-
-function NextGauss(AStd: TNeuralFloat): TNeuralFloat;
-begin
-  Result := Sqrt(-2 * Ln(NextRand() + 1e-12)) * Cos(2 * Pi * NextRand()) * AStd;
-end;
+  // Seeded private stream so the demo is reproducible across runs/platforms.
+  Rng: TStdNormalStream;
 
 // One exact symplectic (leapfrog) step of the TRUE pendulum, used to make the
 // ground-truth training targets and the reference rollout.
@@ -76,14 +65,14 @@ procedure FillSample(StartV, NextV: TNNetVolume);
 var
   q, p, q1, p1: TNeuralFloat;
 begin
-  q := (NextRand() * 2 - 1) * 2.0;   // q in [-2, 2] rad
-  p := (NextRand() * 2 - 1) * 1.5;   // p in [-1.5, 1.5]
+  q := (StdNormalStreamUniform(Rng) * 2 - 1) * 2.0;   // q in [-2, 2] rad
+  p := (StdNormalStreamUniform(Rng) * 2 - 1) * 1.5;   // p in [-1.5, 1.5]
   q1 := q; p1 := p;
   TruePendulumStep(q1, p1, cDt);
   StartV.Raw[0] := q;
   StartV.Raw[1] := p;
-  NextV.Raw[0] := q1 + NextGauss(cNoise);
-  NextV.Raw[1] := p1 + NextGauss(cNoise);
+  NextV.Raw[0] := q1 + StdNormalStreamNext(Rng) * cNoise;
+  NextV.Raw[1] := p1 + StdNormalStreamNext(Rng) * cNoise;
 end;
 
 // Roll a single model out autoregressively from (q0,p0) for ASteps and report
@@ -193,7 +182,7 @@ begin
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
                     exOverflow, exUnderflow, exPrecision]);
   // The manual Compute/Backpropagate loop here is single-threaded already.
-  RngState := 424242;
+  StdNormalStreamInit(Rng, 424242);
 
   // --- Arm 1: TNNetHamiltonianCell (symplectic, energy-conserving by design) --
   // Input is a single (1,1,2) phase vector; the cell integrates it one step

@@ -155,13 +155,13 @@ begin
     if OutLen < 1 then OutLen := 1;
     Flow := Config.FlowSize;
 
-    // Standard-normal prior noise z [flow][out_len] (Box-Muller).
+    // Standard-normal prior noise z [flow][out_len].
     SetLength(Z, Flow);
     for c := 0 to Flow - 1 do
     begin
       SetLength(Z[c], OutLen);
       for t := 0 to OutLen - 1 do
-        Z[c][t] := Sqrt(-2.0 * Ln(Random)) * Cos(2.0 * Pi * Random);
+        Z[c][t] := RandomStdNormal();
     end;
 
     WriteLn('Synthesizing ', OutLen, ' latent frames -> waveform...');

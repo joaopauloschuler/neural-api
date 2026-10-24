@@ -9,7 +9,7 @@ and the VAE decode run on OpenCL by default; everything else runs on the CPU:
 
   prompt -> processor/tokenizer.json -> Qwen3-VL text encoder
     -> transformer prefix pass (text K/V, once)
-    -> N flow-matching Euler steps over the image tokens
+    -> N flow-matching steps (Euler or DPM-Solver++(2M)) over the image tokens
     -> VAE decode, tiled -> RGBA PNG.
 
 One-shot (-p "prompt" or --token-ids): one image, then exit. Each component
@@ -24,8 +24,12 @@ input ends the session). Images go to numbered files from the --output base
 overwritten). Commands: /size WxH, /steps N, /seed N (otherwise the seed
 grows by one per image), /tile SIZE[,STRIDE], /repeat N PROMPT (N images of
 PROMPT with consecutive seeds, the prompt encoded once), /image FILE,
-/images [clear], /init-image FILE|off, /strength S, /profile on|off,
-/stats on|off, /quit.
+/images [clear], /init-image FILE|off, /mask FILE|off, /mask-blur R,
+/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off,
+/change-map FILE|off, /invert-change-map on|off, /strength S,
+/upscale FILE|off, /fbc X|off, /panorama WxH|off, /negative-prompt
+TEXT|off, /guidance-scale W, /pag W|off, /profile on|off, /stats on|off,
+/quit.
 
 Editing (--image FILE, repeatable up to 10, or /image FILE): the prompt is
 an instruction about the condition images (image 1 = the first --image).
@@ -43,9 +47,77 @@ The output keeps the init image's aspect ratio at the area of --width x
 --height (sides multiples of 32, as diffusers' calculate_dimensions).
 Images are resized with PIL's Lanczos coefficients in float. EXIF
 orientation is not applied.
+
+Inpainting (--init-image FILE --mask FILE, or /mask FILE in the REPL): img2img
+that regenerates only the white region of the mask and keeps the rest of the
+init image (diffusers QwenImageInpaintPipeline's blended mode, no retrained
+model). The mask is read as grayscale (alpha ignored), optionally blurred at
+its own size (--mask-blur R: a Gaussian of sigma R pixels, as diffusers'
+mask_processor.blur), stretched to the
+output size, binarized at 50% and taken per 16x16-pixel latent cell (each
+cell's top-left pixel decides). After every step the kept cells are reset to
+the init image's latents at the next noise level, and to the latents
+themselves after the last step. --strength 1 regenerates the hole from pure
+noise; lower values keep more of the init image inside the hole too.
+--padding-mask-crop N (diffusers padding_mask_crop) generates only the mask's
+bounding box plus N pixels, grown to the output aspect, at the output size,
+then pastes it back into the init image at its own size, blended by the mask
+(apply_overlay); a small hole in a large photo then gets full resolution.
+Outpainting (--init-image FILE --outpaint L,T,R,B, or /outpaint in the REPL):
+extends the init image by L, T, R and B pixels on the left, top, right and
+bottom. BuildOutpaintCanvas (neuralimageresize) places the image on a canvas
+grown to multiples of 32, fills the new border by repeating the edge pixels
+and masks that border plus --outpaint-overlap pixels (default 16, one latent
+cell) into the image; the inpaint path then regenerates the mask at strength 1
+unless --strength is given. The output is the canvas itself (--width and
+--height do not apply), cropped to the requested size, and the original pixels
+outside the overlap band are pasted back unchanged (diffusers apply_overlay).
+Differential Diffusion (--init-image FILE --change-map FILE, or /change-map in
+the REPL; Levin & Fried 2024): a gray map sets how much each 16x16 latent cell
+may change (white = change most, black = keep; --invert-change-map reads the
+reference's white = keep maps). It is resized to the output size like a mask
+but not binarized; after run step i of the N that run (all but the last) the
+cells with 1 - change > i / N are reset to the init image's latents at the
+next noise level (the diffusers community Flux differential img2img blend).
+Strength 1 unless --strength is given. Not with --mask or --outpaint.
 GPU memory: in the REPL and with --repeat N > 1 the transformer stays in
 OpenCL memory while the VAE decodes, so both need room at once; /tile 128 (or --vae-tile 128) lowers the
 VAE's share (~3.4 GB of layer buffers instead of ~10.7 GB at 256).
+
+Upscaling (--upscale FILE or /upscale FILE): a Real-ESRGAN / ESRGAN RRDBNet
+checkpoint (RealESRGAN_x4plus .pth or .safetensors) upscales the finished image
+before the PNG save through TRRDBNetUpscaler, so 512x512 becomes 2048x2048 at x4.
+The upscaler net is built after the VAE decode, for each image, and freed after
+it; it runs tile by tile (--upscale-tile, default 32 pixels plus 10 of context
+per side) on the --gpu device. Alpha is resized bilinearly.
+
+Guidance (--negative-prompt TEXT --guidance-scale W > 1): each step runs the
+transformer twice, on the prompt's and on the negative prompt's prefix
+cache, and mixes the velocities as uncond + W * (cond - uncond) (diffusers
+QwenImage21Pipeline true_cfg_scale; Qwen-Image-2.1 is meant to run without).
+--apg ETA,MOMENTUM,THRESHOLD mixes them with Adaptive Projected Guidance on
+the denoised x0 instead; --apg-velocity applies it to the raw velocities.
+
+Perturbed-Attention Guidance (--pag-scale W, or /pag W): on the steps inside
+the --pag-start..--pag-stop window (fractions of the steps run, strict at
+both ends, default 0.01..0.2) one more transformer pass runs on the prompt
+with the --pag-layers blocks' attention scores replaced by the identity, and
+the velocity moves away from it by W (diffusers PerturbedAttentionGuidance).
+--slg skips those blocks instead (Skip Layer Guidance). It adds to CFG, not
+to --apg.
+
+First-Block Cache (--fbc-threshold X or /fbc X): each step runs transformer
+block 0 and compares its residual with the one of the last fully computed
+step; when the relative change is at most X it skips the other blocks and
+reuses their cached residual (diffusers apply_first_block_cache). 0 = off.
+
+Panoramas and large canvases (--panorama WxH or /panorama WxH): MultiDiffusion
+(Bar-Tal et al. 2023, diffusers StableDiffusionPanoramaPipeline). Each step
+runs the transformer on overlapping --width x --height windows of the WxH
+canvas (every --panorama-stride pixels, default half a window) and averages
+the windows' velocities per latent cell, so memory stays at one window.
+--panorama-wrap wraps the windows in X for a 360-degree panorama. Each window
+sees only its own region, so the global composition is weaker than one pass.
 
 The initial noise comes from the FPC RNG (--seed), so an image is repeatable
 here but not equal to a diffusers image with the same seed.
@@ -54,8 +126,19 @@ USAGE
   QwenImage --model DIR [-p TEXT | --token-ids ID,ID,... [--drop-count N]]
             [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 18] [--seed 42]
-            [--repeat N] [--image FILE ... | --init-image FILE [--strength 0.6]]
+            [--repeat N] [--image FILE ... |
+             --init-image FILE [--mask FILE [--mask-blur R]
+             [--padding-mask-crop N] |
+             --outpaint L,T,R,B [--outpaint-overlap 16] |
+             --change-map FILE [--invert-change-map]] [--strength 0.6]]
             [--int8 | --int4 | --fp32] [--int8-input] [--vae-tile SIZE[,STRIDE]]
+            [--lora FILE[:SCALE] ...] [--upscale FILE [--upscale-tile 32]]
+            [--fbc-threshold X]
+            [--negative-prompt TEXT --guidance-scale W
+             [--apg ETA,MOMENTUM,THRESHOLD [--apg-velocity]]]
+            [--pag-scale W [--pag-layers I,J,...] [--pag-start F]
+             [--pag-stop F] [--slg]]
+            [--panorama WxH [--panorama-stride N] [--panorama-wrap]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
             [--no-gpu-shared-kernel] [--profile] [--stats]
@@ -76,18 +159,29 @@ uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio, BaseUnix,{$ENDIF}
-  SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
+  SysUtils, Classes, Types, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread,
-  neuraldiffusion;
+  neuraldiffusion, neuralimageresize;
 
 const
   // Largest accepted image side in pixels (64x the 1024 default area).
   csMaxImageSide = 8192;
   // img2img strength when --strength is not given (diffusers' default).
   csDefaultStrength = 0.6;
+  // Outpaint seam band when --outpaint-overlap is not given: one latent cell.
+  csDefaultOutpaintOverlap = csQwenImage21PixelsPerLatent;
   // Largest --repeat / /repeat count (catches a mistyped count).
   csMaxRepeatCount = 1000;
+  // --upscale-tile when not given: RRDBNet input pixels per tile side.
+  csDefaultUpscaleTile = 32;
   csBytesPerMB = 1024.0 * 1024.0;
+  // PAG / SLG when only some of the --pag-* flags are given: diffusers'
+  // guider defaults, and blocks of the 32-block transformer (README.md).
+  csDefaultPagScale = 2.8;
+  csDefaultPagStart = 0.01;
+  csDefaultPagStop = 0.2;
+  csDefaultPagLayers: array[0..0] of integer = (16);
+  csDefaultSlgLayers: array[0..2] of integer = (6, 7, 8);
 
 type
   // Phase and step timings with the process memory. On a terminal each step
@@ -199,9 +293,11 @@ begin
 end;
 
 // The per-image stage table of --stats and --profile: one row per phase that
-// ran, PNG save, their sum; then OpenCL transfers and bytes held, peak RSS.
+// ran, upscale (UpscaleRanOn '' = none), PNG save, their sum; then OpenCL
+// transfers and bytes held, peak RSS.
 procedure PrintStageTable(const Stats: TQwenImage21ImageStats;
   ImageNumber, EncodeImageNumber, InputImageEncodeNumber: integer;
+  UpscaleMs: double; const UpscaleRanOn, UpscaleDetail: string;
   PngSaveMs: double; IsProfiled, IsPeakPerImage: boolean);
 var
   Phase: TQwenImage21PipelinePhase;
@@ -259,7 +355,7 @@ begin
   UsedImages := Stats.UsedInitImage or (Stats.ConditionImageCount > 0);
   HasImageEncode := UsedImages and (ImageNumber = InputImageEncodeNumber);
   IsOnOpenCL := Stats.TransformerOnOpenCL or Stats.VaeOnOpenCL;
-  TotalMs := PngSaveMs;
+  TotalMs := PngSaveMs + UpscaleMs;
   for Phase := Low(TQwenImage21PipelinePhase) to qppDecode do
     if IsCountedHere(Phase) then
       TotalMs := TotalMs + Stats.PhaseMs[Phase];
@@ -302,6 +398,18 @@ begin
         if Stats.StepCount > 0 then
           Detail := Format('%d steps x %.1f ms', [Stats.StepCount,
             Stats.PhaseMs[Phase] / Stats.StepCount]);
+        if Stats.PanoramaWindowCount > 0 then
+          Detail := Detail + Format(', %d panorama windows',
+            [Stats.PanoramaWindowCount]);
+        if (Stats.SkippedStepCount > 0) and (Stats.PanoramaWindowCount > 0)
+          then Detail := Detail + Format(', %d window passes with blocks ' +
+            '1..N-1 skipped (FBC)', [Stats.SkippedStepCount])
+        else if Stats.SkippedStepCount > 0 then
+          Detail := Detail + Format(', %d with blocks 1..N-1 skipped (FBC)',
+            [Stats.SkippedStepCount]);
+        if Stats.PerturbedPassCount > 0 then
+          Detail := Detail + Format(', %d perturbed passes (PAG/SLG)',
+            [Stats.PerturbedPassCount]);
       end;
       qppDecode:
       begin
@@ -314,6 +422,8 @@ begin
     end;
     AddTimedRow(PhaseName(Phase), RanOn, Stats.PhaseMs[Phase], Detail);
   end;
+  if UpscaleRanOn <> '' then
+    AddTimedRow('upscale', UpscaleRanOn, UpscaleMs, UpscaleDetail);
   AddTimedRow('PNG save', 'CPU', PngSaveMs, '');
   AddRow('sum of stages', '', Format('%.1f', [TotalMs]), '100.0', '');
   if IsOnOpenCL then
@@ -404,6 +514,24 @@ begin
   FStepStart := StepEnd;
 end;
 
+function IntegerListText(const Values: array of integer): string;
+var
+  ValuePos: integer;
+begin
+  Result := '';
+  for ValuePos := 0 to High(Values) do
+  begin
+    if ValuePos > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Values[ValuePos]);
+  end;
+end;
+
+function DefaultPagLayersText(IsSkipLayer: boolean): string;
+begin
+  if IsSkipLayer then Result := IntegerListText(csDefaultSlgLayers)
+  else Result := IntegerListText(csDefaultPagLayers);
+end;
+
 procedure PrintHelp();
 begin
   WriteLn('QwenImage: Qwen-Image-2.1 text-to-image and image editing (CPU; ',
@@ -418,7 +546,11 @@ begin
     'qwenimage_0002.png, ...');
   WriteLn('  --width N, --height N  pixels, rounded DOWN to a multiple of 32 ',
     '(default 1024)');
-  WriteLn('  --steps N            Euler steps (default 18)');
+  WriteLn('  --steps N            sampler steps (default 18)');
+  WriteLn('  --sampler NAME       euler, dpm2m (DPM-Solver++(2M), second ',
+    'order) or unipc');
+  WriteLn('                       (UniPC bh2 predictor-corrector, second ',
+    'order; default euler)');
   WriteLn('  --seed N             initial-noise seed for the FPC RNG (default 42)');
   WriteLn('  --image FILE         edit: a condition image; repeat it for up ',
     'to ', csQwenImage21MaxConditionImages, ' images (image 1, 2, ...');
@@ -435,6 +567,47 @@ begin
   WriteLn('                       ratio at the area of --width x --height. It ',
     're-styles the image;');
   WriteLn('                       it does not follow edit instructions.');
+  WriteLn('  --mask FILE          with --init-image: inpaint; only the ',
+    'mask''s white region is');
+  WriteLn('                       regenerated (grayscale, 50% threshold, ',
+    'stretched to the output');
+  WriteLn('                       size, decided per 16x16 cell), the rest ',
+    'keeps the init image');
+  WriteLn('  --mask-blur R        blur the mask by a Gaussian of sigma R ',
+    'pixels at its own size before');
+  WriteLn('                       the 50% threshold (diffusers ',
+    'mask_processor.blur; default 0 = off)');
+  WriteLn('  --padding-mask-crop N  with --mask: generate only the mask''s ',
+    'bounding box plus N pixels');
+  WriteLn('                       (grown to the output aspect) at the output ',
+    'size, then paste it back into');
+  WriteLn('                       the init image at its own size, blended by ',
+    'the mask (diffusers');
+  WriteLn('                       padding_mask_crop); the output keeps the ',
+    'init image''s size');
+  WriteLn('  --outpaint L,T,R,B   with --init-image: outpaint; add L, T, R, B ',
+    'pixels on the left, top,');
+  WriteLn('                       right and bottom. The output is the init ',
+    'image plus that border at its');
+  WriteLn('                       own scale (--width/--height do not apply); ',
+    'the border and the overlap');
+  WriteLn('                       band are generated, the other original ',
+    'pixels are pasted back exactly.');
+  WriteLn('                       Strength 1 unless --strength is given. Not ',
+    'with --mask.');
+  WriteLn('  --outpaint-overlap N pixels of the init image along each ',
+    'extended side that are regenerated');
+  WriteLn('                       too, so the seam blends (default ',
+    csDefaultOutpaintOverlap, ')');
+  WriteLn('  --change-map FILE    with --init-image: Differential Diffusion; ',
+    'a gray map of how much each');
+  WriteLn('                       16x16 cell may change (white = most, black ',
+    '= keep; stretched to the');
+  WriteLn('                       output size, not binarized). Strength 1 ',
+    'unless --strength is given.');
+  WriteLn('                       Not with --mask or --outpaint.');
+  WriteLn('  --invert-change-map  read --change-map as white = keep (the ',
+    'reference''s maps)');
   WriteLn('  --strength S         img2img noise strength in (0, 1] (default ',
     csDefaultStrength:0:1, '): runs only the last');
   WriteLn('                       part of the schedule (18 steps at 0.6: the ',
@@ -457,8 +630,71 @@ begin
     'input/output/timestep nets and the VAE stay FP32.');
   WriteLn('  --int8-input         int8 activations into the transformer''s ',
     'int8/int4 projections (not with --fp32)');
-  WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
-    'of 16 (default 256,192)');
+  WriteLn('  --lora FILE[:SCALE]  merge a LoRA .safetensors (diffusers, ComfyUI ',
+    'or kohya keys) into the');
+  WriteLn('                       transformer weights at load, times SCALE ',
+    '(default 1). Repeat it to stack');
+  WriteLn('                       adapters.');
+  WriteLn('  --vae-tile S[,T]     VAE decode and encode tile S pixels every T ',
+    'pixels, multiples of 16');
+  WriteLn('                       (default 256,192)');
+  WriteLn('  --upscale FILE       upscale each image with this Real-ESRGAN / ',
+    'ESRGAN RRDBNet checkpoint');
+  WriteLn('                       (.pth or .safetensors; config.json next to ',
+    'it, else read from the tensors)');
+  WriteLn('                       before the save: x4plus turns 512x512 into ',
+    '2048x2048. Runs on the --gpu device.');
+  WriteLn('  --upscale-tile N     upscaler tile in input pixels, 0 = the whole ',
+    'image (default ', csDefaultUpscaleTile, ');');
+  WriteLn('                       a tile holds about 2.7 MB per pixel of ',
+    '(N + 20)^2 on the CPU');
+  WriteLn('  --fbc-threshold X    First-Block Cache: skip transformer blocks ',
+    '1..N-1 on a step whose block-0');
+  WriteLn('                       residual changed by at most X (relative ',
+    'mean |diff|) since the last full');
+  WriteLn('                       step, reusing that step''s residual of ',
+    'those blocks. 0 = off (DEFAULT);');
+  WriteLn('                       0.05..0.2 trade detail for speed (see ',
+    'README.md)');
+  WriteLn('  --negative-prompt TEXT  what the image should not show; used ',
+    'when --guidance-scale > 1');
+  WriteLn('  --guidance-scale W   classifier-free guidance: uncond + W * ',
+    '(cond - uncond), two transformer');
+  WriteLn('                       passes per step. 1 = off (DEFAULT; ',
+    'Qwen-Image-2.1 is meant to run without)');
+  WriteLn('  --apg ETA,MOMENTUM,THRESHOLD  Adaptive Projected Guidance ',
+    'instead of the CFG mix (paper');
+  WriteLn('                       setting e.g. 0,-0.5,15), on the denoised ',
+    'x0 = x - sigma * v');
+  WriteLn('  --apg-velocity       apply --apg to the raw velocities instead ',
+    'of x0');
+  WriteLn('  --pag-scale W        Perturbed-Attention Guidance: one more ',
+    'transformer pass per step inside');
+  WriteLn('                       the window, with identity attention in ',
+    '--pag-layers; 0 = off (DEFAULT).');
+  WriteLn('                       --pag-layers, --pag-start, --pag-stop or ',
+    '--slg alone use W = ', csDefaultPagScale:0:1, ' (diffusers)');
+  WriteLn('  --pag-layers I,J,... the perturbed transformer blocks (from 0; ',
+    'default ', DefaultPagLayersText(false), ',');
+  WriteLn('                       with --slg ', DefaultPagLayersText(true),
+    '; see README.md)');
+  WriteLn('  --pag-start F        perturbed window start, a fraction of the ',
+    'steps (default ', csDefaultPagStart:0:2, ')');
+  WriteLn('  --pag-stop F         perturbed window stop (default ',
+    csDefaultPagStop:0:2, '); both ends are strict, as diffusers');
+  WriteLn('  --slg                Skip Layer Guidance: skip the --pag-layers ',
+    'blocks in that pass instead');
+  WriteLn('  --panorama WxH       MultiDiffusion: a WxH canvas (multiples of ',
+    '32) denoised in overlapping');
+  WriteLn('                       --width x --height windows whose velocities ',
+    'are averaged per latent cell;');
+  WriteLn('                       memory stays at one window. Not with ',
+    '--init-image or --image (see README.md)');
+  WriteLn('  --panorama-stride N  window step in pixels, a multiple of 16 no ',
+    'larger than a window side');
+  WriteLn('                       (default: half the window side)');
+  WriteLn('  --panorama-wrap      wrap the windows past the right edge to the ',
+    'left edge (360-degree panorama)');
   WriteLn('  --serial             single-threaded forward passes (default: ',
     'the parallel layer scheduler with intra-layer threading)');
   WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
@@ -516,7 +752,7 @@ begin
   WriteLn('and reads one prompt per line from stdin (a piped file is a batch). ',
     'REPL commands:');
   WriteLn('  /size WxH            image size for the next prompts');
-  WriteLn('  /steps N             Euler steps for the next prompts');
+  WriteLn('  /steps N             sampler steps for the next prompts');
   WriteLn('  /seed N              seed of the next image (otherwise the seed ',
     'grows by one per image)');
   WriteLn('  /repeat N PROMPT     N images of PROMPT (encoded once), ',
@@ -528,14 +764,42 @@ begin
   WriteLn('                       the vision tower and the VAE encoder');
   WriteLn('  /init-image FILE     init image for the next prompts (img2img); ',
     '/init-image off clears it');
+  WriteLn('  /mask FILE           inpaint mask for the init image (white = ',
+    'regenerate); /mask off');
+  WriteLn('                       clears it');
+  WriteLn('  /mask-blur R         mask blur sigma in pixels, as --mask-blur; ',
+    'reloads the current mask');
+  WriteLn('  /padding-mask-crop N inpaint only the mask''s box plus N pixels, ',
+    'as --padding-mask-crop;');
+  WriteLn('                       /padding-mask-crop off inpaints the whole ',
+    'image');
+  WriteLn('  /outpaint L,T,R,B [OVERLAP]  outpaint the init image, as ',
+    '--outpaint (and --outpaint-overlap);');
+  WriteLn('                       /outpaint off returns to img2img');
+  WriteLn('  /change-map FILE     Differential Diffusion change map for the ',
+    'init image (white = change');
+  WriteLn('                       most), as --change-map; /change-map off ',
+    'returns to img2img');
+  WriteLn('  /invert-change-map on|off  read change maps as white = keep; ',
+    'reloads the current map');
   WriteLn('  /strength S          img2img strength for the next images, ',
     'in (0, 1]');
+  WriteLn('  /upscale FILE        upscale the next images, as --upscale; ',
+    '/upscale off stops it');
   WriteLn('  /tile SIZE[,STRIDE]  VAE tile, as --vae-tile. In the REPL (and ',
     'with --repeat N > 1) the');
   WriteLn('                       transformer stays in OpenCL memory ',
     'during the VAE decode; /tile 128');
   WriteLn('                       (or --vae-tile 128) lowers the VAE''s ',
     'memory if both do not fit.');
+  WriteLn('  /fbc X|off           First-Block Cache threshold for the next ',
+    'images, as --fbc-threshold');
+  WriteLn('  /panorama WxH|off    --panorama canvas for the next prompts ',
+    '(stride and wrap from the flags)');
+  WriteLn('  /negative-prompt TEXT|off  --negative-prompt for the next prompts');
+  WriteLn('  /guidance-scale W    --guidance-scale for the next prompts');
+  WriteLn('  /pag W|off           --pag-scale for the next images (layers, ',
+    'window and --slg from the flags)');
   WriteLn('  /profile on|off      --profile for the next images');
   WriteLn('  /stats on|off        --stats for the next images');
   WriteLn('  /quit                end the session (so does the end of the input)');
@@ -623,6 +887,85 @@ begin
   else Result := '';
 end;
 
+// Parses a number >= 0 or 'off' (= 0) with a '.' decimal point: the
+// First-Block Cache threshold and the PAG scale; returns '' or what is wrong.
+function ParseNumberOrOff(const Text: string; out Value: double): string;
+begin
+  Result := '';
+  if LowerCase(Trim(Text)) = 'off' then Value := 0
+  else if not TryStrToFloat(Trim(Text), Value, PointFormat()) or
+    not (Value >= 0) then
+    Result := '"' + Text + '" is not a number >= 0 or off.';
+end;
+
+// Parses a guidance scale >= 0 (a '.' decimal point); returns '' or what is
+// wrong.
+function ParseGuidanceScale(const Text: string; out Scale: double): string;
+begin
+  Result := '';
+  if not TryStrToFloat(Trim(Text), Scale, PointFormat()) or
+    not (Scale >= 0) then
+    Result := '"' + Text + '" is not a number >= 0.';
+end;
+
+function FbcThresholdText(Threshold: double): string;
+begin
+  if Threshold > 0 then
+    Result := 'First-Block Cache threshold ' +
+      FloatToStr(Threshold, PointFormat())
+  else Result := 'First-Block Cache off';
+end;
+
+// Parses a --lora FILE[:SCALE] value (a '.' decimal point; no number after the
+// last ':' leaves it in the file name); returns '' or what is wrong.
+function ParseLoRAArg(const Text: string; out FileName: string;
+  out Scale: double): string;
+var
+  SpecScale: TNeuralFloat;
+begin
+  SplitLoRASpec(Text, FileName, SpecScale);
+  Scale := SpecScale;
+  if not FileExists(FileName) then
+    Result := 'file "' + FileName + '" not found.'
+  else Result := '';
+end;
+
+// Parses a mask blur radius >= 0 in pixels (a '.' decimal point); returns ''
+// or what is wrong.
+function ParseMaskBlurRadius(const Text: string; out Radius: double): string;
+begin
+  if not TryStrToFloat(Trim(Text), Radius, PointFormat()) or
+    not ((Radius >= 0) and (Radius <= csMaxImageSide)) then
+    Result := '"' + Text + '" is not a number in [0, ' +
+      IntToStr(csMaxImageSide) + '].'
+  else Result := '';
+end;
+
+// Parses a pixel count in 0..csMaxImageSide (an outpaint overlap, a mask crop
+// padding); returns '' or what is wrong.
+function ParsePixelCount(const Text: string; out PixelCount: integer): string;
+begin
+  PixelCount := StrToIntDef(Trim(Text), -1);
+  if (PixelCount < 0) or (PixelCount > csMaxImageSide) then
+    Result := '"' + Text + '" is not an integer in 0..' +
+      IntToStr(csMaxImageSide) + '.'
+  else Result := '';
+end;
+
+// Parses a --panorama-stride: a positive multiple of 16 pixels; returns ''
+// or what is wrong.
+function ParsePanoramaStride(const Text: string; out Stride: integer): string;
+begin
+  Stride := StrToIntDef(Trim(Text), -1);
+  if (Stride < csQwenImage21PixelsPerLatent) or (Stride > csMaxImageSide) or
+     (Stride mod csQwenImage21PixelsPerLatent <> 0) then
+    Result := '"' + Text + '" is not a multiple of ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + ' in ' +
+      IntToStr(csQwenImage21PixelsPerLatent) + '..' + IntToStr(csMaxImageSide) +
+      '.'
+  else Result := '';
+end;
+
 // Parses a repeat count in 1..csMaxRepeatCount; returns '' or what is wrong.
 function ParseRepeatCount(const Text: string; out RepeatCount: integer): string;
 begin
@@ -656,7 +999,8 @@ begin
   else Result := Copy(Prompt, 1, MaxLength - 3) + '...';
 end;
 
-function ParseTokenIds(const List: string): TNeuralIntegerArray;
+// Comma-separated integers (token ids, PAG layers); EConvertError otherwise.
+function ParseIntegerList(const List: string): TNeuralIntegerArray;
 var
   Parts: TStringList;
   PartPos: integer;
@@ -675,7 +1019,8 @@ begin
 end;
 
 var
-  ModelFolder, Prompt, OutputFile, TokenList, Arg, ArgProblem: string;
+  ModelFolder, Prompt, OutputFile, TokenList, Arg, ArgProblem,
+    OutpaintText: string;
   Width, Height, StepCount, DropCount, ArgPos: integer;
   RepeatCount, ImageNumber, FileNumber: integer;
   Seed: cardinal;
@@ -688,10 +1033,48 @@ var
   InitImageFile: string;
   InitImage, ImageLatents: TNNetVolume;
   ImageLatentsWidth, ImageLatentsHeight: integer;
+  // Inpainting: the mask as read (0..255) and its latents, encoded at
+  // MaskLatentsWidth x MaskLatentsHeight (0: not encoded yet). It only
+  // applies while an init image is set.
+  HasMask: boolean;
+  MaskFile: string;
+  // Gaussian sigma in mask pixels that LoadMask blurs the mask with (0: none).
+  MaskBlurRadius: double;
+  MaskImage, MaskLatents: TNNetVolume;
+  MaskLatentsWidth, MaskLatentsHeight: integer;
+  // --padding-mask-crop pixels (-1: off). While IsCropInpainting(): the mask
+  // at the init image's size, its crop region and both crops at output size.
+  PaddingMaskCrop: integer;
+  InpaintCrop: TRect;
+  InpaintFullMask, InpaintCropImage, InpaintCropMask: TNNetVolume;
+  // Differential Diffusion: the change map as read (0..255, inverted when
+  // InvertChangeMap) and its latents, encoded at ChangeLatentsWidth x
+  // ChangeLatentsHeight (0: not encoded yet); applies with an init image.
+  HasChangeMap, InvertChangeMap: boolean;
+  ChangeMapFile: string;
+  ChangeMapImage, ChangeLatents: TNNetVolume;
+  ChangeLatentsWidth, ChangeLatentsHeight: integer;
+  // The crop region the image latents were encoded from (empty: no crop).
+  ImageLatentsCrop: TRect;
+  // Outpainting: the pixels added per side of the init image and the seam
+  // band; the canvas sides grow to multiples of 32 (cropped after decode).
+  HasOutpaint: boolean;
+  OutpaintLeft, OutpaintTop, OutpaintRight, OutpaintBottom,
+    OutpaintOverlap: integer;
+  CanvasLeft, CanvasTop, CanvasRight, CanvasBottom: integer;
+  // The canvas (0..255) and its mask (0..255, blurred by MaskBlurRadius),
+  // built from the init image while IsOutpainting().
+  OutpaintCanvas, OutpaintMask: TNNetVolume;
   // Edit: the condition images as read (0..255) and their files; the
   // pipeline holds their encoding at ConditionEncodedArea pixels (0: none).
   // ImageArgFiles: the --image files, read once the output area is known.
   ConditionFiles, ImageArgFiles: TStringList;
+  // The --lora files and their scales, in the order given.
+  LoRAFiles: TStringList;
+  LoRAScales: array of double;
+  LoRAFile: string;
+  LoRAScale: double;
+  LoRAPos: integer;
   ConditionImages: array of TNNetVolume;
   ConditionEncodedArea: double;
   // The N+1 text runs of the encoded edit prompt.
@@ -700,6 +1083,28 @@ var
   InputImageEncodeNumber: integer;
   Strength: double;
   HasStrengthArg: boolean;
+  // A --pag-* or --slg flag was given, and --pag-scale among them.
+  HasPagArg, HasPagScaleArg: boolean;
+  PagWindowValue: double;
+  FbcThreshold: double;
+  // --panorama canvas (0: off), --panorama-stride (0: half a window) and
+  // --panorama-wrap; the windows are --width x --height.
+  PanoramaWidth, PanoramaHeight, PanoramaStride: integer;
+  PanoramaWrap: boolean;
+  // --sampler: the flow-matching update rule of every Denoise.
+  Sampler: TNNetFlowSampler;
+  SamplerName: string;
+  // --negative-prompt (HasNegativePrompt: given, even empty), --guidance-scale,
+  // --apg (ApgSpec '': plain CFG) and --apg-velocity.
+  NegativePrompt, ApgSpec: string;
+  HasNegativePrompt, ApgOnVelocity: boolean;
+  GuidanceScale: double;
+  NegativeEmbeds: TNNetVolume;
+  // --pag-scale (0: off), --pag-start, --pag-stop, --pag-layers (nil: the
+  // default of the mode) and --slg (skip the blocks instead).
+  PagScale, PagStart, PagStop: double;
+  PagLayers: TNeuralIntegerArray;
+  IsSkipLayerGuidance: boolean;
   // The kernel's peak-RSS mark was reset for the current image.
   IsPeakPerImage: boolean;
   WeightFormat: TQwenImage21WeightFormat;
@@ -712,6 +1117,12 @@ var
   RequestedPlatform, RequestedDevice: integer;
   {$ENDIF}
   VaeTileSize, VaeTileStride, MaxThreads: integer;
+  // --upscale / /upscale: nil when off; built from UpscaleTile.
+  Upscaler: TRRDBNetUpscaler;
+  UpscaleFile: string;
+  UpscaleTile: integer;
+  // The pipeline got an OpenCL device; the upscaler is armed on it too.
+  IsOpenCLSelected: boolean;
   Pipeline: TQwenImage21Pipeline;
   Reporter: TQwenImageReporter;
   PromptEmbeds, Image: TNNetVolume;
@@ -748,6 +1159,74 @@ var
     Result := Length(ConditionImages) > 0;
   end;
 
+  // Both prompts run each step (diffusers: a scale > 1 and a negative prompt).
+  function IsGuided(): boolean;
+  begin
+    Result := (GuidanceScale > 1) and HasNegativePrompt;
+  end;
+
+  function GuidanceText(): string;
+  begin
+    if not IsGuided() then
+    begin
+      Result := 'off';
+      if HasNegativePrompt then
+        Result := Result + ' (the negative prompt needs --guidance-scale > 1)'
+      else if GuidanceScale > 1 then
+        Result := Result + ' (--guidance-scale needs --negative-prompt)';
+      exit;
+    end;
+    Result := 'scale ' + FloatToStr(GuidanceScale, PointFormat()) +
+      ', negative prompt "' + ShortPrompt(NegativePrompt, 40) + '", ';
+    if ApgSpec = '' then Result := Result + 'CFG'
+    else Result := Result + 'APG ' + ApgSpec + ' on ' +
+      BoolToStr(ApgOnVelocity, 'velocity', 'x0');
+  end;
+
+  // --pag-layers, else the default blocks of the --slg / PAG mode.
+  function PagLayersText(): string;
+  begin
+    if Length(PagLayers) > 0 then Result := IntegerListText(PagLayers)
+    else Result := DefaultPagLayersText(IsSkipLayerGuidance);
+  end;
+
+  function PerturbedGuidanceText(): string;
+  begin
+    if PagScale = 0 then exit('off');
+    Result := BoolToStr(IsSkipLayerGuidance, 'SLG', 'PAG') + ' scale ' +
+      FloatToStr(PagScale, PointFormat()) + ' on blocks ' +
+      PagLayersText() + ', steps in (' +
+      FloatToStr(PagStart, PointFormat()) + ', ' +
+      FloatToStr(PagStop, PointFormat()) + ') of the run';
+    if IsGuided() and (ApgSpec <> '') then
+      Result := Result + ' (refused with --apg while guided)';
+  end;
+
+  // Hands the PAG / SLG settings to the pipeline (nil when off).
+  procedure ApplyPerturbedGuidance();
+  var
+    Guider: TNNetPerturbedGuidance;
+  begin
+    if PagScale = 0 then
+    begin
+      Pipeline.PerturbedGuidance := nil;
+      exit;
+    end;
+    Guider := TNNetPerturbedGuidance.Create(1, PagScale, PagStart, PagStop);
+    if IsSkipLayerGuidance then Guider.Mode := pgmSkipBlock;
+    if Length(PagLayers) > 0 then Guider.SetPerturbedLayers(PagLayers)
+    else if IsSkipLayerGuidance then
+      Guider.SetPerturbedLayers(csDefaultSlgLayers)
+    else Guider.SetPerturbedLayers(csDefaultPagLayers);
+    Pipeline.PerturbedGuidance := Guider;
+  end;
+
+  // A panorama canvas is set and no init or condition image overrides it.
+  function IsPanorama(): boolean;
+  begin
+    Result := (PanoramaWidth > 0) and not HasInitImage and not IsEditing();
+  end;
+
   // The image size: --width x --height, or with SourceImage <> nil its aspect
   // ratio at that area (diffusers' calculate_dimensions).
   procedure GetOutputSizeFor(SourceImage: TNNetVolume; out OutputWidth,
@@ -767,7 +1246,12 @@ var
   // once encoded), else --width x --height.
   procedure GetOutputSize(out OutputWidth, OutputHeight: integer);
   begin
-    if HasInitImage then GetOutputSizeFor(InitImage, OutputWidth, OutputHeight)
+    if HasInitImage and HasOutpaint then
+    begin
+      OutputWidth := OutpaintCanvas.SizeX;
+      OutputHeight := OutpaintCanvas.SizeY;
+    end
+    else if HasInitImage then GetOutputSizeFor(InitImage, OutputWidth, OutputHeight)
     else if IsEditing() and (ConditionEncodedArea = double(Width) * Height)
       then
     begin
@@ -777,6 +1261,11 @@ var
     else if IsEditing() then
       GetOutputSizeFor(ConditionImages[High(ConditionImages)], OutputWidth,
         OutputHeight)
+    else if IsPanorama() then
+    begin
+      OutputWidth := PanoramaWidth;
+      OutputHeight := PanoramaHeight;
+    end
     else GetOutputSizeFor(nil, OutputWidth, OutputHeight);
   end;
 
@@ -807,8 +1296,93 @@ var
     if Result = '' then Result := OutputSizeProblemFor(Dest);
   end;
 
-  // Loads FileName and makes it the init image when its output size works;
-  // otherwise returns what is wrong and changes nothing.
+  // An init image and outpaint sides are set.
+  function IsOutpainting(): boolean;
+  begin
+    Result := HasInitImage and HasOutpaint;
+  end;
+
+  // '' when Image outpainted by the given sides makes a usable canvas;
+  // otherwise what is wrong.
+  function OutpaintCanvasProblem(Image: TNNetVolume; Left, Top, Right,
+    Bottom: integer): string;
+  begin
+    GrowOutpaintSidesToMultiple(Image.SizeX, Image.SizeY,
+      csQwenImage21ImageSideMultiple, Left, Top, Right, Bottom);
+    Result := ImageSideProblem(Image.SizeX + Left + Right,
+      Image.SizeY + Top + Bottom);
+    if Result <> '' then
+      Result := 'the outpaint canvas would be ' +
+        IntToStr(Image.SizeX + Left + Right) + 'x' +
+        IntToStr(Image.SizeY + Top + Bottom) + ': ' + Result;
+  end;
+
+  // Rebuilds the canvas and its mask from the init image while outpainting;
+  // the encoded latents no longer match them.
+  procedure BuildOutpaint();
+  var
+    Mask: TNNetVolume;
+  begin
+    ImageLatentsWidth := 0;
+    MaskLatentsWidth := 0;
+    if not IsOutpainting() then exit;
+    CanvasLeft := OutpaintLeft;
+    CanvasTop := OutpaintTop;
+    CanvasRight := OutpaintRight;
+    CanvasBottom := OutpaintBottom;
+    GrowOutpaintSidesToMultiple(InitImage.SizeX, InitImage.SizeY,
+      csQwenImage21ImageSideMultiple, CanvasLeft, CanvasTop, CanvasRight,
+      CanvasBottom);
+    Mask := TNNetVolume.Create();
+    try
+      BuildOutpaintCanvas(InitImage, CanvasLeft, CanvasTop, CanvasRight,
+        CanvasBottom, OutpaintOverlap, OutpaintCanvas, Mask);
+      Mask.Mul(255);
+      GaussianBlurImage(Mask, OutpaintMask, MaskBlurRadius);
+    finally
+      Mask.Free;
+    end;
+  end;
+
+  // Makes Left..Bottom with Overlap the outpaint sides when the init image
+  // (if any) gives a usable canvas; otherwise returns what is wrong.
+  function SetOutpaint(Left, Top, Right, Bottom, Overlap: integer): string;
+  begin
+    Result := '';
+    if HasInitImage then
+      Result := OutpaintCanvasProblem(InitImage, Left, Top, Right, Bottom);
+    if Result <> '' then exit;
+    HasOutpaint := true;
+    OutpaintLeft := Left;
+    OutpaintTop := Top;
+    OutpaintRight := Right;
+    OutpaintBottom := Bottom;
+    OutpaintOverlap := Overlap;
+    BuildOutpaint();
+  end;
+
+  // Copies the requested outpaint area out of the decoded canvas Image (0..255)
+  // and pastes the init image's kept pixels back over it.
+  procedure FinishOutpaint();
+  var
+    Cropped: TNNetVolume;
+  begin
+    Cropped := TNNetVolume.Create();
+    try
+      Cropped.CopyCropping(Image, CanvasLeft - OutpaintLeft,
+        CanvasTop - OutpaintTop,
+        InitImage.SizeX + OutpaintLeft + OutpaintRight,
+        InitImage.SizeY + OutpaintTop + OutpaintBottom);
+      PasteOutpaintOriginal(InitImage, OutpaintLeft, OutpaintTop,
+        OutpaintRight, OutpaintBottom, OutpaintOverlap, Cropped);
+      Image.Copy(Cropped);
+    finally
+      Cropped.Free;
+    end;
+  end;
+
+  // Loads FileName and makes it the init image when its output size (or its
+  // outpaint canvas) works; otherwise returns what is wrong and changes nothing.
   function LoadInitImage(const FileName: string): string;
   var
     Loaded: TNNetVolume;
@@ -816,6 +1390,9 @@ var
     Loaded := TNNetVolume.Create();
     try
       Result := ReadImageFile(FileName, Loaded);
+      if (Result = '') and HasOutpaint then
+        Result := OutpaintCanvasProblem(Loaded, OutpaintLeft, OutpaintTop,
+          OutpaintRight, OutpaintBottom);
       if Result <> '' then exit;
       InitImage.Copy(Loaded);
     finally
@@ -825,6 +1402,129 @@ var
     InitImageFile := FileName;
     ImageLatentsWidth := 0;
     ImageLatentsHeight := 0;
+    BuildOutpaint();
+  end;
+
+  // Loads FileName as the inpaint mask (any size: it is stretched to the
+  // output size), blurred by MaskBlurRadius; otherwise returns what is wrong.
+  function LoadMask(const FileName: string): string;
+  var
+    Loaded: TNNetVolume;
+  begin
+    Result := '';
+    Loaded := TNNetVolume.Create();
+    try
+      try
+        if not LoadImageFromFileIntoVolume(FileName, Loaded, true) then
+          Result := 'could not read ' + FileName + '.';
+      except
+        on E: Exception do Result := 'could not read ' + FileName + ': ' +
+          E.Message;
+      end;
+      if Result <> '' then exit;
+      GaussianBlurImage(Loaded, MaskImage, MaskBlurRadius);
+    finally
+      Loaded.Free;
+    end;
+    HasMask := true;
+    MaskFile := FileName;
+    MaskLatentsWidth := 0;
+    MaskLatentsHeight := 0;
+  end;
+
+  // An init image and a mask are set.
+  function IsInpainting(): boolean;
+  begin
+    Result := HasInitImage and HasMask;
+  end;
+
+  // The mask latents for GenerateFromEmbeds: nil unless inpainting.
+  function ActiveMaskLatents(): TNNetVolume;
+  begin
+    if IsInpainting() or IsOutpainting() then Result := MaskLatents
+    else Result := nil;
+  end;
+
+  // Loads FileName as the change map (any size: it is stretched to the
+  // output size), inverted when InvertChangeMap; otherwise returns what is wrong.
+  function LoadChangeMap(const FileName: string): string;
+  var
+    Loaded: TNNetVolume;
+  begin
+    Result := '';
+    Loaded := TNNetVolume.Create();
+    try
+      try
+        if not LoadImageFromFileIntoVolume(FileName, Loaded, false) then
+          Result := 'could not read ' + FileName + '.';
+      except
+        on E: Exception do Result := 'could not read ' + FileName + ': ' +
+          E.Message;
+      end;
+      if Result <> '' then exit;
+      if InvertChangeMap then
+      begin
+        Loaded.Mul(-1);
+        Loaded.Add(255);
+      end;
+      ChangeMapImage.Copy(Loaded);
+    finally
+      Loaded.Free;
+    end;
+    HasChangeMap := true;
+    ChangeMapFile := FileName;
+    ChangeLatentsWidth := 0;
+    ChangeLatentsHeight := 0;
+  end;
+
+  // An init image and a change map are set (Differential Diffusion).
+  function IsDifferential(): boolean;
+  begin
+    Result := HasInitImage and HasChangeMap;
+  end;
+
+  // The change map latents for GenerateFromEmbeds: nil unless differential.
+  function ActiveChangeLatents(): TNNetVolume;
+  begin
+    if IsDifferential() then Result := ChangeLatents
+    else Result := nil;
+  end;
+
+  // Inpainting with --padding-mask-crop.
+  function IsCropInpainting(): boolean;
+  begin
+    Result := IsInpainting() and (PaddingMaskCrop >= 0);
+  end;
+
+  // Sets InpaintFullMask, InpaintCrop (diffusers get_crop_region) and the two
+  // crops resized as resize_mode "fill" to the output size; raises if no mask.
+  procedure BuildInpaintCrop(OutputWidth, OutputHeight: integer);
+  var
+    Cropped: TNNetVolume;
+    X1, Y1, X2, Y2: integer;
+  begin
+    if (MaskImage.SizeX = InitImage.SizeX) and
+      (MaskImage.SizeY = InitImage.SizeY) then
+    begin
+      InpaintFullMask.ReSize(MaskImage);
+      InpaintFullMask.Copy(MaskImage);
+    end
+    else ResizeImagePIL(MaskImage, InpaintFullMask, InitImage.SizeX,
+      InitImage.SizeY, irfLanczos);
+    GetMaskCropRegion(InpaintFullMask, OutputWidth, OutputHeight,
+      PaddingMaskCrop, X1, Y1, X2, Y2);
+    InpaintCrop := Rect(X1, Y1, X2, Y2);
+    Cropped := TNNetVolume.Create();
+    try
+      Cropped.CopyCropping(InitImage, X1, Y1, X2 - X1, Y2 - Y1);
+      ResizeImageAndFill(Cropped, InpaintCropImage, OutputWidth, OutputHeight,
+        irfLanczos);
+      Cropped.CopyCropping(InpaintFullMask, X1, Y1, X2 - X1, Y2 - Y1);
+      ResizeImageAndFill(Cropped, InpaintCropMask, OutputWidth, OutputHeight,
+        irfLanczos);
+    finally
+      Cropped.Free;
+    end;
   end;
 
   // Appends FileName to the condition images when it reads and fits;
@@ -914,19 +1614,102 @@ var
     Problem: string;
   begin
     if not HasInitImage then exit;
-    Problem := OutputSizeProblemFor(InitImage);
-    if Problem <> '' then raise Exception.Create(Problem);
+    if not IsOutpainting() then
+    begin
+      Problem := OutputSizeProblemFor(InitImage);
+      if Problem <> '' then raise Exception.Create(Problem);
+    end;
     // Raises when the strength leaves no step.
     TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength);
     GetOutputSize(OutputWidth, OutputHeight);
+    if IsCropInpainting() then
+    begin
+      BuildInpaintCrop(OutputWidth, OutputHeight);
+      // The crop mask also follows the init image; it is cheap to encode.
+      MaskLatentsWidth := 0;
+    end
+    else InpaintCrop := Rect(0, 0, 0, 0);
+    if not EqualRect(InpaintCrop, ImageLatentsCrop) then
+    begin
+      ImageLatentsWidth := 0;
+      MaskLatentsWidth := 0;
+      ImageLatentsCrop := InpaintCrop;
+    end;
+    if IsOutpainting() and ((MaskLatentsWidth <> OutputWidth) or
+      (MaskLatentsHeight <> OutputHeight)) then
+    begin
+      MaskLatentsWidth := 0;
+      Pipeline.EncodeMask(OutpaintMask, OutputWidth, OutputHeight,
+        MaskLatents);
+      MaskLatentsWidth := OutputWidth;
+      MaskLatentsHeight := OutputHeight;
+    end
+    else if IsInpainting() and ((MaskLatentsWidth <> OutputWidth) or
+      (MaskLatentsHeight <> OutputHeight)) then
+    begin
+      MaskLatentsWidth := 0;
+      if IsCropInpainting() then
+        Pipeline.EncodeMask(InpaintCropMask, OutputWidth, OutputHeight,
+          MaskLatents)
+      else
+        Pipeline.EncodeMask(MaskImage, OutputWidth, OutputHeight, MaskLatents);
+      MaskLatentsWidth := OutputWidth;
+      MaskLatentsHeight := OutputHeight;
+    end
+    else if IsDifferential() and ((ChangeLatentsWidth <> OutputWidth) or
+      (ChangeLatentsHeight <> OutputHeight)) then
+    begin
+      ChangeLatentsWidth := 0;
+      Pipeline.EncodeChangeMap(ChangeMapImage, OutputWidth, OutputHeight,
+        ChangeLatents);
+      ChangeLatentsWidth := OutputWidth;
+      ChangeLatentsHeight := OutputHeight;
+    end;
     if (ImageLatentsWidth = OutputWidth) and
       (ImageLatentsHeight = OutputHeight) then exit;
     ImageLatentsWidth := 0;
-    Pipeline.EncodeImage(InitImage, OutputWidth, OutputHeight, ImageLatents);
+    if IsOutpainting() then
+      Pipeline.EncodeImage(OutpaintCanvas, OutputWidth, OutputHeight,
+        ImageLatents)
+    else if IsCropInpainting() then
+      Pipeline.EncodeImage(InpaintCropImage, OutputWidth, OutputHeight,
+        ImageLatents)
+    else
+      Pipeline.EncodeImage(InitImage, OutputWidth, OutputHeight,
+        ImageLatents);
     Reporter.OnPhase(qppDone);
     ImageLatentsWidth := OutputWidth;
     ImageLatentsHeight := OutputHeight;
     InputImageEncodeNumber := ImageNumber + 1;
+  end;
+
+  // The negative prompt's embeds (same template and condition images as the
+  // prompt) while guidance is on; cleared otherwise.
+  procedure EncodeNegativePrompt();
+  var
+    NegativeIds, NegativeTextLengths: TNeuralIntegerArray;
+    NegativeDropCount: integer;
+  begin
+    if not IsGuided() then
+    begin
+      Pipeline.ClearNegativePrompt();
+      exit;
+    end;
+    NegativeTextLengths := nil;
+    if IsEditing() then
+    begin
+      NegativeIds := Pipeline.TokenizeEditPrompt(NegativePrompt,
+        Length(ConditionImages), NegativeDropCount);
+      Pipeline.EncodeEditTokenIds(NegativeIds, NegativeDropCount,
+        NegativeEmbeds, NegativeTextLengths);
+    end
+    else
+    begin
+      NegativeIds := Pipeline.TokenizePrompt(NegativePrompt,
+        NegativeDropCount);
+      Pipeline.EncodeTokenIds(NegativeIds, NegativeDropCount, NegativeEmbeds);
+    end;
+    Pipeline.SetNegativePromptEmbeds(NegativeEmbeds, NegativeTextLengths);
   end;
 
   // Encodes the input images when needed (condition images or the init
@@ -936,6 +1719,8 @@ var
     IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     PrepareConditionImages();
     PrepareInitLatents();
+    // First, so the stage table's encode times are the prompt's.
+    EncodeNegativePrompt();
     if IsEditing() then
       Pipeline.EncodeEditTokenIds(TokenIds, DropCount, PromptEmbeds,
         TextLengths)
@@ -945,6 +1730,58 @@ var
   end;
 
   // The Image and Init image lines of the run header.
+  // Replaces the upscaler with FileName's (config read now, weights per
+  // image); returns '' or what is wrong, keeping the previous upscaler then.
+  function SetUpscaler(const FileName: string): string;
+  var
+    NewUpscaler: TRRDBNetUpscaler;
+  begin
+    Result := '';
+    try
+      NewUpscaler := TRRDBNetUpscaler.Create(FileName);
+    except
+      on E: Exception do exit(E.Message);
+    end;
+    NewUpscaler.Tile := UpscaleTile;
+    {$IFDEF OpenCL}
+    if IsOpenCLSelected then
+      NewUpscaler.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
+        OpenCLDevices.Devices[OpenCLDevice], HasSharedKernel);
+    {$ENDIF}
+    Upscaler.Free;
+    Upscaler := NewUpscaler;
+  end;
+
+  function UpscalerText(): string;
+  begin
+    Result := Format('%s (x%d, tile %d)', [Upscaler.FileName,
+      Upscaler.Config.Scale, Upscaler.Tile]);
+  end;
+
+  function PanoramaStrideText(): string;
+  begin
+    if PanoramaStride > 0 then Result := IntToStr(PanoramaStride) + ' pixels'
+    else Result := 'half a window';
+  end;
+
+  // Arms the pipeline's MultiDiffusion windows while IsPanorama(), else
+  // turns them off.
+  procedure ApplyPanorama();
+  begin
+    if IsPanorama() then
+    begin
+      Pipeline.PanoramaWindowWidth := Width;
+      Pipeline.PanoramaWindowHeight := Height;
+    end
+    else
+    begin
+      Pipeline.PanoramaWindowWidth := 0;
+      Pipeline.PanoramaWindowHeight := 0;
+    end;
+    Pipeline.PanoramaStride := PanoramaStride;
+    Pipeline.PanoramaCircular := PanoramaWrap;
+  end;
+
   procedure PrintImageSettings();
   var
     OutputWidth, OutputHeight, StartStep: integer;
@@ -953,6 +1790,11 @@ var
     WriteLn('Image      : ', OutputWidth, 'x', OutputHeight, ' (',
       (OutputWidth div 16) * (OutputHeight div 16), ' image tokens), ',
       StepCount, ' steps, seed ', Seed);
+    if IsPanorama() then
+      WriteLn('Panorama   : ', Width, 'x', Height, ' windows every ',
+        PanoramaStrideText(), BoolToStr(PanoramaWrap, ', wrapping in X', ''))
+    else if PanoramaWidth > 0 then
+      WriteLn('Panorama   : off while an init or condition image is set');
     if IsEditing() then
     begin
       WriteLn('Edit       : ', Length(ConditionImages), ' condition ',
@@ -966,6 +1808,34 @@ var
     WriteLn('Init image : ', InitImageFile, ' (', InitImage.SizeX, 'x',
       InitImage.SizeY, '), strength ', StrengthText(Strength), ', the last ',
       StepCount - StartStep, ' of ', StepCount, ' steps');
+    if IsOutpainting() then
+    begin
+      WriteLn('Outpaint   : ', OutpaintLeft, ',', OutpaintTop, ',',
+        OutpaintRight, ',', OutpaintBottom, ' pixels, overlap ',
+        OutpaintOverlap, '; canvas ', OutpaintCanvas.SizeX, 'x',
+        OutpaintCanvas.SizeY, ' cropped to ', InitImage.SizeX + OutpaintLeft +
+        OutpaintRight, 'x', InitImage.SizeY + OutpaintTop + OutpaintBottom);
+      if MaskBlurRadius > 0 then
+        WriteLn('Mask blur  : Gaussian sigma ', FloatToStr(MaskBlurRadius,
+          PointFormat()), ' pixels');
+    end;
+    if IsInpainting() then
+    begin
+      WriteLn('Mask       : ', MaskFile, ' (', MaskImage.SizeX, 'x',
+        MaskImage.SizeY, '), only its white region is regenerated');
+      if IsCropInpainting() then
+        WriteLn('Mask crop  : its box plus ', PaddingMaskCrop, ' pixels, ',
+          'grown to the output aspect, is generated at ', OutputWidth, 'x',
+          OutputHeight, ' and pasted into the ', InitImage.SizeX, 'x',
+          InitImage.SizeY, ' init image');
+      if MaskBlurRadius > 0 then
+        WriteLn('Mask blur  : Gaussian sigma ', FloatToStr(MaskBlurRadius,
+          PointFormat()), ' pixels');
+    end;
+    if IsDifferential() then
+      WriteLn('Change map : ', ChangeMapFile, ' (', ChangeMapImage.SizeX, 'x',
+        ChangeMapImage.SizeY, '), Differential Diffusion, white = change ',
+        'most', BoolToStr(InvertChangeMap, ' (inverted on load)', ''));
   end;
 
   // Profiling counts transfers too (TNNet.LayerProfiling turns the counting
@@ -1001,18 +1871,22 @@ var
   procedure GenerateImage(const ImageFile: string);
   var
     ImageStart: QWord;
-    SaveStart: TDateTime;
-    PngSaveMs: double;
-    OutputWidth, OutputHeight: integer;
+    SaveStart, UpscaleStart: TDateTime;
+    PngSaveMs, UpscaleMs: double;
+    OutputWidth, OutputHeight, GeneratedWidth, GeneratedHeight: integer;
+    UpscaleRanOn, UpscaleDetail: string;
+    TileConfig: TRRDBNetConfig;
   begin
     // The image that encoded the prompt had its mark reset before the encode.
     if ImageNumber <> EncodeImageNumber then
       IsPeakPerImage := (UseStats or UseProfile) and ResetPeakRss();
     ImageStart := GetTickCount64;
     GetOutputSize(OutputWidth, OutputHeight);
+    ApplyPanorama();
     if HasInitImage then
       Pipeline.GenerateFromEmbeds(PromptEmbeds, OutputWidth, OutputHeight,
-        StepCount, Seed, Image, nil, ImageLatents, Strength)
+        StepCount, Seed, Image, nil, ImageLatents, Strength,
+        ActiveMaskLatents(), ActiveChangeLatents())
     else if IsEditing() then
       Pipeline.GenerateEditFromEmbeds(PromptEmbeds, TextLengths, OutputWidth,
         OutputHeight, StepCount, Seed, Image)
@@ -1021,15 +1895,43 @@ var
         StepCount, Seed, Image);
     SaveStart := Now();
     Image.Mul(255);
+    if IsOutpainting() then FinishOutpaint()
+    else if IsCropInpainting() then
+      PasteInpaintCrop(Image, InitImage, InpaintFullMask, InpaintCrop.Left,
+        InpaintCrop.Top, InpaintCrop.Right, InpaintCrop.Bottom, irfLanczos,
+        Image);
+    UpscaleMs := 0;
+    UpscaleRanOn := '';
+    UpscaleDetail := '';
+    if Assigned(Upscaler) then
+    begin
+      UpscaleStart := Now();
+      GeneratedWidth := Image.SizeX;
+      GeneratedHeight := Image.SizeY;
+      TileConfig := Upscaler.TileConfigFor(GeneratedWidth, GeneratedHeight);
+      Image.Divi(255);
+      Upscaler.Upscale(Image, Image);
+      Image.Mul(255);
+      UpscaleMs := (Now() - UpscaleStart) * MSecsPerDay;
+      if Upscaler.OnOpenCL then UpscaleRanOn := 'OpenCL'
+      else UpscaleRanOn := 'CPU';
+      UpscaleDetail := Format('x%d to %dx%d, net input %dx%d',
+        [Upscaler.Config.Scale, Image.SizeX, Image.SizeY,
+         TileConfig.InputWidth, TileConfig.InputHeight]);
+      WriteLn('Upscaled ', GeneratedWidth, 'x', GeneratedHeight, ' to ',
+        Image.SizeX, 'x', Image.SizeY, ' on ', UpscaleRanOn, ' in ',
+        (UpscaleMs / 1000):0:1, ' s');
+    end;
     if not SaveImageFromVolumeIntoFile(Image, ImageFile) then
       raise Exception.Create('could not write ' + ImageFile);
-    PngSaveMs := (Now() - SaveStart) * MSecsPerDay;
+    PngSaveMs := (Now() - SaveStart) * MSecsPerDay - UpscaleMs;
     WriteLn('Wrote ', ImageFile, ' (', Image.SizeX, 'x', Image.SizeY, 'x',
       Image.Depth, ') in ', ((GetTickCount64 - ImageStart) / 1000):0:1,
       ' s; ', MemoryReport());
     if UseStats or UseProfile then
       PrintStageTable(Pipeline.ImageStats, ImageNumber, EncodeImageNumber,
-        InputImageEncodeNumber, PngSaveMs, UseProfile, IsPeakPerImage);
+        InputImageEncodeNumber, UpscaleMs, UpscaleRanOn, UpscaleDetail,
+        PngSaveMs, UseProfile, IsPeakPerImage);
     if UseProfile then
     begin
       WriteLn;
@@ -1051,7 +1953,7 @@ var
   // --output; the seed then grows by one, also when the image fails.
   procedure GenerateNextImage(Numbered: boolean);
   var
-    ImageFile, StepText: string;
+    ImageFile, StepText, ModeText: string;
     OutputWidth, OutputHeight: integer;
   begin
     Inc(ImageNumber);
@@ -1059,9 +1961,14 @@ var
     else ImageFile := OutputFile;
     GetOutputSize(OutputWidth, OutputHeight);
     StepText := IntToStr(StepCount) + ' steps';
+    if IsOutpainting() then ModeText := 'outpaint'
+    else if IsCropInpainting() then ModeText := 'inpaint (mask crop)'
+    else if IsInpainting() then ModeText := 'inpaint'
+    else if IsDifferential() then ModeText := 'differential img2img'
+    else ModeText := 'img2img';
     if HasInitImage then
-      StepText := Format('img2img strength %s, the last %d of %d steps',
-        [StrengthText(Strength), StepCount -
+      StepText := Format('%s strength %s, the last %d of %d steps',
+        [ModeText, StrengthText(Strength), StepCount -
         TNNetFlowMatchEulerScheduler.Img2ImgStartStep(StepCount, Strength),
         StepCount])
     else if IsEditing() then
@@ -1156,16 +2063,20 @@ var
     end;
   end;
 
-  // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image,
-  // /strength, /profile, /stats and /quit; false on /quit or when /repeat ran
-  // out of memory.
+  // /size, /steps, /seed, /tile, /repeat, /image, /images, /init-image, /mask,
+  // /mask-blur, /outpaint, /strength, /upscale, /fbc, /panorama,
+  // /negative-prompt, /guidance-scale, /pag, /profile, /stats, /quit;
+  // false on /quit or when /repeat ran out of memory.
   function RunReplCommand(const Line: string): boolean;
   var
     IsOn: boolean;
     SpacePos, NewWidth, NewHeight, NewTileSize, NewTileStride: integer;
     NewRepeatCount: integer;
     NewValue: int64;
-    NewStrength: double;
+    NewStrength, NewMaskBlurRadius, NewFbcThreshold, NewGuidanceScale,
+      NewPagScale: double;
+    NewPaddingMaskCrop: integer;
+    NewLeft, NewTop, NewRight, NewBottom, NewOverlap: integer;
     Command, Argument, Problem: string;
   begin
     Result := true;
@@ -1189,7 +2100,10 @@ var
       begin
         Width := NewWidth;
         Height := NewHeight;
-        if HasInitImage or IsEditing() then
+        if IsOutpainting() then
+          WriteLn('[size ', Width, 'x', Height, '; outpainting keeps its ',
+            OutpaintCanvas.SizeX, 'x', OutpaintCanvas.SizeY, ' canvas]')
+        else if HasInitImage or IsEditing() then
         begin
           GetOutputSize(NewWidth, NewHeight);
           WriteLn('[size ', Width, 'x', Height, '; the image''s aspect ',
@@ -1325,6 +2239,151 @@ var
         end;
       end;
     end
+    else if Command = 'mask' then
+    begin
+      if Argument = '' then
+        WriteLn('[/mask: expected /mask FILE or /mask off]')
+      else if LowerCase(Argument) = 'off' then
+      begin
+        HasMask := false;
+        MaskLatentsWidth := 0;
+        if HasInitImage then WriteLn('[mask off: img2img]')
+        else WriteLn('[mask off]');
+      end
+      else if HasOutpaint then
+        WriteLn('[/mask: outpainting is on; /outpaint off first]')
+      else if HasChangeMap then
+        WriteLn('[/mask: a change map is set; /change-map off first]')
+      else
+      begin
+        Problem := LoadMask(Argument);
+        if Problem <> '' then
+        begin
+          if HasMask then
+            WriteLn('[/mask: ', Problem, ' - the mask ', MaskFile,
+              ' stays active]')
+          else WriteLn('[/mask: ', Problem, ' - no mask is set]');
+        end
+        else if HasInitImage then
+          WriteLn('[mask ', MaskFile, ' (', MaskImage.SizeX, 'x',
+            MaskImage.SizeY, '): inpainting ', InitImageFile, ']')
+        else WriteLn('[mask ', MaskFile, ' (', MaskImage.SizeX, 'x',
+          MaskImage.SizeY, '): applies once /init-image sets an init image]');
+      end;
+    end
+    else if Command = 'change-map' then
+    begin
+      if Argument = '' then
+        WriteLn('[/change-map: expected /change-map FILE or /change-map off]')
+      else if LowerCase(Argument) = 'off' then
+      begin
+        HasChangeMap := false;
+        ChangeLatentsWidth := 0;
+        if not HasStrengthArg then Strength := csDefaultStrength;
+        if HasInitImage then
+          WriteLn('[change map off: img2img, strength ',
+            StrengthText(Strength), ']')
+        else WriteLn('[change map off]');
+      end
+      else if HasMask then
+        WriteLn('[/change-map: a mask is set; /mask off first]')
+      else if HasOutpaint then
+        WriteLn('[/change-map: outpainting is on; /outpaint off first]')
+      else
+      begin
+        Problem := LoadChangeMap(Argument);
+        if Problem <> '' then
+        begin
+          if HasChangeMap then
+            WriteLn('[/change-map: ', Problem, ' - the change map ',
+              ChangeMapFile, ' stays active]')
+          else WriteLn('[/change-map: ', Problem, ' - no change map is set]');
+        end
+        else
+        begin
+          if not HasStrengthArg then Strength := 1;
+          if HasInitImage then
+            WriteLn('[change map ', ChangeMapFile, ' (', ChangeMapImage.SizeX,
+              'x', ChangeMapImage.SizeY, '): Differential Diffusion on ',
+              InitImageFile, ', strength ', StrengthText(Strength), ']')
+          else WriteLn('[change map ', ChangeMapFile, ' (',
+            ChangeMapImage.SizeX, 'x', ChangeMapImage.SizeY, '): applies ',
+            'once /init-image sets an init image]');
+        end;
+      end;
+    end
+    else if Command = 'invert-change-map' then
+    begin
+      if (LowerCase(Argument) <> 'on') and (LowerCase(Argument) <> 'off') then
+        WriteLn('[/invert-change-map: expected on or off]')
+      else
+      begin
+        InvertChangeMap := LowerCase(Argument) = 'on';
+        if not HasChangeMap then
+          WriteLn('[invert change map ', LowerCase(Argument), ' for the next ',
+            '/change-map]')
+        else
+        begin
+          Problem := LoadChangeMap(ChangeMapFile);
+          if Problem <> '' then
+          begin
+            // The map in memory keeps its orientation, so the flag does too.
+            InvertChangeMap := not InvertChangeMap;
+            WriteLn('[/invert-change-map: ', Problem, ' - ', ChangeMapFile,
+              ' keeps its previous orientation]');
+          end
+          else WriteLn('[invert change map ', LowerCase(Argument), ': ',
+            ChangeMapFile, ' reloaded]');
+        end;
+      end;
+    end
+    else if Command = 'mask-blur' then
+    begin
+      Problem := ParseMaskBlurRadius(Argument, NewMaskBlurRadius);
+      if Problem <> '' then WriteLn('[/mask-blur: ', Problem, ']')
+      else
+      begin
+        MaskBlurRadius := NewMaskBlurRadius;
+        if HasOutpaint then
+        begin
+          BuildOutpaint();
+          WriteLn('[mask blur ', FloatToStr(MaskBlurRadius, PointFormat()),
+            ' for the outpaint mask]');
+        end
+        else if HasMask then
+        begin
+          Problem := LoadMask(MaskFile);
+          if Problem <> '' then
+            WriteLn('[/mask-blur: ', Problem, ' - the mask keeps its ',
+              'previous blur]')
+          else WriteLn('[mask blur ', FloatToStr(MaskBlurRadius,
+            PointFormat()), ': ', MaskFile, ' reloaded]');
+        end
+        else WriteLn('[mask blur ', FloatToStr(MaskBlurRadius, PointFormat()),
+          ' for the next /mask]');
+      end;
+    end
+    else if Command = 'padding-mask-crop' then
+    begin
+      if LowerCase(Argument) = 'off' then
+      begin
+        PaddingMaskCrop := -1;
+        WriteLn('[padding mask crop off: the whole image is inpainted]');
+      end
+      else
+      begin
+        Problem := ParsePixelCount(Argument, NewPaddingMaskCrop);
+        if Problem <> '' then WriteLn('[/padding-mask-crop: ', Problem, ']')
+        else
+        begin
+          PaddingMaskCrop := NewPaddingMaskCrop;
+          if IsInpainting() then
+            WriteLn('[padding mask crop ', PaddingMaskCrop, ' pixels]')
+          else WriteLn('[padding mask crop ', PaddingMaskCrop, ' pixels: ',
+            'applies once /init-image and /mask are set]');
+        end;
+      end;
+    end
     else if Command = 'strength' then
     begin
       Problem := ParseStrength(Argument, NewStrength);
@@ -1332,7 +2391,171 @@ var
       else
       begin
         Strength := NewStrength;
+        HasStrengthArg := true;
         WriteLn('[strength ', StrengthText(Strength), ']');
+      end;
+    end
+    else if Command = 'outpaint' then
+    begin
+      if LowerCase(Argument) = 'off' then
+      begin
+        HasOutpaint := false;
+        BuildOutpaint();
+        if not HasStrengthArg then Strength := csDefaultStrength;
+        if HasInitImage then
+          WriteLn('[outpaint off: img2img, strength ', StrengthText(Strength),
+            ']')
+        else WriteLn('[outpaint off]');
+      end
+      else if HasMask then
+        WriteLn('[/outpaint: a mask is set; /mask off first]')
+      else if HasChangeMap then
+        WriteLn('[/outpaint: a change map is set; /change-map off first]')
+      else
+      begin
+        SpacePos := Pos(' ', Argument);
+        NewOverlap := OutpaintOverlap;
+        Problem := '';
+        if SpacePos > 0 then
+          Problem := ParsePixelCount(Copy(Argument, SpacePos + 1, MaxInt),
+            NewOverlap)
+        else SpacePos := Length(Argument) + 1;
+        if Problem = '' then
+          Problem := ParseOutpaintSides(Copy(Argument, 1, SpacePos - 1),
+            NewLeft, NewTop, NewRight, NewBottom);
+        if Problem = '' then
+          Problem := SetOutpaint(NewLeft, NewTop, NewRight, NewBottom,
+            NewOverlap);
+        if Problem <> '' then
+          WriteLn('[/outpaint: expected /outpaint L,T,R,B [OVERLAP] or ',
+            '/outpaint off; ', Problem, ']')
+        else
+        begin
+          if not HasStrengthArg then Strength := 1;
+          if HasInitImage then
+            WriteLn('[outpaint ', InitImageFile, ' by ', OutpaintLeft, ',',
+              OutpaintTop, ',', OutpaintRight, ',', OutpaintBottom,
+              ' pixels, overlap ', OutpaintOverlap, ': canvas ',
+              OutpaintCanvas.SizeX, 'x', OutpaintCanvas.SizeY, ', strength ',
+              StrengthText(Strength), ']')
+          else WriteLn('[outpaint ', OutpaintLeft, ',', OutpaintTop, ',',
+            OutpaintRight, ',', OutpaintBottom, ': applies once /init-image ',
+            'sets an init image]');
+        end;
+      end;
+    end
+    else if Command = 'upscale' then
+    begin
+      if Argument = '' then
+      begin
+        if Assigned(Upscaler) then
+          WriteLn('[upscale ', UpscalerText(), '; /upscale off stops it]')
+        else WriteLn('[/upscale: expected /upscale FILE or /upscale off]');
+      end
+      else if LowerCase(Argument) = 'off' then
+      begin
+        FreeAndNil(Upscaler);
+        WriteLn('[upscale off]');
+      end
+      else
+      begin
+        Problem := SetUpscaler(Argument);
+        if Problem = '' then
+          WriteLn('[upscale ', UpscalerText(), ' from the next image]')
+        else if Assigned(Upscaler) then
+          WriteLn('[/upscale: ', Problem, ' - ', UpscalerText(),
+            ' stays active]')
+        else WriteLn('[/upscale: ', Problem, ' - upscaling stays off]');
+      end;
+    end
+    else if Command = 'panorama' then
+    begin
+      if Argument = '' then
+      begin
+        if PanoramaWidth > 0 then
+          WriteLn('[panorama ', PanoramaWidth, 'x', PanoramaHeight,
+            '; /panorama WxH|off changes it]')
+        else WriteLn('[panorama off; /panorama WxH sets a canvas]');
+      end
+      else if LowerCase(Argument) = 'off' then
+      begin
+        PanoramaWidth := 0;
+        PanoramaHeight := 0;
+        WriteLn('[panorama off]');
+      end
+      else
+      begin
+        Problem := ParseImageSize(Argument, NewWidth, NewHeight);
+        if Problem <> '' then WriteLn('[/panorama: ', Problem, ']')
+        else
+        begin
+          PanoramaWidth := NewWidth;
+          PanoramaHeight := NewHeight;
+          WriteLn('[panorama ', PanoramaWidth, 'x', PanoramaHeight, ' in ',
+            Width, 'x', Height, ' windows]');
+          if not IsPanorama() then
+            WriteLn('[/panorama: off while an init or condition image is ',
+              'set]');
+        end;
+      end;
+    end
+    else if Command = 'fbc' then
+    begin
+      if Argument = '' then
+        WriteLn('[', FbcThresholdText(Pipeline.FirstBlockCacheThreshold),
+          '; /fbc X|off changes it]')
+      else
+      begin
+        Problem := ParseNumberOrOff(Argument, NewFbcThreshold);
+        if Problem <> '' then WriteLn('[/fbc: ', Problem, ']')
+        else
+        begin
+          Pipeline.FirstBlockCacheThreshold := NewFbcThreshold;
+          WriteLn('[', FbcThresholdText(NewFbcThreshold),
+            ' from the next image]');
+        end;
+      end;
+    end
+    else if Command = 'negative-prompt' then
+    begin
+      if Argument = '' then
+        WriteLn('[guidance ', GuidanceText(), '; /negative-prompt TEXT|off ',
+          'changes it]')
+      else
+      begin
+        HasNegativePrompt := LowerCase(Argument) <> 'off';
+        if HasNegativePrompt then NegativePrompt := Argument
+        else NegativePrompt := '';
+        WriteLn('[guidance ', GuidanceText(), ' from the next prompt]');
+      end;
+    end
+    else if Command = 'guidance-scale' then
+    begin
+      Problem := ParseGuidanceScale(Argument, NewGuidanceScale);
+      if Problem <> '' then WriteLn('[/guidance-scale: ', Problem, ']')
+      else
+      begin
+        GuidanceScale := NewGuidanceScale;
+        Pipeline.GuidanceScale := GuidanceScale;
+        WriteLn('[guidance ', GuidanceText(), ' from the next prompt]');
+      end;
+    end
+    else if Command = 'pag' then
+    begin
+      if Argument = '' then
+        WriteLn('[perturbed guidance ', PerturbedGuidanceText(),
+          '; /pag W|off changes it]')
+      else
+      begin
+        Problem := ParseNumberOrOff(Argument, NewPagScale);
+        if Problem <> '' then WriteLn('[/pag: ', Problem, ']')
+        else
+        begin
+          PagScale := NewPagScale;
+          ApplyPerturbedGuidance();
+          WriteLn('[perturbed guidance ', PerturbedGuidanceText(),
+            ' from the next image]');
+        end;
       end;
     end
     else if Command = 'profile' then
@@ -1352,8 +2575,9 @@ var
       end;
     end
     else WriteLn('[unknown command /', Command, ' - /size, /steps, /seed, ',
-      '/tile, /repeat, /image, /images, /init-image, /strength, /profile, ',
-      '/stats, /quit]');
+      '/tile, /repeat, /image, /images, /init-image, /mask, /mask-blur, ',
+      '/outpaint, /strength, /upscale, /fbc, /panorama, /negative-prompt, ',
+      '/guidance-scale, /pag, /profile, /stats, /quit]');
   end;
 
   // One prompt per stdin line until /quit or the end of the input.
@@ -1366,8 +2590,11 @@ var
     PrintComputeResult();
     WriteLn('Type a prompt per line; /size WxH, /steps N, /seed N, ',
       '/tile SIZE[,STRIDE], /repeat N PROMPT, /image FILE, /images [clear], ',
-      '/init-image FILE|off, /strength S, /profile on|off, /stats on|off, ',
-      '/quit.');
+      '/init-image FILE|off, /mask FILE|off, /mask-blur R, ',
+      '/padding-mask-crop N|off, /outpaint L,T,R,B [OVERLAP]|off, ',
+      '/change-map FILE|off, /invert-change-map on|off, /strength S, ',
+      '/upscale FILE|off, /fbc X|off, /negative-prompt TEXT|off, ',
+      '/guidance-scale W, /pag W|off, /profile on|off, /stats on|off, /quit.');
     // A piped batch gets no '> ' markers, so its log has one line per event.
     InteractiveInput :=
       {$IFDEF UNIX}IsATTY(StdInputHandle) = 1{$ELSE}true{$ENDIF};
@@ -1420,15 +2647,55 @@ begin
   InitImageFile := '';
   ImageLatentsWidth := 0;
   ImageLatentsHeight := 0;
+  HasMask := false;
+  MaskFile := '';
+  MaskBlurRadius := 0;
+  MaskLatentsWidth := 0;
+  PaddingMaskCrop := -1;
+  HasChangeMap := false;
+  InvertChangeMap := false;
+  ChangeMapFile := '';
+  ChangeLatentsWidth := 0;
+  ChangeLatentsHeight := 0;
+  InpaintCrop := Rect(0, 0, 0, 0);
+  ImageLatentsCrop := Rect(0, 0, 0, 0);
+  MaskLatentsHeight := 0;
+  HasOutpaint := false;
+  OutpaintText := '';
+  OutpaintOverlap := csDefaultOutpaintOverlap;
   InputImageEncodeNumber := 0;
   ConditionFiles := TStringList.Create;
   ImageArgFiles := TStringList.Create;
+  LoRAFiles := TStringList.Create;
+  LoRAScales := nil;
   ConditionImages := nil;
   ConditionEncodedArea := 0;
   Pipeline := nil;
   Strength := csDefaultStrength;
   HasStrengthArg := false;
+  FbcThreshold := 0;
+  PanoramaWidth := 0;
+  PanoramaHeight := 0;
+  PanoramaStride := 0;
+  PanoramaWrap := false;
+  Sampler := fsEuler;
+  NegativePrompt := '';
+  HasNegativePrompt := false;
+  GuidanceScale := 1;
+  ApgSpec := '';
+  ApgOnVelocity := false;
+  PagScale := 0;
+  PagStart := csDefaultPagStart;
+  PagStop := csDefaultPagStop;
+  PagLayers := nil;
+  IsSkipLayerGuidance := false;
+  HasPagArg := false;
+  HasPagScaleArg := false;
   MaxThreads := 0;
+  Upscaler := nil;
+  UpscaleFile := '';
+  UpscaleTile := csDefaultUpscaleTile;
+  IsOpenCLSelected := false;
   VaeTileSize := 256;
   VaeTileStride := 192;
   UseOpenCL := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
@@ -1470,6 +2737,37 @@ begin
       ImageArgFiles.Add(NextArg());
     end
     else if Arg = '--init-image' then InitImageFile := NextArg()
+    else if Arg = '--mask' then MaskFile := NextArg()
+    else if Arg = '--change-map' then ChangeMapFile := NextArg()
+    else if Arg = '--invert-change-map' then InvertChangeMap := true
+    else if Arg = '--mask-blur' then
+    begin
+      ArgProblem := ParseMaskBlurRadius(NextArg(), MaskBlurRadius);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--mask-blur: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--padding-mask-crop' then
+    begin
+      ArgProblem := ParsePixelCount(NextArg(), PaddingMaskCrop);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--padding-mask-crop: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--outpaint' then OutpaintText := NextArg()
+    else if Arg = '--outpaint-overlap' then
+    begin
+      ArgProblem := ParsePixelCount(NextArg(), OutpaintOverlap);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--outpaint-overlap: ', ArgProblem);
+        Halt(2);
+      end;
+    end
     else if Arg = '--strength' then
     begin
       HasStrengthArg := true;
@@ -1484,8 +2782,127 @@ begin
     else if Arg = '--int4' then WeightFormat := qiwInt4
     else if Arg = '--fp32' then WeightFormat := qiwFP32
     else if Arg = '--int8-input' then UseInt8Input := true
+    else if Arg = '--lora' then
+    begin
+      ArgProblem := ParseLoRAArg(NextArg(), LoRAFile, LoRAScale);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--lora: ', ArgProblem);
+        Halt(2);
+      end;
+      LoRAFiles.Add(LoRAFile);
+      SetLength(LoRAScales, Length(LoRAScales) + 1);
+      LoRAScales[High(LoRAScales)] := LoRAScale;
+    end
     else if Arg = '--serial' then UseSerial := true
     else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
+    else if Arg = '--fbc-threshold' then
+    begin
+      ArgProblem := ParseNumberOrOff(NextArg(), FbcThreshold);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--fbc-threshold: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--panorama' then
+    begin
+      ArgProblem := ParseImageSize(NextArg(), PanoramaWidth, PanoramaHeight);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--panorama: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--panorama-stride' then
+    begin
+      ArgProblem := ParsePanoramaStride(NextArg(), PanoramaStride);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--panorama-stride: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--panorama-wrap' then PanoramaWrap := true
+    else if Arg = '--sampler' then
+    begin
+      SamplerName := NextArg();
+      if SamplerName = 'euler' then Sampler := fsEuler
+      else if SamplerName = 'dpm2m' then Sampler := fsDPMSolverPP2M
+      else if SamplerName = 'unipc' then Sampler := fsUniPC
+      else
+      begin
+        WriteLn('--sampler: "', SamplerName, '" is not euler, dpm2m or unipc.');
+        Halt(2);
+      end;
+    end
+    else if Arg = '--negative-prompt' then
+    begin
+      NegativePrompt := NextArg();
+      HasNegativePrompt := true;
+    end
+    else if Arg = '--guidance-scale' then
+    begin
+      ArgProblem := ParseGuidanceScale(NextArg(), GuidanceScale);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--guidance-scale: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--apg' then
+    begin
+      ApgSpec := NextArg();
+      try
+        TNNetAdaptiveProjectedGuidance.CreateFromSpec(ApgSpec).Free;
+      except
+        on E: EConvertError do
+        begin
+          WriteLn('--apg: ', E.Message);
+          Halt(2);
+        end;
+      end;
+    end
+    else if Arg = '--apg-velocity' then ApgOnVelocity := true
+    else if Arg = '--pag-scale' then
+    begin
+      ArgProblem := ParseNumberOrOff(NextArg(), PagScale);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--pag-scale: ', ArgProblem);
+        Halt(2);
+      end;
+      HasPagScaleArg := true;
+    end
+    else if Arg = '--pag-layers' then
+    begin
+      try
+        PagLayers := ParseIntegerList(NextArg());
+      except
+        on E: EConvertError do
+        begin
+          WriteLn('--pag-layers: ', E.Message);
+          Halt(2);
+        end;
+      end;
+      HasPagArg := true;
+    end
+    else if (Arg = '--pag-start') or (Arg = '--pag-stop') then
+    begin
+      if not TryStrToFloat(Trim(NextArg()), PagWindowValue, PointFormat()) then
+      begin
+        WriteLn(Arg, ': "', ParamStr(ArgPos), '" is not a number.');
+        Halt(2);
+      end;
+      if Arg = '--pag-start' then PagStart := PagWindowValue
+      else PagStop := PagWindowValue;
+      HasPagArg := true;
+    end
+    else if Arg = '--slg' then
+    begin
+      IsSkipLayerGuidance := true;
+      HasPagArg := true;
+    end
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--gpu' then UseOpenCL := true
@@ -1501,6 +2918,16 @@ begin
       if ArgProblem <> '' then
       begin
         WriteLn('--vae-tile: ', ArgProblem);
+        Halt(2);
+      end;
+    end
+    else if Arg = '--upscale' then UpscaleFile := NextArg()
+    else if Arg = '--upscale-tile' then
+    begin
+      ArgProblem := ParsePixelCount(NextArg(), UpscaleTile);
+      if ArgProblem <> '' then
+      begin
+        WriteLn('--upscale-tile: ', ArgProblem);
         Halt(2);
       end;
     end
@@ -1551,6 +2978,102 @@ begin
     WriteLn('--image (edit) and --init-image (img2img) are exclusive.');
     Halt(2);
   end;
+  if (MaskFile <> '') and (InitImageFile = '') and
+    (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--mask needs --init-image (the image it keeps).');
+    Halt(2);
+  end;
+  if ChangeMapFile <> '' then
+  begin
+    if (MaskFile <> '') or (OutpaintText <> '') then
+    begin
+      WriteLn('--change-map is exclusive with --mask and --outpaint.');
+      Halt(2);
+    end;
+    if (InitImageFile = '') and (HasPrompt or (TokenList <> '')) then
+    begin
+      WriteLn('--change-map needs --init-image (the image it keeps).');
+      Halt(2);
+    end;
+    if not HasStrengthArg then Strength := 1;
+  end
+  else if InvertChangeMap and (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--invert-change-map needs --change-map.');
+    Halt(2);
+  end;
+  if (PaddingMaskCrop >= 0) and (MaskFile = '') and
+    (HasPrompt or (TokenList <> '')) then
+  begin
+    WriteLn('--padding-mask-crop needs --mask (the region it crops to).');
+    Halt(2);
+  end;
+  if OutpaintText <> '' then
+  begin
+    ArgProblem := ParseOutpaintSides(OutpaintText, OutpaintLeft, OutpaintTop,
+      OutpaintRight, OutpaintBottom);
+    if ArgProblem <> '' then
+    begin
+      WriteLn('--outpaint: ', ArgProblem);
+      Halt(2);
+    end;
+    if MaskFile <> '' then
+    begin
+      WriteLn('--mask and --outpaint are exclusive.');
+      Halt(2);
+    end;
+    if (InitImageFile = '') and (HasPrompt or (TokenList <> '')) then
+    begin
+      WriteLn('--outpaint needs --init-image (the image it extends).');
+      Halt(2);
+    end;
+    if not HasStrengthArg then Strength := 1;
+  end;
+  if (PanoramaWidth > 0) and ((InitImageFile <> '') or
+    (ImageArgFiles.Count > 0)) then
+  begin
+    WriteLn('--panorama runs text-to-image only: not with --init-image or ',
+      '--image.');
+    Halt(2);
+  end;
+  if (PanoramaWidth > 0) and (PanoramaStride > 0) and
+    ((PanoramaStride > Width) or (PanoramaStride > Height)) then
+  begin
+    WriteLn('--panorama-stride: ', PanoramaStride, ' is larger than the ',
+      Width, 'x', Height, ' window.');
+    Halt(2);
+  end;
+  if (PanoramaWidth = 0) and (PanoramaWrap or (PanoramaStride > 0)) then
+  begin
+    if HasPrompt or (TokenList <> '') then
+      WriteLn('[--panorama-stride and --panorama-wrap have no effect ',
+        'without --panorama]')
+    else WriteLn('[--panorama-stride and --panorama-wrap apply once ',
+      '/panorama sets a canvas]');
+  end;
+  if (UpscaleTile <> csDefaultUpscaleTile) and (UpscaleFile = '') then
+  begin
+    if HasPrompt or (TokenList <> '') then
+      WriteLn('[--upscale-tile has no effect without --upscale]')
+    else WriteLn('[--upscale-tile applies once /upscale sets an upscaler]');
+  end;
+  if HasPagArg and not HasPagScaleArg then PagScale := csDefaultPagScale;
+  try
+    TNNetPerturbedGuidance.Create(1, PagScale, PagStart, PagStop).Free;
+  except
+    on E: EArgumentException do
+    begin
+      WriteLn('--pag-start / --pag-stop: ', E.Message);
+      Halt(2);
+    end;
+  end;
+  if (PagScale <> 0) and IsGuided() and (ApgSpec <> '') then
+  begin
+    WriteLn('--pag-scale: perturbed guidance mixes with CFG, not with --apg; ',
+      'drop one of the two.');
+    Halt(2);
+  end;
   if HasStrengthArg and (InitImageFile = '') then
   begin
     if HasPrompt or (TokenList <> '') then
@@ -1561,9 +3084,19 @@ begin
   StartTime := GetTickCount64;
   Reporter := TQwenImageReporter.Create();
   PromptEmbeds := TNNetVolume.Create();
+  NegativeEmbeds := TNNetVolume.Create();
   Image := TNNetVolume.Create();
   InitImage := TNNetVolume.Create();
   ImageLatents := TNNetVolume.Create();
+  MaskImage := TNNetVolume.Create();
+  InpaintFullMask := TNNetVolume.Create();
+  InpaintCropImage := TNNetVolume.Create();
+  InpaintCropMask := TNNetVolume.Create();
+  MaskLatents := TNNetVolume.Create();
+  ChangeMapImage := TNNetVolume.Create();
+  ChangeLatents := TNNetVolume.Create();
+  OutpaintCanvas := TNNetVolume.Create();
+  OutpaintMask := TNNetVolume.Create();
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -1573,10 +3106,21 @@ begin
     Pipeline.TransformerFormat := WeightFormat;
     Pipeline.TextEncoderInt8 := WeightFormat <> qiwFP32;
     Pipeline.Int8Input := UseInt8Input;
+    for LoRAPos := 0 to LoRAFiles.Count - 1 do
+      Pipeline.AddLoRA(LoRAFiles[LoRAPos], LoRAScales[LoRAPos]);
     Pipeline.VaeTileSize := VaeTileSize;
     Pipeline.VaeTileStride := VaeTileStride;
     Pipeline.Parallel := not UseSerial;
     Pipeline.MaxThreads := MaxThreads;
+    Pipeline.FirstBlockCacheThreshold := FbcThreshold;
+    Pipeline.Scheduler.Sampler := Sampler;
+    Pipeline.GuidanceScale := GuidanceScale;
+    if ApgSpec <> '' then
+      Pipeline.AdaptiveProjectedGuidance :=
+        TNNetAdaptiveProjectedGuidance.CreateFromSpec(ApgSpec);
+    Pipeline.ApgOnVelocity := ApgOnVelocity;
+    ApplyPerturbedGuidance();
+    if FbcThreshold > 0 then WriteLn('[', FbcThresholdText(FbcThreshold), ']');
     SetProfile(UseProfile);
     SetStats(UseStats);
     Pipeline.OnPhase := @Reporter.OnPhase;
@@ -1599,6 +3143,7 @@ begin
             OpenCLDevice, ']');
         Pipeline.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
           OpenCLDevices.Devices[OpenCLDevice], HasSharedKernel);
+        IsOpenCLSelected := true;
         ComputeText := 'OpenCL requested on ' +
           OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
           OpenCLDevices.DeviceNames[OpenCLDevice];
@@ -1623,17 +3168,48 @@ begin
     {$ENDIF}
     Width := TQwenImage21Pipeline.RoundDownImageSide(Width);
     Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
+    if OutpaintText <> '' then
+    begin
+      ArgProblem := SetOutpaint(OutpaintLeft, OutpaintTop, OutpaintRight,
+        OutpaintBottom, OutpaintOverlap);
+      if ArgProblem <> '' then
+        raise Exception.Create('--outpaint: ' + ArgProblem);
+      if InitImageFile = '' then
+        WriteLn('[--outpaint applies once /init-image sets an init image]');
+    end;
     if InitImageFile <> '' then
     begin
       ArgProblem := LoadInitImage(InitImageFile);
       if ArgProblem <> '' then
         raise Exception.Create('--init-image: ' + ArgProblem);
     end;
+    if MaskFile <> '' then
+    begin
+      ArgProblem := LoadMask(MaskFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--mask: ' + ArgProblem);
+      if InitImageFile = '' then
+        WriteLn('[--mask applies once /init-image sets an init image]');
+    end;
+    if ChangeMapFile <> '' then
+    begin
+      ArgProblem := LoadChangeMap(ChangeMapFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--change-map: ' + ArgProblem);
+      if InitImageFile = '' then
+        WriteLn('[--change-map applies once /init-image sets an init image]');
+    end;
     for ArgPos := 0 to ImageArgFiles.Count - 1 do
     begin
       ArgProblem := AddConditionImage(ImageArgFiles[ArgPos]);
       if ArgProblem <> '' then
         raise Exception.Create('--image: ' + ArgProblem);
+    end;
+    if UpscaleFile <> '' then
+    begin
+      ArgProblem := SetUpscaler(UpscaleFile);
+      if ArgProblem <> '' then
+        raise Exception.Create('--upscale: ' + ArgProblem);
     end;
     // Refuses a checkpoint that cannot edit before anything loads.
     if IsEditing() then Pipeline.CheckEditSupport();
@@ -1646,6 +3222,13 @@ begin
     end;
     WriteLn('Compute    : ', ComputeText);
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
+    if Assigned(Upscaler) then WriteLn('Upscale    : ', UpscalerText());
+    WriteLn('Guidance   : ', GuidanceText());
+    if PagScale <> 0 then
+      WriteLn('Perturbed  : ', PerturbedGuidanceText());
+    for LoRAPos := 0 to LoRAFiles.Count - 1 do
+      WriteLn('LoRA       : ', LoRAFiles[LoRAPos], ' x ',
+        FloatToStr(LoRAScales[LoRAPos], PointFormat()));
     if UseSerial then WriteLn('Threads    : serial (single-threaded)')
     else if MaxThreads > 0 then
       WriteLn('Threads    : parallel, at most ', MaxThreads, ' workers')
@@ -1656,7 +3239,7 @@ begin
     begin
       if TokenList <> '' then
       begin
-        TokenIds := ParseTokenIds(TokenList);
+        TokenIds := ParseIntegerList(TokenList);
         WriteLn('Prompt     : ', Length(TokenIds), ' token ids, drop ',
           DropCount);
       end
@@ -1675,15 +3258,27 @@ begin
   finally
     Reporter.EndStepLine();
     ClearConditionImages();
+    Upscaler.Free;
     ImageArgFiles.Free;
+    LoRAFiles.Free;
     ConditionFiles.Free;
     Pipeline.Free;
     {$IFDEF OpenCL}
     OpenCLDevices.Free;
     {$ENDIF}
+    OutpaintMask.Free;
+    OutpaintCanvas.Free;
+    ChangeLatents.Free;
+    ChangeMapImage.Free;
+    MaskLatents.Free;
+    InpaintCropMask.Free;
+    InpaintCropImage.Free;
+    InpaintFullMask.Free;
+    MaskImage.Free;
     ImageLatents.Free;
     InitImage.Free;
     Image.Free;
+    NegativeEmbeds.Free;
     PromptEmbeds.Free;
     Reporter.Free;
   end;

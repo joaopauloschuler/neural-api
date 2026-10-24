@@ -62,23 +62,13 @@ var
   TrainY, TestY: array of TNNetVolume;
   TrainLbl, TestLbl: array of integer;
 
-// Box-Muller standard normal.
-function Gauss(): TNeuralFloat;
-var
-  u1, u2: TNeuralFloat;
-begin
-  u1 := Random; if u1 < 1e-7 then u1 := 1e-7;
-  u2 := Random;
-  Gauss := Sqrt(-2 * Ln(u1)) * Cos(2 * Pi * u2);
-end;
-
 procedure BuildData();
 var
   c, i, s: integer;
 begin
   for c := 0 to NCLASSES - 1 do
     for i := 0 to NDIM - 1 do
-      Proto[c][i] := Gauss();
+      Proto[c][i] := RandomStdNormal();
 
   SetLength(TrainX, NTRAIN); SetLength(TrainY, NTRAIN); SetLength(TrainLbl, NTRAIN);
   SetLength(TestX, NTEST);   SetLength(TestY, NTEST);   SetLength(TestLbl, NTEST);
@@ -90,7 +80,7 @@ begin
     TrainX[s] := TNNetVolume.Create(NDIM, 1, 1);
     TrainY[s] := TNNetVolume.Create(NCLASSES, 1, 1);
     for i := 0 to NDIM - 1 do
-      TrainX[s].FData[i] := Proto[c][i] + NOISE * Gauss();
+      TrainX[s].FData[i] := Proto[c][i] + NOISE * RandomStdNormal();
     TrainY[s].SetClassForSoftMax(c);
   end;
   for s := 0 to NTEST - 1 do
@@ -100,7 +90,7 @@ begin
     TestX[s] := TNNetVolume.Create(NDIM, 1, 1);
     TestY[s] := TNNetVolume.Create(NCLASSES, 1, 1);
     for i := 0 to NDIM - 1 do
-      TestX[s].FData[i] := Proto[c][i] + NOISE * Gauss();
+      TestX[s].FData[i] := Proto[c][i] + NOISE * RandomStdNormal();
     TestY[s].SetClassForSoftMax(c);
   end;
 end;

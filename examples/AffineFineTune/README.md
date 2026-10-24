@@ -85,19 +85,19 @@ trunk + head, which stay frozen.
 ```
 Frozen base model accuracy:
   on BASE   test: 100.00 %
-  on TARGET test:  40.69 %   (distribution-shifted -> degraded)
+  on TARGET test:  36.75 %   (distribution-shifted -> degraded)
 
 Trainable-parameter comparison:
   full network        :    388 params
   affine-only fine-tune:     68 params  (17.53 % of full)
 
 Accuracy on TARGET test set:
-  frozen base          :  40.69 %
-  affine-only fine-tune:  99.56 %
+  frozen base          :  36.75 %
+  affine-only fine-tune:  99.81 %
 
 CHECK 1 PASS: affine path is a small fraction of trainable params (17.53 %).
-CHECK 2 PASS: affine fine-tune adapts (99.56 % > base 40.69 % + margin, and >  70 %).
-CHECK 3 PASS: frozen base weight unchanged (0.75188994).
+CHECK 2 PASS: affine fine-tune adapts (99.81 % > base 36.75 % + margin, and >  70 %).
+CHECK 3 PASS: frozen base weight unchanged (0.80794704).
 
 ALL CHECKS PASSED.
 ```

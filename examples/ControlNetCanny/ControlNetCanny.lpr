@@ -1,200 +1,558 @@
 program ControlNetCanny;
 (*
-ControlNetCanny: an OFFLINE, CPU smoke for END-TO-END base-UNet-plus-ControlNet
-single-step denoising -- the StableDiffusionControlNetPipeline inner loop wired
-over the repo's already-landed importers:
+ControlNetCanny: Stable Diffusion 1.x text-to-image guided by a ControlNet
+(diffusers StableDiffusionControlNetPipeline), through TStableDiffusionPipeline
+with a TStableDiffusionControlNet conditioner in neuralpretrained.pas.
 
-  noisy latent + text states + a (canny-edge-style) control image
-    -> ControlNet (BuildControlNetFromSafeTensors / ControlNetResiduals)
-       produces down_block_res_samples + mid_block_res_sample
-    -> base SD UNet built WITH control injection
-       (BuildSDUNet(..., pWithControl=true))
-    -> SDUNetDenoiseWithControl ADDS those residuals into the decoder skip
-       connections, exactly as diffusers does:
-         down_block_res_samples = [d + c for d,c in zip(down, controlnet_down)]
-         mid_block_res_sample  += controlnet_mid
-    -> predicted noise (the eps a sampler would step on).
+  * no --model / --controlnet: the committed random pico fixtures
+    tests/fixtures/tiny_sd15 + tests/fixtures/tiny_sd15_controlnet (16x16,
+    random weights): this checks wiring and I/O only.
+  * --model DIR: a diffusers Stable Diffusion 1.x folder, e.g.
+    runwayml/stable-diffusion-v1-5; --controlnet DIR: a diffusers
+    ControlNetModel folder, e.g. lllyasviel/sd-controlnet-canny.
 
-Nothing here is a new leaf layer: it is pure plumbing over landed pieces (the
-ControlNet importer + ControlNetResiduals, the SD UNet importer + the new
-SDUNetDenoiseWithControl driver). It is a WIRING / THROUGHPUT smoke: it proves
-the base UNet + ControlNet chain runs offline and produces a FINITE noise
-prediction, NOT photorealism (the pico fixtures carry random weights).
+--control FILE is the control image (for the canny ControlNet: white edges on
+black, e.g. the output of cv2.Canny); it is resized to the image size. --photo
+FILE instead resizes a photo to the image size and extracts its edges with
+CannyEdges (a cv2.Canny port in neuralimageresize.pas). --pose-photo FILE
+--yolo FILE --vitpose FILE resizes a photo the same way, finds every person
+(EstimateMultiPersonPose) and draws the OpenPose control image of an openpose
+ControlNet at DWpose's detect resolution (DrawOpenPoseBodiesAtDetectResolution).
+Without any of them the example draws a circle and a square outline.
 
-The committed pico fixtures are config-compatible (both share block_out_channels
-[16,32], latent grid 8, text seq 5, cross dim 12), so the ControlNet residuals
-flow straight into the base UNet skips with no reshaping. The combined forward is
-parity-checked < 1e-4 in TestControlNetCombinedParity
-(tools/controlnet_combined_fixture.py).
+--control-start / --control-end limit the ControlNet to that fraction of the
+steps and --guess-mode runs it in the prompt pass only (diffusers
+control_guidance_start / _end and guess_mode). --ip-adapter FILE --ip-image PNG
+[--ip-scale S] adds an h94/IP-Adapter image prompt on top of the ControlNet
+(TStableDiffusionMultiConditioner).
 
-SHAPES (pico fixtures, the default run):
-  latent          (8, 8, in_channels=4)
-  text states     (text_seq=5, 1, cross_dim=12)
-  control image   (16, 16, cond_channels=3)
-    -> 4 down residuals + 1 mid residual
-    -> predicted noise (8, 8, out_channels=4)
+A second --controlnet DIR adds another ControlNet (diffusers MultiControlNet);
+--control, --photo, --edges-out, --pose-photo, --pose-out, --scale,
+--control-start and --control-end apply to the latest --controlnet (to the
+first one before any).
 
-USAGE:
-  ./ControlNetCanny                              use the committed pico fixtures
-  ./ControlNetCanny <unet.st> <unet.cfg> <controlnet.st> <controlnet.cfg>
-                                                 real diffusers checkpoints
-                                                 (config-compatible base UNet +
-                                                 ControlNet)
+Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
-NO NETWORK ACCESS / SELF-CONTAINED: falls back to the committed pico SD UNet
-(tests/fixtures/tiny_sd_unet.* files) and the matched pico ControlNet
-(tests/fixtures/tiny_controlnet.* files).
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+any later version.
+
+Coded by Claude (AI).
 *)
 {$mode objfpc}{$H+}
 
-uses
-  SysUtils, Math,
-  neuralvolume, neuralnetwork, neuralpretrained;
+uses {$IFDEF UNIX} cthreads, {$ENDIF}
+  Classes, SysUtils, Math,
+  neuralnetwork, neuralvolume, neuraldatasets, neuralpretrained,
+  neuralimageresize;
 
 const
-  cUNetST   = '../../tests/fixtures/tiny_sd_unet.safetensors';
-  cUNetCfg  = '../../tests/fixtures/tiny_sd_unet_config.json';
-  cCtrlST   = '../../tests/fixtures/tiny_controlnet.safetensors';
-  cCtrlCfg  = '../../tests/fixtures/tiny_controlnet_config.json';
+  PicoModelFolder = '../../tests/fixtures/tiny_sd15';
+  PicoControlNetFolder = '../../tests/fixtures/tiny_sd15_controlnet';
 
-// Deterministic, finite synthetic input fillers (no RNG -> reproducible smoke).
-procedure FillLatent(V: TNNetVolume; Grid, Ch: integer);
-var c, y, x: integer;
+type
+  // One --controlnet and the per-ControlNet options that follow it.
+  TControlNetEntry = record
+    Folder, ControlFile, PhotoFile, EdgesFile: string;
+    // --pose-photo and --pose-out; '' for none.
+    PosePhotoFile, PoseFile: string;
+    ConditioningScale, ControlStart, ControlEnd: double;
+  end;
+
+  TControlNetCannyOptions = record
+    ModelFolder, Prompt, NegativePrompt, OutputFile: string;
+    ControlNets: array of TControlNetEntry;
+    // A side < 1: the checkpoint default (512 for SD 1.5).
+    Steps, ImageWidth, ImageHeight: integer;
+    GuidanceScale: double;
+    GuessMode: boolean;
+    // --ip-adapter weights file and --ip-image; '' for none.
+    IPAdapterFile, IPImageFile: string;
+    IPScale: double;
+    // cv2.Canny thresholds and the optional GaussianBlurImage radius before it.
+    CannyLow, CannyHigh, CannyBlur: double;
+    // YOLOv8 and ViTPose safetensors of --pose-photo (configs beside them).
+    YoloFile, ViTPoseFile: string;
+    // Their config.json files; '' = beside the safetensors.
+    YoloConfigFile, ViTPoseConfigFile: string;
+    Seed: cardinal;
+    UseOpenCL, UseInt8: boolean;
+    OpenCLPlatform, OpenCLDevice: integer;
+  end;
+
+  // Prints the pipeline's stages and steps as they run.
+  TControlNetReporter = class(TObject)
+  public
+    procedure OnPhase(Phase: TStableDiffusionPipelinePhase);
+    procedure OnStep(StepIndex, StepCount: integer; Timestep: double;
+      Latents: TNNetVolume);
+  end;
+
+procedure TControlNetReporter.OnPhase(Phase: TStableDiffusionPipelinePhase);
+const
+  PhaseNames: array[TStableDiffusionPipelinePhase] of string = (
+    'loading the text encoder', 'encoding the prompt',
+    'loading the UNet and the ControlNet', 'denoising',
+    'loading the VAE decoder', 'decoding', 'done');
 begin
-  V.ReSize(Grid, Grid, Ch);
-  for c := 0 to Ch - 1 do
-    for y := 0 to Grid - 1 do
-      for x := 0 to Grid - 1 do
-        V.FData[(y * Grid + x) * Ch + c] :=
-          (((c * 64 + y * Grid + x) * 7) mod 13 - 6) / 8.0;
+  WriteLn('  ', PhaseNames[Phase]);
 end;
 
-procedure FillText(V: TNNetVolume; SeqLen, Dim: integer);
-var s, d: integer;
+procedure TControlNetReporter.OnStep(StepIndex, StepCount: integer;
+  Timestep: double; Latents: TNNetVolume);
 begin
-  V.ReSize(SeqLen, 1, Dim);
-  for s := 0 to SeqLen - 1 do
-    for d := 0 to Dim - 1 do
-      V.FData[s * Dim + d] := (((s * 16 + d) * 5) mod 11 - 5) / 8.0;
+  WriteLn(Format('    step %d/%d  t=%.0f', [StepIndex + 1, StepCount, Timestep]));
 end;
 
-// A toy "canny edge" control image: a bright grid lattice (edges every 4 px) on
-// a dark field, replicated across the RGB channels. Just a viewable, finite map.
-procedure FillCanny(V: TNNetVolume; Grid, Ch: integer);
-var c, y, x: integer; edge: TNeuralFloat;
+procedure PrintUsage();
 begin
-  V.ReSize(Grid, Grid, Ch);
-  for y := 0 to Grid - 1 do
-    for x := 0 to Grid - 1 do
+  WriteLn('Usage: ControlNetCanny [--model DIR] [--controlnet DIR] [options]');
+  WriteLn('  --model DIR       diffusers Stable Diffusion 1.x folder ',
+    '(default: the pico fixture)');
+  WriteLn('  --controlnet DIR  diffusers ControlNetModel folder ',
+    '(default: the pico fixture); repeat for several');
+  WriteLn('  --control FILE    control image, e.g. a canny edge map ',
+    '(default: drawn outlines)');
+  WriteLn('  --photo FILE      photo to extract canny edges from instead ',
+    'of --control');
+  WriteLn('  --canny-low T     canny low threshold (default 100)');
+  WriteLn('  --canny-high T    canny high threshold (default 200)');
+  WriteLn('  --canny-blur R    Gaussian blur radius before canny ',
+    '(default 0: none, as cv2.Canny)');
+  WriteLn('  --edges-out PNG   also save the extracted edge map');
+  WriteLn('  --pose-photo FILE photo to draw the OpenPose image of (every ',
+    'person); needs --yolo and --vitpose');
+  WriteLn('  --yolo FILE       YOLOv8 safetensors (config.json beside it) ',
+    'finding the person boxes');
+  WriteLn('  --vitpose FILE    ViTPose safetensors (config.json beside it), ',
+    'e.g. usyd-community/vitpose-base-simple');
+  WriteLn('  --yolo-config F   YOLOv8 config.json (default: beside --yolo)');
+  WriteLn('  --vitpose-config F ViTPose config.json (default: beside --vitpose)');
+  WriteLn('  --pose-out PNG    also save the OpenPose image');
+  WriteLn('                    (--control, --photo, --edges-out, --pose-photo, ',
+    '--pose-out, --scale,');
+  WriteLn('                    --control-start, --control-end: of the latest ',
+    '--controlnet)');
+  WriteLn('  --prompt TEXT     prompt (default "a futuristic city, ',
+    'detailed, sharp focus")');
+  WriteLn('  --negative TEXT   negative prompt (default empty)');
+  WriteLn('  --steps N         denoising steps (default 25)');
+  WriteLn('  --guidance G      classifier-free guidance scale (default 7.5)');
+  WriteLn('  --scale S         controlnet_conditioning_scale (default 1.0)');
+  WriteLn('  --control-start F fraction of the steps before the ControlNet ',
+    'joins (default 0)');
+  WriteLn('  --control-end F   fraction of the steps after which it stops ',
+    '(default 1)');
+  WriteLn('  --guess-mode      ControlNet in the prompt pass only, as ',
+    'diffusers guess_mode');
+  WriteLn('  --ip-adapter FILE IP-Adapter ip-adapter_sd15 (.safetensors/.bin) ',
+    'with image_encoder/ beside it; needs --ip-image');
+  WriteLn('  --ip-image PNG    the image prompt of --ip-adapter');
+  WriteLn('  --ip-scale S      IP-Adapter scale (default 1.0)');
+  WriteLn('  --width N         image width (default: the checkpoint''s, ',
+    '512 for SD 1.5)');
+  WriteLn('  --height N        image height (default: the checkpoint''s)');
+  WriteLn('  --size N          sets both --width and --height');
+  WriteLn('  --seed N          noise seed (default 0)');
+  WriteLn('  --out PNG         output file (default controlnet_canny.png)');
+  WriteLn('  --int8            UNet, ControlNet and text encoder weights in ',
+    'int8');
+  WriteLn('  --gpu             run the nets on OpenCL (needs a build with ',
+    '-dOpenCL)');
+  WriteLn('  --gpu-platform N  OpenCL platform index (default 0)');
+  WriteLn('  --gpu-device N    OpenCL device index (default 0)');
+end;
+
+function DefaultControlNetEntry(const Folder: string): TControlNetEntry;
+begin
+  Result.Folder := Folder;
+  Result.ControlFile := '';
+  Result.PhotoFile := '';
+  Result.EdgesFile := '';
+  Result.PosePhotoFile := '';
+  Result.PoseFile := '';
+  Result.ConditioningScale := 1.0;
+  Result.ControlStart := 0;
+  Result.ControlEnd := 1;
+end;
+
+function ParseOptions(out Opt: TControlNetCannyOptions): boolean;
+var
+  ArgPos, EntryPos, MaxEntryPos: integer;
+  Arg: string;
+  ControlNetFolderGiven: boolean;
+
+  function NextArg(): string;
+  begin
+    Inc(ArgPos);
+    if ArgPos > ParamCount then
+      raise Exception.Create(Arg + ' needs a value');
+    Result := ParamStr(ArgPos);
+  end;
+
+begin
+  Opt.ModelFolder := PicoModelFolder;
+  SetLength(Opt.ControlNets, 1);
+  Opt.ControlNets[0] := DefaultControlNetEntry(PicoControlNetFolder);
+  ControlNetFolderGiven := false;
+  Opt.CannyLow := 100;
+  Opt.CannyHigh := 200;
+  Opt.CannyBlur := 0;
+  Opt.YoloFile := '';
+  Opt.ViTPoseFile := '';
+  Opt.YoloConfigFile := '';
+  Opt.ViTPoseConfigFile := '';
+  Opt.Prompt := 'a futuristic city, detailed, sharp focus';
+  Opt.NegativePrompt := '';
+  Opt.OutputFile := 'controlnet_canny.png';
+  Opt.Steps := 25;
+  Opt.ImageWidth := 0;
+  Opt.ImageHeight := 0;
+  Opt.GuidanceScale := 7.5;
+  Opt.GuessMode := false;
+  Opt.IPAdapterFile := '';
+  Opt.IPImageFile := '';
+  Opt.IPScale := 1.0;
+  Opt.Seed := 0;
+  Opt.UseOpenCL := false;
+  Opt.UseInt8 := false;
+  Opt.OpenCLPlatform := 0;
+  Opt.OpenCLDevice := 0;
+  Result := true;
+  ArgPos := 1;
+  while ArgPos <= ParamCount do
+  begin
+    Arg := ParamStr(ArgPos);
+    EntryPos := High(Opt.ControlNets);
+    if Arg = '--model' then Opt.ModelFolder := NextArg()
+    else if Arg = '--controlnet' then
     begin
-      if ((x mod 4) = 0) or ((y mod 4) = 0) then edge := 1.0 else edge := -1.0;
-      for c := 0 to Ch - 1 do
-        V.FData[(y * Grid + x) * Ch + c] := edge;
+      if ControlNetFolderGiven then
+      begin
+        SetLength(Opt.ControlNets, Length(Opt.ControlNets) + 1);
+        Opt.ControlNets[EntryPos + 1] := DefaultControlNetEntry(NextArg());
+      end
+      else Opt.ControlNets[0].Folder := NextArg();
+      ControlNetFolderGiven := true;
+    end
+    else if Arg = '--control' then
+      Opt.ControlNets[EntryPos].ControlFile := NextArg()
+    else if Arg = '--photo' then Opt.ControlNets[EntryPos].PhotoFile := NextArg()
+    else if Arg = '--edges-out' then
+      Opt.ControlNets[EntryPos].EdgesFile := NextArg()
+    else if Arg = '--pose-photo' then
+      Opt.ControlNets[EntryPos].PosePhotoFile := NextArg()
+    else if Arg = '--pose-out' then
+      Opt.ControlNets[EntryPos].PoseFile := NextArg()
+    else if Arg = '--yolo' then Opt.YoloFile := NextArg()
+    else if Arg = '--vitpose' then Opt.ViTPoseFile := NextArg()
+    else if Arg = '--yolo-config' then Opt.YoloConfigFile := NextArg()
+    else if Arg = '--vitpose-config' then Opt.ViTPoseConfigFile := NextArg()
+    else if Arg = '--canny-low' then
+      Opt.CannyLow := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--canny-high' then
+      Opt.CannyHigh := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--canny-blur' then
+      Opt.CannyBlur := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--prompt' then Opt.Prompt := NextArg()
+    else if Arg = '--negative' then Opt.NegativePrompt := NextArg()
+    else if Arg = '--out' then Opt.OutputFile := NextArg()
+    else if Arg = '--steps' then Opt.Steps := StrToInt(NextArg())
+    else if Arg = '--width' then Opt.ImageWidth := StrToInt(NextArg())
+    else if Arg = '--height' then Opt.ImageHeight := StrToInt(NextArg())
+    else if Arg = '--size' then
+    begin
+      Opt.ImageWidth := StrToInt(NextArg());
+      Opt.ImageHeight := Opt.ImageWidth;
+    end
+    else if Arg = '--guidance' then
+      Opt.GuidanceScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--scale' then
+      Opt.ControlNets[EntryPos].ConditioningScale :=
+        StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--control-start' then
+      Opt.ControlNets[EntryPos].ControlStart :=
+        StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--control-end' then
+      Opt.ControlNets[EntryPos].ControlEnd :=
+        StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--guess-mode' then Opt.GuessMode := true
+    else if Arg = '--ip-adapter' then Opt.IPAdapterFile := NextArg()
+    else if Arg = '--ip-image' then Opt.IPImageFile := NextArg()
+    else if Arg = '--ip-scale' then
+      Opt.IPScale := StrToFloat(NextArg(), DefaultFormatSettings)
+    else if Arg = '--seed' then Opt.Seed := StrToInt64(NextArg())
+    else if Arg = '--int8' then Opt.UseInt8 := true
+    else if Arg = '--gpu' then Opt.UseOpenCL := true
+    else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
+    else if Arg = '--gpu-device' then Opt.OpenCLDevice := StrToInt(NextArg())
+    else if (Arg = '--help') or (Arg = '-h') then
+    begin
+      PrintUsage();
+      Result := false;
+      exit;
+    end
+    else
+      raise Exception.Create('unknown argument: ' + Arg);
+    Inc(ArgPos);
+  end;
+  if Opt.Steps < 1 then raise Exception.Create('--steps must be >= 1');
+  MaxEntryPos := High(Opt.ControlNets);
+  for EntryPos := 0 to MaxEntryPos do
+  begin
+    if Ord(Opt.ControlNets[EntryPos].ControlFile <> '') +
+      Ord(Opt.ControlNets[EntryPos].PhotoFile <> '') +
+      Ord(Opt.ControlNets[EntryPos].PosePhotoFile <> '') > 1 then
+      raise Exception.Create('pass one of --control, --photo, --pose-photo ' +
+        'for ' + Opt.ControlNets[EntryPos].Folder);
+    if (Opt.ControlNets[EntryPos].PosePhotoFile <> '') and
+      ((Opt.YoloFile = '') or (Opt.ViTPoseFile = '')) then
+      raise Exception.Create('--pose-photo needs --yolo and --vitpose');
+  end;
+  if (Opt.IPAdapterFile = '') <> (Opt.IPImageFile = '') then
+    raise Exception.Create('--ip-adapter and --ip-image go together');
+end;
+
+// A (Width, Height, 3) edge map in 0..255: one-pixel white outlines of a
+// centered circle and square (sized by the shorter side) on black.
+procedure DrawEdgeMap(Image: TNNetVolume; Width, Height: integer);
+var
+  X, Y, MaxX, MaxY, CenterX, CenterY, Radius, HalfSquare: integer;
+  IsEdge: boolean;
+begin
+  Image.ReSize(Width, Height, 3);
+  Image.Fill(0);
+  MaxX := Width - 1;
+  MaxY := Height - 1;
+  CenterX := Width div 2;
+  CenterY := Height div 2;
+  Radius := Min(Width, Height) * 3 div 8;
+  HalfSquare := Min(Width, Height) div 4;
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
+    begin
+      IsEdge := Abs(Round(Sqrt(Sqr(X - CenterX) + Sqr(Y - CenterY))) -
+        Radius) = 0;
+      IsEdge := IsEdge or ((Abs(X - CenterX) = HalfSquare) and
+        (Abs(Y - CenterY) <= HalfSquare)) or
+        ((Abs(Y - CenterY) = HalfSquare) and (Abs(X - CenterX) <= HalfSquare));
+      if IsEdge then
+      begin
+        Image[X, Y, 0] := 255;
+        Image[X, Y, 1] := 255;
+        Image[X, Y, 2] := 255;
+      end;
     end;
 end;
 
-procedure VolumeStats(V: TNNetVolume; out MinV, MaxV, MeanV: TNeuralFloat;
-  out Finite: boolean);
-var i: integer; s, val: TNeuralFloat;
+// Control := the OpenPose image of every person in Photo (already at the image
+// size), drawn at DWpose's detect resolution, then Lanczos-resized (diffusers).
+procedure DrawPoseControlImage(const Opt: TControlNetCannyOptions;
+  Photo, Control: TNNetVolume);
+var
+  YoloNN, PoseNN: TNNet;
+  YoloConfig: TYoloConfig;
+  PoseConfig: TViTPoseConfig;
+  Poses: TPoseKeypointsArray;
 begin
-  MinV := 1e30; MaxV := -1e30; s := 0; Finite := true;
-  for i := 0 to V.Size - 1 do
-  begin
-    val := V.FData[i];
-    if IsNan(val) or IsInfinite(val) then Finite := false;
-    if val < MinV then MinV := val;
-    if val > MaxV then MaxV := val;
-    s := s + val;
+  PoseNN := nil;
+  YoloNN := BuildYoloFromSafeTensors(Opt.YoloFile, YoloConfig,
+    {pTrainable=}false, Opt.YoloConfigFile);
+  try
+    PoseNN := BuildViTPoseFromSafeTensors(Opt.ViTPoseFile, PoseConfig,
+      {pTrainable=}false, Opt.ViTPoseConfigFile);
+    Poses := EstimateMultiPersonPose(YoloNN, YoloConfig, PoseNN, PoseConfig,
+      Photo);
+  finally
+    PoseNN.Free;
+    YoloNN.Free;
   end;
-  if V.Size > 0 then MeanV := s / V.Size else MeanV := 0;
+  WriteLn(Format('Pose:       %d person(s) found', [Length(Poses)]));
+  DrawOpenPoseBodiesAtDetectResolution(Control, Photo.SizeX, Photo.SizeY, Poses);
+  ResizeImagePIL(Control, Control, Photo.SizeX, Photo.SizeY, irfLanczos, true);
+end;
+
+// Control := the entry's control image: its --control file, the canny edges
+// of its --photo or the OpenPose image of its --pose-photo at the image size,
+// or the drawn outlines.
+procedure LoadControlImage(const Entry: TControlNetEntry; const Opt:
+  TControlNetCannyOptions; ImageWidth, ImageHeight: integer;
+  Control, Photo: TNNetVolume);
+begin
+  if Entry.ControlFile <> '' then
+  begin
+    if not LoadImageFromFileIntoVolume(Entry.ControlFile, Control) then
+      raise Exception.Create('could not read ' + Entry.ControlFile);
+  end
+  else if Entry.PhotoFile <> '' then
+  begin
+    if not LoadImageFromFileIntoVolume(Entry.PhotoFile, Photo) then
+      raise Exception.Create('could not read ' + Entry.PhotoFile);
+    ResizeImagePIL(Photo, Photo, ImageWidth, ImageHeight, irfLanczos, true);
+    GaussianBlurImage(Photo, Photo, Opt.CannyBlur);
+    CannyEdges(Photo, Control, Opt.CannyLow, Opt.CannyHigh, false, 3);
+    if (Entry.EdgesFile <> '') and
+      not SaveImageFromVolumeIntoFile(Control, Entry.EdgesFile) then
+      raise Exception.Create('could not save ' + Entry.EdgesFile);
+  end
+  else if Entry.PosePhotoFile <> '' then
+  begin
+    if not LoadImageFromFileIntoVolume(Entry.PosePhotoFile, Photo) then
+      raise Exception.Create('could not read ' + Entry.PosePhotoFile);
+    ResizeImagePIL(Photo, Photo, ImageWidth, ImageHeight, irfLanczos, true);
+    DrawPoseControlImage(Opt, Photo, Control);
+    if (Entry.PoseFile <> '') and
+      not SaveImageFromVolumeIntoFile(Control, Entry.PoseFile) then
+      raise Exception.Create('could not save ' + Entry.PoseFile);
+  end
+  else DrawEdgeMap(Control, ImageWidth, ImageHeight);
+end;
+
+procedure Run(const Opt: TControlNetCannyOptions);
+var
+  Pipeline: TStableDiffusionPipeline;
+  ControlNets: array of TStableDiffusionControlNet;
+  IPAdapter: TStableDiffusionIPAdapter;
+  Multi: TStableDiffusionMultiConditioner;
+  Reporter: TControlNetReporter;
+  Control, Image: TNNetVolume;
+  ComputeText: string;
+  Entry: TControlNetEntry;
+  ImageWidth, ImageHeight, EntryPos, MaxEntryPos: integer;
+  StartTime: TDateTime;
+  {$IFDEF OpenCL}
+  OpenCLText: string;
+  {$ENDIF}
+begin
+  MaxEntryPos := High(Opt.ControlNets);
+  Pipeline := TStableDiffusionPipeline.Create(Opt.ModelFolder);
+  SetLength(ControlNets, Length(Opt.ControlNets));
+  for EntryPos := 0 to MaxEntryPos do ControlNets[EntryPos] := nil;
+  IPAdapter := nil;
+  Multi := nil;
+  Reporter := TControlNetReporter.Create;
+  Control := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    ComputeText := 'CPU';
+    if Opt.UseOpenCL then
+    begin
+      {$IFDEF OpenCL}
+      if Pipeline.EnableOpenCLDevice(Opt.OpenCLPlatform, Opt.OpenCLDevice,
+        OpenCLText) then ComputeText := 'OpenCL on ' + OpenCLText
+      else ComputeText := 'CPU (' + OpenCLText + ')';
+      {$ELSE}
+      ComputeText := 'CPU (built without -dOpenCL)';
+      {$ENDIF}
+    end;
+    ImageWidth := Opt.ImageWidth;
+    if ImageWidth < 1 then ImageWidth := Pipeline.DefaultImageSize;
+    ImageHeight := Opt.ImageHeight;
+    if ImageHeight < 1 then ImageHeight := Pipeline.DefaultImageSize;
+    for EntryPos := 0 to MaxEntryPos do
+    begin
+      ControlNets[EntryPos] := TStableDiffusionControlNet.Create(
+        Opt.ControlNets[EntryPos].Folder);
+      LoadControlImage(Opt.ControlNets[EntryPos], Opt, ImageWidth, ImageHeight,
+        Control, Image);
+      ControlNets[EntryPos].SetControlImage(Control);
+      ControlNets[EntryPos].ConditioningScale :=
+        Opt.ControlNets[EntryPos].ConditioningScale;
+      ControlNets[EntryPos].GuidanceStart := Opt.ControlNets[EntryPos].ControlStart;
+      ControlNets[EntryPos].GuidanceEnd := Opt.ControlNets[EntryPos].ControlEnd;
+      ControlNets[EntryPos].GuessMode := Opt.GuessMode;
+    end;
+    if Opt.IPAdapterFile <> '' then
+    begin
+      IPAdapter := TStableDiffusionIPAdapter.Create(Opt.IPAdapterFile);
+      if not LoadImageFromFileIntoVolume(Opt.IPImageFile, Image) then
+        raise Exception.Create('could not read ' + Opt.IPImageFile);
+      IPAdapter.SetImage(Image);
+      IPAdapter.Scale := Opt.IPScale;
+    end;
+    if (MaxEntryPos = 0) and (IPAdapter = nil) then
+      Pipeline.Conditioner := ControlNets[0]
+    else
+    begin
+      Multi := TStableDiffusionMultiConditioner.Create();
+      for EntryPos := 0 to MaxEntryPos do Multi.Add(ControlNets[EntryPos]);
+      if Assigned(IPAdapter) then Multi.Add(IPAdapter);
+      Pipeline.Conditioner := Multi;
+    end;
+    Pipeline.GuidanceScale := Opt.GuidanceScale;
+    Pipeline.NegativePrompt := Opt.NegativePrompt;
+    Pipeline.UNetInt8 := Opt.UseInt8;
+    Pipeline.TextEncoderInt8 := Opt.UseInt8;
+    Pipeline.OnPhase := @Reporter.OnPhase;
+    Pipeline.OnStep := @Reporter.OnStep;
+    WriteLn('Model:      ', Opt.ModelFolder);
+    for EntryPos := 0 to MaxEntryPos do
+    begin
+      Entry := Opt.ControlNets[EntryPos];
+      WriteLn(Format('ControlNet: %s, scale %.2f', [Entry.Folder,
+        Entry.ConditioningScale]));
+      if ControlNets[EntryPos].Config.GlobalPoolConditions then
+        WriteLn('            global_pool_conditions: pooled residuals');
+      if Entry.ControlFile <> '' then WriteLn('Control:    ', Entry.ControlFile)
+      else if Entry.PhotoFile <> '' then
+        WriteLn(Format('Control:    canny edges of %s (low %.0f, high %.0f, ' +
+          'blur %.2f)', [Entry.PhotoFile, Opt.CannyLow, Opt.CannyHigh,
+          Opt.CannyBlur]))
+      else if Entry.PosePhotoFile <> '' then
+        WriteLn('Control:    OpenPose image of ', Entry.PosePhotoFile)
+      else WriteLn('Control:    drawn circle and square outlines');
+      if (Entry.ControlStart > 0) or (Entry.ControlEnd < 1) then
+        WriteLn(Format('Window:     steps %.2f..%.2f of the run',
+          [Entry.ControlStart, Entry.ControlEnd]));
+    end;
+    if Opt.GuessMode or ControlNets[0].Config.GlobalPoolConditions then
+      WriteLn('Guess mode: on');
+    if Assigned(IPAdapter) then
+      WriteLn(Format('IP-Adapter: %s, image %s (%dx%d), scale %.2f',
+        [Opt.IPAdapterFile, Opt.IPImageFile, Image.SizeX, Image.SizeY,
+         Opt.IPScale]));
+    WriteLn('Prompt:     "', Opt.Prompt, '"');
+    WriteLn(Format('Image:      %dx%d, %d steps, guidance %.2f, seed %d, %s',
+      [ImageWidth, ImageHeight, Opt.Steps, Opt.GuidanceScale, Opt.Seed,
+      ComputeText]));
+    if Pipeline.SamplerNotice <> '' then
+      WriteLn('Notice:     ', Pipeline.SamplerNotice);
+    // Euler a draws its per-step noise from the global RNG.
+    RandSeed := Opt.Seed xor $9E3779B9;
+    StartTime := Now();
+    Pipeline.Generate(Opt.Prompt, ImageWidth, ImageHeight, Opt.Steps,
+      Opt.Seed, Image);
+    Image.Mul(255.0);
+    if not SaveImageFromVolumeIntoFile(Image, Opt.OutputFile) then
+      raise Exception.Create('could not save ' + Opt.OutputFile);
+    WriteLn(Format('Total:      %.1f s', [(Now() - StartTime) * 86400.0]));
+    WriteLn('Wrote ', Opt.OutputFile);
+  finally
+    Image.Free;
+    Control.Free;
+    Reporter.Free;
+    Pipeline.Free;
+    Multi.Free;
+    IPAdapter.Free;
+    for EntryPos := 0 to MaxEntryPos do ControlNets[EntryPos].Free;
+  end;
 end;
 
 var
-  UNet, CNet: TNNet;
-  UCfg: TSDUNetConfig;
-  CCfg: TControlNetConfig;
-  UNetST, UNetCfg, CtrlST, CtrlCfg: string;
-  Latent, Text, Cond, MidRes, Noise: TNNetVolume;
-  DownRes: array of TNNetVolume;
-  DownCnt, i: integer;
-  t, MinV, MaxV, MeanV: TNeuralFloat;
-  Finite: boolean;
+  Options: TControlNetCannyOptions;
 begin
-  WriteLn('=== ControlNetCanny: base-UNet + ControlNet single-step smoke ===');
-
-  if ParamCount >= 4 then
-  begin
-    UNetST := ParamStr(1); UNetCfg := ParamStr(2);
-    CtrlST := ParamStr(3); CtrlCfg := ParamStr(4);
-    WriteLn('Using user checkpoints:');
-    WriteLn('  base UNet : ', UNetST);
-    WriteLn('  controlnet: ', CtrlST);
-  end
-  else
-  begin
-    UNetST := cUNetST; UNetCfg := cUNetCfg;
-    CtrlST := cCtrlST; CtrlCfg := cCtrlCfg;
-    WriteLn('No checkpoints passed; using the committed pico fixtures.');
-  end;
-
-  // Base UNet built WITH control injection (extra zero-default skip inputs).
-  UCfg := ReadSDUNetConfigFromJSONFile(UNetCfg);
-  UNet := BuildSDUNetFromSafeTensorsEx(UNetST, UCfg,
-    {pTrainable=}false, {pWithControl=}true);
-  CNet := BuildControlNetFromSafeTensors(CtrlST, CCfg,
-    {pTrainable=}false, CtrlCfg);
-  WriteLn('Base UNet : ', SDUNetConfigToString(UCfg));
-  WriteLn('ControlNet: ', ControlNetConfigToString(CCfg));
-
-  DownCnt := CCfg.NumDownResiduals;
-  if SDUNetControlDownCount(UCfg) <> DownCnt then
-  begin
-    WriteLn('FATAL: base UNet skip count (', SDUNetControlDownCount(UCfg),
-      ') <> controlnet down residual count (', DownCnt,
-      ') -- fixtures are not config-compatible.');
-    Halt(1);
-  end;
-
-  Latent := TNNetVolume.Create;
-  Text := TNNetVolume.Create;
-  Cond := TNNetVolume.Create;
-  MidRes := TNNetVolume.Create;
-  Noise := TNNetVolume.Create;
-  SetLength(DownRes, DownCnt);
-  for i := 0 to DownCnt - 1 do DownRes[i] := TNNetVolume.Create;
   try
-    FillLatent(Latent, UCfg.LatentGrid, UCfg.InChannels);
-    FillText(Text, UCfg.TextSeqLen, UCfg.CrossAttentionDim);
-    FillCanny(Cond, CCfg.CondGrid, CCfg.CondChannels);
-    t := 23.0;
-
-    // 1) ControlNet -> residuals.
-    ControlNetResiduals(CNet, CCfg, Latent, Text, Cond, t, DownRes, MidRes);
-    WriteLn('ControlNet produced ', DownCnt,
-      ' down residuals + 1 mid residual:');
-    for i := 0 to DownCnt - 1 do
-      WriteLn(Format('  down[%d]: (%d,%d,%d)', [i, DownRes[i].Depth,
-        DownRes[i].SizeY, DownRes[i].SizeX]));
-    WriteLn(Format('  mid    : (%d,%d,%d)',
-      [MidRes.Depth, MidRes.SizeY, MidRes.SizeX]));
-
-    // 2) base UNet denoise WITH the residuals injected into the decoder skips.
-    SDUNetDenoiseWithControl(UNet, UCfg, Latent, Text, t,
-      DownRes, MidRes, Noise);
-
-    VolumeStats(Noise, MinV, MaxV, MeanV, Finite);
-    WriteLn(Format('Predicted noise (%d,%d,%d): min %.4f max %.4f mean %.4f',
-      [Noise.Depth, Noise.SizeY, Noise.SizeX, MinV, MaxV, MeanV]));
-    if Finite then
-      WriteLn('OK: finite noise prediction (base UNet + ControlNet wired).')
-    else
+    if not ParseOptions(Options) then exit;
+    if (Options.ModelFolder = PicoModelFolder) or
+      (Options.ControlNets[0].Folder = PicoControlNetFolder) then
+      WriteLn('Pico fixture in use: random weights (wiring check only).');
+    Run(Options);
+  except
+    on E: Exception do
     begin
-      WriteLn('FAIL: noise prediction contains NaN/Inf.');
-      Halt(2);
+      WriteLn('Error: ', E.Message);
+      ExitCode := 1;
     end;
-  finally
-    for i := 0 to DownCnt - 1 do DownRes[i].Free;
-    Noise.Free; MidRes.Free; Cond.Free; Text.Free; Latent.Free;
-    CNet.Free; UNet.Free;
   end;
 end.

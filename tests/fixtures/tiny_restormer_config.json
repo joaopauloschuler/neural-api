@@ -1,0 +1,25 @@
+{
+ "inp_channels": 3,
+ "out_channels": 3,
+ "dim": 4,
+ "num_blocks": [
+  1,
+  1,
+  1,
+  1
+ ],
+ "num_refinement_blocks": 1,
+ "heads": [
+  1,
+  2,
+  2,
+  4
+ ],
+ "ffn_expansion_factor": 2.66,
+ "bias": false,
+ "LayerNorm_type": "WithBias",
+ "dual_pixel_task": false,
+ "model_type": "restormer",
+ "input_width": 24,
+ "input_height": 16
+}

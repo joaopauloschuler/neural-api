@@ -154,7 +154,6 @@ type
     procedure LSTMProjectionJob(Index, ThreadNum: integer);
     procedure LSTMRecurrenceJob(Index, ThreadNum: integer);
     procedure RunLSTMDirection(Direction: integer);
-    class procedure GrowScratch(V: TNNetVolume; FloatCount: integer);
     class procedure CheckSequence(V: TNNetVolume; Channels: integer;
       const OpName: string);
   public
@@ -162,6 +161,8 @@ type
     // it); pThreaded = false runs every op on the calling thread.
     constructor Create(pThreaded: boolean = true; pTilePositions: integer = 36);
     destructor Destroy(); override;
+    // Grows V to at least FloatCount floats and never shrinks it.
+    class procedure GrowScratch(V: TNNetVolume; FloatCount: integer);
     // torch Conv1d (zero padding, dilation); PaddingRight only sets the length.
     procedure Conv1D(Input, Output: TNNetVolume; Weights: TNNetPlainConvWeights;
       Stride, Dilation, PaddingLeft, PaddingRight: integer); overload;
@@ -1109,7 +1110,7 @@ begin
   ScratchPtr := FPatch[Index].DataPtr;
   AlphaPtr := FJobAlpha.DataPtr;
   InvAlphaPtr := FInvAlpha.DataPtr;
-  // The TNNetSnake.ComputePerChannel inference sequence, one row at a time.
+  // y = x + (1/a) .* sin(a .* x)^2, one depth-contiguous row at a time.
   for Position := StartPos to FinishPos do
   begin
     RowPtr := FJobOutput.GetRawPtr(Position * Channels);
@@ -1296,7 +1297,7 @@ var
   StepPos, MaxStepPos, Position: integer;
   Gates, HiddenState: TNNetVolume;
   GatesPtr, InputGatePtr, ForgetGatePtr, CellGatePtr, OutputGatePtr: TNeuralFloatArrPtr;
-  HiddenPtr, CellPtr: TNeuralFloatArrPtr;
+  HiddenPtr, CellPtr, RecurrentPtr: TNeuralFloatArrPtr;
   IsBackward: boolean;
 begin
   Weights := FJobLSTM[Direction];
@@ -1314,6 +1315,7 @@ begin
   OutputGatePtr := Gates.GetRawPtr(3 * Hidden);
   HiddenPtr := HiddenState.DataPtr;
   CellPtr := FCell[Direction].DataPtr;
+  RecurrentPtr := Weights.RecurrentRows.DataPtr;
   HiddenState.Fill(0);
   FCell[Direction].Fill(0);
   MaxStepPos := FJobPositionCount - 1;
@@ -1321,10 +1323,10 @@ begin
   begin
     if IsBackward then Position := MaxStepPos - StepPos else Position := StepPos;
     // Gates read the h of the previous step; h is rewritten only below.
-    Gates.DotProducts(GateCount, 0, 0, Hidden, Weights.RecurrentRows,
-      HiddenState);
-    TNNetVolume.Add(GatesPtr,
-      FProjection[Direction].GetRawPtr(Position * GateCount), GateCount);
+    Move(FProjection[Direction].FData[Position * GateCount], GatesPtr^[0],
+      GateCount * csNeuralFloatSize);
+    TNNetVolume.AddDotProductRows(GatesPtr, RecurrentPtr, Hidden, GateCount,
+      HiddenPtr, Hidden);
     TNNetVolume.Sigmoid(InputGatePtr, InputGatePtr, 2 * Hidden);
     TNNetVolume.Tanh(CellGatePtr, CellGatePtr, Hidden);
     TNNetVolume.Sigmoid(OutputGatePtr, OutputGatePtr, Hidden);

@@ -62,11 +62,30 @@ YOLOv8 (n-style, but PICO widths/depths) architecture:
 
 Coded by Claude (AI).
 
+Segment mode (--seg): the ultralytics Segment(Detect) head used by YOLOv8-seg
+and FastSAM, on the same pico backbone with nc=1 (FastSAM's single class):
+  proto (on head input 15): Conv(w2->npr,3x3) -> ConvTranspose2d(npr,npr,2,s2,
+      +bias) -> Conv(npr->npr,3x3) -> Conv(npr->nm,1x1)    (stride-4 map)
+  cv4[i] per stride: Conv(ci->c4,3x3) -> Conv(c4->c4,3x3) -> Conv2d(c4->nm,+bias)
+  c4 = max(w2 // 4, nm). Per cell the CAI head is [box, cls, nm mask coefs].
+  The oracle then runs DFL decode + NMS, FastSAM's border snap / full-box
+  replacement, and ultralytics 8.0 process_mask (sigmoid(coef @ proto), crop
+  at proto resolution, bilinear upsample, > 0.5) in torch float64. It also
+  writes the retina masks (retina_masks=True, FastSAM's CLI default): 8.0
+  process_mask_native with shape = the net input, i.e. upsample first, then
+  crop with the pixel boxes (no letterbox unpad: the input is the image).
+
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/yolo_tiny_fixture.py
 writes tests/fixtures/tiny_yolo{.safetensors,_config.json,_io.json}.
-Needs numpy + safetensors only.
+  /home/bpsa/x/bin/python tools/yolo_tiny_fixture.py --seg
+writes tests/fixtures/tiny_yolo_seg{.safetensors,_config.json,_io.safetensors}
+(needs torch for the seg oracle; the detect mode needs numpy + safetensors only).
+  /home/bpsa/x/bin/python tools/yolo_tiny_fixture.py --world
+writes tests/fixtures/tiny_yolo_world{.safetensors,_config.json,_io.safetensors}
+(YOLO-World v2; reads tests/fixtures/tiny_clip_embeds.json for the CLIP route).
 """
+import sys
 import json
 import numpy as np
 from safetensors.numpy import save_file
@@ -130,7 +149,7 @@ def add_sppf(sd, idx, cin, cout):
     add_conv_bn(sd, f'model.{idx}.cv2', cout, 4 * cmid, 1)
 
 
-def build_state_dict():
+def build_state_dict(nc=NC):
     sd = {}
     add_conv_bn(sd, 'model.0', W0, IN_CH, 3)
     add_conv_bn(sd, 'model.1', W1, W0, 3)
@@ -157,7 +176,7 @@ def build_state_dict():
         add_conv2d(sd, f'model.22.cv2.{i}.2', 4 * REG_MAX, CB, 1)
         add_conv_bn(sd, f'model.22.cv3.{i}.0', CC, ci, 3)
         add_conv_bn(sd, f'model.22.cv3.{i}.1', CC, CC, 3)
-        add_conv2d(sd, f'model.22.cv3.{i}.2', NC, CC, 1)
+        add_conv2d(sd, f'model.22.cv3.{i}.2', nc, CC, 1)
     return sd
 
 
@@ -204,11 +223,11 @@ def conv2d_raw(x, sd, name, k):
 
 
 def maxpool(x, k, stride, pad):
-    # CAI's TNNetMaxPool zero-PADS the border before taking the window max
-    # (CopyPadding fills 0), so the oracle must pad with 0 too (NOT -inf) to
-    # stay byte-exact. SiLU outputs can be slightly negative, so this matters.
+    # torch nn.MaxPool2d pads with -inf. SiLU outputs can be negative, so a
+    # zero pad would change border cells; BuildYolo shifts the SPPF input to
+    # keep CAI's zero-padded maxpool exact.
     I, H, W = x.shape
-    xp = np.zeros((I, H + 2 * pad, W + 2 * pad), dtype=np.float64)
+    xp = np.full((I, H + 2 * pad, W + 2 * pad), -np.inf, dtype=np.float64)
     xp[:, pad:pad + H, pad:pad + W] = x
     Ho = (H + 2 * pad - k) // stride + 1
     Wo = (W + 2 * pad - k) // stride + 1
@@ -263,7 +282,7 @@ def head_branch(x, sd, i):
     return np.concatenate([bx, cl], axis=0)                  # (4*reg_max+nc,H,W)
 
 
-def forward(x, sd):
+def neck(x, sd):
     f0 = conv_bn(x, sd, 'model.0', 3, 2)
     f1 = conv_bn(f0, sd, 'model.1', 3, 2)
     f2 = c2f(f1, sd, 2, D0, True)
@@ -288,10 +307,11 @@ def forward(x, sd):
     d19 = conv_bn(H4, sd, 'model.19', 3, 2)
     c20 = np.concatenate([d19, P5], axis=0)
     H5 = c2f(c20, sd, 21, D0, False)     # head P5 input (/32)
-    heads = [head_branch(H3, sd, 0),
-             head_branch(H4, sd, 1),
-             head_branch(H5, sd, 2)]
-    # flatten stride-major, row-major (y*W+x): (sum Hi*Wi, 4*reg_max+nc)
+    return H3, H4, H5
+
+
+def flatten_heads(heads):
+    # flatten stride-major, row-major (y*W+x): (sum Hi*Wi, per-cell channels)
     rows = []
     for h in heads:
         C, Hh, Ww = h.shape
@@ -299,6 +319,13 @@ def forward(x, sd):
             for xx in range(Ww):
                 rows.append(h[:, yy, xx])
     return np.array(rows), [(h.shape[1], h.shape[2]) for h in heads]
+
+
+def forward(x, sd):
+    H3, H4, H5 = neck(x, sd)
+    return flatten_heads([head_branch(H3, sd, 0),
+                          head_branch(H4, sd, 1),
+                          head_branch(H5, sd, 2)])
 
 
 def main():
@@ -371,5 +398,439 @@ def main():
     print('all fixture self-checks passed')
 
 
+# ---------------------------------------------------------------------------
+# Segment mode (YOLOv8-seg / FastSAM).
+# ---------------------------------------------------------------------------
+NC_SEG = 1                               # FastSAM: one class ("object")
+NM = 4                                   # mask coefficients (ultralytics 32)
+NPR = 8                                  # proto hidden width (ultralytics 256*w)
+C4 = max(W2 // 4, NM)                    # cv4 hidden width
+SEG_IOU = 0.5                            # NMS IoU threshold pinned in the io
+SEG_KEEP = 24                            # candidates above the score threshold
+
+
+def add_seg_head(sd):
+    add_conv_bn(sd, 'model.22.proto.cv1', NPR, W2, 3)
+    sd['model.22.proto.upsample.weight'] = randn(NPR, NPR, 2, 2, std=0.3)
+    sd['model.22.proto.upsample.bias'] = randn(NPR, std=0.1)
+    add_conv_bn(sd, 'model.22.proto.cv2', NPR, NPR, 3)
+    add_conv_bn(sd, 'model.22.proto.cv3', NM, NPR, 1)
+    for i, ci in enumerate([W2, W3, W4]):
+        add_conv_bn(sd, f'model.22.cv4.{i}.0', C4, ci, 3)
+        add_conv_bn(sd, f'model.22.cv4.{i}.1', C4, C4, 3)
+        sd[f'model.22.cv4.{i}.2.weight'] = randn(NM, C4, 1, 1, std=3.0)
+        sd[f'model.22.cv4.{i}.2.bias'] = randn(NM, std=1.0)
+
+
+def proto_hidden(H3, sd):
+    import torch
+    p = conv_bn(H3, sd, 'model.22.proto.cv1', 3, 1)
+    p = torch.nn.functional.conv_transpose2d(
+        torch.from_numpy(p)[None],
+        torch.from_numpy(sd['model.22.proto.upsample.weight']),
+        torch.from_numpy(sd['model.22.proto.upsample.bias']), stride=2)[0].numpy()
+    return conv_bn(p, sd, 'model.22.proto.cv2', 3, 1)
+
+
+def calibrate_proto_bn(x, sd):
+    # Set proto.cv3's BN stats to the real pre-BN statistics so the proto map
+    # varies across space (random stats leave it nearly constant).
+    H3 = neck(x, sd)[0]
+    pre = conv2d(proto_hidden(H3, sd), sd['model.22.proto.cv3.conv.weight'],
+                 None, 0, 1)
+    sd['model.22.proto.cv3.bn.running_mean'] = pre.mean(axis=(1, 2))
+    sd['model.22.proto.cv3.bn.running_var'] = pre.var(axis=(1, 2))
+    sd['model.22.proto.cv3.bn.weight'] = randn(NM, std=0.5) + 3.0
+    sd['model.22.proto.cv3.bn.bias'] = randn(NM, std=0.5)
+
+
+def seg_forward(x, sd):
+    H3, H4, H5 = neck(x, sd)
+    heads = []
+    for i, Hi in enumerate([H3, H4, H5]):
+        mc = conv_bn(Hi, sd, f'model.22.cv4.{i}.0', 3, 1)
+        mc = conv_bn(mc, sd, f'model.22.cv4.{i}.1', 3, 1)
+        mc = conv2d_raw(mc, sd, f'model.22.cv4.{i}.2', 1)
+        heads.append(np.concatenate([head_branch(Hi, sd, i), mc], axis=0))
+    proto = conv_bn(proto_hidden(H3, sd), sd, 'model.22.proto.cv3', 1, 1)
+    out, grids = flatten_heads(heads)
+    return out, grids, proto
+
+
+def dfl_candidates(out, grids):
+    # ultralytics Detect inference decode: DFL expectation -> xyxy pixels.
+    rows = []
+    cell = 0
+    for (gh, gw), stride in zip(grids, [8, 16, 32]):
+        for gy in range(gh):
+            for gx in range(gw):
+                v = out[cell]
+                d = []
+                for side in range(4):
+                    b = v[side * REG_MAX:(side + 1) * REG_MAX]
+                    e = np.exp(b - b.max())
+                    d.append((e * np.arange(REG_MAX)).sum() / e.sum())
+                cls = v[4 * REG_MAX:4 * REG_MAX + NC_SEG]
+                score = 1.0 / (1.0 + np.exp(-cls.max()))
+                cx, cy = gx + 0.5, gy + 0.5
+                rows.append([(cx - d[0]) * stride, (cy - d[1]) * stride,
+                             (cx + d[2]) * stride, (cy + d[3]) * stride,
+                             score, int(cls.argmax()), cell])
+                cell += 1
+    return rows
+
+
+def box_iou(a, b):
+    iw = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    ih = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = iw * ih
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def greedy_nms(cands, iou_thr):
+    order = sorted(cands, key=lambda r: -r[4])
+    keep, margin = [], 1.0
+    for r in order:
+        ok = True
+        for k in keep:
+            if k[5] == r[5]:
+                iou = box_iou(k, r)
+                margin = min(margin, abs(iou - iou_thr))
+                if iou > iou_thr:
+                    ok = False
+                    break
+        if ok:
+            keep.append(list(r))
+    return keep, margin
+
+
+def fastsam_adjust(dets, size, border=20.0, full_iou=0.9):
+    # FastSAM postprocess: bbox_iou snaps EVERY box to the image border in
+    # place, then boxes with IoU > 0.9 vs the full image become the full box.
+    for d in dets:
+        if d[0] < border: d[0] = 0.0
+        if d[1] < border: d[1] = 0.0
+        if d[2] > size - border: d[2] = float(size)
+        if d[3] > size - border: d[3] = float(size)
+    full = [0.0, 0.0, float(size), float(size)]
+    for d in dets:
+        if box_iou(full, d) > full_iou:
+            d[0:4] = full
+            d[5] = 0
+    return dets
+
+
+def crop_mask(m, boxes):
+    # ultralytics ops.crop_mask: keep x1 <= x < x2, y1 <= y < y2 per mask.
+    import torch
+    n, h, w = m.shape
+    x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4, 1)
+    r = torch.arange(w, dtype=torch.float64)[None, None, :]
+    cc = torch.arange(h, dtype=torch.float64)[None, :, None]
+    return m * ((r >= x1) * (r < x2) * (cc >= y1) * (cc < y2))
+
+
+def mask_logits_sigmoid(proto, coefs):
+    import torch
+    protos = torch.from_numpy(proto)
+    c, mh, mw = protos.shape
+    return (torch.from_numpy(coefs) @ protos.view(c, -1)).sigmoid().view(-1, mh, mw)
+
+
+def process_mask(proto, coefs, boxes, size):
+    # ultralytics 8.0 ops.process_mask(upsample=True), the predictor default path.
+    import torch
+    import torch.nn.functional as F
+    m = mask_logits_sigmoid(proto, coefs)
+    mh, mw = m.shape[1:]
+    db = torch.from_numpy(np.array(boxes, dtype=np.float64)).clone()
+    db[:, 0] *= mw / size; db[:, 2] *= mw / size
+    db[:, 1] *= mh / size; db[:, 3] *= mh / size
+    m = crop_mask(m, db)
+    m = F.interpolate(m[None], (size, size), mode='bilinear',
+                      align_corners=False)[0]
+    return m.numpy()
+
+
+def process_mask_native(proto, coefs, boxes, size):
+    # ultralytics 8.0 ops.process_mask_native(protos, masks_in, bboxes, shape)
+    # with shape = (size, size): gain = mh / size, so the letterbox unpad
+    # slice is the whole map; bilinear upsample, then crop in pixels.
+    import torch
+    import torch.nn.functional as F
+    m = mask_logits_sigmoid(proto, coefs)
+    mh, mw = m.shape[1:]
+    gain = min(mh / size, mw / size)
+    pad = (mw - size * gain) / 2, (mh - size * gain) / 2
+    top, left = int(pad[1]), int(pad[0])
+    bottom, right = int(mh - pad[1]), int(mw - pad[0])
+    m = m[:, top:bottom, left:right]
+    m = F.interpolate(m[None], (size, size), mode='bilinear',
+                      align_corners=False)[0]
+    m = crop_mask(m, torch.from_numpy(np.array(boxes, dtype=np.float64)))
+    return m.numpy()
+
+
+def main_seg():
+    global rng
+    rng = np.random.default_rng(20261023)
+    sd = build_state_dict(NC_SEG)
+    add_seg_head(sd)
+    x = np.zeros((IN_CH, INPUT, INPUT), dtype=np.float64)
+    for c in range(IN_CH):
+        for y in range(INPUT):
+            for px in range(INPUT):
+                x[c, y, px] = (((c * 1024 + y * 32 + px) * 7) % 17 - 8) / 16.0
+    calibrate_proto_bn(x, sd)
+    sd_f32 = {k: v.astype(np.float32) for k, v in sd.items()}
+    sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
+    out, grids, proto = seg_forward(x, sd)
+    cands = dfl_candidates(out, grids)
+    scores = sorted([r[4] for r in cands], reverse=True)
+    # cut at the widest score gap among ranks SEG_KEEP..2*SEG_KEEP
+    k = max(range(SEG_KEEP, 2 * SEG_KEEP), key=lambda j: scores[j - 1] - scores[j])
+    conf = 0.5 * (scores[k - 1] + scores[k])
+    score_margin = conf - scores[k]
+    dets, iou_margin = greedy_nms([r for r in cands if r[4] > conf], SEG_IOU)
+    dets = fastsam_adjust(dets, INPUT)
+    coef_ofs = 4 * REG_MAX + NC_SEG
+    coefs = np.array([out[d[6], coef_ofs:coef_ofs + NM] for d in dets])
+    soft = process_mask(proto, coefs, [d[0:4] for d in dets], INPUT)
+    retina = process_mask_native(proto, coefs, [d[0:4] for d in dets], INPUT)
+    masks = (soft > 0.5).astype(np.float32)
+    # pixels this close to 0.5 may binarize differently in float32; the
+    # Pascal test compares the soft masks and skips them in the 0/1 check.
+    near = int((np.abs(soft - 0.5) < 1e-4).sum())
+    retina_near = int((np.abs(retina - 0.5) < 1e-4).sum())
+    retina_differs = int(((retina > 0.5) != (soft > 0.5)).sum())
+    print(f'head {out.shape}; proto {proto.shape}; conf {conf:.6f} '
+          f'(margin {score_margin:.2e}); NMS IoU margin {iou_margin:.2e}')
+    print(f'{len(dets)} dets; mask pixels on: {masks.sum(axis=(1, 2))}; '
+          f'pixels within 1e-4 of 0.5: {near}')
+    print(f'retina masks: pixels within 1e-4 of 0.5: {retina_near}; '
+          f'binary pixels that differ from process_mask: {retina_differs}')
+    assert score_margin > 1e-4 and iou_margin > 1e-3
+    assert retina_differs > 0
+
+    save_file(sd_f32, 'tests/fixtures/tiny_yolo_seg.safetensors')
+    config = {
+        'model_type': 'yolov8',
+        'task': 'segment',
+        'widths': [W0, W1, W2, W3, W4],
+        'depths': [D0, D1],
+        'num_classes': NC_SEG,
+        'reg_max': REG_MAX,
+        'box_hidden': CB,
+        'cls_hidden': CC,
+        'num_masks': NM,
+        'proto_hidden': NPR,
+        'num_channels': IN_CH,
+        'image_size': INPUT,
+        'bn_eps': BN_EPS,
+        'strides': [8, 16, 32],
+    }
+    with open('tests/fixtures/tiny_yolo_seg_config.json', 'w') as f:
+        json.dump(config, f, indent=1)
+    f32 = lambda a: np.ascontiguousarray(np.array(a, dtype=np.float32))
+    save_file({
+        'input': f32(x),                               # (3, H, W)
+        'head': f32(out),                              # (cells, 4*rm+nc+nm)
+        'proto': f32(proto),                           # (nm, H/4, W/4)
+        'conf': f32([conf]),
+        'iou': f32([SEG_IOU]),
+        'det_boxes': f32([d[0:4] for d in dets]),      # FastSAM-adjusted xyxy
+        'det_scores': f32([d[4] for d in dets]),
+        'det_cells': f32([d[6] for d in dets]),
+        'soft_masks': f32(soft),                       # (N, H, W); mask = > 0.5
+        'retina_soft_masks': f32(retina),              # (N, H, W); mask = > 0.5
+    }, 'tests/fixtures/tiny_yolo_seg_io.safetensors')
+    print('wrote tiny_yolo_seg.safetensors + config + io')
+
+
+# ---------------------------------------------------------------------------
+# World mode (YOLO-World v2, ultralytics yolov8s-worldv2): same backbone and
+# DFL box branch; the neck C2f blocks 12/15/18/21 become C2fAttn and the class
+# branch becomes WorldDetect's cv3 (-> embed) + BNContrastiveHead (cv4). The
+# oracle follows the ultralytics modules literally (einsum + max + sigmoid,
+# BatchNorm then dot with the L2-normalised text), NOT the folded weights the
+# CAI importer bakes, so the folding is what the parity test checks.
+#   C2fAttn(c1, c2, n, ec, nh, gc): c = c2 // 2; y = split(cv1(x)); y += m_j(y[-1]);
+#     y.append(MaxSigmoidAttnBlock(y[-1], txt)); cv2(cat(y))   ((3+n)*c -> c2)
+#   MaxSigmoidAttnBlock(c, c, nh, ec=c, gc): guide = gl(txt) -> (nc, nh, hc);
+#     aw = max_n <x_head, guide_n_head> / sqrt(hc) + bias; x = proj_conv(x)
+#     (Conv 3x3, act=False) * sigmoid(aw) per head.
+#   BNContrastiveHead(embed): BN(x) . normalize(txt) * exp(logit_scale) + bias.
+# WorldModel.set_classes L2-normalises the CLIP text features before both uses.
+# ---------------------------------------------------------------------------
+WORLD_EMBED = 8                          # text embed dim = tiny_clip projection_dim
+WORLD_HEADS = [2, 2, 3, 4]               # C2fAttn heads of model.12/15/18/21
+WORLD_PROMPTS = 3                        # random text embeddings
+WORLD_C3 = 8                             # WorldDetect c3 (cls_hidden)
+
+
+def add_c2f_attn(sd, idx, cin, cout, n, nh):
+    add_c2f(sd, idx, cin, cout, n)
+    c = cout // 2
+    sd[f'model.{idx}.cv2.conv.weight'] = randn(cout, (3 + n) * c, 1, 1, std=0.4)
+    sd[f'model.{idx}.attn.gl.weight'] = randn(c, WORLD_EMBED, std=2.0)
+    sd[f'model.{idx}.attn.gl.bias'] = randn(c, std=0.2)
+    sd[f'model.{idx}.attn.bias'] = randn(nh, std=0.5)
+    add_conv_bn(sd, f'model.{idx}.attn.proj_conv', c, c, 3)
+
+
+def build_world_state_dict():
+    sd = build_state_dict()
+    for idx, cin, cout, nh in [(12, W4 + W3, W3, WORLD_HEADS[0]),
+                               (15, W3 + W2, W2, WORLD_HEADS[1]),
+                               (18, W2 + W3, W3, WORLD_HEADS[2]),
+                               (21, W3 + W4, W4, WORLD_HEADS[3])]:
+        add_c2f_attn(sd, idx, cin, cout, D0, nh)
+    for i, ci in enumerate([W2, W3, W4]):
+        for key in [k for k in sd if k.startswith(f'model.22.cv3.{i}.')]:
+            del sd[key]
+        add_conv_bn(sd, f'model.22.cv3.{i}.0', WORLD_C3, ci, 3)
+        add_conv_bn(sd, f'model.22.cv3.{i}.1', WORLD_C3, WORLD_C3, 3)
+        add_conv2d(sd, f'model.22.cv3.{i}.2', WORLD_EMBED, WORLD_C3, 1)
+        sd[f'model.22.cv4.{i}.norm.weight'] = randn(WORLD_EMBED, std=0.3) + 1.0
+        sd[f'model.22.cv4.{i}.norm.bias'] = randn(WORLD_EMBED, std=0.1)
+        sd[f'model.22.cv4.{i}.norm.running_mean'] = randn(WORLD_EMBED, std=0.1)
+        sd[f'model.22.cv4.{i}.norm.running_var'] = np.abs(randn(WORLD_EMBED, std=0.2)) + 0.5
+        sd[f'model.22.cv4.{i}.bias'] = randn(1, std=0.5) - 1.0
+        sd[f'model.22.cv4.{i}.logit_scale'] = np.array(0.3 * i + 0.5)
+    return sd
+
+
+def batchnorm(x, sd, prefix):
+    g, bt = sd[prefix + '.weight'], sd[prefix + '.bias']
+    rm, rv = sd[prefix + '.running_mean'], sd[prefix + '.running_var']
+    return (x - rm[:, None, None]) / np.sqrt(rv + BN_EPS)[:, None, None] * \
+        g[:, None, None] + bt[:, None, None]
+
+
+def max_sigmoid_attn(x, sd, prefix, nh, txt):
+    c, h, w = x.shape
+    hc = c // nh
+    guide = txt @ sd[prefix + '.gl.weight'].T + sd[prefix + '.gl.bias']
+    guide = guide.reshape(-1, nh, hc)                        # (nc, nh, hc)
+    embed = x.reshape(nh, hc, h, w)
+    aw = np.einsum('mchw,nmc->mhwn', embed, guide).max(axis=-1)
+    aw = aw / hc ** 0.5 + sd[prefix + '.bias'][:, None, None]
+    aw = 1.0 / (1.0 + np.exp(-aw))
+    p = conv2d(x, sd[prefix + '.proj_conv.conv.weight'], None, 1, 1)
+    p = batchnorm(p, sd, prefix + '.proj_conv.bn')
+    return (p.reshape(nh, hc, h, w) * aw[:, None]).reshape(c, h, w)
+
+
+def c2f_attn(x, sd, idx, n, nh, txt):
+    y = conv_bn(x, sd, f'model.{idx}.cv1', 1, 1)
+    c = y.shape[0] // 2
+    outs = [y[:c], y[c:]]
+    for j in range(n):
+        outs.append(bottleneck(outs[-1], sd, f'model.{idx}.m.{j}', False))
+    outs.append(max_sigmoid_attn(outs[-1], sd, f'model.{idx}.attn', nh, txt))
+    return conv_bn(np.concatenate(outs, axis=0), sd, f'model.{idx}.cv2', 1, 1)
+
+
+def world_forward(x, sd, txt):
+    txt = txt / np.linalg.norm(txt, axis=-1, keepdims=True)
+    f0 = conv_bn(x, sd, 'model.0', 3, 2)
+    f1 = conv_bn(f0, sd, 'model.1', 3, 2)
+    f2 = c2f(f1, sd, 2, D0, True)
+    f3 = conv_bn(f2, sd, 'model.3', 3, 2)
+    P3 = c2f(f3, sd, 4, D1, True)
+    f5 = conv_bn(P3, sd, 'model.5', 3, 2)
+    P4 = c2f(f5, sd, 6, D1, True)
+    f7 = conv_bn(P4, sd, 'model.7', 3, 2)
+    f8 = c2f(f7, sd, 8, D0, True)
+    P5 = sppf(f8, sd, 9)
+    N4 = c2f_attn(np.concatenate([upsample2x(P5), P4]), sd, 12, D0,
+                  WORLD_HEADS[0], txt)
+    H3 = c2f_attn(np.concatenate([upsample2x(N4), P3]), sd, 15, D0,
+                  WORLD_HEADS[1], txt)
+    d16 = conv_bn(H3, sd, 'model.16', 3, 2)
+    H4 = c2f_attn(np.concatenate([d16, N4]), sd, 18, D0, WORLD_HEADS[2], txt)
+    d19 = conv_bn(H4, sd, 'model.19', 3, 2)
+    H5 = c2f_attn(np.concatenate([d19, P5]), sd, 21, D0, WORLD_HEADS[3], txt)
+    heads = []
+    for i, Hi in enumerate([H3, H4, H5]):
+        bx = conv_bn(Hi, sd, f'model.22.cv2.{i}.0', 3, 1)
+        bx = conv_bn(bx, sd, f'model.22.cv2.{i}.1', 3, 1)
+        bx = conv2d_raw(bx, sd, f'model.22.cv2.{i}.2', 1)
+        em = conv_bn(Hi, sd, f'model.22.cv3.{i}.0', 3, 1)
+        em = conv_bn(em, sd, f'model.22.cv3.{i}.1', 3, 1)
+        em = conv2d_raw(em, sd, f'model.22.cv3.{i}.2', 1)
+        em = batchnorm(em, sd, f'model.22.cv4.{i}.norm')
+        cl = np.einsum('chw,kc->khw', em, txt)
+        cl = cl * np.exp(sd[f'model.22.cv4.{i}.logit_scale']) + \
+            sd[f'model.22.cv4.{i}.bias']
+        heads.append(np.concatenate([bx, cl], axis=0))
+    return flatten_heads(heads)[0]
+
+
+def main_world():
+    global rng
+    rng = np.random.default_rng(20261024)
+    sd = build_world_state_dict()
+    sd_f32 = {k: np.asarray(v, dtype=np.float32) for k, v in sd.items()}
+    sd = {k: v.astype(np.float64) for k, v in sd_f32.items()}
+    txt = randn(WORLD_PROMPTS, WORLD_EMBED).astype(np.float32).astype(np.float64)
+    with open('tests/fixtures/tiny_clip_embeds.json') as f:
+        clip_txt = np.array(json.load(f)['text_embeds'], dtype=np.float32)
+    clip_txt = clip_txt.astype(np.float64)
+    x = np.zeros((IN_CH, INPUT, INPUT), dtype=np.float64)
+    for c in range(IN_CH):
+        for y in range(INPUT):
+            for px in range(INPUT):
+                x[c, y, px] = (((c * 1024 + y * 32 + px) * 7) % 17 - 8) / 16.0
+    out = world_forward(x, sd, txt)
+    clip_out = world_forward(x, sd, clip_txt)
+    cls = out[:, 4 * REG_MAX:]
+    print(f'head {out.shape}; clip head {clip_out.shape}; class logits '
+          f'min {cls.min():.4f} max {cls.max():.4f}; best-class histogram '
+          f'{np.bincount(cls.argmax(axis=1), minlength=WORLD_PROMPTS)}')
+    for key in ['model.12.attn.gl.weight', 'model.15.attn.bias',
+                'model.18.attn.proj_conv.conv.weight', 'model.21.attn.gl.bias',
+                'model.22.cv4.0.norm.running_mean', 'model.22.cv4.2.logit_scale']:
+        alt = dict(sd)
+        alt[key] = np.zeros_like(sd[key])
+        d = np.abs(world_forward(x, alt, txt) - out).max()
+        assert d > 1e-5, f'{key} had no effect ({d})'
+        print(f'{key:40s} effect: max|diff| = {d:.4f}')
+    # Every prompt must win the attention max somewhere (else max == one prompt).
+    assert np.abs(world_forward(x, sd, txt[[0, 0, 0]]) - out)[:, :4 * REG_MAX].max() > 1e-5
+
+    save_file(sd_f32, 'tests/fixtures/tiny_yolo_world.safetensors')
+    config = {
+        'model_type': 'yolo_world',
+        'widths': [W0, W1, W2, W3, W4],
+        'depths': [D0, D1],
+        'reg_max': REG_MAX,
+        'box_hidden': CB,
+        'cls_hidden': WORLD_C3,
+        'text_embed_dim': WORLD_EMBED,
+        'attn_heads': WORLD_HEADS,
+        'num_channels': IN_CH,
+        'image_size': INPUT,
+        'bn_eps': BN_EPS,
+        'strides': [8, 16, 32],
+    }
+    with open('tests/fixtures/tiny_yolo_world_config.json', 'w') as f:
+        json.dump(config, f, indent=1)
+    f32 = lambda a: np.ascontiguousarray(np.array(a, dtype=np.float32))
+    save_file({
+        'input': f32(x),                       # (3, H, W)
+        'text_embeds': f32(txt),               # (prompts, embed), not normalised
+        'head': f32(out),                      # (cells, 4*rm + prompts)
+        'clip_head': f32(clip_out),            # tiny_clip text_embeds as prompts
+    }, 'tests/fixtures/tiny_yolo_world_io.safetensors')
+    print(f'wrote tiny_yolo_world.safetensors ({len(sd_f32)} tensors) + config + io')
+
+
 if __name__ == '__main__':
-    main()
+    if '--seg' in sys.argv[1:]:
+        main_seg()
+    elif '--world' in sys.argv[1:]:
+        main_world()
+    else:
+        main()

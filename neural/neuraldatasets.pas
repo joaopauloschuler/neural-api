@@ -28,12 +28,12 @@ interface
 
 uses
   {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, System.Generics.Collections, {$ENDIF}
-  neuralvolume, neuralnetwork, pascoremath32
+  neuralvolume, neuralnetwork, neuralimageresize, pascoremath32
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,
   FPReadGif, FPReadPNM, FPReadPSD, FPReadTGA, FPReadTiff,
   FPWriteBMP, FPWritePCX, FPWriteJPEG, FPWritePNG,
-  FPWritePNM, FPWriteTGA, FPWriteTiff
+  FPWritePNM, FPWriteTGA, FPWriteTiff, Classes
   {$ENDIF}
   ;
 
@@ -186,18 +186,33 @@ type
     FolderName, pImageSubFolder: string;
     TrainingProp, ValidationProp, TestProp: single);
 
+  // Fills FileNames with the names (no path) of the PNG / JPEG / PPM files of
+  // Dir, sorted as frames: case-insensitive, digit runs by value ("f2" < "f10").
+  procedure ListImageFilesInFolder(const Dir: string; FileNames: TStringList);
+
   {$IFDEF FPC}
-  // Vol becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha; 0..255 each.
+  // M.LoadFromFile, except netpbm (.ppm/.pgm/.pbm/.pnm) goes through a reader
+  // that works around the FPC 3.2 raw-PNM bug (pixel bytes lost to a buffer).
+  function LoadFPImageFromFile(M: TFPMemoryImage; ImageFileName: string): boolean;
+  // Vol becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha; 0..255 each. With
+  // pFullPrecision a 16-bit image loads as sample / 257; 8-bit ones load the same.
   procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
-    pWithAlpha: boolean = false);
+    pWithAlpha: boolean = false; pFullPrecision: boolean = false);
   // Depth 4 carries the 4th channel as alpha; smaller depths are opaque.
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
   // A depth-4 volume saved as .png keeps its alpha channel (0..255 each).
   function SaveImageFromVolumeIntoFile(V:TNNetVolume; ImageFileName:string):boolean;
+  // Channel 0 of V, clamped to [0,1], as a 16-bit grayscale PNG (value*65535,
+  // as diffusers export_depth_to_16bit_png). False when the save fails.
+  function SaveGray16PNGFromVolume(V: TNNetVolume; const FileName: string): boolean;
+  // Channel 0 (pGrayScale) or channels 0..2 of V, clamped to [0,1], as a 16-bit
+  // PNG (value*65535). False when the save fails.
+  function SavePNG16FromVolume(V: TNNetVolume; const FileName: string;
+    pGrayScale: boolean): boolean;
   // V becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha (opaque files get
-  // alpha 255); 0..255 each. False when the file does not load.
+  // alpha 255); 0..255 each (pFullPrecision: see LoadImageIntoVolume).
   function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
-    pWithAlpha: boolean): boolean; overload;
+    pWithAlpha: boolean; pFullPrecision: boolean = false): boolean; overload;
   {$ENDIF}
 
   // Loads an image from a file and stores it into a Volume.
@@ -236,26 +251,29 @@ type
   TNNetImagePreprocess = record
     ResizeShorterSide: integer;     // size.shortest_edge (resize target)
     CropSize: integer;              // crop_size (square)
+    // False when size is {"height","width"}: resize straight to that size.
+    ResizeKeepsAspect: boolean;
+    ResizeHeight, ResizeWidth: integer; // size.height/width (= shortest edge)
+    CropHeight, CropWidth: integer;     // crop_size.height/width
     Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
     Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+    Resample: TImageResampleFilter; // resample (PIL code, default BICUBIC)
   end;
 
-// Applies the standard inference transform to Src (an (W,H,3) RGB volume with
-// 0..255 byte-valued channels, the layout LoadImageFromFileIntoVolume yields)
-// and writes the (CropSize,CropSize,3) normalized result into Dst:
-//   shorter-side resize to ResizeShorterSide (aspect preserved, bilinear) ->
-//   center-crop to CropSize -> (x/255 - Mean[c])/Std[c] per channel.
-// Mean/Std are RGB triples (e.g. csImageNetMean / csImageNetStd). Src and Dst
-// may NOT be the same volume.
+// Src (W,H,3) RGB 0..255 -> Dst (CropSize,CropSize,3): PIL shorter-side resize
+// (torchvision default bilinear), center crop, (x/255-Mean)/Std; Src <> Dst.
 procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat);
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter = irfBilinear); overload;
 
-// Reads the standard inference transform straight into a TNNetImagePreprocess
-// from a HuggingFace preprocessor_config.json. Handles size as an int, as
-// {"shortest_edge":N} or as {"height":..,"width":..}, and crop_size as an int
-// or {"height":..,"width":..}. Defaults follow CLIPImageProcessor (shortest
-// edge / crop 224, the OpenAI image_mean/image_std) when a field is absent.
+// Config-driven transform: shorter-side or direct (H,W) resize per
+// Config.ResizeKeepsAspect, center crop to (CropWidth,CropHeight), normalize.
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  const Config: TNNetImagePreprocess); overload;
+
+// Reads a HuggingFace preprocessor_config.json into a TNNetImagePreprocess;
+// size/crop_size/crop_pct per image_processor_type (ResolveHFImageResize).
 function ReadImagePreprocessConfig(
   const FileName: string): TNNetImagePreprocess;
 
@@ -263,7 +281,8 @@ function ReadImagePreprocessConfig(
 // volume (LoadImageFromFileIntoVolume + PreprocessImageForVisionModel).
 function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat): boolean;
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter = irfBilinear): boolean;
 
 // Writes the header of a confusion matrix into a CSV file
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
@@ -938,7 +957,7 @@ implementation
 
 uses
   math, neuralthread,
-  {$IFDEF FPC}Classes,SysUtils,fileutil,fpjson,jsonparser{$ELSE}
+  {$IFDEF FPC}SysUtils,fileutil,fpjson,jsonparser{$ELSE}
   SysUtils,
   IOUtils,
   Types
@@ -2848,6 +2867,92 @@ begin
 end;
 
 {$IFDEF FPC}
+type
+  // FPC 3.2 TFPReaderPNM reads the header through a 1 KB buffer and then reads
+  // raw rasters straight from the stream; this rewinds to the raster start.
+  TNNetReaderPNM = class(TFPReaderPNM)
+  protected
+    procedure InternalRead(Stream: TStream; Img: TFPCustomImage); override;
+  end;
+
+procedure TNNetReaderPNM.InternalRead(Stream: TStream; Img: TFPCustomImage);
+var
+  StartPos, RasterPos: Int64;
+  Magic: array[0..1] of AnsiChar;
+  FieldValues: array[0..2] of integer;
+  FieldCount, NeededFields, Row: integer;
+  C: AnsiChar;
+begin
+  StartPos := Stream.Position;
+  Stream.ReadBuffer(Magic, 2);
+  if (Magic[0] <> 'P') or not (Magic[1] in ['4'..'6']) then
+  begin
+    Stream.Position := StartPos;
+    inherited InternalRead(Stream, Img);
+    exit;
+  end;
+  if Magic[1] = '4' then NeededFields := 2 else NeededFields := 3;
+  FieldCount := 0;
+  while FieldCount < NeededFields do
+  begin
+    Stream.ReadBuffer(C, 1);
+    if C = '#' then
+    begin
+      repeat Stream.ReadBuffer(C, 1) until (C = #10) or (C = #13);
+    end
+    else if C in ['0'..'9'] then
+    begin
+      // The single whitespace that ends the last field is consumed here.
+      FieldValues[FieldCount] := 0;
+      repeat
+        FieldValues[FieldCount] := FieldValues[FieldCount] * 10 + (Ord(C) - Ord('0'));
+        Stream.ReadBuffer(C, 1);
+      until not (C in ['0'..'9']);
+      Inc(FieldCount);
+    end
+    else if not (C in [#9, #10, #13, #32]) then
+      raise FPImageException.Create('Invalid PNM header data');
+  end;
+  RasterPos := Stream.Position;
+  Stream.Position := StartPos;
+  ReadHeader(Stream);
+  Stream.Position := RasterPos;
+  Img.SetSize(FieldValues[0], FieldValues[1]);
+  if Magic[1] = '4'
+  then FScanLineSize := (FieldValues[0] + 7) shr 3
+  else FScanLineSize := (FBitPP div 8) * FieldValues[0];
+  GetMem(FScanLine, FScanLineSize);
+  try
+    for Row := 0 to FieldValues[1] - 1 do
+    begin
+      ReadScanLine(Row, Stream);
+      WriteScanLine(Row, Img);
+    end;
+  finally
+    FreeMem(FScanLine);
+  end;
+end;
+
+function LoadFPImageFromFile(M: TFPMemoryImage; ImageFileName: string): boolean;
+var
+  Reader: TNNetReaderPNM;
+  Ext: string;
+begin
+  Ext := LowerCase(ExtractFileExt(ImageFileName));
+  if (Ext = '.ppm') or (Ext = '.pgm') or (Ext = '.pbm') or (Ext = '.pnm') then
+  begin
+    Reader := TNNetReaderPNM.Create;
+    try
+      M.LoadFromFile(ImageFileName, Reader);
+      Result := true;
+    finally
+      Reader.Free;
+    end;
+  end
+  else
+    Result := M.LoadFromFile(ImageFileName);
+end;
+
 function TFileNameList.ThreadSafeLoadImageFromFileIntoVolume(
   ImageFileName: string; V: TNNetVolume): boolean;
 var
@@ -2855,7 +2960,7 @@ var
 begin
   M := TFPMemoryImage.Create(1, 1);
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
-  Result := M.LoadFromFile( ImageFileName );
+  Result := LoadFPImageFromFile(M, ImageFileName);
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
   if Result then LoadImageIntoVolume(M, V);
   M.Free;
@@ -2867,14 +2972,14 @@ begin
 end;
 
 function LoadImageFromFileIntoVolume(ImageFileName: string; V: TNNetVolume;
-  pWithAlpha: boolean): boolean;
+  pWithAlpha: boolean; pFullPrecision: boolean): boolean;
 var
   M: TFPMemoryImage;
 begin
   M := TFPMemoryImage.Create(1, 1);
   try
-    Result := M.LoadFromFile(ImageFileName);
-    if Result then LoadImageIntoVolume(M, V, pWithAlpha);
+    Result := LoadFPImageFromFile(M, ImageFileName);
+    if Result then LoadImageIntoVolume(M, V, pWithAlpha, pFullPrecision);
   finally
     M.Free;
   end;
@@ -2908,15 +3013,105 @@ begin
   end;
 end;
 
+function SaveGray16PNGFromVolume(V: TNNetVolume; const FileName: string): boolean;
+begin
+  Result := SavePNG16FromVolume(V, FileName, {pGrayScale=}true);
+end;
+
+function SavePNG16FromVolume(V: TNNetVolume; const FileName: string;
+  pGrayScale: boolean): boolean;
+var
+  M: TFPMemoryImage;
+  PngWriter: TFPWriterPNG;
+  LocalColor: TFPColor;
+  X, Y, MaxX, MaxY, RawPos, GreenOffset, BlueOffset: integer;
+
+  function Word16(Value: TNeuralFloat): word;
+  begin
+    Result := Round(Max(0.0, Min(1.0, Value)) * 65535);
+  end;
+
+begin
+  if pGrayScale then
+  begin
+    GreenOffset := 0;
+    BlueOffset := 0;
+  end
+  else
+  begin
+    if V.Depth < 3 then
+      raise Exception.Create('SavePNG16FromVolume: RGB needs 3 channels, got ' +
+        IntToStr(V.Depth) + '.');
+    GreenOffset := 1;
+    BlueOffset := 2;
+  end;
+  M := TFPMemoryImage.Create(V.SizeX, V.SizeY);
+  PngWriter := TFPWriterPNG.Create;
+  try
+    MaxX := V.SizeX - 1;
+    MaxY := V.SizeY - 1;
+    LocalColor.alpha := alphaOpaque;
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+      begin
+        RawPos := V.GetRawPos(X, Y);
+        LocalColor.red := Word16(V.FData[RawPos]);
+        LocalColor.green := Word16(V.FData[RawPos + GreenOffset]);
+        LocalColor.blue := Word16(V.FData[RawPos + BlueOffset]);
+        M.Colors[X, Y] := LocalColor;
+      end;
+    PngWriter.GrayScale := pGrayScale;
+    PngWriter.WordSized := true;
+    PngWriter.UseAlpha := false;
+    try
+      M.SaveToFile(FileName, PngWriter);
+      Result := true;
+    except
+      Result := false;
+    end;
+  finally
+    PngWriter.Free;
+    M.Free;
+  end;
+end;
+
 procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
-  pWithAlpha: boolean);
+  pWithAlpha: boolean; pFullPrecision: boolean);
+const
+  csSampleToByteDivisor = 257;
 var
   CountX, CountY, MaxX, MaxY: integer;
   LocalColor: TFPColor;
   RawPos, PixelStride: integer;
+
+  // FPImage readers widen an 8-bit sample v to v * 257 (PNG, BMP) or v shl 8
+  // (JPEG); any other low byte is 16-bit data.
+  function IsWide(Sample: word): boolean;
+  begin
+    Result := ((Sample and 255) <> 0) and ((Sample and 255) <> (Sample shr 8));
+  end;
+
+  function HasWideSamples(): boolean;
+  var
+    ScanX, ScanY: integer;
+    ScanColor: TFPColor;
+  begin
+    Result := true;
+    for ScanY := 0 to MaxY do
+      for ScanX := 0 to MaxX do
+      begin
+        ScanColor := M.Colors[ScanX, ScanY];
+        if IsWide(ScanColor.red) or IsWide(ScanColor.green) or
+          IsWide(ScanColor.blue) or (pWithAlpha and IsWide(ScanColor.alpha)) then
+          exit;
+      end;
+    Result := false;
+  end;
+
 begin
   MaxX := M.Width - 1;
   MaxY := M.Height - 1;
+  if pFullPrecision then pFullPrecision := HasWideSamples();
   if pWithAlpha then PixelStride := 4 else PixelStride := 3;
   Vol.ReSize(MaxX + 1, MaxY + 1, PixelStride);
 
@@ -2926,11 +3121,21 @@ begin
     for CountX := 0 to MaxX do
     begin
       LocalColor := M.Colors[CountX, CountY];
-
-      Vol.FData[RawPos]     := LocalColor.red shr 8;
-      Vol.FData[RawPos + 1] := LocalColor.green shr 8;
-      Vol.FData[RawPos + 2] := LocalColor.blue shr 8;
-      if pWithAlpha then Vol.FData[RawPos + 3] := LocalColor.alpha shr 8;
+      if pFullPrecision then
+      begin
+        Vol.FData[RawPos]     := LocalColor.red / csSampleToByteDivisor;
+        Vol.FData[RawPos + 1] := LocalColor.green / csSampleToByteDivisor;
+        Vol.FData[RawPos + 2] := LocalColor.blue / csSampleToByteDivisor;
+        if pWithAlpha then
+          Vol.FData[RawPos + 3] := LocalColor.alpha / csSampleToByteDivisor;
+      end
+      else
+      begin
+        Vol.FData[RawPos]     := LocalColor.red shr 8;
+        Vol.FData[RawPos + 1] := LocalColor.green shr 8;
+        Vol.FData[RawPos + 2] := LocalColor.blue shr 8;
+        if pWithAlpha then Vol.FData[RawPos + 3] := LocalColor.alpha shr 8;
+      end;
       Inc(RawPos, PixelStride);
     end;
   end;
@@ -3063,7 +3268,7 @@ begin
             try
             {$IFDEF FPC}
               {$IFDEF HASTHREADS}EnterCriticalSection(FCritSecLoad);{$ENDIF}
-              M.LoadFromFile( Self.GetFileName(ClassId, ImageId) );
+              LoadFPImageFromFile(M, Self.GetFileName(ClassId, ImageId));
               {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSecLoad);{$ENDIF}
               LoadImageIntoVolume(M, SourceVolume);
             {$ELSE}
@@ -3096,6 +3301,67 @@ begin
   LocalPicture.Free;
   {$ENDIF}
   AuxVolume.Free;
+end;
+
+// TStringList sort order of ListImageFilesInFolder.
+function CompareFileNamesNatural(List: TStringList; Index1, Index2: integer): integer;
+var
+  NameA, NameB: string;
+  PosA, PosB, StartA, StartB, LenA, LenB: integer;
+begin
+  NameA := LowerCase(List[Index1]);
+  NameB := LowerCase(List[Index2]);
+  PosA := 1;
+  PosB := 1;
+  while (PosA <= Length(NameA)) and (PosB <= Length(NameB)) do
+  begin
+    if (NameA[PosA] in ['0'..'9']) and (NameB[PosB] in ['0'..'9']) then
+    begin
+      StartA := PosA;
+      StartB := PosB;
+      while (PosA <= Length(NameA)) and (NameA[PosA] in ['0'..'9']) do Inc(PosA);
+      while (PosB <= Length(NameB)) and (NameB[PosB] in ['0'..'9']) do Inc(PosB);
+      // Leading zeros do not count: compare the significant digits.
+      while (StartA < PosA - 1) and (NameA[StartA] = '0') do Inc(StartA);
+      while (StartB < PosB - 1) and (NameB[StartB] = '0') do Inc(StartB);
+      LenA := PosA - StartA;
+      LenB := PosB - StartB;
+      if LenA <> LenB then exit(LenA - LenB);
+      Result := CompareStr(Copy(NameA, StartA, LenA), Copy(NameB, StartB, LenB));
+      if Result <> 0 then exit;
+    end
+    else
+    begin
+      if NameA[PosA] <> NameB[PosB] then
+        exit(Ord(NameA[PosA]) - Ord(NameB[PosB]));
+      Inc(PosA);
+      Inc(PosB);
+    end;
+  end;
+  Result := (Length(NameA) - PosA) - (Length(NameB) - PosB);
+end;
+
+procedure ListImageFilesInFolder(const Dir: string; FileNames: TStringList);
+var
+  Search: TSearchRec;
+  Extension: string;
+begin
+  FileNames.Clear;
+  if FindFirst(IncludeTrailingPathDelimiter(Dir) + '*', faAnyFile, Search) = 0 then
+  try
+    repeat
+      if (Search.Attr and faDirectory) = 0 then
+      begin
+        Extension := LowerCase(ExtractFileExt(Search.Name));
+        if (Extension = '.png') or (Extension = '.jpg') or
+           (Extension = '.jpeg') or (Extension = '.ppm') then
+          FileNames.Add(Search.Name);
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+  FileNames.CustomSort(@CompareFileNamesNatural);
 end;
 
 procedure CreateFileNameListsFromImagesFromFolder(out TrainingFileNames,
@@ -3536,19 +3802,17 @@ begin
   end;
 end;
 
-procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
-  ResizeShorterSide, CropSize: integer;
+// Work (resized 0..255 RGB) -> Dst (CropWidth,CropHeight,3): centered crop
+// (zero padded where the window leaves Work), then (x/255 - Mean)/Std.
+procedure CenterCropAndNormalizeImage(Work, Dst: TNNetVolume;
+  CropWidth, CropHeight: integer; const Mean, Std: array of TNeuralFloat);
+begin
+  CropAndNormalizeImage(Work, Dst, (Work.SizeX - CropWidth) div 2,
+    (Work.SizeY - CropHeight) div 2, CropWidth, CropHeight, Mean, Std);
+end;
+
+procedure CheckVisionModelPreprocessArgs(Src, Dst: TNNetVolume;
   const Mean, Std: array of TNeuralFloat);
-var
-  Work: TNNetVolume;
-  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
-  Scale, Fx, Fy: TNeuralFloat;
-  ResizeWM1, ResizeHM1, CropM1, WorkBase, SrcBase, DstBase: integer;
-  ScaleX, ScaleY: TNeuralFloat;
-  SrcXMax, SrcYMax, DstStride, WorkStride: integer;
-  WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
-  RowOutY: boolean;
-  ScaleC, BiasC: array[0..2] of TNeuralFloat;
 begin
   if (Src = nil) or (Dst = nil) then
     raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
@@ -3562,99 +3826,41 @@ begin
   if (Length(Mean) < 3) or (Length(Std) < 3) then
     raise Exception.Create(
       'PreprocessImageForVisionModel: Mean/Std need 3 elements.');
+end;
 
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter);
+var
+  Work: TNNetVolume;
+begin
+  CheckVisionModelPreprocessArgs(Src, Dst, Mean, Std);
   Work := TNNetVolume.Create;
   try
-    // ---- (1) resize: shorter edge -> ResizeShorterSide, aspect preserved.
-    // PIL/torchvision default is bicubic; this is bilinear (identity when the
-    // source is already at the target size, so a pre-resized Src is exact).
-    if (Src.SizeX <> ResizeShorterSide) or (Src.SizeY <> ResizeShorterSide) then
-    begin
-      if Src.SizeX <= Src.SizeY then
-      begin
-        Scale := ResizeShorterSide / Src.SizeX;
-        ResizeW := ResizeShorterSide;
-        ResizeH := Round(Src.SizeY * Scale);
-      end
-      else
-      begin
-        Scale := ResizeShorterSide / Src.SizeY;
-        ResizeH := ResizeShorterSide;
-        ResizeW := Round(Src.SizeX * Scale);
-      end;
-      if ResizeW < 1 then ResizeW := 1;
-      if ResizeH < 1 then ResizeH := 1;
-      Work.ReSize(ResizeW, ResizeH, 3);
-      ResizeHM1 := ResizeH - 1;
-      ResizeWM1 := ResizeW - 1;
-      ScaleX := Src.SizeX / ResizeW;
-      ScaleY := Src.SizeY / ResizeH;
-      SrcXMax := Src.SizeX - 1;
-      SrcYMax := Src.SizeY - 1;
-      for Y := 0 to ResizeHM1 do
-      begin
-        // bilinear sample location (align_corners = false convention); Y-only
-        Fy := (Y + 0.5) * ScaleY - 0.5;
-        if Fy < 0 then Fy := 0;
-        SrcY := Trunc(Fy);
-        if SrcY > SrcYMax then SrcY := SrcYMax;
-        for X := 0 to ResizeWM1 do
-        begin
-          Fx := (X + 0.5) * ScaleX - 0.5;
-          if Fx < 0 then Fx := 0;
-          SrcX := Trunc(Fx);
-          if SrcX > SrcXMax then SrcX := SrcXMax;
-          WorkBase := Work.GetRawPos(X, Y, 0);
-          SrcBase := Src.GetRawPos(SrcX, SrcY, 0);
-          Move(Src.FData[SrcBase], Work.FData[WorkBase], 3 * csNeuralFloatSize);
-        end;
-      end;
-    end
-    else
-      Work.Copy(Src);
+    ResizeByteImageShortestEdge(Src, Work, ResizeShorterSide, Filter);
+    CenterCropAndNormalizeImage(Work, Dst, CropSize, CropSize, Mean, Std);
+  finally
+    Work.Free;
+  end;
+end;
 
-    // ---- (2) center crop to (CropSize, CropSize).
-    OffX := (Work.SizeX - CropSize) div 2;
-    OffY := (Work.SizeY - CropSize) div 2;
-    Dst.ReSize(CropSize, CropSize, 3);
-    CropM1 := CropSize - 1;
-    DstStride := Dst.GetRawPos(1, 0, 0);
-    WorkStride := Work.GetRawPos(1, 0, 0);
-    WorkSizeXM1 := Work.SizeX - 1;
-    WorkSizeYM1 := Work.SizeY - 1;
-    // (v/255 - Mean[C]) / Std[C] folded into one multiply-add per pixel: the
-    // per-channel scale and bias are invariant over the whole crop (#5).
-    for C := 0 to 2 do
-    begin
-      ScaleC[C] := (1.0 / 255.0) / Std[C];
-      BiasC[C] := -Mean[C] / Std[C];
-    end;
-    for Y := 0 to CropM1 do
-    begin
-      SrcY := OffY + Y;
-      RowOutY := (SrcY < 0) or (SrcY > WorkSizeYM1);
-      if not RowOutY then WorkRowBase := Work.GetRawPos(0, SrcY, 0)
-      else WorkRowBase := 0;
-      DstBase := Dst.GetRawPos(0, Y, 0);
-      for X := 0 to CropM1 do
-      begin
-        SrcX := OffX + X;
-        // pad with zeros if the crop window exceeds the resized image
-        if RowOutY or (SrcX < 0) or (SrcX > WorkSizeXM1) then
-        begin
-          for C := 0 to 2 do Dst.FData[DstBase + C] := 0;
-        end
-        else
-        begin
-          // ---- (3) rescale by 1/255 then per-channel normalize.
-          WorkBase := WorkRowBase + SrcX * WorkStride;
-          for C := 0 to 2 do
-            Dst.FData[DstBase + C] :=
-              Work.FData[WorkBase + C] * ScaleC[C] + BiasC[C];
-        end;
-        Inc(DstBase, DstStride);
-      end;
-    end;
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  const Config: TNNetImagePreprocess);
+var
+  Work: TNNetVolume;
+begin
+  CheckVisionModelPreprocessArgs(Src, Dst, Config.Mean, Config.Std);
+  Work := TNNetVolume.Create;
+  try
+    if Config.ResizeKeepsAspect then
+      ResizeByteImageShortestEdge(Src, Work, Config.ResizeShorterSide,
+        Config.Resample)
+    else
+      ResizeImagePIL(Src, Work, Config.ResizeWidth, Config.ResizeHeight,
+        Config.Resample, {RoundToBytes=}true);
+    CenterCropAndNormalizeImage(Work, Dst, Config.CropWidth,
+      Config.CropHeight, Config.Mean, Config.Std);
   finally
     Work.Free;
   end;
@@ -3662,7 +3868,8 @@ end;
 
 function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
   ResizeShorterSide, CropSize: integer;
-  const Mean, Std: array of TNeuralFloat): boolean;
+  const Mean, Std: array of TNeuralFloat;
+  Filter: TImageResampleFilter = irfBilinear): boolean;
 var
   Raw: TNNetVolume;
 begin
@@ -3671,10 +3878,23 @@ begin
     Result := LoadImageFromFileIntoVolume(ImageFileName, Raw);
     if Result then
       PreprocessImageForVisionModel(Raw, V, ResizeShorterSide, CropSize,
-        Mean, Std);
+        Mean, Std, Filter);
   finally
     Raw.Free;
   end;
+end;
+
+// Copies a resolved THFImageResize into the TNNetImagePreprocess size fields.
+procedure SetPreprocessResize(var Config: TNNetImagePreprocess;
+  const Resize: THFImageResize);
+begin
+  Config.ResizeShorterSide := Resize.ShortestEdge;
+  Config.ResizeKeepsAspect := Resize.KeepsAspect;
+  Config.ResizeHeight := Resize.ResizeHeight;
+  Config.ResizeWidth := Resize.ResizeWidth;
+  Config.CropSize := Resize.CropHeight;
+  Config.CropHeight := Resize.CropHeight;
+  Config.CropWidth := Resize.CropWidth;
 end;
 
 {$IFDEF FPC}
@@ -3684,6 +3904,9 @@ var
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
+  CropPctData: TJSONData;
+  CropPct: double;
+  Resize: THFImageResize;
 
   // Reads a size-like field that may be an int (square) or an object with
   // shortest_edge / height / width. Returns the resolved edge length.
@@ -3707,6 +3930,27 @@ var
     end
     else if Data.JSONType = jtNumber then
       Result := Data.AsInteger;
+  end;
+
+  // True when the field is {"height":..,"width":..} without shortest_edge;
+  // otherwise Height = Width = ReadEdge(FieldName, DefaultEdge).
+  function ReadHeightWidth(const FieldName: string; DefaultEdge: integer;
+    out Height, Width: integer): boolean;
+  var
+    O: TJSONObject;
+  begin
+    Height := ReadEdge(FieldName, DefaultEdge);
+    Width := Height;
+    Result := false;
+    if not (Obj.Find(FieldName) is TJSONObject) then Exit;
+    O := TJSONObject(Obj.Find(FieldName));
+    if (O.IndexOfName('shortest_edge') < 0) and
+      (O.IndexOfName('height') >= 0) and (O.IndexOfName('width') >= 0) then
+    begin
+      Height := O.Get('height', DefaultEdge);
+      Width := O.Get('width', DefaultEdge);
+      Result := true;
+    end;
   end;
 
   procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
@@ -3749,8 +3993,23 @@ begin
         FileName + '" is not a JSON object.');
     Obj := TJSONObject(Root);
 
-    Result.ResizeShorterSide := ReadEdge('size', 224);
-    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    Resize.ShortestEdge := ReadEdge('size', 224);
+    Resize.KeepsAspect := not ReadHeightWidth('size', Resize.ShortestEdge,
+      Resize.ResizeHeight, Resize.ResizeWidth);
+    ReadHeightWidth('crop_size', ReadEdge('crop_size', Resize.ShortestEdge),
+      Resize.CropHeight, Resize.CropWidth);
+    Resize.DoCenterCrop := Obj.Get('do_center_crop', true);
+    CropPctData := Obj.Find('crop_pct');
+    if (CropPctData <> nil) and (CropPctData.JSONType = jtNumber) then
+      CropPct := CropPctData.AsFloat
+    else
+      CropPct := 0;
+    ResolveHFImageResize(Obj.Get('image_processor_type',
+      Obj.Get('feature_extractor_type', '')),
+      (Obj.Find('size') <> nil) and (Obj.Find('size').JSONType = jtNumber),
+      Obj.Find('crop_size') <> nil, CropPct, Resize);
+    SetPreprocessResize(Result, Resize);
+    Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
       csClipMean[0], csClipMean[1], csClipMean[2]);
@@ -3768,6 +4027,9 @@ var
   JsonText: TStringList;
   Root: TJSONValue;
   Obj: TJSONObject;
+  CropPct: double;
+  ProcessorType: string;
+  Resize: THFImageResize;
 
   // Reads a size-like field that may be an int (square) or an object with
   // shortest_edge / height / width. Returns the resolved edge length.
@@ -3793,6 +4055,29 @@ var
     end
     else if Data is TJSONNumber then
       Result := (Data as TJSONNumber).AsInt;
+  end;
+
+  // True when the field is {"height":..,"width":..} without shortest_edge;
+  // otherwise Height = Width = ReadEdge(FieldName, DefaultEdge).
+  function ReadHeightWidth(const FieldName: string; DefaultEdge: integer;
+    out Height, Width: integer): boolean;
+  var
+    O: TJSONObject;
+    Temp, HeightValue, WidthValue: TJSONValue;
+  begin
+    Height := ReadEdge(FieldName, DefaultEdge);
+    Width := Height;
+    Result := false;
+    if not (Obj.FindValue(FieldName) is TJSONObject) then Exit;
+    O := Obj.FindValue(FieldName) as TJSONObject;
+    if (not O.TryGetValue('shortest_edge', Temp)) and
+      O.TryGetValue('height', HeightValue) and
+      O.TryGetValue('width', WidthValue) then
+    begin
+      Height := (HeightValue as TJSONNumber).AsInt;
+      Width := (WidthValue as TJSONNumber).AsInt;
+      Result := true;
+    end;
   end;
 
   procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
@@ -3832,8 +4117,25 @@ begin
         FileName + '" is not a JSON object.');
     Obj := Root as TJSONObject;
 
-    Result.ResizeShorterSide := ReadEdge('size', 224);
-    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    Resize.ShortestEdge := ReadEdge('size', 224);
+    Resize.KeepsAspect := not ReadHeightWidth('size', Resize.ShortestEdge,
+      Resize.ResizeHeight, Resize.ResizeWidth);
+    ReadHeightWidth('crop_size', ReadEdge('crop_size', Resize.ShortestEdge),
+      Resize.CropHeight, Resize.CropWidth);
+    Resize.DoCenterCrop := not (Obj.FindValue('do_center_crop') is TJSONFalse);
+    if Obj.FindValue('crop_pct') is TJSONNumber then
+      CropPct := (Obj.FindValue('crop_pct') as TJSONNumber).AsDouble
+    else
+      CropPct := 0;
+    if not Obj.TryGetValue<string>('image_processor_type', ProcessorType) then
+      if not Obj.TryGetValue<string>('feature_extractor_type',
+        ProcessorType) then
+        ProcessorType := '';
+    ResolveHFImageResize(ProcessorType,
+      Obj.FindValue('size') is TJSONNumber,
+      Obj.FindValue('crop_size') <> nil, CropPct, Resize);
+    SetPreprocessResize(Result, Resize);
+    Result.Resample := PILResampleCodeToFilter(ReadEdge('resample', 3));
     // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
     ReadTriple('image_mean', Result.Mean,
       csClipMean[0], csClipMean[1], csClipMean[2]);

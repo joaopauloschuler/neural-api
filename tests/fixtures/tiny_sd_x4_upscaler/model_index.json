@@ -1,0 +1,41 @@
+{
+  "_class_name": "StableDiffusionUpscalePipeline",
+  "_diffusers_version": "0.41.0.dev0",
+  "feature_extractor": [
+    null,
+    null
+  ],
+  "low_res_scheduler": [
+    "diffusers",
+    "DDPMScheduler"
+  ],
+  "max_noise_level": 350,
+  "safety_checker": [
+    null,
+    null
+  ],
+  "scheduler": [
+    "diffusers",
+    "DDIMScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "CLIPTextModel"
+  ],
+  "tokenizer": [
+    "transformers",
+    "CLIPTokenizer"
+  ],
+  "unet": [
+    "diffusers",
+    "UNet2DConditionModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderKL"
+  ],
+  "watermarker": [
+    null,
+    null
+  ]
+}

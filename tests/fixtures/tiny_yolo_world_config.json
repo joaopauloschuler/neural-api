@@ -1,0 +1,32 @@
+{
+ "model_type": "yolo_world",
+ "widths": [
+  4,
+  6,
+  8,
+  12,
+  16
+ ],
+ "depths": [
+  1,
+  2
+ ],
+ "reg_max": 8,
+ "box_hidden": 8,
+ "cls_hidden": 8,
+ "text_embed_dim": 8,
+ "attn_heads": [
+  2,
+  2,
+  3,
+  4
+ ],
+ "num_channels": 3,
+ "image_size": 96,
+ "bn_eps": 0.001,
+ "strides": [
+  8,
+  16,
+  32
+ ]
+}

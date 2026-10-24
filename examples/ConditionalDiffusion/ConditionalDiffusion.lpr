@@ -59,6 +59,9 @@ RUN MODES.
     on one CPU. Enough to see the loss fall and the fidelity/diversity trend.
   --full : many more training steps and more samples per weight for a sharp,
     statistically cleaner trade-off and a nicer PNG grid.
+  --apg ETA,MOMENTUM,THRESHOLD : Adaptive Projected Guidance instead of the
+    plain CFG mix at every swept w (e.g. 0,-0.5,15), applied to the x0
+    predictions as in the paper; add --apg-eps to apply it to eps instead.
 
 OUTPUT. A PNG grid (conditional_samples.png) whose ROWS are increasing CFG
 weights and whose COLUMNS are independent samples of one chosen digit, so you
@@ -162,6 +165,10 @@ var
   // Current CFG weight used by the denoiser callback.
   gCurW: TNeuralFloat;
   gReqDigit: integer;
+
+  // Adaptive Projected Guidance replacing ApplyCFG when --apg is given (else nil).
+  gAPG: TNNetAdaptiveProjectedGuidance;
+  gApgOnEps: boolean;
 
   Denoiser: TCFGDenoiser;
 
@@ -401,7 +408,18 @@ var
       SetLabelInput(cNullLabel);
       NN.Compute([Xt, TimeVol, LabelVol]);
       Uncond.Copy(NN.GetLastLayer.Output);
-      TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, EpsCFG, gCurW);
+      if Assigned(gAPG) then
+      begin
+        if not gApgOnEps then
+        begin
+          Sched.PredictX0(Xt, Cond, Cond, t);
+          Sched.PredictX0(Xt, Uncond, Uncond, t);
+        end;
+        gAPG.ApplyAPG(Cond, Uncond, EpsCFG, gCurW);
+        if not gApgOnEps then Sched.RawPredFromX0(Xt, EpsCFG, EpsCFG, t);
+      end
+      else
+        TNNetDiffusionScheduler.ApplyCFG(Cond, Uncond, EpsCFG, gCurW);
     finally
       Cond.Free;
       Uncond.Free;
@@ -421,6 +439,7 @@ var
   begin
     for i := 0 to Dst.Size - 1 do
       Dst.FData[i] := RandG(0, 1);
+    if Assigned(gAPG) then gAPG.Reset;
     Sched.Sample(Dst, @Denoiser.Denoise, DDIMSteps, smDDIM, 0.0);
   end;
 
@@ -560,8 +579,21 @@ begin
   RandSeed := 2026;
 
   FullMode := false;
-  for i := 1 to ParamCount do
-    if (ParamStr(i) = '--full') then FullMode := true;
+  gAPG := nil;
+  gApgOnEps := false;
+  i := 1;
+  while i <= ParamCount do
+  begin
+    if ParamStr(i) = '--full' then FullMode := true
+    else if ParamStr(i) = '--apg-eps' then gApgOnEps := true
+    else if ParamStr(i) = '--apg' then
+    begin
+      Inc(i);
+      gAPG.Free;
+      gAPG := TNNetAdaptiveProjectedGuidance.CreateFromSpec(ParamStr(i));
+    end;
+    Inc(i);
+  end;
 
   if FullMode then
   begin
@@ -577,6 +609,10 @@ begin
   end;
   WriteLn('Class-conditional DDPM: label embedding + label dropout -> CFG.');
   WriteLn('Demonstrates that the CFG weight trades diversity for class fidelity.');
+  if Assigned(gAPG) then
+    WriteLn(Format('Guidance: APG on %s, eta %.3f, momentum %.3f, norm threshold %.3f',
+      [BoolToStr(gApgOnEps, 'eps', 'x0'), gAPG.Eta, gAPG.Momentum,
+      gAPG.NormThreshold]));
   WriteLn;
 
   if not (CheckMNISTFile('train')) or not (CheckMNISTFile('t10k')) then
@@ -625,6 +661,7 @@ begin
     NN.Free;
     Clf.Free;
     Sched.Free;
+    gAPG.Free;
     Denoiser.Free;
     TrainV.Free;
     ValV.Free;

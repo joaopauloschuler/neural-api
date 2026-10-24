@@ -11,7 +11,7 @@
  ],
  "layers_per_block": 1,
  "cross_attention_dim": 12,
- "attention_head_dim": 8,
+ "attention_head_dim": 2,
  "norm_num_groups": 4,
  "flip_sin_to_cos": true,
  "freq_shift": 0,

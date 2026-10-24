@@ -82,29 +82,29 @@ failure), proving the base weights truly do not move.
 ```
 === Pretraining base classifier on BASE task ===
   base accuracy on BASE   test: 100.00 %
-  base accuracy on TARGET test:  90.25 %   (distribution-shifted -> degraded)
+  base accuracy on TARGET test:  89.06 %   (distribution-shifted -> degraded)
 
 === Reference: full fine-tune (every weight trainable) ===
-  full fine-tune TARGET accuracy:  99.88 %  (244 trainable params)
+  full fine-tune TARGET accuracy:  99.94 %  (244 trainable params)
 
 === LoRA rank sweep (only A/B adapter params trainable) ===
 
 ---------------------------------------------------------------
 Rank sweep: trainable adapter params vs recovered TARGET accuracy
-  full network (upper bound):   244 params  ->  99.88 %
-  frozen base (lower bound) :     0 params  ->  90.25 %
+  full network (upper bound):   244 params  ->  99.94 %
+  frozen base (lower bound) :     0 params  ->  89.06 %
   ---------------------------------------------------
    rank | adapter params | % of full | TARGET acc
   ------+----------------+-----------+-----------
-      1 |             37 |    15.16 % |   98.88 %
-      2 |             62 |    25.41 % |   99.88 %
+      1 |             37 |    15.16 % |   99.94 %
+      2 |             62 |    25.41 % |   99.94 %
       4 |            112 |    45.90 % |   99.94 %
-      8 |            212 |    86.89 % |   99.88 %
+      8 |            212 |    86.89 % |   99.94 %
 ---------------------------------------------------------------
 
 CHECK 1 PASS: B zero-init -> adapted == frozen base before training (max diff 0.000000000).
 CHECK 2 PASS: rank-1 adapter uses far fewer params (37 < 244).
-CHECK 3 PASS: best LoRA recovers accuracy (99.94 % > base 90.25 % + margin, and >  70 %).
+CHECK 3 PASS: best LoRA recovers accuracy (99.94 % > base 89.06 % + margin, and >  70 %).
 
 ALL CHECKS PASSED.
 ```

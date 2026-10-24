@@ -98,18 +98,6 @@ var
   // cNumClasses random, well-separated blob centers in cInDim space.
   Centers: array[0..cNumClasses - 1, 0..cInDim - 1] of TNeuralFloat;
 
-// Box-Muller N(0,1) sample (no extra dependency).
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Random class centers with a decent pairwise separation.
 procedure BuildCenters();
 var
@@ -117,7 +105,7 @@ var
 begin
   for C := 0 to cNumClasses - 1 do
     for D := 0 to cInDim - 1 do
-      Centers[C][D] := RandomGauss() * 2.0;
+      Centers[C][D] := RandomStdNormal() * 2.0;
 end;
 
 // Builds the synthetic dataset: cSamplesPerCls nD Gaussian points per class.
@@ -131,7 +119,7 @@ begin
     for I := 1 to cSamplesPerCls do
     begin
       for D := 0 to cInDim - 1 do
-        Data[Idx].X[D] := Centers[C][D] + RandomGauss() * cSigma;
+        Data[Idx].X[D] := Centers[C][D] + RandomStdNormal() * cSigma;
       Data[Idx].Cls := C;
       Inc(Idx);
     end;

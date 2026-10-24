@@ -64,12 +64,12 @@ Pure CPU, ~30 s, tiny memory footprint.
 ## Headline result (seed 424242)
 
 ```
-one-step MSE  HNN = 0.000441   free MLP = 0.000457   (noise floor ~ 0.000400)
+  one-step MSE  HNN = 0.000465   free MLP = 0.000426   (noise floor ~ 0.000400)
 
 energy drift over 800 autoregressive steps (lower = better):
   true leapfrog : end |dE|=0.00189   max |dE|=0.00213   (reference)
-  HNN (symplectic): end |dE|=0.11390   max |dE|=0.15949
-  free MLP field  : end |dE|=0.62376   max |dE|=0.63201
+  HNN (symplectic): end |dE|=0.04333   max |dE|=0.16324
+  free MLP field  : end |dE|=266.16669   max |dE|=266.16669
 ```
 
 Both models fit the one-step transition equally well (down to the observation

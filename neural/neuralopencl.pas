@@ -220,9 +220,10 @@ type
     function QueueScratchBuffer(pBytes: csize_t; out pGeneration: integer): cl_mem;
     // Bytes of this command queue's scratch buffer (0 before the first use).
     function QueueScratchBytes(): csize_t;
-    // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
-    // memory; ordered after earlier work on the queue and returns at once.
-    function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
+    // Enqueues a cb-byte copy from src at srcOffsetBytes to dst at dstOffsetBytes,
+    // both in OpenCL memory, on this queue; ordered after earlier work, returns at once.
+    function CopyBuffer(src, dst: cl_mem; cb: csize_t; dstOffsetBytes: csize_t = 0;
+      srcOffsetBytes: csize_t = 0): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -457,6 +458,7 @@ type
       FSplitKFP16Kernel: cl_kernel;
       FSplitKReduceFP16Kernel: cl_kernel;
       FCastFP16Kernel: cl_kernel;
+      FCastFP16LaunchCount: integer;
       /// Last (shape, buffer, kernel) tuple bound into the split-K entry points
       /// by BindSplitKInvariantArgs. The split-K handles are per-instance, so
       /// eleven of the sixteen arguments survive from launch to launch and are
@@ -526,6 +528,25 @@ type
       FImplicitConvKernel, FImplicitConvTiledKernel: cl_kernel;
       FImplicitConvReady: boolean;
       FImplicitConvLaunchCount: integer;
+      /// TRANSPOSED CONVOLUTION (cai_conv_transpose): owned handle bound by
+      /// PrepareTransposedConv.
+      FTransposedConvKernel: cl_kernel;
+      /// NEAREST-2X UPSAMPLE FOLD (PrepareUpsampleFold): the four 2x2 phase
+      /// slabs cai_conv_upsample_fold_weights derives from FInputBufferAs; stale
+      /// until derived after the A operand last changed.
+      FUpsampleFoldBuffer: cl_mem;
+      FUpsampleFoldWeightsKernel: cl_kernel;
+      FUpsampleFoldStale: boolean;
+      FUpsampleFoldLaunchCount: integer;
+      /// MODULATED CONVOLUTION (PrepareModulatedConv): FModulatedAsBuffer is the
+      /// slab cai_conv_modulate_weights derives per forward from FInputBufferAs;
+      /// FModSquareSumsBuffer is stale until rebuilt after the A operand changed.
+      FModulatedAsBuffer, FModSquareSumsBuffer, FModRowScalesBuffer,
+        FModStyleBuffer: cl_mem;
+      FModSquareSumsKernel, FModRowScalesKernel, FModulateWeightsKernel: cl_kernel;
+      FModSquareSumsStale: boolean;
+      FModInDepth: longint;
+      FModulatedConvLaunchCount, FModSquareSumsLaunchCount: integer;
       /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
       /// retained references to another instance's resident weights
       /// (PrepareForComputeBorrowingCodes, or BorrowCodesKeepingBuffers, which
@@ -546,6 +567,8 @@ type
       function BindTiledFixedArgs(pKernel: cl_kernel): integer;
       /// Releases FTiledKernel, FTiledBlockKernel and the split-K pair.
       procedure ReleaseTiledKernels();
+      /// Releases the modulated-convolution kernels and buffers.
+      procedure ReleaseModulatedConv();
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -573,9 +596,10 @@ type
       /// The B operand ComputeInt8 binds. In FP16 mode this narrows whatever the
       /// caller supplied into FInputBufferBsFP16 first; NewVBs = false means the
       /// caller's cai_im2col_h already wrote that buffer, so nothing is done.
-      /// Coded by Claude (AI).
+      /// pExternalVBsIsHalf: pExternalVBs is already half and is bound as is.
       function PrepareInt8BOperand(VBs: TNNetVolume; NewVBs: boolean;
-        pExternalVBs: cl_mem; var err: integer): cl_mem;
+        pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean;
+        var err: integer): cl_mem;
       /// Uploads VBias (one float per A row, else raises) into the resident
       /// grow-only bias buffer when needed; returns UseBias (0 for nil). Coded by Claude (AI).
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
@@ -594,6 +618,22 @@ type
       /// pRowsPerTile x pColsPerTile work-group and pSplits K-splits, on the shared queue.
       procedure RunTiledGemm(pKernel: cl_kernel;
         pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
+      /// RunTiledGemm's grid over FNumAs rows and pNumBs columns, with
+      /// pAxis2Groups work-groups along axis 2 (a 2-D launch when 1).
+      procedure RunTiledGrid(pKernel: cl_kernel; pLanes, pRowsPerTile,
+        pColsPerTile, pNumBs, pAxis2Groups: longint);
+      /// Binds the 23 arguments of cai_conv_implicit(_tiled) and launches the
+      /// tiled kernel when the shape allows; err accumulates failures.
+      /// Uploads VAs when NewVAs and launches cai_conv_transpose over SrcBuffer,
+      /// an InSizeX x InSizeY x InDepth source; reports its own failures.
+      procedure LaunchTransposedConv(VAs: TNNetVolume; NewVAs: boolean;
+        SrcBuffer: cl_mem; UseBias, InSizeX, InSizeY, InDepth, OutSizeX,
+        FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY, Groups,
+        pActFN: longint; err: integer);
+      procedure LaunchImplicitConv(AsBuffer, SrcBuffer: cl_mem; NumBs,
+        GemmSize, UseBias, OutSizeX, RowSpan, InSizeX, InSizeY, InDepth,
+        Stride, PaddingX, PaddingY, DilationX, DilationY, PixelStride, OutFrames,
+        FrameStep, UpsampleFold: longint; var err: integer);
       /// The large grid's split count (1 = none): TiledGemmSplitK fitted to
       /// FSize, or AutoTiledGemmSplitCount unless the queue is private.
       function SelectTiledSplitCount(): integer;
@@ -613,7 +653,7 @@ type
       /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
-        pExternalVBs: cl_mem);
+        pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean);
 
     public
       constructor Create(DotProductKernel: TNeuralKernel;
@@ -644,7 +684,8 @@ type
       /// uploaded and nothing is released here. SrcVol then only carries the
       /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
-        OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY, DilationX: longint;
+        OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY, DilationX,
+        DilationY: longint;
         NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
@@ -657,10 +698,46 @@ type
       function PrepareImplicitConv(): boolean;
       /// Compute for an FP32 convolution with B gathered inside the GEMM from
       /// unpadded SrcVol (or borrowed pExternalSrc): no column matrix, no B buffer.
+      /// OutFrames > 1 is the frames-along-depth 3-D conv: each output pixel has
+      /// OutFrames columns, frame t's tap window is WindowDepth floats at t*FrameStep.
       procedure ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
-        OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint;
+        OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, DilationY,
+        pActFN: longint;
         NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
-        NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
+        NewSrc: boolean = true; pExternalSrc: cl_mem = nil;
+        OutFrames: longint = 1; FrameStep: longint = 0; WindowDepth: longint = 0);
+      /// Binds cai_conv_transpose after an FP32 PrepareForCompute whose FNumBs
+      /// is the output position count; False when the device rejected it.
+      function PrepareTransposedConv(): boolean;
+      /// Transposed convolution of SrcVol (or borrowed pExternalSrc) into the
+      /// result buffer; VAs is the [row + k*FNumAs] neuron weight layout.
+      procedure ComputeTransposedConv(VAs, SrcVol: TNNetVolume;
+        OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY,
+        Groups, pActFN: longint; NewVAs: boolean; VBias: TNNetVolume;
+        NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
+      /// Grouped GEMM after PrepareTransposedConv: row a of group g = a div
+      /// (NumAs/Groups) dots A[a + k*NumAs] with B[b*Groups*FSize + g*FSize + k].
+      procedure ComputeGroupedGemm(VAs, VBs: TNNetVolume; Groups, pActFN: longint;
+        NewVAs, NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        pExternalVBs: cl_mem = nil);
+      /// Allocates the phase slabs after PrepareImplicitConv on a 3x3 layout
+      /// (FSize = 9 x depth); False when the device refused them.
+      function PrepareUpsampleFold(): boolean;
+      /// ComputeImplicitConv of a 3x3 pad-1 stride-1 conv over a nearest-2x
+      /// upsample of SrcVol, as four 2x2 phase GEMMs over SrcVol itself.
+      procedure ComputeUpsampleFoldConv(VAs, SrcVol: TNNetVolume; pActFN: longint;
+        NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        NewSrc: boolean; pExternalSrc: cl_mem);
+      /// Allocates the modulation kernels and buffers after PrepareImplicitConv
+      /// for InDepth input channels; False when the device refused them.
+      function PrepareModulatedConv(InDepth: longint): boolean;
+      /// ComputeImplicitConv (stride 1, SAME padding) of VAs modulated on OpenCL by
+      /// StyleBuffer (InDepth floats) and, when Demodulate, demodulated per row;
+      /// every row is scaled by OutputGain before the bias.
+      procedure ComputeModulatedConv(VAs, SrcVol: TNNetVolume; StyleBuffer: cl_mem;
+        FeatureSize, pActFN: longint; Demodulate: boolean; DemodEps: TNeuralFloat;
+        OutputGain: TNeuralFloat; NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        NewSrc: boolean; pExternalSrc: cl_mem);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -673,10 +750,11 @@ type
       /// Int8 twin of Compute: same B upload, fused bias and activation
       /// semantics, but the A operand is the resident code buffer and the
       /// per-row scales ride as kernel arg 10 (deferred dequantization).
-      /// Coded by Claude (AI).
+      /// pExternalVBsIsHalf (FP16 mode only): pExternalVBs is bound without a cast.
       procedure ComputeInt8(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
-        NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+        NewVBias: boolean = true; pExternalVBs: cl_mem = nil;
+        pExternalVBsIsHalf: boolean = false);
       /// Arms the Q4_0 weight mode: pPacked is NumAs*pSize/2 bytes in the
       /// layout packed[a + p*NumAs] (p = k/2, low nibble = code k, high = code
       /// k+1, biased +8); pBlockScales is NumAs*pSize/32 floats in the layout
@@ -732,6 +810,11 @@ type
       /// True after a successful PrepareForComputeInt4 (cleared by
       /// UnprepareForCompute); the int4 layers gate their device route on it.
       property Int4Ready: boolean read FInt4Ready;
+      /// The resolved FP16 activation verdict, the half B buffer the last
+      /// narrowing wrote, and the cai_f32_to_half launches so far (test hook).
+      property FP16Activations: boolean read FFP16Activations;
+      property InputBufferBsFP16: cl_mem read FInputBufferBsFP16;
+      property CastFP16LaunchCount: integer read FCastFP16LaunchCount;
       /// The resident weight codes (nil when unarmed) and whether they are a
       /// retained reference to another instance's buffer: the test hooks that
       /// prove a borrower created no second copy.
@@ -747,9 +830,22 @@ type
       property LastTiledGemmSplits: integer read FLastTiledSplits;
       /// True after a successful PrepareImplicitConv.
       property ImplicitConvReady: boolean read FImplicitConvReady;
+      /// True after a successful PrepareTransposedConv.
+      function TransposedConvReady(): boolean;
       /// Implicit-GEMM convolution launches (tiled ones count in
       /// TiledGemmLaunchCount too).
       property ImplicitConvLaunchCount: integer read FImplicitConvLaunchCount;
+      /// True after a successful PrepareUpsampleFold.
+      function UpsampleFoldReady(): boolean;
+      /// ComputeUpsampleFoldConv launches (also counted as implicit convs).
+      property UpsampleFoldLaunchCount: integer read FUpsampleFoldLaunchCount;
+      /// True after a successful PrepareModulatedConv.
+      function ModulatedConvReady(): boolean;
+      /// InDepth floats a caller uploads a host-side style into.
+      property ModulationStyleBuffer: cl_mem read FModStyleBuffer;
+      /// ComputeModulatedConv launches, and rebuilds of the square-sum table.
+      property ModulatedConvLaunchCount: integer read FModulatedConvLaunchCount;
+      property ModSquareSumsLaunchCount: integer read FModSquareSumsLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -1018,7 +1114,9 @@ begin
   Result := OpenCLMemBytes(FInputBufferBs) +
     OpenCLMemBytes(FResultBuffer) +
     OpenCLMemBytes(FGatherSrcBuffer) + OpenCLMemBytes(FPartialBuffer) +
-    OpenCLMemBytes(FInputBufferBsFP16);
+    OpenCLMemBytes(FInputBufferBsFP16) + OpenCLMemBytes(FUpsampleFoldBuffer) +
+    OpenCLMemBytes(FModulatedAsBuffer) + OpenCLMemBytes(FModSquareSumsBuffer) +
+    OpenCLMemBytes(FModRowScalesBuffer) + OpenCLMemBytes(FModStyleBuffer);
   if not FWeightsBorrowed then
     Result := Result + OpenCLMemBytes(FInputBufferAs);
   if not FBiasBorrowed then
@@ -1054,9 +1152,17 @@ begin
   ReleaseTiledKernels();
   if Assigned(FImplicitConvKernel)         then clReleaseKernel(FImplicitConvKernel);
   if Assigned(FImplicitConvTiledKernel)    then clReleaseKernel(FImplicitConvTiledKernel);
+  if Assigned(FTransposedConvKernel)       then clReleaseKernel(FTransposedConvKernel);
+  if Assigned(FUpsampleFoldWeightsKernel)  then clReleaseKernel(FUpsampleFoldWeightsKernel);
+  if Assigned(FUpsampleFoldBuffer) then clReleaseMemObject(FUpsampleFoldBuffer);
   FImplicitConvKernel := nil;
   FImplicitConvTiledKernel := nil;
   FImplicitConvReady := false;
+  FTransposedConvKernel := nil;
+  FUpsampleFoldWeightsKernel := nil;
+  FUpsampleFoldBuffer := nil;
+  FUpsampleFoldStale := false;
+  ReleaseModulatedConv();
   FMainKernel := nil;
   FSinglePassKernel := nil;
   FTiledRejected := false;
@@ -1233,7 +1339,7 @@ end;
 
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
   SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, PaddingX, PaddingY,
-  DilationX: longint; NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
+  DilationX, DilationY: longint; NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
 var
   k: cl_kernel;
   N, InSizeX, InSizeY, InDepth: longint;
@@ -1272,8 +1378,9 @@ begin
   err := err or clSetKernelArg(k, 8, csLongintSize, @PaddingX);
   err := err or clSetKernelArg(k, 9, csLongintSize, @PaddingY);
   err := err or clSetKernelArg(k, 10, csLongintSize, @DilationX);
-  err := err or clSetKernelArg(k, 11, csCLMemSize, @SrcBuffer);
-  err := err or clSetKernelArg(k, 12, csCLMemSize, @ColsBuffer);
+  err := err or clSetKernelArg(k, 11, csLongintSize, @DilationY);
+  err := err or clSetKernelArg(k, 12, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(k, 13, csCLMemSize, @ColsBuffer);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
@@ -1350,7 +1457,10 @@ begin
           'kernel arguments: ' + IntToStr(err));
 
       if NewVAs and not FWeightsBorrowed then
+      begin
         err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+        FUpsampleFoldStale := true;
+      end;
       if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
@@ -1638,6 +1748,7 @@ begin
   err := CL_SUCCESS;
   PrepareBiasOperand(VBias, {NewVBias=}true, err);
   err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs, CL_TRUE);
+  FUpsampleFoldStale := true;
   Result := err = CL_SUCCESS;
 end;
 
@@ -2217,19 +2328,25 @@ end;
 
 procedure TDotProductSharedKernel.RunTiledGemm(pKernel: cl_kernel;
   pLanes, pRowsPerTile, pColsPerTile: longint; pSplits: longint = 1);
+begin
+  RunTiledGrid(pKernel, pLanes, pRowsPerTile, pColsPerTile, FNumBs, pSplits);
+  FLastTiledLanes := pLanes;
+  FLastTiledSplits := pSplits;
+end;
+
+procedure TDotProductSharedKernel.RunTiledGrid(pKernel: cl_kernel; pLanes,
+  pRowsPerTile, pColsPerTile, pNumBs, pAxis2Groups: longint);
 var
   RowTiles, ColTiles: longint;
 begin
   RowTiles := (FNumAs + pRowsPerTile - 1) div pRowsPerTile;
-  ColTiles := (FNumBs + pColsPerTile - 1) div pColsPerTile;
-  if pSplits > 1
+  ColTiles := (pNumBs + pColsPerTile - 1) div pColsPerTile;
+  if pAxis2Groups > 1
     then FDotProductKernel.RunKernel3D(pKernel, RowTiles * pLanes, ColTiles,
-      pSplits, pLanes, 1, 1)
+      pAxis2Groups, pLanes, 1, 1)
     else FDotProductKernel.RunKernel2D(pKernel, RowTiles * pLanes, ColTiles,
       pLanes, 1);
   Inc(FTiledLaunchCount);
-  FLastTiledLanes := pLanes;
-  FLastTiledSplits := pSplits;
 end;
 
 function TDotProductSharedKernel.PrepareImplicitConv(): boolean;
@@ -2252,15 +2369,15 @@ begin
 end;
 
 procedure TDotProductSharedKernel.ComputeImplicitConv(VAs, SrcVol: TNNetVolume;
-  OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, pActFN: longint; NewVAs: boolean;
+  OutSizeX, RowSpan, Stride, PaddingX, PaddingY, DilationX, DilationY,
+  pActFN: longint; NewVAs: boolean;
   VBias: TNNetVolume; NewVBias: boolean; NewSrc: boolean;
-  pExternalSrc: cl_mem);
+  pExternalSrc: cl_mem; OutFrames: longint; FrameStep: longint;
+  WindowDepth: longint);
 var
   err: integer;
-  UseBias, InSizeX, InSizeY, InDepth: longint;
-  K: cl_kernel;
+  UseBias, InSizeX, InSizeY, InDepth, PixelStride: longint;
   SrcBuffer: cl_mem;
-  UseTiled: boolean;
 begin
   if not FImplicitConvReady then
   begin
@@ -2278,20 +2395,48 @@ begin
   FActFun := pActFN;
   InSizeX := SrcVol.SizeX;
   InSizeY := SrcVol.SizeY;
-  InDepth := SrcVol.Depth;
+  PixelStride := SrcVol.Depth;
+  if WindowDepth > 0 then InDepth := WindowDepth else InDepth := PixelStride;
   err := CL_SUCCESS;
   UseBias := PrepareBiasOperand(VBias, NewVBias, err);
   SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
   if NewVAs and not FWeightsBorrowed then
+  begin
     err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+    FUpsampleFoldStale := true;
+  end;
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
+      'uploading: ' + IntToStr(err));
+    exit;
+  end;
+  LaunchImplicitConv(FInputBufferAs, SrcBuffer, FNumBs, FSize, UseBias,
+    OutSizeX, RowSpan, InSizeX, InSizeY, InDepth, Stride, PaddingX, PaddingY,
+    DilationX, DilationY, PixelStride, OutFrames, FrameStep, {UpsampleFold=}0,
+    err);
+  if err <> CL_SUCCESS then
+    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
+      'setting arguments: ' + IntToStr(err));
+end;
+
+procedure TDotProductSharedKernel.LaunchImplicitConv(AsBuffer,
+  SrcBuffer: cl_mem; NumBs, GemmSize, UseBias, OutSizeX, RowSpan, InSizeX,
+  InSizeY, InDepth, Stride, PaddingX, PaddingY, DilationX, DilationY, PixelStride,
+  OutFrames, FrameStep, UpsampleFold: longint; var err: integer);
+var
+  K: cl_kernel;
+  UseTiled: boolean;
+  PhaseCount: longint;
+begin
   UseTiled := Assigned(FImplicitConvTiledKernel) and
     (FNumAs >= csTiledGemmFP32MinRows) and ShouldUseTiledGemm();
   if UseTiled then K := FImplicitConvTiledKernel else K := FImplicitConvKernel;
   err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @NumBs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @GemmSize);
   err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
-  err := err or clSetKernelArg(K, 4, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(K, 4, csCLMemSize, @AsBuffer);
   err := err or clSetKernelArg(K, 5, csCLMemSize, @SrcBuffer);
   err := err or clSetKernelArg(K, 6, csCLMemSize, @FResultBuffer);
   err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
@@ -2305,17 +2450,349 @@ begin
   err := err or clSetKernelArg(K, 15, csLongintSize, @PaddingX);
   err := err or clSetKernelArg(K, 16, csLongintSize, @PaddingY);
   err := err or clSetKernelArg(K, 17, csLongintSize, @DilationX);
-  if err <> CL_SUCCESS then
+  err := err or clSetKernelArg(K, 18, csLongintSize, @DilationY);
+  err := err or clSetKernelArg(K, 19, csLongintSize, @PixelStride);
+  err := err or clSetKernelArg(K, 20, csLongintSize, @OutFrames);
+  err := err or clSetKernelArg(K, 21, csLongintSize, @FrameStep);
+  err := err or clSetKernelArg(K, 22, csLongintSize, @UpsampleFold);
+  if err <> CL_SUCCESS then exit;
+  if UpsampleFold <> 0 then PhaseCount := 4 else PhaseCount := 1;
+  if UseTiled
+    then RunTiledGrid(K, csTiledGemmLanes,
+      csTiledGemmLanes * csTiledGemmRowsPerLane, csTiledGemmCols, NumBs,
+      PhaseCount)
+    else if PhaseCount > 1
+      then FDotProductKernel.RunKernel3D(K, FNumAs, NumBs, PhaseCount)
+      else FDotProductKernel.RunKernel2D(K, FNumAs, NumBs);
+  Inc(FImplicitConvLaunchCount);
+end;
+
+function TDotProductSharedKernel.TransposedConvReady(): boolean;
+begin
+  Result := Assigned(FTransposedConvKernel);
+end;
+
+function TDotProductSharedKernel.PrepareTransposedConv(): boolean;
+begin
+  if (not Assigned(FTransposedConvKernel)) and (not FInt8Ready) and
+    (not FInt4Ready) then
+    FTransposedConvKernel := FDotProductKernel.CreateKernel('cai_conv_transpose');
+  Result := Assigned(FTransposedConvKernel);
+end;
+
+procedure TDotProductSharedKernel.ComputeTransposedConv(VAs, SrcVol: TNNetVolume;
+  OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY, Groups,
+  pActFN: longint; NewVAs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+  NewSrc: boolean; pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias: longint;
+  SrcBuffer: cl_mem;
+begin
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  LaunchTransposedConv(VAs, NewVAs, SrcBuffer, UseBias, SrcVol.SizeX,
+    SrcVol.SizeY, SrcVol.Depth, OutSizeX, FeatureSizeX, FeatureSizeY, Stride,
+    PaddingX, PaddingY, Groups, pActFN, err);
+end;
+
+// A 1x1 stride-1 transposed conv over a NumBs x 1 source of Groups*FSize-float
+// pixels is exactly the grouped GEMM: row a reads only its group's FSize run.
+procedure TDotProductSharedKernel.ComputeGroupedGemm(VAs, VBs: TNNetVolume;
+  Groups, pActFN: longint; NewVAs, NewVBs: boolean; VBias: TNNetVolume;
+  NewVBias: boolean; pExternalVBs: cl_mem);
+var
+  err: integer;
+  UseBias: longint;
+  SrcBuffer: cl_mem;
+begin
+  if (Groups < 1) or (FNumAs mod Groups <> 0) then
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeImplicitConv - failed ' +
-      'setting arguments or uploading: ' + IntToStr(err));
+    ErrorProc('Error: TDotProductSharedKernel.ComputeGroupedGemm - ' +
+      IntToStr(FNumAs) + ' rows do not split into ' + IntToStr(Groups) +
+      ' groups.');
     exit;
   end;
-  if UseTiled
-    then RunTiledGemm(K, csTiledGemmLanes,
-      csTiledGemmLanes * csTiledGemmRowsPerLane, csTiledGemmCols)
-    else FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
-  Inc(FImplicitConvLaunchCount);
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(VBs, NewVBs, pExternalVBs, err);
+  LaunchTransposedConv(VAs, NewVAs, SrcBuffer, UseBias, {InSizeX}FNumBs,
+    {InSizeY}1, {InDepth}Groups * FSize, {OutSizeX}FNumBs, {FeatureSizeX}1,
+    {FeatureSizeY}1, {Stride}1, {PaddingX}0, {PaddingY}0, Groups, pActFN, err);
+end;
+
+procedure TDotProductSharedKernel.LaunchTransposedConv(VAs: TNNetVolume;
+  NewVAs: boolean; SrcBuffer: cl_mem; UseBias, InSizeX, InSizeY, InDepth,
+  OutSizeX, FeatureSizeX, FeatureSizeY, Stride, PaddingX, PaddingY, Groups,
+  pActFN: longint; err: integer);
+var
+  K: cl_kernel;
+begin
+  K := FTransposedConvKernel;
+  if not Assigned(K) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv without ' +
+      'PrepareTransposedConv.');
+    exit;
+  end;
+  if VAs.Size <> FSize * FNumAs then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv - VA size: ' +
+      IntToStr(VAs.Size) + ' FSize: ' + IntToStr(FSize) +
+      ' NumAs:' + IntToStr(FNumAs));
+    exit;
+  end;
+  FActFun := pActFN;
+  if NewVAs and not FWeightsBorrowed then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv - failed ' +
+      'uploading: ' + IntToStr(err));
+    exit;
+  end;
+  err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @FActFun);
+  err := err or clSetKernelArg(K, 3, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(K, 4, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(K, 5, csCLMemSize, @FResultBuffer);
+  err := err or clSetKernelArg(K, 6, csLongintSize, @UseBias);
+  err := err or clSetKernelArg(K, 7, csCLMemSize, @FBiasBuffer);
+  err := err or clSetKernelArg(K, 8, csLongintSize, @OutSizeX);
+  err := err or clSetKernelArg(K, 9, csLongintSize, @InSizeX);
+  err := err or clSetKernelArg(K, 10, csLongintSize, @InSizeY);
+  err := err or clSetKernelArg(K, 11, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(K, 12, csLongintSize, @FeatureSizeX);
+  err := err or clSetKernelArg(K, 13, csLongintSize, @FeatureSizeY);
+  err := err or clSetKernelArg(K, 14, csLongintSize, @Stride);
+  err := err or clSetKernelArg(K, 15, csLongintSize, @PaddingX);
+  err := err or clSetKernelArg(K, 16, csLongintSize, @PaddingY);
+  err := err or clSetKernelArg(K, 17, csLongintSize, @Groups);
+  if err = CL_SUCCESS then
+    err := FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
+  if err <> CL_SUCCESS then
+    ErrorProc('Error: TDotProductSharedKernel.LaunchTransposedConv - failed ' +
+      'launching: ' + IntToStr(err));
+end;
+
+function TDotProductSharedKernel.UpsampleFoldReady(): boolean;
+begin
+  Result := FImplicitConvReady and Assigned(FUpsampleFoldBuffer) and
+    Assigned(FUpsampleFoldWeightsKernel);
+end;
+
+function TDotProductSharedKernel.PrepareUpsampleFold(): boolean;
+begin
+  Result := UpsampleFoldReady();
+  if Result or (not FImplicitConvReady) or (FSize mod 9 <> 0) then exit;
+  FUpsampleFoldWeightsKernel :=
+    FDotProductKernel.CreateKernel('cai_conv_upsample_fold_weights');
+  if not Assigned(FUpsampleFoldWeightsKernel) then exit;
+  FUpsampleFoldBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * (FSize div 9) * 16 * csNeuralFloatSize);
+  if not Assigned(FUpsampleFoldBuffer) then
+  begin
+    clReleaseKernel(FUpsampleFoldWeightsKernel);
+    FUpsampleFoldWeightsKernel := nil;
+    exit;
+  end;
+  FUpsampleFoldStale := true;
+  Result := true;
+end;
+
+procedure TDotProductSharedKernel.ComputeUpsampleFoldConv(VAs,
+  SrcVol: TNNetVolume; pActFN: longint; NewVAs: boolean; VBias: TNNetVolume;
+  NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InDepth: longint;
+  SrcBuffer: cl_mem;
+begin
+  InDepth := SrcVol.Depth;
+  if (not UpsampleFoldReady()) or (VAs.Size <> FSize * FNumAs) or
+    (FSize <> 9 * InDepth) or (FNumBs <> 4 * SrcVol.SizeX * SrcVol.SizeY) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeUpsampleFoldConv - ' +
+      'unarmed or shape mismatch: FSize ' + IntToStr(FSize) + ', NumBs ' +
+      IntToStr(FNumBs) + ', source ' + IntToStr(SrcVol.SizeX) + 'x' +
+      IntToStr(SrcVol.SizeY) + 'x' + IntToStr(InDepth));
+    exit;
+  end;
+  FActFun := pActFN;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs then
+  begin
+    if not FWeightsBorrowed then
+      err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+    FUpsampleFoldStale := true;
+  end;
+  if FUpsampleFoldStale and (err = CL_SUCCESS) then
+  begin
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 0, csLongintSize,
+      @FNumAs);
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 1, csLongintSize,
+      @InDepth);
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 2, csCLMemSize,
+      @FInputBufferAs);
+    err := err or clSetKernelArg(FUpsampleFoldWeightsKernel, 3, csCLMemSize,
+      @FUpsampleFoldBuffer);
+    if err = CL_SUCCESS then
+    begin
+      FDotProductKernel.RunKernel3D(FUpsampleFoldWeightsKernel, FNumAs,
+        InDepth, 16);
+      FUpsampleFoldStale := false;
+    end;
+  end;
+  if err = CL_SUCCESS then
+    LaunchImplicitConv(FUpsampleFoldBuffer, SrcBuffer, FNumBs div 4,
+      4 * InDepth, UseBias, {OutSizeX}SrcVol.SizeX, {RowSpan}2 * InDepth,
+      SrcVol.SizeX, SrcVol.SizeY, InDepth, {Stride}1, {PaddingX}1,
+      {PaddingY}1, {DilationX}1, {DilationY}1, {PixelStride}InDepth, {OutFrames}1,
+      {FrameStep}0, {UpsampleFold}1, err);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeUpsampleFoldConv - ' +
+      'failed uploading, deriving the phase weights or launching: ' +
+      IntToStr(err));
+    exit;
+  end;
+  Inc(FUpsampleFoldLaunchCount);
+end;
+
+function TDotProductSharedKernel.ModulatedConvReady(): boolean;
+begin
+  Result := FImplicitConvReady and Assigned(FModulatedAsBuffer) and
+    Assigned(FModSquareSumsBuffer) and Assigned(FModRowScalesBuffer) and
+    Assigned(FModStyleBuffer) and Assigned(FModSquareSumsKernel) and
+    Assigned(FModRowScalesKernel) and Assigned(FModulateWeightsKernel);
+end;
+
+procedure TDotProductSharedKernel.ReleaseModulatedConv();
+begin
+  if Assigned(FModSquareSumsKernel) then clReleaseKernel(FModSquareSumsKernel);
+  if Assigned(FModRowScalesKernel) then clReleaseKernel(FModRowScalesKernel);
+  if Assigned(FModulateWeightsKernel) then clReleaseKernel(FModulateWeightsKernel);
+  if Assigned(FModulatedAsBuffer) then clReleaseMemObject(FModulatedAsBuffer);
+  if Assigned(FModSquareSumsBuffer) then clReleaseMemObject(FModSquareSumsBuffer);
+  if Assigned(FModRowScalesBuffer) then clReleaseMemObject(FModRowScalesBuffer);
+  if Assigned(FModStyleBuffer) then clReleaseMemObject(FModStyleBuffer);
+  FModSquareSumsKernel := nil;
+  FModRowScalesKernel := nil;
+  FModulateWeightsKernel := nil;
+  FModulatedAsBuffer := nil;
+  FModSquareSumsBuffer := nil;
+  FModRowScalesBuffer := nil;
+  FModStyleBuffer := nil;
+  FModSquareSumsStale := false;
+  FModInDepth := 0;
+end;
+
+function TDotProductSharedKernel.PrepareModulatedConv(InDepth: longint): boolean;
+begin
+  Result := ModulatedConvReady() and (FModInDepth = InDepth);
+  if Result or (not FImplicitConvReady) or (InDepth <= 0) or
+    (FSize mod InDepth <> 0) then exit;
+  ReleaseModulatedConv();
+  FModSquareSumsKernel := FDotProductKernel.CreateKernel('cai_conv_weight_square_sums');
+  FModRowScalesKernel := FDotProductKernel.CreateKernel('cai_conv_modulation_row_scales');
+  FModulateWeightsKernel := FDotProductKernel.CreateKernel('cai_conv_modulate_weights');
+  FModulatedAsBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * FSize * csNeuralFloatSize);
+  FModSquareSumsBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * InDepth * csNeuralFloatSize);
+  FModRowScalesBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_WRITE,
+    csize_t(FNumAs) * csNeuralFloatSize);
+  FModStyleBuffer := FDotProductKernel.CreateBuffer(CL_MEM_READ_ONLY,
+    csize_t(InDepth) * csNeuralFloatSize);
+  FModInDepth := InDepth;
+  FModSquareSumsStale := true;
+  Result := ModulatedConvReady();
+  if not Result then ReleaseModulatedConv();
+end;
+
+procedure TDotProductSharedKernel.ComputeModulatedConv(VAs, SrcVol: TNNetVolume;
+  StyleBuffer: cl_mem; FeatureSize, pActFN: longint; Demodulate: boolean;
+  DemodEps: TNeuralFloat; OutputGain: TNeuralFloat; NewVAs: boolean; VBias: TNNetVolume;
+  NewVBias: boolean; NewSrc: boolean; pExternalSrc: cl_mem);
+var
+  err: integer;
+  UseBias, InDepth, Padding, DemodulateFlag: longint;
+  SrcBuffer: cl_mem;
+begin
+  InDepth := SrcVol.Depth;
+  if (not ModulatedConvReady()) or (InDepth <> FModInDepth) or
+    (VAs.Size <> FSize * FNumAs) or
+    (FSize <> FeatureSize * FeatureSize * InDepth) or
+    (FNumBs <> SrcVol.SizeX * SrcVol.SizeY) or (StyleBuffer = nil) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeModulatedConv - ' +
+      'unarmed or shape mismatch: FSize ' + IntToStr(FSize) + ', NumBs ' +
+      IntToStr(FNumBs) + ', source ' + IntToStr(SrcVol.SizeX) + 'x' +
+      IntToStr(SrcVol.SizeY) + 'x' + IntToStr(InDepth));
+    exit;
+  end;
+  FActFun := pActFN;
+  Padding := FeatureSize shr 1;
+  if Demodulate then DemodulateFlag := 1 else DemodulateFlag := 0;
+  err := CL_SUCCESS;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+  SrcBuffer := PrepareGatherSource(SrcVol, NewSrc, pExternalSrc, err);
+  if NewVAs then
+  begin
+    if not FWeightsBorrowed then
+      err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+    FModSquareSumsStale := true;
+  end;
+  if FModSquareSumsStale and (err = CL_SUCCESS) then
+  begin
+    err := err or clSetKernelArg(FModSquareSumsKernel, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 1, csLongintSize, @InDepth);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 2, csLongintSize, @FSize);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 3, csCLMemSize, @FInputBufferAs);
+    err := err or clSetKernelArg(FModSquareSumsKernel, 4, csCLMemSize, @FModSquareSumsBuffer);
+    if err = CL_SUCCESS then
+      err := FDotProductKernel.RunKernel2D(FModSquareSumsKernel, FNumAs, InDepth);
+    if err = CL_SUCCESS then
+    begin
+      FModSquareSumsStale := false;
+      Inc(FModSquareSumsLaunchCount);
+    end;
+  end;
+  err := err or clSetKernelArg(FModRowScalesKernel, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(FModRowScalesKernel, 1, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(FModRowScalesKernel, 2, csLongintSize, @DemodulateFlag);
+  err := err or clSetKernelArg(FModRowScalesKernel, 3, csNeuralFloatSize, @DemodEps);
+  err := err or clSetKernelArg(FModRowScalesKernel, 4, csNeuralFloatSize, @OutputGain);
+  err := err or clSetKernelArg(FModRowScalesKernel, 5, csCLMemSize, @FModSquareSumsBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 6, csCLMemSize, @StyleBuffer);
+  err := err or clSetKernelArg(FModRowScalesKernel, 7, csCLMemSize, @FModRowScalesBuffer);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 1, csLongintSize, @FSize);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 2, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 3, csCLMemSize, @FInputBufferAs);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 4, csCLMemSize, @StyleBuffer);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 5, csCLMemSize, @FModRowScalesBuffer);
+  err := err or clSetKernelArg(FModulateWeightsKernel, 6, csCLMemSize, @FModulatedAsBuffer);
+  if err = CL_SUCCESS then
+    err := FDotProductKernel.RunKernel(FModRowScalesKernel, FNumAs);
+  if err = CL_SUCCESS then
+    err := FDotProductKernel.RunKernel2D(FModulateWeightsKernel, FNumAs, FSize);
+  if err = CL_SUCCESS then
+    LaunchImplicitConv(FModulatedAsBuffer, SrcBuffer, FNumBs, FSize, UseBias,
+      {OutSizeX}SrcVol.SizeX, {RowSpan}FeatureSize * InDepth, SrcVol.SizeX,
+      SrcVol.SizeY, InDepth, {Stride}1, Padding, Padding, {DilationX}1,
+      {DilationY}1, {PixelStride}InDepth, {OutFrames}1, {FrameStep}0, {UpsampleFold}0, err);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeModulatedConv - failed ' +
+      'uploading, modulating the weights or launching: ' + IntToStr(err));
+    exit;
+  end;
+  Inc(FModulatedConvLaunchCount);
 end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;
@@ -2422,12 +2899,28 @@ begin
   Result := Result or clSetKernelArg(k, 1, csCLMemSize, @pSrcFP32);
   Result := Result or clSetKernelArg(k, 2, csCLMemSize, @FInputBufferBsFP16);
   // Same in-order queue as the GEMM that reads it, so no wait is needed.
-  if Result = CL_SUCCESS then FDotProductKernel.RunKernel(k, ElementCount);
+  if Result = CL_SUCCESS then
+  begin
+    FDotProductKernel.RunKernel(k, ElementCount);
+    Inc(FCastFP16LaunchCount);
+  end;
 end;
 
 function TDotProductSharedKernel.PrepareInt8BOperand(VBs: TNNetVolume;
-  NewVBs: boolean; pExternalVBs: cl_mem; var err: integer): cl_mem;
+  NewVBs: boolean; pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean;
+  var err: integer): cl_mem;
 begin
+  if pExternalVBsIsHalf then
+  begin
+    Result := pExternalVBs;
+    if not FFP16Activations then
+    begin
+      ErrorProc('Error: PrepareInt8BOperand - a half B operand needs the ' +
+        'FP16 activation mode.');
+      err := err or CL_INVALID_VALUE;
+    end;
+    exit;
+  end;
   if not FFP16Activations then
   begin
     if pExternalVBs <> nil then Result := pExternalVBs
@@ -2574,7 +3067,8 @@ end;
 
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
-  NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+  NewVBias: boolean = true; pExternalVBs: cl_mem = nil;
+  pExternalVBsIsHalf: boolean = false);
 begin
   if not FInt8Ready then
   begin
@@ -2582,7 +3076,8 @@ begin
       'PrepareForComputeInt8.');
     exit;
   end;
-  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs);
+  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs,
+    pExternalVBsIsHalf);
 end;
 
 procedure TDotProductSharedKernel.ComputeInt4(VBs: TNNetVolume;
@@ -2595,7 +3090,8 @@ begin
       'PrepareForComputeInt4.');
     exit;
   end;
-  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs);
+  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs,
+    {pExternalVBsIsHalf=}false);
 end;
 
 function TDotProductSharedKernel.PrepareBiasOperand(VBias: TNNetVolume;
@@ -2629,7 +3125,7 @@ end;
 
 procedure TDotProductSharedKernel.ComputeResidentCodes(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
-  pExternalVBs: cl_mem);
+  pExternalVBs: cl_mem; pExternalVBsIsHalf: boolean);
 var
   err: integer;
   UseBias: longint;
@@ -2650,7 +3146,8 @@ begin
   UseBias := PrepareBiasOperand(VBias, NewVBias, err);
 
   // Binds (FP32) or narrows into (FP16) the B operand the GEMM below reads.
-  BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs, err);
+  BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs,
+    pExternalVBsIsHalf, err);
 
   // A window of columns: one work-group per (row tile, column tile), each
   // weight code read once per column tile. Only the four arguments below
@@ -3907,9 +4404,11 @@ begin
   end;
 end;
 
-function TEasyOpenCL.CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
+function TEasyOpenCL.CopyBuffer(src, dst: cl_mem; cb: csize_t;
+  dstOffsetBytes: csize_t; srcOffsetBytes: csize_t): integer;
 begin
-  Result := clEnqueueCopyBuffer(FCommands, src, dst, 0, 0, cb, 0, nil, nil);
+  Result := clEnqueueCopyBuffer(FCommands, src, dst, srcOffsetBytes,
+    dstOffsetBytes, cb, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
     FErrorProc('ERROR: Failed to copy buffer: ' + IntToStr(Result) +

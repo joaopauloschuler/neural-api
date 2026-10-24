@@ -99,12 +99,6 @@ begin
   RandSeed := oldSeed;
 end;
 
-// Box-Muller standard normal.
-function RandNormal(): TNeuralFloat;
-begin
-  Result := Sqrt(-2.0 * Ln(Random + 1e-12)) * Cos(2.0 * Pi * Random);
-end;
-
 // Make a (pLen,1,DMODEL) sample of class c: the class signal is planted into the
 // informative channels at a class-shifted position, everything else is noise.
 procedure MakeSample(c, seed, pLen: integer; Inp: TNNetVolume);
@@ -116,7 +110,7 @@ begin
   Inp.ReSize(pLen, 1, DMODEL);
   for ti := 0 to pLen - 1 do
     for f := 0 to DMODEL - 1 do
-      Inp[ti, 0, f] := RandNormal() * NOISE;
+      Inp[ti, 0, f] := RandomStdNormal() * NOISE;
   // Plant the class signal into NINFO informative channels at NPLANT positions
   // SPREAD across the LONG sequence (not clustered at the front), so the latent
   // read has to gather class evidence from all over the input.

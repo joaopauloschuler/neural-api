@@ -129,18 +129,6 @@ type
 var
   Protos: TProtoArray;
 
-// Box-Muller N(0,1) sample (no extra dependency).
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 // Random unit-spread prototypes, one per latent class.
 procedure BuildProtos();
 var
@@ -148,7 +136,7 @@ var
 begin
   for C := 0 to cNumClasses - 1 do
     for D := 0 to cInDim - 1 do
-      Protos[C][D] := RandomGauss();
+      Protos[C][D] := RandomStdNormal();
 end;
 
 // An augmented "view" of class C: prototype + Gaussian noise, into V at X=Slab.
@@ -157,7 +145,7 @@ var
   D: integer;
 begin
   for D := 0 to cInDim - 1 do
-    V[Slab, 0, D] := Protos[C][D] + RandomGauss() * cSigma;
+    V[Slab, 0, D] := Protos[C][D] + RandomStdNormal() * cSigma;
 end;
 
 // Picks a class different from Avoid.

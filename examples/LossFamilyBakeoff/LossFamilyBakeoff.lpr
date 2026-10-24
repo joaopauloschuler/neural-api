@@ -67,17 +67,6 @@ const
   OUTLIER_MAG     = 80.0;   // big additive corruption (orig units, |r|~2 norm)
   LEARNING_RATE   = 0.001;
 
-  function RandG01(): TNeuralFloat;
-  // Box-Muller standard normal.
-  var
-    U1, U2: TNeuralFloat;
-  begin
-    U1 := Random;
-    if U1 < 1e-12 then U1 := 1e-12;
-    U2 := Random;
-    Result := Sqrt(-2.0 * Ln(U1)) * Cos(2.0 * Pi * U2);
-  end;
-
   // Clean pairs: exact hypotenuse, no noise.
   function CreateCleanPairList(MaxCnt: integer): TNNetVolumePairList;
   var
@@ -112,7 +101,7 @@ const
       LocalX := Random(100);
       LocalY := Random(100);
       Hypotenuse := sqrt(LocalX*LocalX + LocalY*LocalY);
-      Target := Hypotenuse + NOISE_SIGMA * RandG01();
+      Target := Hypotenuse + NOISE_SIGMA * RandomStdNormal();
       if Random < OUTLIER_FRAC then
       begin
         if Random < 0.5 then Sign := 1.0 else Sign := -1.0;

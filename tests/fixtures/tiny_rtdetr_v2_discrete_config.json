@@ -1,0 +1,124 @@
+{
+  "activation_dropout": 0.0,
+  "activation_function": "silu",
+  "anchor_image_size": null,
+  "attention_dropout": 0.0,
+  "auxiliary_loss": true,
+  "backbone_config": {
+    "depths": [
+      1,
+      2,
+      1,
+      1
+    ],
+    "downsample_in_bottleneck": false,
+    "downsample_in_first_stage": false,
+    "embedding_size": 8,
+    "hidden_act": "relu",
+    "hidden_sizes": [
+      8,
+      16,
+      24,
+      32
+    ],
+    "layer_type": "basic",
+    "model_type": "rt_detr_resnet",
+    "num_channels": 3,
+    "out_features": [
+      "stage2",
+      "stage3",
+      "stage4"
+    ],
+    "out_indices": [
+      2,
+      3,
+      4
+    ],
+    "stage_names": [
+      "stem",
+      "stage1",
+      "stage2",
+      "stage3",
+      "stage4"
+    ]
+  },
+  "batch_norm_eps": 1e-05,
+  "box_noise_scale": 1.0,
+  "d_model": 16,
+  "decoder_activation_function": "relu",
+  "decoder_attention_heads": 2,
+  "decoder_ffn_dim": 32,
+  "decoder_in_channels": [
+    16,
+    16,
+    16
+  ],
+  "decoder_layers": 2,
+  "decoder_method": "discrete",
+  "decoder_n_levels": 3,
+  "decoder_n_points": 3,
+  "decoder_offset_scale": 0.7,
+  "dropout": 0.0,
+  "encode_proj_layers": [
+    2
+  ],
+  "encoder_activation_function": "gelu",
+  "encoder_attention_heads": 2,
+  "encoder_ffn_dim": 32,
+  "encoder_hidden_dim": 16,
+  "encoder_in_channels": [
+    16,
+    24,
+    32
+  ],
+  "encoder_layers": 1,
+  "eos_coefficient": 0.0001,
+  "eval_size": null,
+  "feat_strides": [
+    8,
+    16,
+    32
+  ],
+  "focal_loss_alpha": 0.75,
+  "focal_loss_gamma": 2.0,
+  "freeze_backbone_batch_norms": true,
+  "hidden_expansion": 1.0,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1",
+    "2": "LABEL_2",
+    "3": "LABEL_3",
+    "4": "LABEL_4"
+  },
+  "initializer_bias_prior_prob": null,
+  "initializer_range": 0.01,
+  "is_encoder_decoder": true,
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1,
+    "LABEL_2": 2,
+    "LABEL_3": 3,
+    "LABEL_4": 4
+  },
+  "label_noise_ratio": 0.5,
+  "layer_norm_eps": 1e-05,
+  "learn_initial_query": false,
+  "matcher_alpha": 0.25,
+  "matcher_bbox_cost": 5.0,
+  "matcher_class_cost": 2.0,
+  "matcher_gamma": 2.0,
+  "matcher_giou_cost": 2.0,
+  "model_type": "rt_detr_v2",
+  "normalize_before": false,
+  "num_denoising": 100,
+  "num_feature_levels": 3,
+  "num_queries": 10,
+  "positional_encoding_temperature": 10000,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.17.0",
+  "use_focal_loss": true,
+  "weight_loss_bbox": 5.0,
+  "weight_loss_giou": 2.0,
+  "weight_loss_vfl": 1.0,
+  "with_box_refine": true
+}

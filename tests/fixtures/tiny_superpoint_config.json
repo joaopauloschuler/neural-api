@@ -1,0 +1,16 @@
+{
+  "model_type": "superpoint",
+  "encoder_hidden_sizes": [
+    4,
+    4,
+    6,
+    6
+  ],
+  "decoder_hidden_size": 8,
+  "keypoint_decoder_dim": 65,
+  "descriptor_decoder_dim": 8,
+  "keypoint_threshold": 0.005,
+  "max_keypoints": -1,
+  "nms_radius": 4,
+  "border_removal_distance": 4
+}

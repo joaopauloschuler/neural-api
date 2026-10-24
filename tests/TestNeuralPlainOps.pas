@@ -63,6 +63,9 @@ type
     // TNNetVolume.DotProductsPacked vs a double reference on odd shapes (rows,
     // positions and lengths not multiples of the 16 x 6 block), strides, bias.
     procedure TestDotProductsPackedMatchesReference;
+    // TNNetVolume.AddDotProductRows vs a double reference: row counts not a
+    // multiple of 4, lengths not a multiple of 8, strides, accumulation into C.
+    procedure TestAddDotProductRowsMatchesReference;
     // Conv1D, PointwiseConv and ConvTranspose1D vs a double reference at
     // generator-like sizes (128 / 256 channels, kernels 3 / 7 / 11, dilations).
     procedure TestConvsMatchReferenceAtGeneratorSizes;
@@ -556,7 +559,8 @@ begin
     FSerial.Snake(SerialOut, Alpha);
     FThreaded.Snake(ThreadedOut, Alpha);
     Diff := MaxAbsDiff(SerialOut, SnakeLayer.Output);
-    AssertTrue('max diff ' + FloatToStr(Diff), Diff = 0);
+    // The layer runs Sin over whole blocks, these rows through its scalar tail.
+    AssertTrue('max diff ' + FloatToStr(Diff), Diff < 1e-5);
     AssertEquals('serial vs threaded', 0,
       MaxAbsDiff(SerialOut, ThreadedOut), 0);
   finally
@@ -934,6 +938,76 @@ begin
     B.Free;
     PackedA.Free;
     A.Free;
+  end;
+end;
+
+procedure TTestNeuralPlainOps.TestAddDotProductRowsMatchesReference;
+const
+  // NumRows, VectorSize, extra row stride.
+  csCases: array[0..12, 0..2] of integer = (
+    (1, 1, 0),
+    (3, 7, 0),
+    (4, 8, 0),
+    (5, 9, 2),
+    (4, 16, 0),
+    (7, 24, 1),
+    (8, 33, 0),
+    (13, 100, 3),
+    (16, 256, 0),
+    (3, 256, 0),
+    (6, 5, 4),
+    (1024, 256, 0),
+    (9, 15, 1));
+  csSentinel = 1234.5;
+var
+  CasePos, NumRows, VectorSize, RowStride, RowPos, ElementPos: integer;
+  Rows, B, C: TNNetVolume;
+  Actual, Reference, Magnitude: array of double;
+  Product: double;
+begin
+  Rows := TNNetVolume.Create();
+  B := TNNetVolume.Create();
+  C := TNNetVolume.Create();
+  try
+    for CasePos := 0 to High(csCases) do
+    begin
+      NumRows := csCases[CasePos, 0];
+      VectorSize := csCases[CasePos, 1];
+      RowStride := VectorSize + csCases[CasePos, 2];
+      Rows.ReSize(NumRows * RowStride, 1, 1);
+      B.ReSize(VectorSize, 1, 1);
+      C.ReSize(NumRows + 1, 1, 1);
+      FillRandom(Rows);
+      FillRandom(B);
+      FillRandom(C);
+      C.FData[NumRows] := csSentinel;
+      SetLength(Actual, NumRows);
+      SetLength(Reference, NumRows);
+      SetLength(Magnitude, NumRows);
+      for RowPos := 0 to NumRows - 1 do
+      begin
+        Reference[RowPos] := C.FData[RowPos];
+        Magnitude[RowPos] := Abs(C.FData[RowPos]);
+        for ElementPos := 0 to VectorSize - 1 do
+        begin
+          Product := double(Rows.FData[RowPos * RowStride + ElementPos]) *
+            B.FData[ElementPos];
+          Reference[RowPos] := Reference[RowPos] + Product;
+          Magnitude[RowPos] := Magnitude[RowPos] + Abs(Product);
+        end;
+      end;
+      TNNetVolume.AddDotProductRows(C.DataPtr, Rows.DataPtr, RowStride, NumRows,
+        B.DataPtr, VectorSize);
+      for RowPos := 0 to NumRows - 1 do Actual[RowPos] := C.FData[RowPos];
+      AssertCloseToReference('case ' + IntToStr(CasePos), Actual, Reference,
+        Magnitude);
+      AssertEquals('case ' + IntToStr(CasePos) + ' sentinel', csSentinel,
+        C.FData[NumRows], 0);
+    end;
+  finally
+    C.Free;
+    B.Free;
+    Rows.Free;
   end;
 end;
 

@@ -71,15 +71,15 @@ SAME-class pairs (target cos -> +1)  (n=600)  mean cos = 1.000  +/- 0.000
   ...
   [  0.80,  1.00)   600 |########################################
 
-DIFFERENT-class pairs (pushed below margin)  (n=600)  mean cos = -0.250  +/- 0.382
-  [ -1.00, -0.80)   102 |##################
+DIFFERENT-class pairs (pushed below margin)  (n=600)  mean cos = -0.253  +/- 0.470
+  [ -1.00, -0.80)    99 |#############
   ...
-  [  0.00,  0.20)   226 |########################################
+  [  0.00,  0.20)   309 |########################################
 ```
 
-Same-class pairs collapse onto `cos = +1`; different-class pairs are all driven
-below the `margin` (0.2 here), exactly the headline behavior of the
-cosine-embedding loss.
+Same-class pairs collapse onto `cos = +1`; almost all different-class pairs
+(583 of 600 in this run) are driven below the `margin` (0.2 here), exactly the
+headline behavior of the cosine-embedding loss.
 
 ## Building and running
 

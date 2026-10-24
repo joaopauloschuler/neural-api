@@ -72,12 +72,12 @@ checked against finite differences in `tests/TestNeuralNumerical.pas`
 ==== UNCERTAINTY PROBES ====
      (x, y)        pred    probabilities      u       region
   ( -2.50,  2.50)   class 0   p=[0.924 0.076]   u=0.150   in-dist (blob 0)
-  (  2.50,  2.50)   class 1   p=[0.076 0.924]   u=0.151   in-dist (blob 1)
-  ( -2.50, -4.00)   class 0   p=[0.635 0.365]   u=0.729   OOD (below blob 0)
+  ( -2.20,  2.20)   class 0   p=[0.923 0.077]   u=0.152   in-dist (blob 0)
+  ( -2.50, -4.00)   class 0   p=[0.635 0.365]   u=0.730   OOD (below blob 0)
   (  0.00, -6.00)   class 0   p=[0.500 0.500]   u=1.000   OOD (far below)
   (  0.00, -9.00)   class 0   p=[0.500 0.500]   u=1.000   OOD (far below)
-  ( -2.33, -8.69)   class 0   p=[0.508 0.492]   u=0.985   OOD (lower shell)
-  (  2.33, -8.69)   class 1   p=[0.495 0.505]   u=0.989   OOD (lower shell)
+  ( -6.36, -6.36)   class 0   p=[0.740 0.260]   u=0.521   OOD (lower shell)
+  ( -2.33, -8.69)   class 0   p=[0.507 0.493]   u=0.985   OOD (lower shell)
 
 ==== VERDICT ====
   mean uncertainty   in-distribution=0.151   OOD=0.853

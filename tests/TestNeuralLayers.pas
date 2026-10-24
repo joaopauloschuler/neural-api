@@ -14,6 +14,15 @@ const
   MAX_NAN_CHECK_ITERATIONS = 100;
 
 type
+  // Runs a deconvolution's out-channel ranges on an explicit thread pool,
+  // split as the scheduler splits wkChunk items. Coded by Claude (AI).
+  TDeconvChunkProbe = class(TNNetDeconvolution)
+  private
+    procedure ComputeRangeWorker(index, threadnum: integer);
+  public
+    procedure ComputeOnPool(pPool: TNeuralThreadList);
+  end;
+
   // Builds round-trip net pKind; pTrainable=False adds every layer inference-only.
   TRoundTripNetBuilder = function(pKind: integer;
     pTrainable, pLowMemory: boolean): TNNet of object;
@@ -63,9 +72,13 @@ type
     procedure TestSinhScalarParity;
     procedure TestLnScalarParity;
     procedure TestSinScalarParity;
+    procedure TestSinWideRangeSweep;
+    procedure TestSnakeInferenceMatchesFormula;
+    procedure TestSnakeTrainingForwardMatchesFormula;
     procedure TestCosScalarParity;
     procedure TestSinCosMatchesSeparateSinAndCos;
     procedure TestArcSinhScalarParity;
+    procedure TestArcSinhLargeMagnitude;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
     procedure TestSimpleXORLearning;
@@ -146,6 +159,7 @@ type
     procedure TestMaxChannelRectangular;
     procedure TestMinChannelRectangular;
     procedure TestMaxChannelSquareRegression;
+    procedure TestAvgChannelRectangular;
     procedure TestFlipXPaddedConvBackprop;
     procedure TestFlipYPaddedConvBackprop;
     // Int8 convolution input (quantized FInputCopy + byte im2col)
@@ -170,7 +184,9 @@ type
     procedure TestNetQuantizeWeightsInt4CountsConvertedLayers;
     procedure TestConvImportInt4QuantRowMatchesQuantizeRow;
     procedure TestBeginInt4QuantImportRefusesIneligibleLayers;
-    procedure TestDeconvolutionNeverChunkEligible;
+    procedure TestDeconvolutionChunkEligible;
+    procedure TestDeconvolutionChunkParity;
+    procedure TestDeconvolutionSkipsInterleavedWeights;
     // Int8 input arming at net level and on TNNetFullConnect
     procedure TestNetEnableInt8InputCountsQuantizedLayers;
     procedure TestDequantizeWeightsInt8DropsInt8Input;
@@ -178,6 +194,22 @@ type
   end;
 
 implementation
+
+procedure TDeconvChunkProbe.ComputeRangeWorker(index, threadnum: integer);
+var
+  WorkCount, FirstNeuron, LastNeuron: integer;
+begin
+  WorkCount := ChunkWorkCount();
+  FirstNeuron := (index * WorkCount) div threadnum;
+  LastNeuron := ((index + 1) * WorkCount) div threadnum - 1;
+  if LastNeuron >= FirstNeuron then ComputeRange(FirstNeuron, LastNeuron);
+end;
+
+procedure TDeconvChunkProbe.ComputeOnPool(pPool: TNeuralThreadList);
+begin
+  PrepareChunkedForward();
+  pPool.StartProc({$IFDEF FPC}@{$ENDIF}ComputeRangeWorker, true);
+end;
 
 procedure TTestNeuralLayers.TestFullyConnectedForward;
 var
@@ -1730,6 +1762,151 @@ begin
   end;
 end;
 
+procedure TTestNeuralLayers.TestSinWideRangeSweep;
+// Dense sweep of Sin vs pcr_sinf over |arg| <= 1000, the range Snake feeds it
+// (alpha * x for loud audio activations).
+const
+  N = 200003;
+  AbsTol = 5e-7;
+var
+  Src, Dst: TNNetVolume;
+  I: integer;
+  e, maxErr, maxArg: TNeuralFloat;
+begin
+  Src := TNNetVolume.Create(N, 1, 1);
+  Dst := TNNetVolume.Create(N, 1, 1);
+  try
+    for I := 0 to N - 1 do
+      Src.FData[I] := -1000.0 + 2000.0 * I / (N - 1);
+    TNNetVolume.Sin(Dst.DataPtr, Src.DataPtr, N);
+    maxErr := 0;
+    maxArg := 0;
+    for I := 0 to N - 1 do
+    begin
+      e := Abs(Dst.FData[I] - pcr_sinf(Src.FData[I]));
+      if e > maxErr then
+      begin
+        maxErr := e;
+        maxArg := Src.FData[I];
+      end;
+    end;
+    AssertTrue('Sin vs pcr_sinf on |x| <= 1000: max abs err ' + FloatToStr(maxErr) +
+      ' at x = ' + FloatToStr(maxArg), maxErr < AbsTol);
+  finally
+    Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestSnakeInferenceMatchesFormula;
+// Inference Snake (both alpha modes) vs x + sin(a*x)^2 / a through pcr_sinf.
+// 1500 x 5 spans two blocks plus a partial one; depth 5000 exceeds one block.
+const
+  csScalarAlpha = 1.7;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Snake: TNNetLayer;
+  CasePos, ElementPos, Depth: integer;
+  x, Alpha, SinAx, Expected, Diff, MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 20261022;
+  for CasePos := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create();
+    try
+      if CasePos = 0 then Input.ReSize(1500, 1, 5) else Input.ReSize(3, 1, 5000);
+      for ElementPos := 0 to Input.Size - 1 do
+        if ElementPos mod 3 = 0 then Input.FData[ElementPos] := 600 * (2 * Random - 1)
+        else Input.FData[ElementPos] := 3 * (2 * Random - 1);
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth));
+      Snake := NN.AddLayer(TNNetSnake.Create(csScalarAlpha, CasePos = 1));
+      Depth := Input.Depth;
+      if CasePos = 1 then
+        for ElementPos := 0 to Depth - 1 do
+          Snake.Neurons[0].Weights.FData[ElementPos] := 0.2 + 2.0 * ElementPos / Depth;
+      NN.SetTrainable(False, False);
+      NN.Compute(Input);
+      MaxDiff := 0;
+      for ElementPos := 0 to Input.Size - 1 do
+      begin
+        x := Input.FData[ElementPos];
+        if CasePos = 1 then Alpha := Snake.Neurons[0].Weights.FData[ElementPos mod Depth]
+        else Alpha := csScalarAlpha;
+        SinAx := pcr_sinf(Alpha * x);
+        Expected := x + SinAx * SinAx / Alpha;
+        // Absolute sin error over alpha, plus the rounding of the final x + term.
+        Diff := Abs(NN.GetLastLayer.Output.FData[ElementPos] - Expected) /
+          (1e-5 / Alpha + 2.4e-7 * Abs(x));
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('Snake case ' + IntToStr(CasePos) + ': max scaled diff ' +
+        FloatToStr(MaxDiff), MaxDiff < 1);
+    finally
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestSnakeTrainingForwardMatchesFormula;
+// Training Snake forward (both alpha modes): output and the cached derivative
+// 1 + 2*sin(ax)*cos(ax) vs pcr_sincosf, on shapes spanning several blocks.
+const
+  csScalarAlpha = 1.7;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Snake: TNNetLayer;
+  CasePos, ElementPos, Depth: integer;
+  x, Alpha, SinAx, CosAx, Expected, Diff, MaxDiff, MaxDerivDiff: TNeuralFloat;
+begin
+  RandSeed := 20261023;
+  for CasePos := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create();
+    try
+      if CasePos = 0 then Input.ReSize(1500, 1, 5) else Input.ReSize(3, 1, 2100);
+      for ElementPos := 0 to Input.Size - 1 do
+        if ElementPos mod 3 = 0 then Input.FData[ElementPos] := 600 * (2 * Random - 1)
+        else Input.FData[ElementPos] := 3 * (2 * Random - 1);
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, 1, Input.Depth, 1));
+      Snake := NN.AddLayer(TNNetSnake.Create(csScalarAlpha, CasePos = 1));
+      Depth := Input.Depth;
+      if CasePos = 1 then
+        for ElementPos := 0 to Depth - 1 do
+          Snake.Neurons[0].Weights.FData[ElementPos] := 0.2 + 2.0 * ElementPos / Depth;
+      AssertEquals('derivative volume sized', Snake.Output.Size,
+        Snake.OutputErrorDeriv.Size);
+      NN.Compute(Input);
+      MaxDiff := 0;
+      MaxDerivDiff := 0;
+      for ElementPos := 0 to Input.Size - 1 do
+      begin
+        x := Input.FData[ElementPos];
+        if CasePos = 1 then Alpha := Snake.Neurons[0].Weights.FData[ElementPos mod Depth]
+        else Alpha := csScalarAlpha;
+        pcr_sincosf(Alpha * x, SinAx, CosAx);
+        Expected := x + SinAx * SinAx / Alpha;
+        Diff := Abs(Snake.Output.FData[ElementPos] - Expected) /
+          (1e-5 / Alpha + 2.4e-7 * Abs(x));
+        if Diff > MaxDiff then MaxDiff := Diff;
+        Diff := Abs(Snake.OutputErrorDeriv.FData[ElementPos] -
+          (1.0 + 2.0 * SinAx * CosAx));
+        if Diff > MaxDerivDiff then MaxDerivDiff := Diff;
+      end;
+      AssertTrue('Snake case ' + IntToStr(CasePos) + ': max scaled output diff ' +
+        FloatToStr(MaxDiff), MaxDiff < 1);
+      AssertTrue('Snake case ' + IntToStr(CasePos) + ': max derivative diff ' +
+        FloatToStr(MaxDerivDiff), MaxDerivDiff < 1e-5);
+    finally
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestSinScalarParity;
 // Sin (Cephes sinf with 3-part Cody-Waite reduction on the AVX2 build) must
 // match the scalar pcr_sinf reference within tolerance on every build. N=131
@@ -1927,6 +2104,44 @@ begin
       ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
   finally
     Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestArcSinhLargeMagnitude;
+// TNNetArcSinh host forward and derivative where ln(x + sqrt(x^2 + 1)) cancels
+// (x << 0) or x^2 overflows single precision (|x| = 1e30), against double asinh.
+const
+  csInputs: array[0..6] of TNeuralFloat = (-1e4, -1000, -3000, -5000, 1e30, -1e30, -1e-3);
+  csExpected: array[0..6] of double = (-9.903487555036127, -7.600902709541988,
+    -8.699514775987968, -9.210340381976183, 69.77069997038132, -69.77069997038132,
+    -0.0009999998333334083);
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ActLayer: TNNetLayer;
+  InputPos: integer;
+  X, ExpectedDeriv: double;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Length(csInputs), 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(Length(csInputs)));
+    ActLayer := NN.AddLayer(TNNetArcSinh.Create());
+    for InputPos := 0 to High(csInputs) do
+      Input.FData[InputPos] := csInputs[InputPos];
+    NN.Compute(Input);
+    for InputPos := 0 to High(csInputs) do
+    begin
+      X := csInputs[InputPos];
+      AssertEquals('ArcSinh(' + FloatToStr(X) + ')', csExpected[InputPos],
+        ActLayer.Output.FData[InputPos], 1e-6 * Max(1.0, Abs(csExpected[InputPos])));
+      ExpectedDeriv := 1.0 / Sqrt(X * X + 1.0);
+      AssertEquals('ArcSinh derivative at ' + FloatToStr(X), ExpectedDeriv,
+        ActLayer.OutputErrorDeriv.FData[InputPos], 1e-6 * ExpectedDeriv);
+    end;
+  finally
+    Input.Free;
+    NN.Free;
   end;
 end;
 
@@ -2782,6 +2997,12 @@ begin
          Result.AddLayer(T(TNNetMLSTMCell.Create()));
          Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
        end;
+    18: begin
+         Result.AddLayer(TNNetInput.Create(3, 2, 3, 1));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(12)));
+         Result.AddLayer(T(TNNetTransposedChannelAttention.Create(2)));
+         Result.AddLayer(T(TNNetPointwiseConvLinear.Create(2)));
+       end;
   end;
   if not pTrainable then Result.SetTrainable(false, pLowMemory);
   // Retention has no softmax to bound its scores; 0.05 overflows it in 3 steps.
@@ -3008,7 +3229,8 @@ begin
     'Retention (learned gamma)', 'CrossAttention', 'T5RelPosBiasAttention',
     'DifferentialAttention', 'LinformerAttention', 'GatedResidual',
     'CapsuleRouting', 'HardConcrete', 'GRN', 'APL', 'SplineActivation',
-    'Invertible1x1Conv', 'MLSTMCell'], @BuildScratchRoundTripNetA, 0);
+    'Invertible1x1Conv', 'MLSTMCell', 'TransposedChannelAttention'],
+    @BuildScratchRoundTripNetA, 0);
 end;
 
 procedure TTestNeuralLayers.TestSetTrainableRoundTripScratchLayersB;
@@ -4327,6 +4549,66 @@ begin
 end;
 
 // The SQUARE case must be unchanged by the rectangular fix.
+// TNNetAvgChannel on W<>H maps (both orientations) is the true global mean,
+// and its backward spreads dOut/(W*H) to every cell.
+procedure TTestNeuralLayers.TestAvgChannelRectangular;
+const
+  Shapes: array[0..1, 0..1] of integer = ((3, 5), (6, 2));
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+  ShapeCnt, CntX, CntY, W, H: integer;
+  Sum0, Sum1: TNeuralFloat;
+begin
+  for ShapeCnt := 0 to 1 do
+  begin
+    W := Shapes[ShapeCnt, 0];
+    H := Shapes[ShapeCnt, 1];
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(W, H, 2);
+    try
+      NN.AddLayer(TNNetInput.Create(W, H, 2, 1));
+      ChannelLayer := NN.AddLayer(TNNetAvgChannel.Create());
+      Sum0 := 0;
+      Sum1 := 0;
+      for CntY := 0 to H - 1 do
+        for CntX := 0 to W - 1 do
+        begin
+          Input[CntX, CntY, 0] := CntX + 10 * CntY;
+          Input[CntX, CntY, 1] := -0.5 * CntX * CntY + 1;
+          Sum0 := Sum0 + Input[CntX, CntY, 0];
+          Sum1 := Sum1 + Input[CntX, CntY, 1];
+        end;
+      NN.Compute(Input);
+      AssertEquals('Output SizeX must be 1', 1, ChannelLayer.Output.SizeX);
+      AssertEquals('Output SizeY must be 1', 1, ChannelLayer.Output.SizeY);
+      AssertEquals('Output Depth must be 2', 2, ChannelLayer.Output.Depth);
+      AssertEquals('Global mean of channel 0', Sum0 / (W * H),
+        ChannelLayer.Output.Raw[0], 0.0001);
+      AssertEquals('Global mean of channel 1', Sum1 / (W * H),
+        ChannelLayer.Output.Raw[1], 0.0001);
+
+      ChannelLayer.OutputError.Raw[0] := 1.0;
+      ChannelLayer.OutputError.Raw[1] := 3.0;
+      NN.GetFirstLayer.OutputError.Fill(0);
+      ChannelLayer.IncDepartingBranchesCnt();
+      ChannelLayer.Backpropagate();
+      for CntY := 0 to H - 1 do
+        for CntX := 0 to W - 1 do
+        begin
+          AssertEquals('Grad channel 0', 1.0 / (W * H),
+            NN.GetFirstLayer.OutputError[CntX, CntY, 0], 0.00001);
+          AssertEquals('Grad channel 1', 3.0 / (W * H),
+            NN.GetFirstLayer.OutputError[CntX, CntY, 1], 0.00001);
+        end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestMaxChannelSquareRegression;
 var
   NN: TNNet;
@@ -5479,23 +5761,182 @@ begin
   end;
 end;
 
-// A chunked TNNetDeconvolution would run the inherited forward-convolution
-// ComputeRange instead of its transposed scatter. Coded by Claude (AI).
-procedure TTestNeuralLayers.TestDeconvolutionNeverChunkEligible;
+// The deconvolution chunks over out-channels whenever intra-layer threading
+// is on and the forward stays on the CPU. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionChunkEligible;
 var
   NN: TNNet;
   Deconv: TNNetDeconvolution;
-  Conv: TNNetConvolution;
 begin
   NN := TNNet.Create();
   try
     NN.AddLayer(TNNetInput.Create(8, 8, 16));
-    Conv := TNNetConvolution(NN.AddLayer(TNNetConvolution.Create(16, 3, 1, 1)));
-    Deconv := TNNetDeconvolution(NN.AddLayer(TNNetDeconvolution.Create(16, 3, 2, 1)));
+    Deconv := TNNetDeconvolution(NN.AddLayer(TNNetDeconvolution.Create(13, 3, 2, 1)));
+    AssertFalse('no chunks without intra-layer threading', Deconv.ChunkEligible());
     NN.EnableIntraLayerThreading(true);
-    NN.SchedulerMinGain := 0;
-    AssertTrue('the plain convolution is chunk-eligible', Conv.ChunkEligible());
-    AssertFalse('the deconvolution must never chunk', Deconv.ChunkEligible());
+    AssertTrue('the deconvolution chunks', Deconv.ChunkEligible());
+    AssertEquals('one work item per out-channel', 13, Deconv.ChunkWorkCount());
+  finally
+    NN.Free;
+  end;
+end;
+
+// Out-channel ranges computed on 2, 3 and 4 real threads must reproduce the
+// serial forward (output and pre-activation) over dense, grouped, depthwise,
+// strided, padded and odd-channel shapes, on the GEMM and the direct path, in
+// inference, low-memory and trainable mode. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionChunkParity;
+const
+  csSentinel = -7777;
+  csTolerance = 1e-5;
+  // InX, InY, InC, OutC, K, Stride, Pad, OutPad, Groups, Activation (0 identity,
+  // 1 ReLU, 2 tanh), Mode (0 inference, 1 trainable, 2 low-memory), SuppressBias.
+  csCaseWidth = 12;
+  csCases: array[0..119] of integer = (
+    6, 5, 4, 5, 3, 2, 1, 1, 1, 1, 0, 0,
+    5, 4, 6, 7, 3, 2, 0, 0, 1, 2, 0, 0,
+    3, 3, 8, 6, 2, 2, 0, 0, 1, 1, 0, 1,
+    4, 3, 5, 9, 2, 3, 0, 0, 1, 0, 0, 0,
+    5, 4, 6, 4, 3, 2, 0, 0, 2, 1, 0, 0,
+    4, 4, 9, 9, 3, 2, 1, 1, 9, 0, 0, 1,
+    7, 6, 6, 9, 4, 2, 1, 0, 3, 2, 1, 0,
+    6, 5, 5, 7, 3, 1, 1, 0, 1, 0, 1, 0,
+    5, 5, 7, 11, 3, 2, 1, 1, 1, 2, 2, 0,
+    6, 4, 6, 3, 3, 2, 0, 1, 3, 1, 2, 0);
+  csThreadCounts: array[0..2] of integer = (2, 3, 4);
+var
+  NN: TNNet;
+  Deconv: TDeconvChunkProbe;
+  Input, SerialOutput, SerialRaw: TNNetVolume;
+  Pool: TNeuralThreadList;
+  CaseBase, CasePos, MaxCasePos, ThreadPos, NeuronPos, WeightPos: integer;
+  ElementPos, MaxElementPos, GemmCaseCnt, DirectCaseCnt: integer;
+  CaseName: string;
+begin
+  Input := TNNetVolume.Create();
+  SerialOutput := TNNetVolume.Create();
+  SerialRaw := TNNetVolume.Create();
+  GemmCaseCnt := 0;
+  DirectCaseCnt := 0;
+  try
+    MaxCasePos := Length(csCases) div csCaseWidth - 1;
+    for CasePos := 0 to MaxCasePos do
+    begin
+      CaseBase := CasePos * csCaseWidth;
+      CaseName := 'case ' + IntToStr(CasePos);
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(csCases[CaseBase], csCases[CaseBase + 1],
+          csCases[CaseBase + 2]));
+        Deconv := TDeconvChunkProbe.Create(csCases[CaseBase + 3],
+          csCases[CaseBase + 4], csCases[CaseBase + 5], csCases[CaseBase + 6],
+          csCases[CaseBase + 7], csCases[CaseBase + 11]);
+        Deconv.FGroups := csCases[CaseBase + 8];
+        case csCases[CaseBase + 9] of
+          0: begin
+               Deconv.FActivationFn := @Identity;
+               Deconv.FActivationFnDerivative := @IdentityDerivative;
+             end;
+          1: begin
+               Deconv.FActivationFn := @RectifiedLinearUnit;
+               Deconv.FActivationFnDerivative := @RectifiedLinearUnitDerivative;
+             end;
+        else
+          begin
+            Deconv.FActivationFn := @HiperbolicTangent;
+            Deconv.FActivationFnDerivative := @HiperbolicTangentDerivative;
+          end;
+        end;
+        NN.AddLayer(Deconv);
+        if csCases[CaseBase + 10] <> 1 then
+          NN.SetTrainable(False, {pLowMemory=}csCases[CaseBase + 10] = 2);
+        for NeuronPos := 0 to Deconv.Neurons.Count - 1 do
+        begin
+          for WeightPos := 0 to Deconv.Neurons[NeuronPos].Weights.Size - 1 do
+            Deconv.Neurons[NeuronPos].Weights.Raw[WeightPos] :=
+              0.3 * Sin(NeuronPos * 0.71 + WeightPos * 0.13);
+          Deconv.Neurons[NeuronPos].BiasWeight := 0.1 * (NeuronPos mod 5) - 0.2;
+        end;
+        Deconv.FlushWeightCache();
+        if Deconv.CPUGemmEligible() then Inc(GemmCaseCnt) else Inc(DirectCaseCnt);
+        Input.ReSize(csCases[CaseBase], csCases[CaseBase + 1], csCases[CaseBase + 2]);
+        for ElementPos := 0 to Input.Size - 1 do
+          Input.Raw[ElementPos] := Sin(ElementPos * 0.37) - 0.1;
+
+        NN.Compute(Input);
+        SerialOutput.Copy(Deconv.Output);
+        SerialRaw.Copy(Deconv.FOutputRaw);
+        AssertTrue(CaseName + ' serial output is non-trivial',
+          SerialOutput.GetSumAbs() > 0);
+        MaxElementPos := SerialOutput.Size - 1;
+
+        for ThreadPos := 0 to High(csThreadCounts) do
+        begin
+          Deconv.Output.Fill(csSentinel);
+          Deconv.FOutputRaw.Fill(csSentinel);
+          Pool := TNeuralThreadList.Create(csThreadCounts[ThreadPos]);
+          try
+            Pool.StartEngine();
+            Deconv.ComputeOnPool(Pool);
+            Pool.StopEngine();
+          finally
+            Pool.Free;
+          end;
+          for ElementPos := 0 to MaxElementPos do
+          begin
+            AssertEquals(CaseName + ' output at ' + IntToStr(ElementPos) +
+              ' on ' + IntToStr(csThreadCounts[ThreadPos]) + ' threads',
+              SerialOutput.FData[ElementPos], Deconv.Output.FData[ElementPos],
+              csTolerance);
+            AssertEquals(CaseName + ' pre-activation at ' + IntToStr(ElementPos) +
+              ' on ' + IntToStr(csThreadCounts[ThreadPos]) + ' threads',
+              SerialRaw.FData[ElementPos], Deconv.FOutputRaw.FData[ElementPos],
+              csTolerance);
+          end;
+        end;
+
+        // The planner's chunk path (serial fallback on a one-core box).
+        NN.EnableIntraLayerThreading(true);
+        NN.SchedulerMinGain := 0;
+        AssertTrue(CaseName + ' is chunk-eligible', Deconv.ChunkEligible());
+        Deconv.Output.Fill(csSentinel);
+        NN.Compute(Input, 0, {Parallel=}true);
+        for ElementPos := 0 to MaxElementPos do
+          AssertEquals(CaseName + ' scheduled output at ' + IntToStr(ElementPos),
+            SerialOutput.FData[ElementPos], Deconv.Output.FData[ElementPos],
+            csTolerance);
+      finally
+        NN.Free;
+      end;
+    end;
+    AssertTrue('some cases run the CPU GEMM', GemmCaseCnt > 0);
+    AssertTrue('some cases run the direct scatter', DirectCaseCnt > 0);
+  finally
+    SerialRaw.Free;
+    SerialOutput.Free;
+    Input.Free;
+  end;
+end;
+
+// No deconvolution forward reads FConcatedWInter, so a 32-multiple channel
+// count must not build that weight copy. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionSkipsInterleavedWeights;
+var
+  NN: TNNet;
+  Deconv: TDeconvChunkProbe;
+  WeightCount: integer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 32));
+    Deconv := TDeconvChunkProbe.Create(32, 3, 2, 1);
+    NN.AddLayer(Deconv);
+    NN.SetTrainable(False, {pLowMemory=}False);
+    Deconv.FlushWeightCache();
+    WeightCount := Deconv.Neurons.Count * Deconv.Neurons[0].Weights.Size;
+    AssertEquals('the GEMM bank is built', WeightCount,
+      Deconv.FConcatedWeights.Size);
+    AssertTrue('no interleaved copy', Deconv.FConcatedWInter.Size < WeightCount);
   finally
     NN.Free;
   end;

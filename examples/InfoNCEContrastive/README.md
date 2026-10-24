@@ -81,18 +81,18 @@ z_j||^2)` over negatives), plus the InfoNCE loss. Sample output:
 
 ```
 BEFORE training:
-  mean pos cosine =   0.7163   mean neg cosine =   0.1261   gap =   0.5902
-  alignment       =   0.5674   uniformity      =  -1.8768   InfoNCE loss =   1.0432
+  mean pos cosine =   0.6069   mean neg cosine =   0.2795   gap =   0.3274
+  alignment       =   0.7862   uniformity      =  -1.6902   InfoNCE loss =   1.7131
 
 AFTER training:
-  mean pos cosine =   0.9916   mean neg cosine =  -0.2076   gap =   1.1992
-  alignment       =   0.0168   uniformity      =  -4.4304   InfoNCE loss =   0.0185
+  mean pos cosine =   0.9882   mean neg cosine =  -0.1946   gap =   1.1828
+  alignment       =   0.0236   uniformity      =  -4.3330   InfoNCE loss =   0.0224
 
 Summary (Wang & Isola 2020 alignment/uniformity):
-  pos-vs-neg cosine gap : 0.5902 -> 1.1992   (wider is better)
-  alignment             : 0.5674 -> 0.0168   (lower is better)
-  uniformity            : -1.8768 -> -4.4304
-  InfoNCE loss          : 1.0432 -> 0.0185   (lower is better)
+  pos-vs-neg cosine gap : 0.3274 -> 1.1828   (wider is better)
+  alignment             : 0.7862 -> 0.0236   (lower is better)
+  uniformity            : -1.6902 -> -4.3330
+  InfoNCE loss          : 1.7131 -> 0.0224   (lower is better)
 
 Correctness signals:
   [PASS] pos-vs-neg cosine gap widened (positives pulled together, negatives pushed apart)

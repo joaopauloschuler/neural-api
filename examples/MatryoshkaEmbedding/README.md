@@ -68,20 +68,20 @@ Wall clock: **~6.5 s** on 2 CPU cores, single-threaded numerics.
 
   width  matryoshka-prefix   dedicated-baseline
   -----  -----------------   ------------------
-     8        0.913              0.913
-    16        0.925              0.909
-    32        0.916                (none)
-    64        0.919                (none)
+     8        0.975              0.966
+    16        0.966              0.969
+    32        0.962                (none)
+    64        0.962                (none)
 
   ASCII accuracy-vs-width curve (Matryoshka prefixes):
-   d= 8 |##############################################  91.3%
-   d=16 |##############################################  92.5%
-   d=32 |##############################################  91.6%
-   d=64 |##############################################  91.9%
+   d= 8 |#################################################  97.5%
+   d=16 |################################################  96.6%
+   d=32 |################################################  96.3%
+   d=64 |################################################  96.3%
 ```
 
-**Headline:** the Matryoshka 8-dim and 16-dim **prefixes** (0.913 / 0.925) are
-right on top of the **dedicated** fixed-8 / fixed-16 baselines (0.913 / 0.909) —
+**Headline:** the Matryoshka 8-dim and 16-dim **prefixes** (0.975 / 0.966) are
+right on top of the **dedicated** fixed-8 / fixed-16 baselines (0.966 / 0.969) —
 the nested prefixes lose essentially nothing versus models trained specifically
 at those widths, so you get adaptive-cost retrieval for free from one model.
 
@@ -91,7 +91,7 @@ Two honesty notes:
   head losses** (~1.4 each); the single-head baselines print ~0.1. Different
   scales, both converged — do not compare the raw loss numbers across models.
 * On this easy 6-D blob task even an 8-dim prefix nearly saturates, so the
-  curve is fairly **flat** (it does rise 8 -> 16). On a harder dataset the
+  curve is essentially **flat** (within ~1 point across widths). On a harder dataset the
   width curve would be steeper; the close-to-baseline property is the point
   being demonstrated here, and it holds.
 

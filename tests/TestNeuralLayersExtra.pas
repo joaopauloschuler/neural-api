@@ -137,6 +137,16 @@ type
     procedure TestActivationReportsRepeatStable;
     procedure TestLensReportsIgnoreNilProbes;
     procedure TestEnableInputGradient;
+    // TNNet.SetErrorOnlyBackprop on an inference-only clone of a pico net
+    // (conv, group norm, strided ReLU conv, pointwise conv, attention, token
+    // layer norm, dense): the input gradient equals the trainable net's, the
+    // weights stay byte-identical, no delta buffer exists, False restores
+    // inference, and a weight layer without an error-only backward is refused.
+    procedure TestErrorOnlyBackpropMatchesTrainable;
+    // Error-only through int8 weights: the input gradient matches an FP32 net
+    // holding the dequantized weights and stays close to the FP32 original;
+    // an int4 pointwise conv stays close to its FP32 original.
+    procedure TestErrorOnlyBackpropQuantized;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
     procedure TestGradientNoiseScaleReportSmoke;
@@ -145,6 +155,7 @@ type
     procedure TestModeConnectivityReportSmoke;
     procedure TestPermutationAlignReportSmoke;
     procedure TestPermutationAlignDegenerateScoreRow;
+    procedure TestPermutationAlignPicksExactAssignment;
     procedure TestIntrinsicDimensionReportSmoke;
     procedure TestNeuralTangentKernelReportSmoke;
     procedure TestActivationPatchingReportSmoke;
@@ -209,9 +220,77 @@ type
     // (Y outer / X inner), so a non-square input catches any axis mix-up.
     procedure TestDepthwiseConvForwardMatchesReference;
     procedure TestDepthwiseConvInt8ForwardMatchesFP32;
+    // Dilated taps (torch dilation) on the FP32 and int8 forwards.
+    procedure TestDepthwiseConvDilatedForwardMatchesReference;
+    procedure TestDepthwiseConvDilatedInt8ForwardMatchesFP32;
+    // The dilation survives save/load; a file without it loads as dilation 1.
+    procedure TestDepthwiseConvDilationSaveLoad;
+    // Dilated TNNetConvolution[Linear|ReLU] (torch Conv2d dilation) vs a naive
+    // padded reference at stride 1 and 2; int8 weights and int8 x int8 inputs.
+    procedure TestConvolutionDilatedForwardMatchesReference;
+    procedure TestConvolutionDilatedInt8ForwardMatchesFP32;
+    // Save/load round trip; old files load as dilation 1; classes with their
+    // own forward refuse a dilation.
+    procedure TestConvolutionDilationSaveLoad;
+    // Dilated TNNetConvolutionRectangular[ReLU] (torch Conv2d, non-square
+    // kernel) vs the naive reference; save/load round trip of the dilation.
+    procedure TestConvolutionRectangularDilatedForwardMatchesReference;
+    procedure TestConvolutionRectangularDilationSaveLoad;
+    // The dense-only TNNetConvolution backward routines refuse a dilated layer.
+    procedure TestConvolutionDenseOnlyBackwardRefusesDilation;
+    // TNNetTriplaneSample: hand-derived bilinear samples (texel centre, between
+    // texels, outside the box, plane edges), plane/concat order, both paddings,
+    // align_corners, and the save/load round trip.
+    procedure TestTriplaneSampleHandCases;
+    procedure TestTriplaneSampleSaveLoad;
+    // TNNetGridSample3D: hand-derived trilinear samples (voxel centre, midpoint,
+    // zeros vs border outside the volume, align_corners, nearest) and save/load.
+    procedure TestGridSample3DHandCases;
+    procedure TestGridSample3DSaveLoad;
+    // TNNetMultiScaleDeformableAttention: forward against a naive bilinear
+    // reference (cxcywh and xy references), finite-difference gradients of
+    // the offsets|logits, value and reference sources, and save/load.
+    procedure TestMultiScaleDeformableAttentionForward;
+    procedure TestMultiScaleDeformableAttentionGradients;
+    procedure TestMultiScaleDeformableAttentionSaveLoad;
+    // D-FINE options: equal per-level counts with OffsetScale 0.5 are the old
+    // layer bit for bit; per-level counts (3, 1) with OffsetScale 0.7 against
+    // the naive reference, gradients, save/load and loading an old save.
+    procedure TestMultiScaleDeformableAttentionEqualLevelPointsUnchanged;
+    procedure TestMultiScaleDeformableAttentionPerLevelPointsForward;
+    procedure TestMultiScaleDeformableAttentionPerLevelPointsGradients;
+    procedure TestMultiScaleDeformableAttentionPerLevelPointsSaveLoad;
+    procedure TestMultiScaleDeformableAttentionLoadsOldSave;
+    // decoder_method "discrete" (per-level counts (3, 1), OffsetScale 0.7):
+    // forward against the naive nearest-cell reference with clamping, value and
+    // logit gradients (zero location gradient), and save/load of the flag.
+    procedure TestMultiScaleDeformableAttentionDiscreteForward;
+    procedure TestMultiScaleDeformableAttentionDiscreteGradients;
+    procedure TestMultiScaleDeformableAttentionDiscreteSaveLoad;
+    // TNNetTopKGatherTokens: score order, error scatter and save/load.
+    procedure TestTopKGatherTokens;
+    // A Create with no point counts and no level shapes reports the error
+    // without reading past the arrays.
+    procedure TestMultiScaleDeformableAttentionEmptyLevelPoints;
+    // TNNetTopKValues: sorted values with a tie, error scatter and save/load.
+    procedure TestTopKValues;
   private
-    // Naive per-tap depthwise reference used by the two tests above.
-    procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer);
+    // Builds offsets|logits input (layer 0), value input and reference input
+    // with deterministic values, then the deformable attention layer built as
+    // Mode says (csDeformMode*).
+    procedure BuildDeformableAttentionNet(NN: TNNet; ReferenceDepth: integer;
+      Offsets, Values, References: TNNetVolume; Mode: integer = 0);
+    procedure AssertDeformableForwardMatchesReference(Mode: integer);
+    procedure AssertDeformableGradientsMatchFiniteDifferences(Mode: integer);
+    procedure AssertDeformableSaveLoadRoundTrip(Mode: integer);
+    // Naive per-tap reference for a padded dilated convolution.
+    procedure AssertConvolutionDilatedMatchesReference(Padding, Stride,
+      Dilation: integer; UseReLU: boolean; FeatureSizeX: integer = 3;
+      FeatureSizeY: integer = 3);
+    // Naive per-tap depthwise reference used by the forward tests above.
+    procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer;
+      Dilation: integer = 1);
+    procedure AssertDepthwiseConvInt8MatchesFP32(Dilation: integer);
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
     // QuantizeBanks quantizes ONLY the two bank layers, leaving the reference
@@ -5197,6 +5276,231 @@ begin
   end;
 end;
 
+function BuildErrorOnlyPicoNet(): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(6, 4, 3));
+  Result.AddLayer(TNNetConvolutionLinear.Create(8, 3, 1, 1));
+  Result.AddLayer(TNNetGroupNorm.Create(2));
+  Result.AddLayer(TNNetConvolutionReLU.Create(6, 3, 1, 2));
+  Result.AddLayer(TNNetReshape.Create(6, 1, 6));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(12));
+  Result.AddLayer(TNNetScaledDotProductAttention.Create(4, false));
+  Result.AddLayer(TNNetTokenLayerNorm.Create());
+  Result.AddLayer(TNNetFullConnectReLU.Create(7));
+  Result.AddLayer(TNNetFullConnectLinear.Create(3));
+  Result.InitWeights();
+  Result.SetLearningRate(0.01, 0);
+  Result.SetBatchUpdate(true);
+end;
+
+function ErrorOnlyMaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+var
+  Pos: integer;
+begin
+  Result := 0;
+  for Pos := 0 to A.Size - 1 do
+    Result := Max(Result, Abs(A.FData[Pos] - B.FData[Pos]));
+end;
+
+// || A - B || / || B ||
+function ErrorOnlyRelativeDiff(A, B: TNNetVolume): TNeuralFloat;
+var
+  Pos: integer;
+  DiffSqr: TNeuralFloat;
+begin
+  DiffSqr := 0;
+  for Pos := 0 to A.Size - 1 do
+    DiffSqr := DiffSqr + Sqr(A.FData[Pos] - B.FData[Pos]);
+  Result := Sqrt(DiffSqr / B.GetSumSqr());
+end;
+
+function NetHasNeuronDeltas(NN: TNNet): boolean;
+var
+  LayerCnt, NeuronCnt: integer;
+begin
+  Result := false;
+  for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    for NeuronCnt := 0 to NN.Layers[LayerCnt].Neurons.Count - 1 do
+      if (NN.Layers[LayerCnt].Neurons[NeuronCnt].Delta <> nil) or
+        (NN.Layers[LayerCnt].Neurons[NeuronCnt].BackInertia <> nil) then
+        exit(true);
+end;
+
+procedure TTestNeuralLayersExtra.TestErrorOnlyBackpropMatchesTrainable;
+var
+  Trainable, ErrorOnly, Refused: TNNet;
+  X, Target: TNNetVolume;
+  WeightsBefore: string;
+  Pass, LayerCnt: integer;
+  IsRefused: boolean;
+begin
+  RandSeed := 20261023;
+  Trainable := BuildErrorOnlyPicoNet();
+  ErrorOnly := Trainable.Clone();
+  X := TNNetVolume.Create(6, 4, 3);
+  Target := TNNetVolume.Create(3, 1, 1);
+  Refused := nil;
+  try
+    ErrorOnly.SetTrainable(false);
+    AssertFalse('inference-only clone has no deltas', NetHasNeuronDeltas(ErrorOnly));
+    ErrorOnly.SetErrorOnlyBackprop(true);
+    AssertTrue('net reports error-only', ErrorOnly.ErrorOnlyBackprop);
+    for LayerCnt := 0 to ErrorOnly.GetLastLayerIdx() do
+      AssertTrue('layer ' + IntToStr(LayerCnt) + ' error-only',
+        ErrorOnly.Layers[LayerCnt].ErrorOnlyBackprop);
+    Trainable.EnableInputGradient();
+    ErrorOnly.EnableInputGradient();
+    WeightsBefore := ErrorOnly.SaveDataToString();
+    for Pass := 0 to 1 do
+    begin
+      X.RandomizeGaussian(1.0);
+      Target.RandomizeGaussian(1.0);
+      Trainable.Compute(X);
+      Trainable.Backpropagate(Target);
+      ErrorOnly.Compute(X);
+      ErrorOnly.Backpropagate(Target);
+      AssertEquals('pass ' + IntToStr(Pass) + ' same output', 0,
+        ErrorOnlyMaxAbsDiff(ErrorOnly.GetLastLayer().Output,
+        Trainable.GetLastLayer().Output), 1e-6);
+      AssertTrue('pass ' + IntToStr(Pass) + ' nonzero input gradient',
+        Trainable.Layers[0].OutputError.GetSumAbs() > 1e-4);
+      AssertEquals('pass ' + IntToStr(Pass) + ' input gradient', 0,
+        ErrorOnlyMaxAbsDiff(ErrorOnly.Layers[0].OutputError,
+        Trainable.Layers[0].OutputError), 1e-6);
+    end;
+    AssertTrue('weights byte-identical',
+      WeightsBefore = ErrorOnly.SaveDataToString());
+    AssertFalse('no delta buffers after backprop', NetHasNeuronDeltas(ErrorOnly));
+    ErrorOnly.ClearDeltas();
+    ErrorOnly.UpdateWeights();
+    AssertTrue('UpdateWeights leaves the weights alone',
+      WeightsBefore = ErrorOnly.SaveDataToString());
+    ErrorOnly.SetErrorOnlyBackprop(false);
+    AssertFalse('net leaves error-only', ErrorOnly.ErrorOnlyBackprop);
+    AssertFalse('conv back to inference-only', ErrorOnly.Layers[1].IsTrainable);
+    AssertFalse('conv leaves error-only', ErrorOnly.Layers[1].ErrorOnlyBackprop);
+    AssertEquals('conv error buffer collapsed', 1,
+      ErrorOnly.Layers[1].OutputError.Size);
+    AssertFalse('still no deltas', NetHasNeuronDeltas(ErrorOnly));
+    ErrorOnly.Compute(X);
+    AssertEquals('inference output unchanged', 0,
+      ErrorOnlyMaxAbsDiff(ErrorOnly.GetLastLayer().Output,
+      Trainable.GetLastLayer().Output), 1e-6);
+    // TNNetBitLinear's backward differs from the plain weight-row sum.
+    Refused := TNNet.Create();
+    Refused.AddLayer(TNNetInput.Create(8));
+    Refused.AddLayer(TNNetBitLinear.Create(3));
+    Refused.SetTrainable(false);
+    IsRefused := false;
+    try
+      Refused.SetErrorOnlyBackprop(true);
+    except
+      on Exception do IsRefused := true;
+    end;
+    AssertTrue('BitLinear refused', IsRefused);
+    AssertFalse('refusal changes no layer', Refused.Layers[0].ErrorOnlyBackprop);
+    AssertFalse('refusal leaves the net', Refused.ErrorOnlyBackprop);
+  finally
+    Refused.Free;
+    Target.Free;
+    X.Free;
+    ErrorOnly.Free;
+    Trainable.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestErrorOnlyBackpropQuantized;
+var
+  Reference, Quantized, Dequantized: TNNet;
+  X, Target: TNNetVolume;
+  LayerCnt: integer;
+begin
+  RandSeed := 20261024;
+  Reference := BuildErrorOnlyPicoNet();
+  Quantized := Reference.Clone();
+  Dequantized := Reference.Clone();
+  X := TNNetVolume.Create(6, 4, 3);
+  Target := TNNetVolume.Create(3, 1, 1);
+  try
+    Quantized.SetTrainable(false);
+    Quantized.QuantizeWeightsInt8();
+    AssertTrue('conv is int8', Quantized.Layers[1].HasInferenceOnlyWeights());
+    AssertTrue('dense is int8', Quantized.Layers[9].HasInferenceOnlyWeights());
+    // The FP32 twin of the int8 weights.
+    for LayerCnt := 0 to Dequantized.GetLastLayerIdx() do
+      if Dequantized.Layers[LayerCnt] is TNNetLayerConcatedWeights then
+      begin
+        TNNetLayerConcatedWeights(Dequantized.Layers[LayerCnt]).QuantizeWeightsInt8();
+        TNNetLayerConcatedWeights(Dequantized.Layers[LayerCnt]).DequantizeWeightsInt8();
+      end;
+    // Clone does not carry SetBatchUpdate: without it every backward step
+    // would move the twin's weights before its previous-layer error.
+    Dequantized.SetBatchUpdate(true);
+    Quantized.SetErrorOnlyBackprop(true);
+    AssertTrue('int8 conv error-only', Quantized.Layers[1].ErrorOnlyBackprop);
+    Reference.EnableInputGradient();
+    Quantized.EnableInputGradient();
+    Dequantized.EnableInputGradient();
+    X.RandomizeGaussian(1.0);
+    Target.RandomizeGaussian(1.0);
+    Reference.Compute(X);
+    Reference.Backpropagate(Target);
+    Dequantized.Compute(X);
+    Dequantized.Backpropagate(Target);
+    Quantized.Compute(X);
+    Quantized.Backpropagate(Target);
+    AssertFalse('int8 net has no deltas', NetHasNeuronDeltas(Quantized));
+    AssertEquals('int8 = dequantized FP32 input gradient', 0,
+      ErrorOnlyMaxAbsDiff(Quantized.Layers[0].OutputError,
+      Dequantized.Layers[0].OutputError), 1e-5);
+    // Rows of 6 to 27 weights through attention: about 5% here (measured).
+    AssertEquals('int8 close to the FP32 input gradient', 0,
+      ErrorOnlyRelativeDiff(Quantized.Layers[0].OutputError,
+      Reference.Layers[0].OutputError), 0.1);
+  finally
+    Target.Free;
+    X.Free;
+    Dequantized.Free;
+    Quantized.Free;
+    Reference.Free;
+  end;
+  // Int4 weights x int8 input: a pointwise conv with 32 input channels.
+  Reference := TNNet.Create();
+  X := TNNetVolume.Create(4, 3, 32);
+  Target := TNNetVolume.Create(3, 1, 1);
+  Quantized := nil;
+  try
+    Reference.AddLayer(TNNetInput.Create(4, 3, 32));
+    Reference.AddLayer(TNNetPointwiseConvLinear.Create(8));
+    Reference.AddLayer(TNNetFullConnectLinear.Create(3));
+    Reference.InitWeights();
+    Reference.SetLearningRate(0.01, 0);
+    Reference.SetBatchUpdate(true);
+    Quantized := Reference.Clone();
+    Quantized.SetTrainable(false);
+    TNNetLayerConcatedWeights(Quantized.Layers[1]).QuantizeWeightsInt4();
+    AssertTrue('conv is int4', Quantized.Layers[1].HasInferenceOnlyWeights());
+    Quantized.SetErrorOnlyBackprop(true);
+    Reference.EnableInputGradient();
+    Quantized.EnableInputGradient();
+    X.RandomizeGaussian(1.0);
+    Target.RandomizeGaussian(1.0);
+    Reference.Compute(X);
+    Reference.Backpropagate(Target);
+    Quantized.Compute(X);
+    Quantized.Backpropagate(Target);
+    AssertEquals('int4 close to the FP32 input gradient', 0,
+      ErrorOnlyRelativeDiff(Quantized.Layers[0].OutputError,
+      Reference.Layers[0].OutputError), 0.25);
+  finally
+    Quantized.Free;
+    Target.Free;
+    X.Free;
+    Reference.Free;
+  end;
+end;
+
 procedure TTestNeuralLayersExtra.TestAdversarialRobustnessReportSmoke;
 var
   NN: TNNet;
@@ -6420,10 +6724,8 @@ begin
   end;
 end;
 
-// A non-finite weight makes one A-unit's whole similarity row NaN, so that unit
-// never wins a greedy pick and the alignment loop ends with positions still
-// unassigned. The permutation must still be complete: the neuron reorder indexes
-// the saved weight rows by it, so a leftover -1 reads out of bounds.
+// A non-finite weight makes one A-unit's whole similarity row NaN. The assignment
+// must still yield a complete permutation: the neuron reorder indexes by it.
 procedure TTestNeuralLayersExtra.TestPermutationAlignDegenerateScoreRow;
 var
   NN, NNB: TNNet;
@@ -6486,6 +6788,69 @@ begin
     NN.Free;
     NNB.Free;
     SetExceptionMask(OldMask);
+    RandSeed := SavedSeed;
+  end;
+end;
+
+// Hand-built 2-unit hidden layer whose weight-row cosines (A rows, B columns)
+// are [[0.970, 0.600], [0.243, -0.800]]: greedy takes the 0.970 pair first and
+// totals 0.170 (identity, churn 0), the exact assignment swaps for 0.843.
+procedure TTestNeuralLayersExtra.TestPermutationAlignPicksExactAssignment;
+var
+  NN, NNB: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  SnapB, Report: string;
+  I: integer;
+  SavedSeed: longword;
+
+  procedure BuildNet(ANN: TNNet);
+  begin
+    ANN.AddLayer(TNNetInput.Create(2, 1, 1));
+    ANN.AddLayer(TNNetFullConnectReLU.Create(2));
+    ANN.AddLayer(TNNetFullConnectLinear.Create(1));
+    ANN.InitWeights();
+  end;
+
+  procedure SetHiddenRow(ANN: TNNet; Unit_: integer; W0, W1: TNeuralFloat);
+  begin
+    ANN.Layers[1].Neurons[Unit_].Weights.FData[0] := W0;
+    ANN.Layers[1].Neurons[Unit_].Weights.FData[1] := W1;
+  end;
+
+begin
+  SavedSeed := RandSeed;
+  NN := TNNet.Create();
+  NNB := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    RandSeed := 31;
+    BuildNet(NN);
+    BuildNet(NNB);
+    SetHiddenRow(NN, 0, 1.0, 0.0);
+    SetHiddenRow(NN, 1, 0.0, 1.0);
+    SetHiddenRow(NNB, 0, 4.0, 1.0);
+    SetHiddenRow(NNB, 1, 0.6, -0.8);
+    for I := 1 to 4 do
+    begin
+      X := TNNetVolume.Create(2, 1, 1);
+      Y := TNNetVolume.Create(1, 1, 1);
+      X.FData[0] := I * 0.5;
+      X.FData[1] := 1.0 - I * 0.3;
+      Y.FData[0] := I * 0.1;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+    SnapB := NNB.SaveDataToString();
+
+    Report := TNNet.PermutationAlignReport(NN, SnapB, Samples, 0, 4);
+    AssertTrue('exact assignment swaps both units (greedy would keep them)',
+      Pos('churn = 1.000', Report) > 0);
+    AssertTrue('exact assignment keeps permutation invariance',
+      Pos('Check 1 permutation invariance: PASS', Report) > 0);
+  finally
+    Samples.Free;
+    NN.Free;
+    NNB.Free;
     RandSeed := SavedSeed;
   end;
 end;
@@ -8943,41 +9308,44 @@ begin
   end;
 end;
 
-// Builds Input(7,5,3) -> DepthwiseConvLinear(Multiplier, 3x3, no padding,
-// Stride) on random weights and random input, then recomputes every output
-// element with a naive tap loop. The input is deliberately NON-SQUARE so a
-// swapped X/Y axis shows up as a shape error or a wrong value rather than
+// Builds Input(9,7,3) -> DepthwiseConvLinear(Multiplier, 3x3, no padding,
+// Stride, Dilation) on random weights and random input, then recomputes every
+// output element with a naive tap loop. The input is deliberately NON-SQUARE so
+// a swapped X/Y axis shows up as a shape error or a wrong value rather than
 // cancelling out.
 procedure TTestNeuralLayersExtra.AssertDepthwiseConvMatchesReference(
-  Multiplier, Stride: integer);
+  Multiplier, Stride: integer; Dilation: integer);
 const
-  InX = 7; InY = 5; InD = 3; FeatureSize = 3;
+  InX = 9; InY = 7; InD = 3; FeatureSize = 3;
 var
   NN: TNNet;
   Input: TNNetVolume;
   Layer: TNNetLayer;
   W, Output: TNNetVolume;
   NeuronCnt, ox, oy, d, fx, fy: integer;
-  MaxOutXPos, MaxOutYPos, Expected: integer;
+  MaxOutXPos, MaxOutYPos, Expected, Extent: integer;
   Sum: TNeuralFloat;
   Tag: string;
 begin
-  Tag := 'mult=' + IntToStr(Multiplier) + ' stride=' + IntToStr(Stride);
+  Tag := 'mult=' + IntToStr(Multiplier) + ' stride=' + IntToStr(Stride) +
+    ' dilation=' + IntToStr(Dilation);
+  Extent := Dilation * (FeatureSize - 1) + 1;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(InX, InY, InD);
   try
     NN.AddLayer(TNNetInput.Create(InX, InY, InD));
     Layer := NN.AddLayer(
-      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, Stride));
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, Stride,
+        Dilation));
     for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
       Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
     Input.Randomize();
     NN.Compute(Input);
     Output := Layer.Output;
 
-    Expected := (InX - FeatureSize) div Stride + 1;
+    Expected := (InX - Extent) div Stride + 1;
     AssertEquals('output SizeX (' + Tag + ')', Expected, Output.SizeX);
-    Expected := (InY - FeatureSize) div Stride + 1;
+    Expected := (InY - Extent) div Stride + 1;
     AssertEquals('output SizeY (' + Tag + ')', Expected, Output.SizeY);
     AssertEquals('output depth (' + Tag + ')', Multiplier * InD, Output.Depth);
 
@@ -8993,8 +9361,8 @@ begin
             Sum := 0;
             for fx := 0 to FeatureSize - 1 do
               for fy := 0 to FeatureSize - 1 do
-                Sum := Sum +
-                  Input[ox * Stride + fx, oy * Stride + fy, d] * W[fx, fy, d];
+                Sum := Sum + Input[ox * Stride + fx * Dilation,
+                  oy * Stride + fy * Dilation, d] * W[fx, fy, d];
             AssertEquals('depthwise out[' + IntToStr(ox) + ',' + IntToStr(oy) +
               ',' + IntToStr(NeuronCnt) + ':' + IntToStr(d) + '] (' + Tag + ')',
               Sum, Output[ox, oy, NeuronCnt * InD + d], 1e-4);
@@ -9015,11 +9383,77 @@ begin
   AssertDepthwiseConvMatchesReference(3, 2);
 end;
 
+procedure TTestNeuralLayersExtra.TestDepthwiseConvDilatedForwardMatchesReference;
+begin
+  AssertDepthwiseConvMatchesReference(1, 1, 2);
+  AssertDepthwiseConvMatchesReference(3, 1, 2);
+  AssertDepthwiseConvMatchesReference(2, 2, 2);
+  AssertDepthwiseConvMatchesReference(1, 1, 3);
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvInt8ForwardMatchesFP32;
+begin
+  AssertDepthwiseConvInt8MatchesFP32(1);
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvDilatedInt8ForwardMatchesFP32;
+begin
+  AssertDepthwiseConvInt8MatchesFP32(2);
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvDilationSaveLoad;
+const
+  InX = 9; InY = 7; InD = 3;
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    // Padding (K div 2) * D keeps the size, as torchvision pads a dilated conv.
+    NN.AddLayer(TNNetDepthwiseConvReLU.Create(2, 3, 2, 1, 2));
+    Input.Randomize();
+    NN.Compute(Input);
+    AssertEquals('same-size output X', InX, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('same-size output Y', InY, NN.GetLastLayer.Output.SizeY);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('loaded dilation', 2,
+      TNNetDepthwiseConv(Loaded.GetLastLayer).DilationX);
+    Loaded.Compute(Input);
+    AssertEquals('loaded output size', NN.GetLastLayer.Output.Size,
+      Loaded.GetLastLayer.Output.Size);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('loaded output ' + IntToStr(i),
+        NN.GetLastLayer.Output.FData[i], Loaded.GetLastLayer.Output.FData[i], 1e-6);
+    // A structure saved before the dilation slot existed holds 0 in FStruct[4].
+    Saved := StringReplace(NN.SaveStructureToString(),
+      'TNNetDepthwiseConvReLU:2;3;2;1;2;', 'TNNetDepthwiseConvReLU:2;3;2;1;0;', []);
+    AssertTrue('structure string has the depthwise slots',
+      Pos('TNNetDepthwiseConvReLU:2;3;2;1;0;', Saved) > 0);
+    Loaded.Free;
+    Loaded := TNNet.Create();
+    Loaded.LoadStructureFromString(Saved);
+    AssertEquals('old file loads as dilation 1', 1,
+      TNNetDepthwiseConv(Loaded.GetLastLayer).DilationX);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
 // The int8 forward walks its own nest over the same taps; it must land within
 // quantization drift of the FP32 forward it replaces.
-procedure TTestNeuralLayersExtra.TestDepthwiseConvInt8ForwardMatchesFP32;
+procedure TTestNeuralLayersExtra.AssertDepthwiseConvInt8MatchesFP32(
+  Dilation: integer);
 const
-  InX = 7; InY = 5; InD = 3; FeatureSize = 3; Multiplier = 2;
+  InX = 9; InY = 7; InD = 3; FeatureSize = 3; Multiplier = 2;
 var
   NN: TNNet;
   Input, Reference: TNNetVolume;
@@ -9032,7 +9466,7 @@ begin
   try
     NN.AddLayer(TNNetInput.Create(InX, InY, InD));
     Layer := NN.AddLayer(
-      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, 1));
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, 1, Dilation));
     for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
       Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
     Input.Randomize();
@@ -9050,6 +9484,1318 @@ begin
     NN.Free;
     Input.Free;
     Reference.Free;
+  end;
+end;
+
+// Input(11,9,4) -> TNNetConvolution[Linear|ReLU](5 features, 3x3, Padding,
+// Stride, dilation) with random weights and biases, recomputed by a naive tap
+// loop that reads zero outside the input. Non-square so an X/Y swap shows.
+// FeatureSizeX <> FeatureSizeY builds TNNetConvolutionRectangular[ReLU].
+procedure TTestNeuralLayersExtra.AssertConvolutionDilatedMatchesReference(
+  Padding, Stride, Dilation: integer; UseReLU: boolean; FeatureSizeX: integer;
+  FeatureSizeY: integer);
+const
+  InX = 11; InY = 9; InD = 4; NumFeatures = 5;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  W, Output: TNNetVolume;
+  NeuronCnt, ox, oy, d, fx, fy, ix, iy: integer;
+  Expected, ExtentX, ExtentY: integer;
+  Sum: TNeuralFloat;
+  Tag: string;
+begin
+  Tag := 'kernel=' + IntToStr(FeatureSizeX) + 'x' + IntToStr(FeatureSizeY) +
+    ' pad=' + IntToStr(Padding) + ' stride=' + IntToStr(Stride) +
+    ' dilation=' + IntToStr(Dilation) + ' relu=' + BoolToStr(UseReLU, true);
+  ExtentX := Dilation * (FeatureSizeX - 1) + 1;
+  ExtentY := Dilation * (FeatureSizeY - 1) + 1;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    if FeatureSizeX <> FeatureSizeY then
+    begin
+      if UseReLU then
+        Layer := NN.AddLayer(TNNetConvolutionRectangularReLU.Create(NumFeatures,
+          FeatureSizeX, FeatureSizeY, Padding, Stride, 0, Dilation))
+      else
+        Layer := NN.AddLayer(TNNetConvolutionRectangular.Create(NumFeatures,
+          FeatureSizeX, FeatureSizeY, Padding, Stride, 0, Dilation));
+    end
+    else if UseReLU then
+      Layer := NN.AddLayer(TNNetConvolutionReLU.Create(NumFeatures, FeatureSizeX,
+        Padding, Stride, 0, Dilation))
+    else
+      Layer := NN.AddLayer(TNNetConvolutionLinear.Create(NumFeatures,
+        FeatureSizeX, Padding, Stride, 0, Dilation));
+    AssertEquals('DilationX (' + Tag + ')', Dilation,
+      TNNetConvolution(Layer).DilationX);
+    AssertEquals('DilationY (' + Tag + ')', Dilation,
+      TNNetConvolution(Layer).DilationY);
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+    begin
+      Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+      Layer.Neurons[NeuronCnt].BiasWeight := 0.1 * (NeuronCnt - 2);
+    end;
+    Layer.FlushWeightCache();
+    Input.Randomize();
+    NN.Compute(Input);
+    Output := Layer.Output;
+
+    Expected := (InX + 2 * Padding - ExtentX) div Stride + 1;
+    AssertEquals('output SizeX (' + Tag + ')', Expected, Output.SizeX);
+    Expected := (InY + 2 * Padding - ExtentY) div Stride + 1;
+    AssertEquals('output SizeY (' + Tag + ')', Expected, Output.SizeY);
+    AssertEquals('output depth (' + Tag + ')', NumFeatures, Output.Depth);
+
+    for NeuronCnt := 0 to NumFeatures - 1 do
+    begin
+      W := Layer.Neurons[NeuronCnt].Weights;
+      for oy := 0 to Output.SizeY - 1 do
+        for ox := 0 to Output.SizeX - 1 do
+        begin
+          Sum := Layer.Neurons[NeuronCnt].BiasWeight;
+          for fy := 0 to FeatureSizeY - 1 do
+            for fx := 0 to FeatureSizeX - 1 do
+            begin
+              ix := ox * Stride + fx * Dilation - Padding;
+              iy := oy * Stride + fy * Dilation - Padding;
+              if (ix >= 0) and (ix < InX) and (iy >= 0) and (iy < InY) then
+                for d := 0 to InD - 1 do
+                  Sum := Sum + Input[ix, iy, d] * W[fx, fy, d];
+            end;
+          if UseReLU and (Sum < 0) then Sum := 0;
+          AssertEquals('conv out[' + IntToStr(ox) + ',' + IntToStr(oy) + ',' +
+            IntToStr(NeuronCnt) + '] (' + Tag + ')',
+            Sum, Output[ox, oy, NeuronCnt], 1e-4);
+        end;
+    end;
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestConvolutionDilatedForwardMatchesReference;
+begin
+  AssertConvolutionDilatedMatchesReference(2, 1, 2, false);
+  AssertConvolutionDilatedMatchesReference(2, 2, 2, false);
+  AssertConvolutionDilatedMatchesReference(2, 1, 2, true);
+  AssertConvolutionDilatedMatchesReference(0, 1, 3, false);
+  AssertConvolutionDilatedMatchesReference(1, 2, 1, false);
+end;
+
+// Int8 weights over the FP32 im2col, then int8 weights x int8 input over the
+// byte im2col: both within quantization drift of the FP32 forward. Passes 2
+// and 3 repeat both on a dilated 3x2 TNNetConvolutionRectangular.
+procedure TTestNeuralLayersExtra.TestConvolutionDilatedInt8ForwardMatchesFP32;
+const
+  InX = 11; InY = 9; InD = 4;
+var
+  NN: TNNet;
+  Input, Reference: TNNetVolume;
+  Conv: TNNetConvolution;
+  NeuronCnt, i: integer;
+  MaxAbsRef: TNeuralFloat;
+  Pass: integer;
+begin
+  Input := TNNetVolume.Create(InX, InY, InD);
+  Reference := TNNetVolume.Create();
+  try
+    Input.Randomize();
+    for Pass := 0 to 3 do
+    begin
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+        if Pass < 2 then
+          Conv := TNNetConvolutionLinear.Create(6, 3, 2, 1, 0, 2)
+        else
+          Conv := TNNetConvolutionRectangular.Create(6, 3, 2, 2, 1, 0, 2);
+        NN.AddLayer(Conv);
+        RandSeed := 2718;
+        for NeuronCnt := 0 to Conv.Neurons.Count - 1 do
+          Conv.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+        Conv.FlushWeightCache();
+        NN.SetTrainable(False);
+        NN.Compute(Input);
+        Reference.Copy(Conv.Output);
+        MaxAbsRef := Reference.GetMaxAbs();
+        AssertTrue('FP32 reference is non-trivial', MaxAbsRef > 0.1);
+        TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+        if Odd(Pass) then
+        begin
+          Conv.EnableInt8Input();
+          AssertTrue('int8 x int8 forward is taken',
+            Conv.InputPreparedInt8 <> nil);
+        end;
+        NN.Compute(Input);
+        AssertEquals('int8 output size', Reference.Size, Conv.Output.Size);
+        for i := 0 to Reference.Size - 1 do
+          AssertEquals('int8 (pass ' + IntToStr(Pass) + ') element ' +
+            IntToStr(i), Reference.FData[i], Conv.Output.FData[i],
+            0.05 * MaxAbsRef);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Reference.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestConvolutionDilationSaveLoad;
+const
+  InX = 9; InY = 7; InD = 3;
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  Saved, Structure: string;
+  i: integer;
+  Refused: boolean;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    // Padding (K div 2) * D keeps the size, as in the ResNet dilated layer4.
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 2, 1, 0, 2));
+    NN.AddLayer(TNNetConvolution.Create(3, 3, 1, 1));
+    Input.Randomize();
+    NN.Compute(Input);
+    AssertEquals('same-size output X', InX, NN.Layers[1].Output.SizeX);
+    AssertEquals('same-size output Y', InY, NN.Layers[1].Output.SizeY);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', NN.SaveStructureToString(),
+      Loaded.SaveStructureToString());
+    AssertEquals('loaded dilation', 2,
+      TNNetConvolution(Loaded.Layers[1]).DilationY);
+    AssertEquals('undilated layer stays 1', 1,
+      TNNetConvolution(Loaded.Layers[2]).DilationX);
+    Loaded.Compute(Input);
+    AssertEquals('loaded output size', NN.GetLastLayer.Output.Size,
+      Loaded.GetLastLayer.Output.Size);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('loaded output ' + IntToStr(i),
+        NN.GetLastLayer.Output.FData[i], Loaded.GetLastLayer.Output.FData[i], 1e-6);
+    // A structure saved before the dilation slot existed holds 0 in FStruct[6].
+    Structure := NN.SaveStructureToString();
+    AssertTrue('dilation in FStruct[6]',
+      Pos('TNNetConvolutionReLU:4;3;2;1;0;0;2;0', Structure) > 0);
+    Structure := StringReplace(Structure, 'TNNetConvolutionReLU:4;3;2;1;0;0;2;0',
+      'TNNetConvolutionReLU:4;3;2;1;0;0;0;0', []);
+    Loaded.Free;
+    Loaded := TNNet.Create();
+    Loaded.LoadStructureFromString(Structure);
+    AssertEquals('old file loads as dilation 1', 1,
+      TNNetConvolution(Loaded.Layers[1]).DilationX);
+    AssertEquals('old file output size', InX - 2 + 2 * 2,
+      Loaded.Layers[1].Output.SizeX);
+    Refused := false;
+    try
+      TNNetQuaternionConv.Create(4, 3, 2, 1, 0, 2).Free;
+    except
+      on E: Exception do Refused := true;
+    end;
+    AssertTrue('a convolution with its own forward refuses a dilation', Refused);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestConvolutionRectangularDilatedForwardMatchesReference;
+begin
+  AssertConvolutionDilatedMatchesReference(2, 1, 2, false, 3, 1);
+  AssertConvolutionDilatedMatchesReference(2, 2, 2, true, 1, 3);
+  AssertConvolutionDilatedMatchesReference(0, 1, 3, false, 2, 3);
+  AssertConvolutionDilatedMatchesReference(1, 2, 2, false, 3, 2);
+  AssertConvolutionDilatedMatchesReference(1, 1, 1, true, 3, 2);
+end;
+
+procedure TTestNeuralLayersExtra.TestConvolutionRectangularDilationSaveLoad;
+const
+  InX = 9; InY = 7; InD = 3;
+  DilatedStructure = 'TNNetConvolutionRectangularReLU:4;3;2;1;0;1;2;0';
+var
+  NN, Loaded: TNNet;
+  Input: TNNetVolume;
+  Saved, Structure: string;
+  ElementPos: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    // 3x1 kernel, dilation 2, padding 2: X keeps its size, Y grows by 4.
+    NN.AddLayer(TNNetConvolutionRectangularReLU.Create(4, 3, 1, 2, 1, 0, 2));
+    NN.AddLayer(TNNetConvolutionRectangular.Create(3, 1, 3, 1, 1));
+    Input.Randomize();
+    NN.Compute(Input);
+    AssertEquals('output X', InX, NN.Layers[1].Output.SizeX);
+    AssertEquals('output Y', InY + 4, NN.Layers[1].Output.SizeY);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', NN.SaveStructureToString(),
+      Loaded.SaveStructureToString());
+    AssertEquals('loaded DilationX', 2,
+      TNNetConvolution(Loaded.Layers[1]).DilationX);
+    AssertEquals('loaded DilationY', 2,
+      TNNetConvolution(Loaded.Layers[1]).DilationY);
+    AssertEquals('loaded FeatureSizeY', 1,
+      TNNetConvolution(Loaded.Layers[1]).FeatureSizeY);
+    AssertEquals('undilated layer stays 1', 1,
+      TNNetConvolution(Loaded.Layers[2]).DilationY);
+    Loaded.Compute(Input);
+    AssertEquals('loaded output size', NN.GetLastLayer.Output.Size,
+      Loaded.GetLastLayer.Output.Size);
+    for ElementPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('loaded output ' + IntToStr(ElementPos),
+        NN.GetLastLayer.Output.FData[ElementPos],
+        Loaded.GetLastLayer.Output.FData[ElementPos], 1e-6);
+    // A structure saved before the dilation slot existed holds 0 in FStruct[6].
+    Structure := NN.SaveStructureToString();
+    AssertTrue('dilation in FStruct[6]', Pos(DilatedStructure, Structure) > 0);
+    Structure := StringReplace(Structure, DilatedStructure,
+      'TNNetConvolutionRectangularReLU:4;3;2;1;0;1;0;0', []);
+    Loaded.Free;
+    Loaded := TNNet.Create();
+    Loaded.LoadStructureFromString(Structure);
+    AssertEquals('old file loads as dilation 1', 1,
+      TNNetConvolution(Loaded.Layers[1]).DilationY);
+    AssertEquals('old file output Y', InY + 4,
+      Loaded.Layers[1].Output.SizeY);
+    AssertEquals('old file output X', InX + 2,
+      Loaded.Layers[1].Output.SizeX);
+  finally
+    Input.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+type
+  // Exposes the protected dense-only backward routines of TNNetConvolution.
+  TConvolutionDenseBackwardAccess = class(TNNetConvolution);
+
+procedure TTestNeuralLayersExtra.TestConvolutionDenseOnlyBackwardRefusesDilation;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TConvolutionDenseBackwardAccess;
+  RoutinePos: integer;
+  Refused: boolean;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 6, 2));
+    Conv := TConvolutionDenseBackwardAccess(NN.AddLayer(
+      TNNetConvolutionRectangular.Create(3, 3, 2, 2, 1, 0, 2)));
+    Input.Randomize();
+    NN.Compute(Input);
+    for RoutinePos := 0 to 2 do
+    begin
+      Refused := false;
+      try
+        case RoutinePos of
+          0: Conv.BackpropagateCPU();
+          1: Conv.BackpropagateFastCPU();
+          2: Conv.BackpropagateFastCPUDev();
+        end;
+      except
+        on E: Exception do Refused := Pos('dilated', E.Message) > 0;
+      end;
+      AssertTrue('dense-only backward routine ' + IntToStr(RoutinePos) +
+        ' refuses a dilated layer', Refused);
+    end;
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+const
+  csDeformQueries = 3;
+  csDeformHeads = 2;
+  csDeformPoints = 2;
+  csDeformHeadDim = 3;
+  csDeformLevelShapes: array[0..3] of integer = (3, 4, 2, 2); // (H, W) pairs
+  csDeformTokens = 3 * 4 + 2 * 2;
+  // BuildDeformableAttentionNet modes: the (Points, LevelShapes) constructor,
+  // the per-level constructor with equal counts and OffsetScale 0.5, the
+  // per-level constructor with csDeformLevelPoints and csDeformOffsetScale,
+  // and that one with discrete sampling.
+  csDeformModeLegacy = 0;
+  csDeformModeEqualLevelPoints = 1;
+  csDeformModePerLevelPoints = 2;
+  csDeformModeDiscrete = 3;
+  csDeformLevelPoints: array[0..1] of integer = (3, 1);
+  csDeformOffsetScale = 0.7;
+
+// P_l of level Level and the OffsetScale a csDeformMode* net is built with.
+function DeformLevelPoints(Mode, Level: integer): integer;
+begin
+  if Mode >= csDeformModePerLevelPoints then Result := csDeformLevelPoints[Level]
+  else Result := csDeformPoints;
+end;
+
+function DeformOffsetScale(Mode: integer): TNeuralFloat;
+begin
+  if Mode >= csDeformModePerLevelPoints then Result := csDeformOffsetScale
+  else Result := 0.5;
+end;
+
+procedure TTestNeuralLayersExtra.BuildDeformableAttentionNet(NN: TNNet;
+  ReferenceDepth: integer; Offsets, Values, References: TNNetVolume;
+  Mode: integer);
+var
+  OffsetInput, ValueInput, ReferenceInput, Deformable: TNNetLayer;
+  Pos, Query, SampleCount: integer;
+begin
+  SampleCount := DeformLevelPoints(Mode, 0) + DeformLevelPoints(Mode, 1);
+  Offsets.ReSize(csDeformQueries, 1, csDeformHeads * SampleCount * 3);
+  Values.ReSize(csDeformTokens, 1, csDeformHeads * csDeformHeadDim);
+  References.ReSize(csDeformQueries, 1, ReferenceDepth);
+  for Pos := 0 to Offsets.Size - 1 do
+    Offsets.Raw[Pos] := 1.3 * Sin(Pos * 0.71 + 0.2);
+  for Pos := 0 to Values.Size - 1 do
+    Values.Raw[Pos] := Cos(Pos * 0.37) * 0.8 + 0.1;
+  for Query := 0 to csDeformQueries - 1 do
+  begin
+    References.Raw[Query * ReferenceDepth] := 0.31 + 0.19 * Query;
+    References.Raw[Query * ReferenceDepth + 1] := 0.62 - 0.13 * Query;
+    if ReferenceDepth = 4 then
+    begin
+      References.Raw[Query * ReferenceDepth + 2] := 0.45 + 0.1 * Query;
+      References.Raw[Query * ReferenceDepth + 3] := 0.37 + 0.05 * Query;
+    end;
+  end;
+  OffsetInput := NN.AddLayer(TNNetInput.Create(Offsets.SizeX, 1, Offsets.Depth, 1));
+  ValueInput := NN.AddLayerAfter(TNNetInput.Create(csDeformTokens, 1,
+    Values.Depth, 1), 0);
+  ReferenceInput := NN.AddLayerAfter(TNNetInput.Create(csDeformQueries, 1,
+    ReferenceDepth, 1), 0);
+  if Mode = csDeformModeLegacy then
+    Deformable := TNNetMultiScaleDeformableAttention.Create(csDeformHeads,
+      csDeformPoints, csDeformLevelShapes, ValueInput, ReferenceInput)
+  else
+    Deformable := TNNetMultiScaleDeformableAttention.Create(csDeformHeads,
+      [DeformLevelPoints(Mode, 0), DeformLevelPoints(Mode, 1)],
+      csDeformLevelShapes, ValueInput, ReferenceInput, DeformOffsetScale(Mode),
+      Mode = csDeformModeDiscrete);
+  NN.AddLayerAfter(Deformable, OffsetInput);
+  ValueInput.Output.Copy(Values);
+  ReferenceInput.Output.Copy(References);
+end;
+
+// Naive reference: softmax per (query, head) over every level's points,
+// loc = ref + offset scaled, then grid_sample(align_corners=False, zeros)
+// corner by corner, or in discrete mode the clamped trunc(loc * (W, H) + 0.5) cell.
+procedure TTestNeuralLayersExtra.AssertDeformableForwardMatchesReference(
+  Mode: integer);
+var
+  NN: TNNet;
+  Offsets, Values, References: TNNetVolume;
+  ReferenceDepth, Query, Head, Level, Point, Channel, Sample, CornerX, CornerY: integer;
+  LevelStart, LevelW, LevelH, SampleCount, X0, Y0, Depth: integer;
+  LevelPoints, LevelSampleStart: integer;
+  Logits: array[0..7] of double;
+  MaxLogit, ExpSum, LocX, LocY, PixelX, PixelY, Weight, Expected, MaxDiff: double;
+  OffsetX, OffsetY, OffsetScale: double;
+  ClampedCount: integer;
+begin
+  ClampedCount := 0;
+  SampleCount := DeformLevelPoints(Mode, 0) + DeformLevelPoints(Mode, 1);
+  OffsetScale := DeformOffsetScale(Mode);
+  Depth := csDeformHeads * SampleCount * 3;
+  for ReferenceDepth := 2 to 4 do
+  begin
+    if ReferenceDepth = 3 then continue;
+    NN := TNNet.Create();
+    Offsets := TNNetVolume.Create();
+    Values := TNNetVolume.Create();
+    References := TNNetVolume.Create();
+    try
+      BuildDeformableAttentionNet(NN, ReferenceDepth, Offsets, Values, References,
+        Mode);
+      NN.Compute(Offsets);
+      MaxDiff := 0;
+      for Query := 0 to csDeformQueries - 1 do
+        for Head := 0 to csDeformHeads - 1 do
+        begin
+          MaxLogit := -1e30;
+          for Sample := 0 to SampleCount - 1 do
+          begin
+            Logits[Sample] := Offsets.Raw[Query * Depth +
+              csDeformHeads * SampleCount * 2 + Head * SampleCount + Sample];
+            MaxLogit := Max(MaxLogit, Logits[Sample]);
+          end;
+          ExpSum := 0;
+          for Sample := 0 to SampleCount - 1 do
+          begin
+            Logits[Sample] := Exp(Logits[Sample] - MaxLogit);
+            ExpSum := ExpSum + Logits[Sample];
+          end;
+          for Channel := 0 to csDeformHeadDim - 1 do
+          begin
+            Expected := 0;
+            LevelStart := 0;
+            LevelSampleStart := 0;
+            for Level := 0 to 1 do
+            begin
+              LevelH := csDeformLevelShapes[2 * Level];
+              LevelW := csDeformLevelShapes[2 * Level + 1];
+              LevelPoints := DeformLevelPoints(Mode, Level);
+              for Point := 0 to LevelPoints - 1 do
+              begin
+                Sample := LevelSampleStart + Point;
+                OffsetX := Offsets.Raw[Query * Depth + (Head * SampleCount + Sample) * 2];
+                OffsetY := Offsets.Raw[Query * Depth + (Head * SampleCount + Sample) * 2 + 1];
+                if ReferenceDepth = 4 then
+                begin
+                  LocX := References.Raw[Query * 4] + OffsetX / LevelPoints *
+                    References.Raw[Query * 4 + 2] * OffsetScale;
+                  LocY := References.Raw[Query * 4 + 1] + OffsetY / LevelPoints *
+                    References.Raw[Query * 4 + 3] * OffsetScale;
+                end
+                else
+                begin
+                  LocX := References.Raw[Query * 2] + OffsetX / LevelW;
+                  LocY := References.Raw[Query * 2 + 1] + OffsetY / LevelH;
+                end;
+                if Mode = csDeformModeDiscrete then
+                begin
+                  // transformers: (loc * [W, H] + 0.5).to(int64).clamp(0, W - 1)
+                  X0 := Trunc(LocX * LevelW + 0.5);
+                  Y0 := Trunc(LocY * LevelH + 0.5);
+                  if (X0 < 0) or (X0 >= LevelW) or (Y0 < 0) or (Y0 >= LevelH) then
+                    Inc(ClampedCount);
+                  X0 := Min(Max(X0, 0), LevelW - 1);
+                  Y0 := Min(Max(Y0, 0), LevelH - 1);
+                  Expected := Expected + Logits[Sample] / ExpSum *
+                    Values.Raw[(LevelStart + Y0 * LevelW + X0) *
+                    csDeformHeads * csDeformHeadDim + Head * csDeformHeadDim +
+                    Channel];
+                  continue;
+                end;
+                PixelX := ((2 * LocX - 1 + 1) * LevelW - 1) / 2;
+                PixelY := ((2 * LocY - 1 + 1) * LevelH - 1) / 2;
+                X0 := Floor(PixelX);
+                Y0 := Floor(PixelY);
+                for CornerY := Y0 to Y0 + 1 do
+                  for CornerX := X0 to X0 + 1 do
+                  begin
+                    if (CornerX < 0) or (CornerY < 0) or (CornerX >= LevelW) or
+                       (CornerY >= LevelH) then continue;
+                    Weight := (1 - Abs(PixelX - CornerX)) * (1 - Abs(PixelY - CornerY));
+                    Expected := Expected + Logits[Sample] / ExpSum * Weight *
+                      Values.Raw[(LevelStart + CornerY * LevelW + CornerX) *
+                      csDeformHeads * csDeformHeadDim + Head * csDeformHeadDim +
+                      Channel];
+                  end;
+              end;
+              Inc(LevelStart, LevelW * LevelH);
+              Inc(LevelSampleStart, LevelPoints);
+            end;
+            MaxDiff := Max(MaxDiff, Abs(Expected - NN.GetLastLayer.Output.Raw[
+              Query * csDeformHeads * csDeformHeadDim + Head * csDeformHeadDim +
+              Channel]));
+          end;
+        end;
+      AssertTrue('mode ' + IntToStr(Mode) + ' reference depth ' +
+        IntToStr(ReferenceDepth) + ' max |diff| = ' + FloatToStr(MaxDiff),
+        MaxDiff < 1e-5);
+    finally
+      References.Free;
+      Values.Free;
+      Offsets.Free;
+      NN.Free;
+    end;
+  end;
+  if Mode = csDeformModeDiscrete then
+    AssertTrue('some discrete samples are clamped to the map border',
+      ClampedCount > 0);
+end;
+
+// Two-input net: Layers[0] the (4, 3*4, 2) triplane, Layers[1] PointCount points.
+procedure BuildTriplaneSampleNet(NN: TNNet; PointCount: integer;
+  Radius: TNeuralFloat; Pad: TNNetGridSamplePad; AlignCorners: boolean);
+var
+  PlanesInput, PointsInput: TNNetLayer;
+begin
+  PlanesInput := NN.AddLayer(TNNetInput.Create(4, 12, 2, 1));
+  PointsInput := NN.AddLayerAfter(TNNetInput.Create(PointCount, 1, 3, 1), 0);
+  NN.AddLayerAfter(TNNetTriplaneSample.Create(PointsInput, Radius, Pad,
+    AlignCorners), PlanesInput);
+end;
+
+// Texel (x, y) of plane k, channel c holds 100k + 10y + x + 0.5c, so an interior
+// bilinear sample at pixel (px, py) is 100k + 10py + px + 0.5c.
+procedure FillTriplaneRamp(Planes: TNNetVolume);
+var
+  Plane, PixelX, PixelY, Channel: integer;
+begin
+  for Plane := 0 to 2 do
+  for PixelY := 0 to 3 do
+  for PixelX := 0 to 3 do
+  for Channel := 0 to 1 do
+    Planes.Store(PixelX, Plane * 4 + PixelY, Channel,
+      100 * Plane + 10 * PixelY + PixelX + 0.5 * Channel);
+end;
+
+procedure TTestNeuralLayersExtra.TestTriplaneSampleHandCases;
+type
+  TTriplaneCase = record
+    x, y, z: TNeuralFloat;
+    // Per plane: the channel-0 value and the summed weight of in-bound corners
+    // (channel 1 adds 0.5 * that weight).
+    Value, WeightSum: array[0..2] of TNeuralFloat;
+  end;
+const
+  // Radius 0.5, align_corners=False: pixel = ((coord / 0.5 + 1) * 4 - 1) / 2.
+  csZeros: array[0..3] of TTriplaneCase = (
+    // Texel centres: plane 0 at pixel (1, 2), plane 1 (1, 2), plane 2 (2, 2).
+    (x: -0.125; y: 0.125; z: 0.125; Value: (21, 121, 222); WeightSum: (1, 1, 1)),
+    // Between texels: (1.5, 0.25), (1.5, 1.5), (0.25, 1.5).
+    (x: 0; y: -0.3125; z: 0; Value: (4, 116.5, 215.25); WeightSum: (1, 1, 1)),
+    // x outside the box (pixel 4.5): planes 0 and 1 read zero padding.
+    (x: 0.75; y: 0; z: 0; Value: (0, 0, 216.5); WeightSum: (0, 0, 1)),
+    // On the box faces x = +r, y = -r: pixels 3.5 and -0.5 keep half a texel.
+    (x: 0.5; y: -0.5; z: 0; Value: (0.75, 59, 107.5); WeightSum: (0.25, 0.5, 0.5)));
+  // padding_mode='border' clips the pixel coordinate to [0, 3].
+  csBorder: array[0..1] of TTriplaneCase = (
+    (x: 0.5; y: -0.5; z: 0; Value: (3, 118, 215); WeightSum: (1, 1, 1)),
+    (x: 0.75; y: 0; z: 0; Value: (18, 118, 216.5); WeightSum: (1, 1, 1)));
+  // align_corners=True: pixel = (coord / 0.5 + 1) / 2 * 3.
+  csAlign: array[0..1] of TTriplaneCase = (
+    (x: 0.5; y: -0.5; z: 0.5; Value: (3, 133, 230); WeightSum: (1, 1, 1)),
+    (x: -0.125; y: 0.125; z: 0.125; Value: (19.875, 119.875, 220.625);
+      WeightSum: (1, 1, 1)));
+
+  procedure CheckCases(const Cases: array of TTriplaneCase; Pad: TNNetGridSamplePad;
+    AlignCorners: boolean; const CaseName: string);
+  var
+    NN: TNNet;
+    Planes, Points, Output: TNNetVolume;
+    CasePos, MaxCasePos, Plane, Channel: integer;
+    Expected: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Planes := TNNetVolume.Create(4, 12, 2);
+    Points := TNNetVolume.Create(Length(Cases), 1, 3);
+    try
+      BuildTriplaneSampleNet(NN, Length(Cases), 0.5, Pad, AlignCorners);
+      FillTriplaneRamp(Planes);
+      MaxCasePos := High(Cases);
+      for CasePos := 0 to MaxCasePos do
+      begin
+        Points.Store(CasePos, 0, 0, Cases[CasePos].x);
+        Points.Store(CasePos, 0, 1, Cases[CasePos].y);
+        Points.Store(CasePos, 0, 2, Cases[CasePos].z);
+      end;
+      NN.Layers[1].Output.Copy(Points);
+      NN.Compute(Planes);
+      Output := NN.GetLastLayer.Output;
+      AssertEquals(CaseName + ' output SizeX', Length(Cases), Output.SizeX);
+      AssertEquals(CaseName + ' output SizeY', 1, Output.SizeY);
+      AssertEquals(CaseName + ' output Depth = 3 * Cp', 6, Output.Depth);
+      for CasePos := 0 to MaxCasePos do
+      for Plane := 0 to 2 do
+      for Channel := 0 to 1 do
+      begin
+        Expected := Cases[CasePos].Value[Plane] +
+          0.5 * Channel * Cases[CasePos].WeightSum[Plane];
+        AssertEquals(CaseName + ' point ' + IntToStr(CasePos) + ' plane ' +
+          IntToStr(Plane) + ' channel ' + IntToStr(Channel), Expected,
+          Output.Get(CasePos, 0, Plane * 2 + Channel), 1e-4);
+      end;
+    finally
+      Points.Free;
+      Planes.Free;
+      NN.Free;
+    end;
+  end;
+
+begin
+  CheckCases(csZeros, gspZeros, false, 'zeros');
+  CheckCases(csBorder, gspBorder, false, 'border');
+  CheckCases(csAlign, gspZeros, true, 'align_corners');
+end;
+
+procedure TTestNeuralLayersExtra.TestTriplaneSampleSaveLoad;
+const
+  csPointCount = 9;
+var
+  NN, Loaded: TNNet;
+  Planes, Points: TNNetVolume;
+  Saved: string;
+  Pos, MaxPos: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Planes := TNNetVolume.Create(4, 12, 2);
+  Points := TNNetVolume.Create(csPointCount, 1, 3);
+  try
+    RandSeed := 20261024;
+    BuildTriplaneSampleNet(NN, csPointCount, 0.87, gspBorder, true);
+    Planes.RandomizeGaussian();
+    Points.Randomize();
+    NN.Layers[1].Output.Copy(Points);
+    NN.Compute(Planes);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+    AssertTrue('loaded layer class', Loaded.GetLastLayer is TNNetTriplaneSample);
+    AssertTrue('points source reconnected',
+      TNNetTriplaneSample(Loaded.GetLastLayer).PointsSource = Loaded.Layers[1]);
+    Loaded.Layers[1].Output.Copy(Points);
+    Loaded.Compute(Planes);
+    MaxPos := NN.GetLastLayer.Output.Size - 1;
+    for Pos := 0 to MaxPos do
+      AssertEquals('output ' + IntToStr(Pos), NN.GetLastLayer.Output.Raw[Pos],
+        Loaded.GetLastLayer.Output.Raw[Pos], 1e-6);
+  finally
+    Points.Free;
+    Planes.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+// Normalized torch grid coordinate of source pixel Pixel along Dim pixels.
+function GridSample3DNormalized(Pixel: TNeuralFloat; Dim: integer;
+  AlignCorners: boolean): TNeuralFloat;
+begin
+  if AlignCorners
+    then Result := 2 * Pixel / (Dim - 1) - 1
+    else Result := (2 * Pixel + 1) / Dim - 1;
+end;
+
+procedure TTestNeuralLayersExtra.TestGridSample3DHandCases;
+type
+  TGridSample3DCase = record
+    // Source pixel (x, y, z), the channel-0 value and the summed weight of the
+    // in-bound corners (channel 1 adds 0.5 * that weight).
+    px, py, pz, Value, WeightSum: TNeuralFloat;
+  end;
+const
+  csWidth = 3;
+  csHeight = 2;
+  csFrames = 4;
+  csChannels = 2;
+  // Voxel (x, y, z) channel c holds 100z + 10y + x + 0.5c, so an interior
+  // trilinear sample at (px, py, pz) is 100pz + 10py + px.
+  csZeros: array[0..4] of TGridSample3DCase = (
+    // Voxel centre, then the midpoint of eight voxels.
+    (px: 1; py: 0; pz: 2; Value: 201; WeightSum: 1),
+    (px: 0.5; py: 0.5; pz: 1.5; Value: 155.5; WeightSum: 1),
+    // Half a voxel left of the volume: the x = -1 corners read zero padding.
+    (px: -0.5; py: 1; pz: 1; Value: 55; WeightSum: 0.5),
+    // Every corner outside along the frame axis.
+    (px: 1; py: 0; pz: 4.5; Value: 0; WeightSum: 0),
+    // A quarter frame before frame 0: weight 0.75 on frame 0.
+    (px: 1; py: 1; pz: -0.25; Value: 8.25; WeightSum: 0.75));
+  // padding_mode='border' clips the pixel coordinate to the volume.
+  csBorder: array[0..2] of TGridSample3DCase = (
+    (px: -0.5; py: 1; pz: 1; Value: 110; WeightSum: 1),
+    (px: 1; py: 0; pz: 4.5; Value: 301; WeightSum: 1),
+    (px: 1; py: 1; pz: -0.25; Value: 11; WeightSum: 1));
+  // align_corners=True: the volume corners sit at normalized -1 and +1.
+  csAlign: array[0..2] of TGridSample3DCase = (
+    (px: 2; py: 1; pz: 3; Value: 312; WeightSum: 1),
+    (px: 0; py: 0; pz: 0; Value: 0; WeightSum: 1),
+    (px: 1; py: 0.5; pz: 1.5; Value: 156; WeightSum: 1));
+  // nearest rounds half to even: z 2.5 -> 2, z 3.5 -> 4 (outside), x -0.5 -> 0.
+  csNearest: array[0..2] of TGridSample3DCase = (
+    (px: 1.4; py: 0.6; pz: 2.5; Value: 211; WeightSum: 1),
+    (px: 0.5; py: 0.5; pz: 3.5; Value: 0; WeightSum: 0),
+    (px: -0.5; py: 1; pz: 1; Value: 110; WeightSum: 1));
+
+  procedure CheckCases(const Cases: array of TGridSample3DCase;
+    Interp: TNNetGridSampleInterp; Pad: TNNetGridSamplePad;
+    AlignCorners: boolean; const CaseName: string);
+  var
+    NN: TNNet;
+    FeaturesInput, GridInput: TNNetLayer;
+    Features, Grid, Output: TNNetVolume;
+    CasePos, MaxCasePos, PixelX, PixelY, Frame, Channel: integer;
+    Expected: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Features := TNNetVolume.Create(csWidth, csHeight, csFrames * csChannels);
+    // Every case is one output frame of a single grid column.
+    Grid := TNNetVolume.Create(1, 1, 3 * Length(Cases));
+    try
+      FeaturesInput := NN.AddLayer(TNNetInput.Create(csWidth, csHeight,
+        csFrames * csChannels, 1));
+      GridInput := NN.AddLayerAfter(TNNetInput.Create(1, 1, 3 * Length(Cases), 1), 0);
+      NN.AddLayerAfter(TNNetGridSample3D.Create(GridInput, csChannels, Interp,
+        Pad, AlignCorners), FeaturesInput);
+      for Frame := 0 to csFrames - 1 do
+      for PixelY := 0 to csHeight - 1 do
+      for PixelX := 0 to csWidth - 1 do
+      for Channel := 0 to csChannels - 1 do
+        Features.Store(PixelX, PixelY, Frame * csChannels + Channel,
+          100 * Frame + 10 * PixelY + PixelX + 0.5 * Channel);
+      MaxCasePos := High(Cases);
+      for CasePos := 0 to MaxCasePos do
+      begin
+        Grid.Raw[CasePos * 3] := GridSample3DNormalized(Cases[CasePos].px,
+          csWidth, AlignCorners);
+        Grid.Raw[CasePos * 3 + 1] := GridSample3DNormalized(Cases[CasePos].py,
+          csHeight, AlignCorners);
+        Grid.Raw[CasePos * 3 + 2] := GridSample3DNormalized(Cases[CasePos].pz,
+          csFrames, AlignCorners);
+      end;
+      GridInput.Output.Copy(Grid);
+      NN.Compute(Features);
+      Output := NN.GetLastLayer.Output;
+      AssertEquals(CaseName + ' output SizeX', 1, Output.SizeX);
+      AssertEquals(CaseName + ' output SizeY', 1, Output.SizeY);
+      AssertEquals(CaseName + ' output Depth = frames * C',
+        Length(Cases) * csChannels, Output.Depth);
+      for CasePos := 0 to MaxCasePos do
+      for Channel := 0 to csChannels - 1 do
+      begin
+        Expected := Cases[CasePos].Value +
+          0.5 * Channel * Cases[CasePos].WeightSum;
+        AssertEquals(CaseName + ' case ' + IntToStr(CasePos) + ' channel ' +
+          IntToStr(Channel), Expected,
+          Output.Raw[CasePos * csChannels + Channel], 1e-3);
+      end;
+    finally
+      Grid.Free;
+      Features.Free;
+      NN.Free;
+    end;
+  end;
+
+begin
+  CheckCases(csZeros, gsiBilinear, gspZeros, false, 'zeros');
+  CheckCases(csBorder, gsiBilinear, gspBorder, false, 'border');
+  CheckCases(csAlign, gsiBilinear, gspZeros, true, 'align_corners');
+  CheckCases(csNearest, gsiNearest, gspZeros, false, 'nearest');
+end;
+
+procedure TTestNeuralLayersExtra.TestGridSample3DSaveLoad;
+var
+  NN, Loaded: TNNet;
+  FeaturesInput, GridInput: TNNetLayer;
+  Features, Grid: TNNetVolume;
+  Interp: TNNetGridSampleInterp;
+  Saved: string;
+  Pos, MaxPos: integer;
+begin
+  for Interp := gsiBilinear to gsiNearest do
+  begin
+    NN := TNNet.Create();
+    Loaded := TNNet.Create();
+    Features := TNNetVolume.Create(3, 2, 4 * 2);
+    Grid := TNNetVolume.Create(4, 3, 2 * 3);
+    try
+      RandSeed := 20261024 + Ord(Interp);
+      FeaturesInput := NN.AddLayer(TNNetInput.Create(3, 2, 4 * 2, 1));
+      GridInput := NN.AddLayerAfter(TNNetInput.Create(4, 3, 2 * 3, 1), 0);
+      NN.AddLayerAfter(TNNetGridSample3D.Create(GridInput, 2, Interp, gspBorder,
+        true), FeaturesInput);
+      Features.RandomizeGaussian();
+      Grid.Randomize();
+      GridInput.Output.Copy(Grid);
+      NN.Compute(Features);
+      Saved := NN.SaveToString();
+      Loaded.LoadFromString(Saved);
+      AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+      AssertTrue('loaded layer class', Loaded.GetLastLayer is TNNetGridSample3D);
+      AssertTrue('grid source reconnected',
+        TNNetGridSample3D(Loaded.GetLastLayer).GridSource = Loaded.Layers[1]);
+      AssertEquals('channels per frame', 2,
+        TNNetGridSample3D(Loaded.GetLastLayer).Channels);
+      AssertEquals('output Depth = grid frames * C', 4,
+        Loaded.GetLastLayer.Output.Depth);
+      Loaded.Layers[1].Output.Copy(Grid);
+      Loaded.Compute(Features);
+      MaxPos := NN.GetLastLayer.Output.Size - 1;
+      for Pos := 0 to MaxPos do
+        AssertEquals('output ' + IntToStr(Pos), NN.GetLastLayer.Output.Raw[Pos],
+          Loaded.GetLastLayer.Output.Raw[Pos], 1e-6);
+    finally
+      Grid.Free;
+      Features.Free;
+      Loaded.Free;
+      NN.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionForward;
+begin
+  AssertDeformableForwardMatchesReference(csDeformModeLegacy);
+end;
+
+procedure TTestNeuralLayersExtra.AssertDeformableGradientsMatchFiniteDifferences(
+  Mode: integer);
+const
+  Epsilon = 0.0005;
+var
+  NN: TNNet;
+  Offsets, Values, References, Desired, Probe: TNNetVolume;
+  Sources: array[0..2] of TNNetLayer;
+  SourcePos, Pos, Checked: integer;
+  LossPlus, LossMinus, Numerical, Analytical, MaxError: TNeuralFloat;
+
+  function Loss(): TNeuralFloat;
+  var
+    OutPos: integer;
+    Diff: TNeuralFloat;
+  begin
+    NN.Compute(Sources[0].Output);
+    Result := 0;
+    for OutPos := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[OutPos] - Desired.Raw[OutPos];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  Desired := TNNetVolume.Create();
+  Probe := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References, Mode);
+    NN.Layers[0].Output.Copy(Offsets);
+    for SourcePos := 0 to 2 do Sources[SourcePos] := NN.Layers[SourcePos];
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for Pos := 0 to Desired.Size - 1 do Desired.Raw[Pos] := 0.3 * Sin(Pos * 0.9);
+    MaxError := 0;
+    Checked := 0;
+    for SourcePos := 0 to 2 do
+      for Pos := 0 to Sources[SourcePos].Output.Size - 1 do
+      begin
+        Probe.Copy(Sources[SourcePos].Output);
+        Sources[SourcePos].Output.Raw[Pos] := Probe.Raw[Pos] + Epsilon;
+        LossPlus := Loss();
+        Sources[SourcePos].Output.Raw[Pos] := Probe.Raw[Pos] - Epsilon;
+        LossMinus := Loss();
+        Sources[SourcePos].Output.Copy(Probe);
+        Numerical := (LossPlus - LossMinus) / (2 * Epsilon);
+        NN.Compute(Sources[0].Output);
+        Sources[0].OutputError.Fill(0);
+        Sources[1].OutputError.Fill(0);
+        Sources[2].OutputError.Fill(0);
+        NN.Backpropagate(Desired);
+        Analytical := Sources[SourcePos].OutputError.Raw[Pos];
+        MaxError := Max(MaxError, Abs(Numerical - Analytical));
+        AssertTrue('mode ' + IntToStr(Mode) + ' source ' + IntToStr(SourcePos) +
+          ' element ' + IntToStr(Pos) + ' numerical ' + FloatToStr(Numerical) +
+          ' analytical ' + FloatToStr(Analytical), Abs(Numerical - Analytical) < 0.01);
+        Inc(Checked);
+      end;
+    AssertTrue('every source element checked', Checked > 100);
+  finally
+    Probe.Free;
+    Desired.Free;
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionGradients;
+begin
+  AssertDeformableGradientsMatchFiniteDifferences(csDeformModeLegacy);
+end;
+
+procedure TTestNeuralLayersExtra.AssertDeformableSaveLoadRoundTrip(Mode: integer);
+var
+  NN, Loaded: TNNet;
+  Offsets, Values, References: TNNetVolume;
+  Saved: string;
+  Pos: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References, Mode);
+    NN.Compute(Offsets);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+    AssertTrue('loaded layer class',
+      Loaded.GetLastLayer is TNNetMultiScaleDeformableAttention);
+    Loaded.Layers[1].Output.Copy(Values);
+    Loaded.Layers[2].Output.Copy(References);
+    Loaded.Compute(Offsets);
+    for Pos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('output ' + IntToStr(Pos), NN.GetLastLayer.Output.Raw[Pos],
+        Loaded.GetLastLayer.Output.Raw[Pos], 1e-6);
+  finally
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionSaveLoad;
+begin
+  AssertDeformableSaveLoadRoundTrip(csDeformModeLegacy);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionEqualLevelPointsUnchanged;
+var
+  LegacyNN, LevelPointsNN: TNNet;
+  Offsets, Values, References: TNNetVolume;
+  ReferenceDepth, Pos: integer;
+begin
+  for ReferenceDepth := 2 to 4 do
+  begin
+    if ReferenceDepth = 3 then continue;
+    LegacyNN := TNNet.Create();
+    LevelPointsNN := TNNet.Create();
+    Offsets := TNNetVolume.Create();
+    Values := TNNetVolume.Create();
+    References := TNNetVolume.Create();
+    try
+      BuildDeformableAttentionNet(LegacyNN, ReferenceDepth, Offsets, Values,
+        References, csDeformModeLegacy);
+      BuildDeformableAttentionNet(LevelPointsNN, ReferenceDepth, Offsets, Values,
+        References, csDeformModeEqualLevelPoints);
+      LegacyNN.Compute(Offsets);
+      LevelPointsNN.Compute(Offsets);
+      AssertEquals('same saved structure', LegacyNN.SaveStructureToString(),
+        LevelPointsNN.SaveStructureToString());
+      for Pos := 0 to LegacyNN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('reference depth ' + IntToStr(ReferenceDepth) + ' output ' +
+          IntToStr(Pos) + ' must be bit-identical',
+          LegacyNN.GetLastLayer.Output.Raw[Pos] =
+          LevelPointsNN.GetLastLayer.Output.Raw[Pos]);
+    finally
+      References.Free;
+      Values.Free;
+      Offsets.Free;
+      LevelPointsNN.Free;
+      LegacyNN.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionPerLevelPointsForward;
+begin
+  AssertDeformableForwardMatchesReference(csDeformModePerLevelPoints);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionPerLevelPointsGradients;
+begin
+  AssertDeformableGradientsMatchFiniteDifferences(csDeformModePerLevelPoints);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionPerLevelPointsSaveLoad;
+begin
+  AssertDeformableSaveLoadRoundTrip(csDeformModePerLevelPoints);
+end;
+
+// A structure saved before the per-level counts existed carries all-zero
+// floats; it must load as Points on every level and OffsetScale 0.5.
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionLoadsOldSave;
+var
+  NN, Loaded: TNNet;
+  Offsets, Values, References: TNNetVolume;
+  Structure, OldStructure: string;
+  Pos: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References,
+      csDeformModeLegacy);
+    NN.Compute(Offsets);
+    Structure := NN.SaveStructureToString();
+    // The deformable layer is the last one, so its floats close the string.
+    Pos := Length(Structure);
+    while (Pos > 0) and (Structure[Pos] <> ':') do Dec(Pos);
+    AssertTrue('float section found', Pos > 0);
+    OldStructure := Copy(Structure, 1, Pos) + '0;0;0;0;0;0;0;0';
+    AssertFalse('the old save differs from the new one', OldStructure = Structure);
+    Loaded.LoadStructureFromString(OldStructure);
+    AssertEquals('an old save re-saves with the new floats', Structure,
+      Loaded.SaveStructureToString());
+    Loaded.Layers[1].Output.Copy(Values);
+    Loaded.Layers[2].Output.Copy(References);
+    Loaded.Compute(Offsets);
+    for Pos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('output ' + IntToStr(Pos) + ' must be bit-identical',
+        NN.GetLastLayer.Output.Raw[Pos] = Loaded.GetLastLayer.Output.Raw[Pos]);
+  finally
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionDiscreteForward;
+begin
+  AssertDeformableForwardMatchesReference(csDeformModeDiscrete);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionDiscreteGradients;
+var
+  NN: TNNet;
+  Offsets, Values, References, Desired: TNNetVolume;
+  SampleCount, Query, Channel: integer;
+  OffsetErrorSum, LogitErrorSum: TNeuralFloat;
+begin
+  // Finite differences: a location step that stays inside a cell leaves the
+  // loss unchanged, so the offset and reference gradients must be 0.
+  AssertDeformableGradientsMatchFiniteDifferences(csDeformModeDiscrete);
+  NN := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  Desired := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References,
+      csDeformModeDiscrete);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.Compute(Offsets);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Desired.Fill(0.25);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Layers[1].OutputError.Fill(0);
+    NN.Layers[2].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    SampleCount := DeformLevelPoints(csDeformModeDiscrete, 0) +
+      DeformLevelPoints(csDeformModeDiscrete, 1);
+    OffsetErrorSum := 0;
+    LogitErrorSum := 0;
+    for Query := 0 to csDeformQueries - 1 do
+      for Channel := 0 to csDeformHeads * SampleCount * 3 - 1 do
+        if Channel < csDeformHeads * SampleCount * 2 then
+          OffsetErrorSum := OffsetErrorSum + Abs(NN.Layers[0].OutputError[Query, 0, Channel])
+        else
+          LogitErrorSum := LogitErrorSum + Abs(NN.Layers[0].OutputError[Query, 0, Channel]);
+    AssertEquals('no offset gradient', 0, OffsetErrorSum, 0);
+    AssertTrue('logit gradient', LogitErrorSum > 0);
+    AssertEquals('no reference gradient', 0, NN.Layers[2].OutputError.GetSumAbs(), 0);
+    AssertTrue('value gradient', NN.Layers[1].OutputError.GetSumAbs() > 0);
+  finally
+    Desired.Free;
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionDiscreteSaveLoad;
+var
+  NN, Loaded, Bilinear: TNNet;
+  Offsets, Values, References: TNNetVolume;
+begin
+  AssertDeformableSaveLoadRoundTrip(csDeformModeDiscrete);
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 2, Offsets, Values, References,
+      csDeformModeDiscrete);
+    Loaded.LoadStructureFromString(NN.SaveStructureToString());
+    AssertTrue('the flag is saved',
+      TNNetMultiScaleDeformableAttention(NN.GetLastLayer).IsDiscreteSampling);
+    AssertTrue('the flag is loaded',
+      TNNetMultiScaleDeformableAttention(Loaded.GetLastLayer).IsDiscreteSampling);
+    Bilinear := TNNet.Create();
+    try
+      BuildDeformableAttentionNet(Bilinear, 2, Offsets, Values, References,
+        csDeformModePerLevelPoints);
+      Loaded.Free;
+      Loaded := TNNet.Create();
+      Loaded.LoadStructureFromString(Bilinear.SaveStructureToString());
+      AssertFalse('bilinear stays bilinear',
+        TNNetMultiScaleDeformableAttention(Loaded.GetLastLayer).IsDiscreteSampling);
+    finally
+      Bilinear.Free;
+    end;
+  finally
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestTopKGatherTokens;
+const
+  // Per-token maxima 0.5, 0.9, 0.3, 2.0, -0.4, 0.7: the top 3 are 3, 1, 5.
+  Scores: array[0..11] of TNeuralFloat =
+    (0.1, 0.5, 0.9, -1, 0.3, 0.2, 2.0, 0, -0.5, -0.4, 0.7, 0.6);
+  ExpectedTokens: array[0..2] of integer = (3, 1, 5);
+var
+  NN, Loaded: TNNet;
+  RowInput, ScoreInput: TNNetLayer;
+  Rows, Desired: TNNetVolume;
+  Pos, Rank, Channel, Token: integer;
+  Saved: string;
+  Selected: boolean;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Rows := TNNetVolume.Create(6, 1, 3);
+  Desired := TNNetVolume.Create(3, 1, 3);
+  try
+    RowInput := NN.AddLayer(TNNetInput.Create(6, 1, 3, 1));
+    ScoreInput := NN.AddLayerAfter(TNNetInput.Create(6, 1, 2, 1), 0);
+    NN.AddLayerAfter(TNNetTopKGatherTokens.Create(3, ScoreInput), RowInput);
+    for Pos := 0 to Rows.Size - 1 do Rows.Raw[Pos] := Pos;
+    for Pos := 0 to 11 do ScoreInput.Output.Raw[Pos] := Scores[Pos];
+    NN.Compute(Rows);
+    for Rank := 0 to 2 do
+      for Channel := 0 to 2 do
+        AssertEquals('rank ' + IntToStr(Rank) + ' channel ' + IntToStr(Channel),
+          ExpectedTokens[Rank] * 3 + Channel,
+          NN.GetLastLayer.Output[Rank, 0, Channel], 1e-6);
+    // Backward: the error lands on the selected rows only.
+    NN.SetLearningRate(1.0, 0.0);
+    Desired.Fill(0);
+    RowInput.OutputError.Fill(0);
+    ScoreInput.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for Token := 0 to 5 do
+    begin
+      Selected := (Token = 3) or (Token = 1) or (Token = 5);
+      for Channel := 0 to 2 do
+        if Selected then
+          AssertTrue('selected token ' + IntToStr(Token) + ' gets error',
+            Abs(RowInput.OutputError[Token, 0, Channel]) > 0)
+        else
+          AssertEquals('token ' + IntToStr(Token) + ' error', 0,
+            RowInput.OutputError[Token, 0, Channel], 0);
+    end;
+    AssertEquals('no score gradient', 0, ScoreInput.OutputError.GetSumAbs(), 0);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+    Loaded.Layers[1].Output.Copy(ScoreInput.Output);
+    Loaded.Compute(Rows);
+    for Pos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('loaded output ' + IntToStr(Pos),
+        NN.GetLastLayer.Output.Raw[Pos], Loaded.GetLastLayer.Output.Raw[Pos], 0);
+  finally
+    Desired.Free;
+    Rows.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionEmptyLevelPoints;
+var
+  ValueSource, ReferenceSource: TNNetLayer;
+  Layer: TNNetMultiScaleDeformableAttention;
+begin
+  ValueSource := TNNetInput.Create(4, 1, 4);
+  ReferenceSource := TNNetInput.Create(2, 1, 4);
+  Layer := nil;
+  try
+    Layer := TNNetMultiScaleDeformableAttention.Create(2, [], [], ValueSource,
+      ReferenceSource);
+    AssertTrue('the layer is built', Layer <> nil);
+  finally
+    Layer.Free;
+    ReferenceSource.Free;
+    ValueSource.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestTopKValues;
+const
+  // Two cells of depth 5; cell 0 has a tie (0.7 at depths 1 and 3).
+  Values: array[0..9] of TNeuralFloat =
+    (0.1, 0.7, 0.3, 0.7, -1,  2, -1, 0.5, 1.5, 0);
+  ExpectedValues: array[0..5] of TNeuralFloat = (0.7, 0.7, 0.3, 2, 1.5, 0.5);
+  ExpectedDepths: array[0..5] of integer = (1, 3, 2, 0, 3, 2);
+var
+  NN, Loaded: TNNet;
+  Input: TNNetLayer;
+  Source, Desired: TNNetVolume;
+  Pos, Cell, Depth, Rank: integer;
+  Saved: string;
+  Selected: boolean;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Source := TNNetVolume.Create(2, 1, 5);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  try
+    Input := NN.AddLayer(TNNetInput.Create(2, 1, 5, 1));
+    NN.AddLayer(TNNetTopKValues.Create(3));
+    for Pos := 0 to 9 do Source.Raw[Pos] := Values[Pos];
+    NN.Compute(Source);
+    AssertEquals('output depth', 3, NN.GetLastLayer.Output.Depth);
+    for Pos := 0 to 5 do
+      AssertEquals('value ' + IntToStr(Pos), ExpectedValues[Pos],
+        NN.GetLastLayer.Output.Raw[Pos], 1e-7);
+    // Backward: each output error lands on the depth it was read from.
+    NN.SetLearningRate(1.0, 0.0);
+    Desired.Fill(0);
+    Input.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for Cell := 0 to 1 do
+      for Depth := 0 to 4 do
+      begin
+        Selected := false;
+        for Rank := 0 to 2 do
+          if ExpectedDepths[Cell * 3 + Rank] = Depth then
+          begin
+            Selected := true;
+            AssertEquals('cell ' + IntToStr(Cell) + ' depth ' + IntToStr(Depth),
+              NN.GetLastLayer.OutputError.Raw[Cell * 3 + Rank],
+              Input.OutputError.Raw[Cell * 5 + Depth], 1e-7);
+          end;
+        if not Selected then
+          AssertEquals('cell ' + IntToStr(Cell) + ' depth ' + IntToStr(Depth) +
+            ' not selected', 0, Input.OutputError.Raw[Cell * 5 + Depth], 0);
+      end;
+    AssertTrue('some error flowed back', Input.OutputError.GetSumAbs() > 0);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+    Loaded.Compute(Source);
+    for Pos := 0 to 5 do
+      AssertEquals('loaded value ' + IntToStr(Pos),
+        NN.GetLastLayer.Output.Raw[Pos], Loaded.GetLastLayer.Output.Raw[Pos], 0);
+  finally
+    Desired.Free;
+    Source.Free;
+    Loaded.Free;
+    NN.Free;
   end;
 end;
 

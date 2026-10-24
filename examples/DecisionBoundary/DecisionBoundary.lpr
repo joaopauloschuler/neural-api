@@ -49,24 +49,12 @@ const
      ( 0.0,  1.3));
   cSigma: TNeuralFloat = 0.55;
 
-// Why: Box-Muller gives N(0,1) samples without pulling in a dependency.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
 procedure MakeGaussSample(ClassId: integer; out X, Y: TNNetVolume);
 begin
   X := TNNetVolume.Create(2, 1, 1);
   Y := TNNetVolume.Create(cGauss3Classes, 1, 1);
-  X.FData[0] := cCenters[ClassId][0] + RandomGauss() * cSigma;
-  X.FData[1] := cCenters[ClassId][1] + RandomGauss() * cSigma;
+  X.FData[0] := cCenters[ClassId][0] + RandomStdNormal() * cSigma;
+  X.FData[1] := cCenters[ClassId][1] + RandomStdNormal() * cSigma;
   Y.Fill(0);
   Y.FData[ClassId] := 1.0;
 end;
@@ -175,8 +163,8 @@ begin
     X.FData[1] := -R * Sin(T) + 0.25;
   end;
   // heavy label/coordinate noise so an oversized net can memorise wiggles.
-  X.FData[0] := X.FData[0] + RandomGauss() * 0.35;
-  X.FData[1] := X.FData[1] + RandomGauss() * 0.35;
+  X.FData[0] := X.FData[0] + RandomStdNormal() * 0.35;
+  X.FData[1] := X.FData[1] + RandomStdNormal() * 0.35;
   Y.Fill(0);
   Y.FData[Cls] := 1.0;
 end;

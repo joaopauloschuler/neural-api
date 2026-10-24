@@ -48,6 +48,10 @@ uses {$IFDEF FPC}fgl,{$ELSE}Contnrs,Generics.Collections,{$ENDIF} classes, sysut
 const csMinAvxSize = 16;
 // Rows per panel of TNNetVolume.PackDotProductRows (two ymm registers).
 const csDotProductPanelRows = 16;
+// ArcSinh: past csArcSinhSquareCap sqrt(x^2 + 1) = |x| in single precision, and
+// |x| saturates at csArcSinhMagnitudeCap = 2^125 so 1/(2|x|) stays a normal float.
+const csArcSinhSquareCap = 1e15;
+const csArcSinhMagnitudeCap = 4.2535295865117308e37;
 
 const
   csEncodeRGB  = 0;
@@ -462,8 +466,20 @@ type
       // Makes FData the same dynamic array as Original.FData, so a write through
       // either volume reaches both. Sizes must match unless pAdoptShape is set.
       procedure ShareDataWith(Original: TNNetVolume; pAdoptShape: boolean = false);
-      // Gives this volume its own copy of FData when another volume shares it.
+      // Makes FData Original's storage, which holds at least Size elements: this
+      // volume uses its first Size elements (every method reads Size, not Length(FData)).
+      procedure ShareDataPrefixWith(Original: TNNetVolume);
+      // Gives this volume fresh zeroed storage of Max(Capacity, Size) elements;
+      // a volume of at most that size may then ShareDataPrefixWith it.
+      procedure AllocateData(Capacity: integer);
+      // Gives this volume its own copy of FData when another volume shares it,
+      // or zeroed storage after ReleaseData.
       procedure UnshareData();
+      // Frees FData but keeps the shape: until ShareDataWith or UnshareData the
+      // volume holds no elements.
+      procedure ReleaseData();
+      // FData holds at least Size elements.
+      function HasData(): boolean;
       // SqrElements is a caller-owned scratch volume shaped like Original; it
       // is resized here only when the shape changes, so nothing is allocated
       // per call (rule #17).
@@ -544,8 +560,10 @@ type
       // A slice over all B is the neuron-axis intra-layer chunk; kernel-size
       // agnostic (VBs is the im2col matrix, so VectorSize folds the kernel), so
       // it covers spatial convs, not just pointwise. Reuses the same inline
-      // kernel - no per-element call overhead. Coded by Claude (AI).
-      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      // kernel - no per-element call overhead. ResultBOffset shifts the written
+      // rows: B row CntB lands at FData[(CntB-ResultBOffset)*NumAs + CntA].
+      // Coded by Claude (AI).
+      procedure DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1; ResultBOffset: integer = 0); overload;
       // DotProductsPacked's weight layout: panels of csDotProductPanelRows rows,
       // each stored [element][row]; rows past NumAs are zero.
       class procedure PackDotProductRows(PtrDst, PtrSrc: TNeuralFloatArrPtr; NumAs, VectorSize: integer); static;
@@ -554,6 +572,9 @@ type
       // Register-blocked PtrC[b * CStride + a] := A row a . B row b (+ PtrBias[a] unless nil)
       // for a < NumAs, b < NumBs; A from PackDotProductRows, B rows BStride floats apart.
       class procedure DotProductsPacked(PtrC: TNeuralFloatArrPtr; CStride: integer; PtrPackedA: TNeuralFloatArrPtr; NumAs: integer; PtrB: TNeuralFloatArrPtr; BStride, NumBs, VectorSize: integer; PtrBias: TNeuralFloatArrPtr); static;
+      // PtrC[r] += (NumRows rows RowStride floats apart, row r) . PtrB for r < NumRows:
+      // a GEMV that shares each PtrB load across four rows.
+      class procedure AddDotProductRows(PtrC, PtrRows: TNeuralFloatArrPtr; RowStride, NumRows: integer; PtrB: TNeuralFloatArrPtr; VectorSize: integer); static;
       // Fused int8-weight x float32-input dot product: returns the RAW code
       // sum (sum of code_i * b_i) with NO scale applied - the caller multiplies
       // by the per-row quantization scale once, so the kernel never touches a
@@ -630,6 +651,9 @@ type
       // the value and add 32 elements per iteration; every other build runs the
       // scalar loop. Bit-exact either way: a float add is a float add.
       class procedure AddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); static;
+      // Dst[i] := A[i] + Scale * (B[i] - C[i]): one step of a sliding-window running
+      // sum (TNNetBoxFilter). Dst may alias A. AVX2/64-bit: 32 lanes per iteration.
+      class procedure AddScaledDifference(PtrDst, PtrA, PtrB, PtrC: TNeuralFloatArrPtr; Scale: TNeuralFloat; pSize: integer); static;
       class procedure Exp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // ExpShiftSum writes dst[0..N-1] := exp(src[0..N-1] - Shift) and
       // returns the sum of everything it wrote - the numerator and the
@@ -859,10 +883,8 @@ type
       // pays one pass over src instead of two. Bit-identical to calling Sin then
       // Cos. Either destination may alias src.
       class procedure SinCos(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // ArcSinh writes dst[0..N-1] := arcsinh(src) = ln(x + sqrt(x^2 + 1)).
-      // Built on Ln (and a vectorized sqrt in the prep pass) so it inherits the
-      // AVX2 path. The sqrt argument is always >= 1 so ln stays in its accurate range
-      // and dst may alias src (the prep pass reads src into a scratch before Ln).
+      // ArcSinh writes dst[0..N-1] := arcsinh(src) = sign(x) * ln(|x| + sqrt(x^2 + 1)),
+      // built on Ln; exact to |x| = 2^125, saturating past it. dst may alias src.
       class procedure ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -1811,6 +1833,84 @@ type
   function NeuralLinearSolve(var A: array of TNeuralFloat;
     var B: array of TNeuralFloat; n, m: integer): boolean;
 
+type
+  { Seeded private standard-normal stream (32-bit LCG + Marsaglia polar, spare
+    cached) so a caller can draw noise without moving the global Random sequence. }
+  TStdNormalStream = record
+    State: longword;
+    Spare: TNeuralFloat;
+    HaveSpare: boolean;
+  end;
+
+  // Seeds the stream and drops any cached spare.
+  procedure StdNormalStreamInit(var Stream: TStdNormalStream; Seed: longword);
+  // Uniform sample in (0, 1] from the stream's LCG.
+  function StdNormalStreamUniform(var Stream: TStdNormalStream): TNeuralFloat;
+  // Standard normal sample from the stream.
+  function StdNormalStreamNext(var Stream: TStdNormalStream): TNeuralFloat;
+
+type
+  { Reusable FFT plan built by FFTPlanInit: radix-2 twiddles for power-of-two N,
+    Bluestein chirp, filter and scratch otherwise. Not thread-safe: one per thread. }
+  TFFTPlan = record
+    N: integer;
+    IsPow2: boolean;
+    ConvLen: integer;
+    CosTab, SinTab: array of Double;
+    ChirpRe, ChirpIm: array of Double;
+    FilterRe, FilterIm: array of Double;
+    WorkRe, WorkIm: array of Double;
+  end;
+
+  // True iff x > 0 and x is a power of two.
+  function IsPowerOfTwo(x: integer): boolean; {$IFDEF Release} inline; {$ENDIF}
+
+  { In-place radix-2 complex FFT of Re/Im[0..N-1], N a power of two. Inverse uses
+    exp(+i) and divides by N. CosTab/SinTab (cos/sin(2*pi*j/N), j < N/2) are optional. }
+  procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+    Inverse: boolean; const CosTab, SinTab: array of Double); overload;
+  procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+    Inverse: boolean); overload;
+
+  // Builds Plan for any N >= 1; allocates only when N changes.
+  procedure FFTPlanInit(var Plan: TFFTPlan; N: integer);
+  { In-place complex FFT of Re/Im[0..Plan.N-1] for any N: radix-2 or Bluestein.
+    Same sign and 1/N convention as FFTRadix2InPlace; no allocation. }
+  procedure FFTPlanExecute(var Plan: TFFTPlan; var Re, Im: array of Double;
+    Inverse: boolean);
+
+type
+  { Real-input FFT plan built by RealFFTPlanInit: even N runs one N/2-point complex
+    FFT plus a twiddle split, odd N one N-point complex FFT. Not thread-safe. }
+  TRealFFTPlan = record
+    N: integer;
+    Complex: TFFTPlan;
+    TwiddleCos, TwiddleSin: array of Double;
+    WorkRe, WorkIm: array of Double;
+  end;
+
+  // Builds Plan for any N >= 1; allocates only when N changes.
+  procedure RealFFTPlanInit(var Plan: TRealFFTPlan; N: integer);
+  { OutRe/OutIm[0..N div 2] := bins 0..N div 2 of the forward DFT of real X[0..N-1].
+    Out may alias X; no allocation. }
+  procedure RealFFTForward(var Plan: TRealFFTPlan; const X: array of Double;
+    var OutRe, OutIm: array of Double);
+  { X[0..N-1] := Re(inverse DFT) of the Hermitian half spectrum InRe/InIm[0..N div 2],
+    divided by N as FFTPlanExecute; Im of DC and Nyquist ignored. X may alias In. }
+  procedure RealFFTInverse(var Plan: TRealFFTPlan; const InRe, InIm: array of Double;
+    var X: array of Double);
+  { OutRe/OutIm[0..NumBins-1] := bins 0..NumBins-1 (1 <= NumBins <= N) of the forward
+    DFT of real X[0..N-1]; bins above N div 2 are rebuilt as conj(bin N-k). Out needs
+    Max(NumBins, N div 2 + 1) entries and may alias X; no allocation. }
+  procedure RealFFTForwardBins(var Plan: TRealFFTPlan; const X: array of Double;
+    var OutRe, OutIm: array of Double; NumBins: integer);
+  { X[0..N-1] := Re(inverse DFT) of the spectrum that is In[k] for k < NumBins
+    (1 <= NumBins <= N) and 0 above, divided by N as FFTPlanExecute. Overwrites
+    In[0..N div 2] with that spectrum's Hermitian part; In needs Max(NumBins,
+    N div 2 + 1) entries and must not alias X. No allocation. }
+  procedure RealFFTInverseRealPart(var Plan: TRealFFTPlan; var InRe, InIm: array of Double;
+    NumBins: integer; var X: array of Double);
+
   { NeuralBoxIoU returns the Intersection-over-Union of two axis-aligned boxes
     given in corner (x1,y1,x2,y2) format (x2>=x1, y2>=y1; pixel or any
     consistent unit). Degenerate boxes are clamped to zero area, and a zero
@@ -1828,6 +1928,37 @@ type
     Degenerate boxes are clamped to zero area; a zero enclosing area yields 0. }
   function NeuralBoxGIoU(AX1, AY1, AX2, AY2,
     BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
+
+type
+  { Caller-owned scratch for NeuralLinearSumAssignment. The solver grows it on
+    demand and never shrinks it; keep one per caller (not thread-safe). }
+  TNeuralAssignmentWork = record
+    RowDual, ColDual, ShortestPathCosts: array of TNeuralFloat;
+    Path, ColForRow, RowForCol, RemainingCols: array of integer;
+    IsRowScanned, IsColScanned: array of boolean;
+  end;
+
+  { Exact min-cost assignment on the row-major Rows x Cols finite Cost matrix (scipy
+    linear_sum_assignment). Fills RowToCol[0..Rows-1] (-1 = unassigned); returns the total. }
+  function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+    Rows, Cols: integer; var RowToCol: array of integer;
+    var Work: TNeuralAssignmentWork): TNeuralFloat; overload;
+  // Same, with scratch allocated per call.
+  function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+    Rows, Cols: integer; var RowToCol: array of integer): TNeuralFloat; overload;
+
+  // Quicksorts Order[iLo..iHi] in place so Scores[Order[..]] is descending;
+  // no heap allocation, ties in unspecified order.
+  procedure QuickSortOrderByScoreDesc(var Order: array of integer;
+    const Scores: array of TNeuralFloat; iLo, iHi: Integer);
+  // Quicksorts Order[iLo..iHi] in place so Dist[Order[..]] is ascending;
+  // no heap allocation, ties in unspecified order.
+  procedure QuickSortOrderByDist(var Order: array of integer;
+    const Dist: array of TNeuralFloat; iLo, iHi: Integer);
+  // Lower weighted median of Values[0..Count-1]: the smallest value whose cumulative
+  // Weight reaches half the total (plain lower median when the total is 0); Order: Count scratch.
+  function NeuralWeightedMedian(const Values, Weights: array of TNeuralFloat;
+    var Order: array of integer; Count: integer): TNeuralFloat;
 
   { NeuralGreedyNMS runs greedy, score-sorted, class-aware Non-Max-Suppression
     over Count boxes. Boxes are passed as four parallel flat arrays in corner
@@ -1851,6 +1982,13 @@ type
     Tsang (2000) method, supporting any Alpha > 0. }
   function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
   function RandomBetaValue(Alpha: TNeuralFloat): TNeuralFloat;
+
+  // Standard normal sample (Marsaglia polar) drawn from the global Random RNG.
+  function RandomStdNormal(): TNeuralFloat;
+
+  // RandSeed := Seed, and the next Random starts Seed's sequence even when FPC's
+  // generator would skip the reseed (it reseeds only when RandSeed changed).
+  procedure RestartRandSeed(Seed: cardinal);
 
   { MixVolumes computes the convex combination
       Output := Lambda*A + (1-Lambda)*B
@@ -2193,6 +2331,90 @@ begin
     'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
   ];
 end;
+{$ENDIF}
+
+{$IFDEF AVX64}
+{$IFDEF AVX2}
+// PtrC[0..3] += row r . PtrB for the four rows; each 8-float load of PtrB feeds
+// four FMAs. BodyElements is a positive multiple of 8.
+procedure AVXAddDotProductRows4(PtrC, PtrRow0, PtrRow1, PtrRow2, PtrRow3,
+  PtrB: pointer; BodyElements: int64);
+var
+  LocalC, LocalRow0, LocalRow1, LocalRow2, LocalRow3, LocalB: pointer;
+  LocalBodyElements: int64;
+begin
+  LocalC := PtrC;
+  LocalRow0 := PtrRow0;
+  LocalRow1 := PtrRow1;
+  LocalRow2 := PtrRow2;
+  LocalRow3 := PtrRow3;
+  LocalB := PtrB;
+  LocalBodyElements := BodyElements;
+  asm
+  mov r8, LocalRow0
+  mov r9, LocalRow1
+  mov r10, LocalRow2
+  mov r11, LocalRow3
+  mov rdx, LocalB
+  mov rcx, LocalBodyElements
+  xor rsi, rsi
+  vxorps ymm0, ymm0, ymm0
+  vxorps ymm1, ymm1, ymm1
+  vxorps ymm2, ymm2, ymm2
+  vxorps ymm3, ymm3, ymm3
+  vxorps ymm4, ymm4, ymm4
+  vxorps ymm5, ymm5, ymm5
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
+  shr rcx, 4
+  jz @Tail8
+@Loop16:
+  vmovups ymm8, [rdx+rsi]
+  vmovups ymm9, [rdx+rsi+32]
+  vfmadd231ps ymm0, ymm8, [r8+rsi]
+  vfmadd231ps ymm1, ymm8, [r9+rsi]
+  vfmadd231ps ymm2, ymm8, [r10+rsi]
+  vfmadd231ps ymm3, ymm8, [r11+rsi]
+  vfmadd231ps ymm4, ymm9, [r8+rsi+32]
+  vfmadd231ps ymm5, ymm9, [r9+rsi+32]
+  vfmadd231ps ymm6, ymm9, [r10+rsi+32]
+  vfmadd231ps ymm7, ymm9, [r11+rsi+32]
+  add rsi, 64
+  dec rcx
+  jnz @Loop16
+@Tail8:
+  mov rcx, LocalBodyElements
+  test rcx, 8
+  jz @Reduce
+  vmovups ymm8, [rdx+rsi]
+  vfmadd231ps ymm0, ymm8, [r8+rsi]
+  vfmadd231ps ymm1, ymm8, [r9+rsi]
+  vfmadd231ps ymm2, ymm8, [r10+rsi]
+  vfmadd231ps ymm3, ymm8, [r11+rsi]
+@Reduce:
+  vaddps ymm0, ymm0, ymm4
+  vaddps ymm1, ymm1, ymm5
+  vaddps ymm2, ymm2, ymm6
+  vaddps ymm3, ymm3, ymm7
+  // Per 128-bit lane: (r0, r1, r2, r3) partial sums, then fold the two lanes.
+  vhaddps ymm0, ymm0, ymm1
+  vhaddps ymm2, ymm2, ymm3
+  vhaddps ymm0, ymm0, ymm2
+  vextractf128 xmm1, ymm0, 1
+  vaddps xmm0, xmm0, xmm1
+  mov rax, LocalC
+  vmovups xmm1, [rax]
+  vaddps xmm0, xmm0, xmm1
+  vmovups [rax], xmm0
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'RSI', 'R8', 'R9', 'R10', 'R11',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9'
+  ];
+end;
+{$ENDIF}
 {$ENDIF}
 
 {$IFDEF AVX64}
@@ -5284,6 +5506,458 @@ begin
   end;
 end;
 
+var
+  FFTNoTwiddles: array of Double;
+
+function IsPowerOfTwo(x: integer): boolean;
+begin
+  Result := (x > 0) and ((x and (x - 1)) = 0);
+end;
+
+procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+  Inverse: boolean; const CosTab, SinTab: array of Double);
+var
+  i, j, k, Len, Half, BlockStart, p, q: integer;
+  MaxSamplePos, MaxPairPos, TwIdx, TwStep: integer;
+  Ang, wRe, wIm, wpRe, wpIm, Tmp, InvN, SinSign: Double;
+  uRe, uIm, vRe, vIm, pRe, pIm: Double;
+begin
+  MaxSamplePos := N - 1;
+  j := 0;
+  for i := 1 to MaxSamplePos do
+  begin
+    k := N shr 1;
+    while (j and k) <> 0 do
+    begin
+      j := j and (not k);
+      k := k shr 1;
+    end;
+    j := j or k;
+    if i < j then
+    begin
+      Tmp := Re[i]; Re[i] := Re[j]; Re[j] := Tmp;
+      Tmp := Im[i]; Im[i] := Im[j]; Im[j] := Tmp;
+    end;
+  end;
+  if Inverse then SinSign := 1.0 else SinSign := -1.0;
+  Len := 2;
+  while Len <= N do
+  begin
+    Half := Len shr 1;
+    MaxPairPos := Half - 1;
+    BlockStart := 0;
+    if Length(CosTab) > 0 then
+    begin
+      // Table twiddles: stage Len reads entry k*(N div Len) of the length-N table.
+      TwStep := N div Len;
+      while BlockStart < N do
+      begin
+        TwIdx := 0;
+        p := BlockStart;
+        q := BlockStart + Half;
+        for k := 0 to MaxPairPos do
+        begin
+          wRe := CosTab[TwIdx];
+          wIm := SinTab[TwIdx] * SinSign;
+          uRe := Re[p]; uIm := Im[p];
+          pRe := Re[q]; pIm := Im[q];
+          vRe := wRe * pRe - wIm * pIm;
+          vIm := wRe * pIm + wIm * pRe;
+          Re[p] := uRe + vRe; Im[p] := uIm + vIm;
+          Re[q] := uRe - vRe; Im[q] := uIm - vIm;
+          Inc(p);
+          Inc(q);
+          Inc(TwIdx, TwStep);
+        end;
+        Inc(BlockStart, Len);
+      end;
+    end
+    else
+    begin
+      Ang := SinSign * 2 * Pi / Len;
+      wpRe := Cos(Ang);
+      wpIm := Sin(Ang);
+      while BlockStart < N do
+      begin
+        wRe := 1.0;
+        wIm := 0.0;
+        p := BlockStart;
+        q := BlockStart + Half;
+        for k := 0 to MaxPairPos do
+        begin
+          uRe := Re[p]; uIm := Im[p];
+          pRe := Re[q]; pIm := Im[q];
+          vRe := wRe * pRe - wIm * pIm;
+          vIm := wRe * pIm + wIm * pRe;
+          Re[p] := uRe + vRe; Im[p] := uIm + vIm;
+          Re[q] := uRe - vRe; Im[q] := uIm - vIm;
+          Inc(p);
+          Inc(q);
+          Tmp := wRe * wpRe - wIm * wpIm;
+          wIm := wRe * wpIm + wIm * wpRe;
+          wRe := Tmp;
+        end;
+        Inc(BlockStart, Len);
+      end;
+    end;
+    Len := Len shl 1;
+  end;
+  if Inverse then
+  begin
+    // N is a power of two, so 1/N is exact and the multiply equals the divide.
+    InvN := 1.0 / N;
+    for i := 0 to MaxSamplePos do
+    begin
+      Re[i] := Re[i] * InvN;
+      Im[i] := Im[i] * InvN;
+    end;
+  end;
+end;
+
+procedure FFTRadix2InPlace(var Re, Im: array of Double; N: integer;
+  Inverse: boolean);
+begin
+  FFTRadix2InPlace(Re, Im, N, Inverse, FFTNoTwiddles, FFTNoTwiddles);
+end;
+
+procedure FFTPlanInit(var Plan: TFFTPlan; N: integer);
+var
+  TabLen, MaxTabPos, MaxSamplePos, MaxConvPos, SampleCnt: integer;
+  ChirpPhase: Int64;
+  Ang, InvConvLen: Double;
+begin
+  if N < 1 then
+    raise Exception.Create('FFTPlanInit: N must be >= 1, got ' + IntToStr(N));
+  if (Plan.N = N) and (Length(Plan.WorkRe) > 0) then Exit;
+  Plan.N := N;
+  Plan.IsPow2 := IsPowerOfTwo(N);
+  if Plan.IsPow2 then
+    Plan.ConvLen := N
+  else
+  begin
+    Plan.ConvLen := 1;
+    while Plan.ConvLen < 2 * N - 1 do
+      Plan.ConvLen := Plan.ConvLen shl 1;
+  end;
+  TabLen := Plan.ConvLen div 2;
+  SetLength(Plan.CosTab, TabLen);
+  SetLength(Plan.SinTab, TabLen);
+  MaxTabPos := TabLen - 1;
+  for SampleCnt := 0 to MaxTabPos do
+  begin
+    Ang := 2 * Pi * SampleCnt / Plan.ConvLen;
+    Plan.CosTab[SampleCnt] := Cos(Ang);
+    Plan.SinTab[SampleCnt] := Sin(Ang);
+  end;
+  SetLength(Plan.WorkRe, Plan.ConvLen);
+  SetLength(Plan.WorkIm, Plan.ConvLen);
+  if Plan.IsPow2 then
+  begin
+    SetLength(Plan.ChirpRe, 0);
+    SetLength(Plan.ChirpIm, 0);
+    SetLength(Plan.FilterRe, 0);
+    SetLength(Plan.FilterIm, 0);
+    Exit;
+  end;
+  // Bluestein: 2nk = n^2 + k^2 - (k-n)^2, so X = c * ((x*c) circ-conv conj(c)),
+  // c[n] = exp(-i*pi*n^2/N); n^2 is reduced mod 2N to keep the phase exact.
+  SetLength(Plan.ChirpRe, N);
+  SetLength(Plan.ChirpIm, N);
+  MaxSamplePos := N - 1;
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    ChirpPhase := (Int64(SampleCnt) * SampleCnt) mod (2 * Int64(N));
+    Ang := Pi * ChirpPhase / N;
+    Plan.ChirpRe[SampleCnt] := Cos(Ang);
+    Plan.ChirpIm[SampleCnt] := -Sin(Ang);
+  end;
+  SetLength(Plan.FilterRe, Plan.ConvLen);
+  SetLength(Plan.FilterIm, Plan.ConvLen);
+  MaxConvPos := Plan.ConvLen - 1;
+  for SampleCnt := 0 to MaxConvPos do
+  begin
+    Plan.FilterRe[SampleCnt] := 0.0;
+    Plan.FilterIm[SampleCnt] := 0.0;
+  end;
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    Plan.FilterRe[SampleCnt] := Plan.ChirpRe[SampleCnt];
+    Plan.FilterIm[SampleCnt] := -Plan.ChirpIm[SampleCnt];
+  end;
+  for SampleCnt := 1 to MaxSamplePos do
+  begin
+    Plan.FilterRe[Plan.ConvLen - SampleCnt] := Plan.ChirpRe[SampleCnt];
+    Plan.FilterIm[Plan.ConvLen - SampleCnt] := -Plan.ChirpIm[SampleCnt];
+  end;
+  FFTRadix2InPlace(Plan.FilterRe, Plan.FilterIm, Plan.ConvLen, false,
+    Plan.CosTab, Plan.SinTab);
+  // The 1/ConvLen of the convolution's inverse FFT is folded into the filter.
+  InvConvLen := 1.0 / Plan.ConvLen;
+  for SampleCnt := 0 to MaxConvPos do
+  begin
+    Plan.FilterRe[SampleCnt] := Plan.FilterRe[SampleCnt] * InvConvLen;
+    Plan.FilterIm[SampleCnt] := Plan.FilterIm[SampleCnt] * InvConvLen;
+  end;
+end;
+
+procedure FFTPlanExecute(var Plan: TFFTPlan; var Re, Im: array of Double;
+  Inverse: boolean);
+var
+  SampleCnt, MaxSamplePos, MaxConvPos, N: integer;
+  xRe, xIm, cRe, cIm, fRe, fIm, InSign, OutScale, OutImScale: Double;
+begin
+  N := Plan.N;
+  if Plan.IsPow2 then
+  begin
+    FFTRadix2InPlace(Re, Im, N, Inverse, Plan.CosTab, Plan.SinTab);
+    Exit;
+  end;
+  // The inverse is conj(DFT(conj(x)))/N, so one forward Bluestein serves both.
+  if Inverse then
+  begin
+    InSign := -1.0;
+    OutScale := 1.0 / Double(N);
+    OutImScale := -OutScale;
+  end
+  else
+  begin
+    InSign := 1.0;
+    OutScale := 1.0;
+    OutImScale := 1.0;
+  end;
+  MaxSamplePos := N - 1;
+  MaxConvPos := Plan.ConvLen - 1;
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    xRe := Re[SampleCnt];
+    xIm := Im[SampleCnt] * InSign;
+    cRe := Plan.ChirpRe[SampleCnt];
+    cIm := Plan.ChirpIm[SampleCnt];
+    Plan.WorkRe[SampleCnt] := xRe * cRe - xIm * cIm;
+    Plan.WorkIm[SampleCnt] := xRe * cIm + xIm * cRe;
+  end;
+  FillChar(Plan.WorkRe[N], (Plan.ConvLen - N) * csDoubleSize, 0);
+  FillChar(Plan.WorkIm[N], (Plan.ConvLen - N) * csDoubleSize, 0);
+  FFTRadix2InPlace(Plan.WorkRe, Plan.WorkIm, Plan.ConvLen, false,
+    Plan.CosTab, Plan.SinTab);
+  // Multiply by the filter and conjugate, so a forward FFT acts as the inverse.
+  for SampleCnt := 0 to MaxConvPos do
+  begin
+    xRe := Plan.WorkRe[SampleCnt];
+    xIm := Plan.WorkIm[SampleCnt];
+    fRe := Plan.FilterRe[SampleCnt];
+    fIm := Plan.FilterIm[SampleCnt];
+    Plan.WorkRe[SampleCnt] := xRe * fRe - xIm * fIm;
+    Plan.WorkIm[SampleCnt] := -(xRe * fIm + xIm * fRe);
+  end;
+  FFTRadix2InPlace(Plan.WorkRe, Plan.WorkIm, Plan.ConvLen, false,
+    Plan.CosTab, Plan.SinTab);
+  for SampleCnt := 0 to MaxSamplePos do
+  begin
+    xRe := Plan.WorkRe[SampleCnt];
+    xIm := -Plan.WorkIm[SampleCnt];
+    cRe := Plan.ChirpRe[SampleCnt];
+    cIm := Plan.ChirpIm[SampleCnt];
+    Re[SampleCnt] := (xRe * cRe - xIm * cIm) * OutScale;
+    Im[SampleCnt] := (xRe * cIm + xIm * cRe) * OutImScale;
+  end;
+end;
+
+procedure RealFFTPlanInit(var Plan: TRealFFTPlan; N: integer);
+var
+  HalfN, MaxBinPos, BinCnt, ComplexN: integer;
+  Ang: Double;
+begin
+  if N < 1 then
+    raise Exception.Create('RealFFTPlanInit: N must be >= 1, got ' + IntToStr(N));
+  if (Plan.N = N) and (Length(Plan.WorkRe) > 0) then Exit;
+  Plan.N := N;
+  HalfN := N div 2;
+  if Odd(N) then ComplexN := N else ComplexN := HalfN;
+  FFTPlanInit(Plan.Complex, ComplexN);
+  SetLength(Plan.WorkRe, ComplexN);
+  SetLength(Plan.WorkIm, ComplexN);
+  if Odd(N) then
+  begin
+    SetLength(Plan.TwiddleCos, 0);
+    SetLength(Plan.TwiddleSin, 0);
+    Exit;
+  end;
+  SetLength(Plan.TwiddleCos, HalfN + 1);
+  SetLength(Plan.TwiddleSin, HalfN + 1);
+  MaxBinPos := HalfN;
+  for BinCnt := 0 to MaxBinPos do
+  begin
+    Ang := 2 * Pi * BinCnt / N;
+    Plan.TwiddleCos[BinCnt] := Cos(Ang);
+    Plan.TwiddleSin[BinCnt] := Sin(Ang);
+  end;
+end;
+
+procedure RealFFTForward(var Plan: TRealFFTPlan; const X: array of Double;
+  var OutRe, OutIm: array of Double);
+var
+  HalfN, MaxHalfPos, SampleCnt, BinCnt, MirrorBin, BinBytes: integer;
+  ZRe, ZIm, MirrorRe, MirrorIm, EvenRe, EvenIm, OddRe, OddIm, TwCos, TwSin: Double;
+begin
+  HalfN := Plan.N div 2;
+  if Odd(Plan.N) then
+  begin
+    BinBytes := (HalfN + 1) * csDoubleSize;
+    Move(X[0], Plan.WorkRe[0], Plan.N * csDoubleSize);
+    FillChar(Plan.WorkIm[0], Plan.N * csDoubleSize, 0);
+    FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, false);
+    Move(Plan.WorkRe[0], OutRe[0], BinBytes);
+    Move(Plan.WorkIm[0], OutIm[0], BinBytes);
+    Exit;
+  end;
+  // z[m] = x[2m] + i*x[2m+1]; Z = FFT_{N/2}(z) holds the even and odd half-DFTs.
+  MaxHalfPos := HalfN - 1;
+  SampleCnt := 0;
+  for BinCnt := 0 to MaxHalfPos do
+  begin
+    Plan.WorkRe[BinCnt] := X[SampleCnt];
+    Plan.WorkIm[BinCnt] := X[SampleCnt + 1];
+    Inc(SampleCnt, 2);
+  end;
+  FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, false);
+  ZRe := Plan.WorkRe[0];
+  ZIm := Plan.WorkIm[0];
+  OutRe[0] := ZRe + ZIm;
+  OutIm[0] := 0;
+  OutRe[HalfN] := ZRe - ZIm;
+  OutIm[HalfN] := 0;
+  // E_k = (Z_k + conj Z_{M-k}) / 2, O_k = (Z_k - conj Z_{M-k}) / 2i, X_k = E_k + W^k O_k.
+  MirrorBin := MaxHalfPos;
+  for BinCnt := 1 to MaxHalfPos do
+  begin
+    ZRe := Plan.WorkRe[BinCnt];
+    ZIm := Plan.WorkIm[BinCnt];
+    MirrorRe := Plan.WorkRe[MirrorBin];
+    MirrorIm := Plan.WorkIm[MirrorBin];
+    EvenRe := 0.5 * (ZRe + MirrorRe);
+    EvenIm := 0.5 * (ZIm - MirrorIm);
+    OddRe := 0.5 * (ZIm + MirrorIm);
+    OddIm := 0.5 * (MirrorRe - ZRe);
+    TwCos := Plan.TwiddleCos[BinCnt];
+    TwSin := Plan.TwiddleSin[BinCnt];
+    OutRe[BinCnt] := EvenRe + TwCos * OddRe + TwSin * OddIm;
+    OutIm[BinCnt] := EvenIm + TwCos * OddIm - TwSin * OddRe;
+    Dec(MirrorBin);
+  end;
+end;
+
+procedure RealFFTInverse(var Plan: TRealFFTPlan; const InRe, InIm: array of Double;
+  var X: array of Double);
+var
+  HalfN, MaxHalfPos, MaxMirrorPos, SampleCnt, BinCnt, MirrorBin: integer;
+  BinRe, BinIm, MirrorRe, MirrorIm, EvenRe, EvenIm, DiffRe, DiffIm, OddRe, OddIm: Double;
+  TwCos, TwSin: Double;
+begin
+  HalfN := Plan.N div 2;
+  if Odd(Plan.N) then
+  begin
+    MaxMirrorPos := HalfN;
+    Move(InRe[0], Plan.WorkRe[0], (HalfN + 1) * csDoubleSize);
+    Move(InIm[0], Plan.WorkIm[0], (HalfN + 1) * csDoubleSize);
+    for BinCnt := 1 to MaxMirrorPos do
+    begin
+      Plan.WorkRe[Plan.N - BinCnt] := Plan.WorkRe[BinCnt];
+      Plan.WorkIm[Plan.N - BinCnt] := -Plan.WorkIm[BinCnt];
+    end;
+    FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, true);
+    Move(Plan.WorkRe[0], X[0], Plan.N * csDoubleSize);
+    Exit;
+  end;
+  // Inverse split: E_k = (X_k + conj X_{M-k}) / 2, O_k = W^-k (X_k - conj X_{M-k}) / 2,
+  // Z_k = E_k + i*O_k is the N/2-point DFT of x[2m] + i*x[2m+1].
+  MaxHalfPos := HalfN - 1;
+  BinRe := InRe[0];
+  MirrorRe := InRe[HalfN];
+  Plan.WorkRe[0] := 0.5 * (BinRe + MirrorRe);
+  Plan.WorkIm[0] := 0.5 * (BinRe - MirrorRe);
+  MirrorBin := MaxHalfPos;
+  for BinCnt := 1 to MaxHalfPos do
+  begin
+    BinRe := InRe[BinCnt];
+    BinIm := InIm[BinCnt];
+    MirrorRe := InRe[MirrorBin];
+    MirrorIm := InIm[MirrorBin];
+    EvenRe := 0.5 * (BinRe + MirrorRe);
+    EvenIm := 0.5 * (BinIm - MirrorIm);
+    DiffRe := 0.5 * (BinRe - MirrorRe);
+    DiffIm := 0.5 * (BinIm + MirrorIm);
+    TwCos := Plan.TwiddleCos[BinCnt];
+    TwSin := Plan.TwiddleSin[BinCnt];
+    OddRe := DiffRe * TwCos - DiffIm * TwSin;
+    OddIm := DiffRe * TwSin + DiffIm * TwCos;
+    Plan.WorkRe[BinCnt] := EvenRe - OddIm;
+    Plan.WorkIm[BinCnt] := EvenIm + OddRe;
+    Dec(MirrorBin);
+  end;
+  FFTPlanExecute(Plan.Complex, Plan.WorkRe, Plan.WorkIm, true);
+  SampleCnt := 0;
+  for BinCnt := 0 to MaxHalfPos do
+  begin
+    X[SampleCnt] := Plan.WorkRe[BinCnt];
+    X[SampleCnt + 1] := Plan.WorkIm[BinCnt];
+    Inc(SampleCnt, 2);
+  end;
+end;
+
+procedure RealFFTForwardBins(var Plan: TRealFFTPlan; const X: array of Double;
+  var OutRe, OutIm: array of Double; NumBins: integer);
+var
+  BinCnt, MaxBinPos, MirrorBin: integer;
+begin
+  RealFFTForward(Plan, X, OutRe, OutIm);
+  // A real signal's spectrum is Hermitian: X_k = conj X_{N-k}.
+  MaxBinPos := NumBins - 1;
+  MirrorBin := Plan.N - (Plan.N div 2 + 1);
+  for BinCnt := Plan.N div 2 + 1 to MaxBinPos do
+  begin
+    OutRe[BinCnt] := OutRe[MirrorBin];
+    OutIm[BinCnt] := -OutIm[MirrorBin];
+    Dec(MirrorBin);
+  end;
+end;
+
+procedure RealFFTInverseRealPart(var Plan: TRealFFTPlan; var InRe, InIm: array of Double;
+  NumBins: integer; var X: array of Double);
+var
+  HalfN, FirstMirrorBin, MaxLoneBinPos, BinCnt, MirrorBin, ZeroCnt: integer;
+begin
+  HalfN := Plan.N div 2;
+  // Re(IDFT(S)) = IDFT(H) with H_k = (S_k + conj S_{N-k}) / 2, so only H_0..H_{N/2}
+  // is built. Bins of the half at or above NumBins are zero in S.
+  ZeroCnt := HalfN + 1 - NumBins;
+  if ZeroCnt > 0 then
+  begin
+    FillChar(InRe[NumBins], ZeroCnt * csDoubleSize, 0);
+    FillChar(InIm[NumBins], ZeroCnt * csDoubleSize, 0);
+  end;
+  // S_{N-k} is nonzero only when N-k < NumBins. Bin 0 is its own mirror and only
+  // its real part is read by RealFFTInverse, so it stays as it is.
+  FirstMirrorBin := Plan.N - NumBins + 1;
+  MaxLoneBinPos := Min(FirstMirrorBin - 1, HalfN);
+  for BinCnt := 1 to MaxLoneBinPos do
+  begin
+    InRe[BinCnt] := 0.5 * InRe[BinCnt];
+    InIm[BinCnt] := 0.5 * InIm[BinCnt];
+  end;
+  // N-k > N div 2 for every k < N/2, so the mirror is never a bin already
+  // rewritten; the even-N Nyquist bin is its own mirror and is read first.
+  MirrorBin := NumBins - 1;
+  for BinCnt := FirstMirrorBin to HalfN do
+  begin
+    InRe[BinCnt] := 0.5 * (InRe[BinCnt] + InRe[MirrorBin]);
+    InIm[BinCnt] := 0.5 * (InIm[BinCnt] - InIm[MirrorBin]);
+    Dec(MirrorBin);
+  end;
+  RealFFTInverse(Plan, InRe, InIm, X);
+end;
+
+
 function NeuralBoxIoU(AX1, AY1, AX2, AY2,
   BX1, BY1, BX2, BY2: TNeuralFloat): TNeuralFloat;
 var
@@ -5329,6 +6003,149 @@ begin
     Result := IoU - (AreaC - UnionA) / AreaC
   else
     Result := 0;
+end;
+
+function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+  Rows, Cols: integer; var RowToCol: array of integer;
+  var Work: TNeuralAssignmentWork): TNeuralFloat;
+var
+  SolveRows, SolveCols, RowStride, ColStride, MaxRowPos: integer;
+  MaxSolveRowPos, MaxSolveColPos, MaxRemainingPos: integer;
+  CurRow, RowPos, ColPos, Sink, RemainingCount, BestIndex, ScanPos: integer;
+  NextCol, CostRowBase: integer;
+  MinVal, Lowest, Reduced, CurRowDual, PathCost: TNeuralFloat;
+begin
+  Result := 0;
+  MaxRowPos := Rows - 1;
+  for RowPos := 0 to MaxRowPos do RowToCol[RowPos] := -1;
+  if (Rows <= 0) or (Cols <= 0) then Exit;
+  // Shortest augmenting path (Crouse 2016) needs solve rows <= solve cols, so
+  // a tall matrix is solved through a transposed stride view, without a copy.
+  if Rows <= Cols then
+  begin
+    SolveRows := Rows; SolveCols := Cols; RowStride := Cols; ColStride := 1;
+  end
+  else
+  begin
+    SolveRows := Cols; SolveCols := Rows; RowStride := 1; ColStride := Cols;
+  end;
+  if Length(Work.RowDual) < SolveRows then
+  begin
+    SetLength(Work.RowDual, SolveRows);
+    SetLength(Work.ColForRow, SolveRows);
+    SetLength(Work.IsRowScanned, SolveRows);
+  end;
+  if Length(Work.ColDual) < SolveCols then
+  begin
+    SetLength(Work.ColDual, SolveCols);
+    SetLength(Work.ShortestPathCosts, SolveCols);
+    SetLength(Work.Path, SolveCols);
+    SetLength(Work.RowForCol, SolveCols);
+    SetLength(Work.RemainingCols, SolveCols);
+    SetLength(Work.IsColScanned, SolveCols);
+  end;
+  MaxSolveRowPos := SolveRows - 1;
+  MaxSolveColPos := SolveCols - 1;
+  for RowPos := 0 to MaxSolveRowPos do
+  begin
+    Work.RowDual[RowPos] := 0;
+    Work.ColForRow[RowPos] := -1;
+  end;
+  for ColPos := 0 to MaxSolveColPos do
+  begin
+    Work.ColDual[ColPos] := 0;
+    Work.RowForCol[ColPos] := -1;
+  end;
+  for CurRow := 0 to MaxSolveRowPos do
+  begin
+    MinVal := 0;
+    RemainingCount := SolveCols;
+    // Reverse column order reproduces scipy's tie-breaking.
+    for ColPos := 0 to MaxSolveColPos do
+    begin
+      Work.RemainingCols[ColPos] := MaxSolveColPos - ColPos;
+      Work.ShortestPathCosts[ColPos] := Infinity;
+      Work.IsColScanned[ColPos] := False;
+    end;
+    for RowPos := 0 to MaxSolveRowPos do Work.IsRowScanned[RowPos] := False;
+    Sink := -1;
+    RowPos := CurRow;
+    while Sink < 0 do
+    begin
+      Work.IsRowScanned[RowPos] := True;
+      BestIndex := -1;
+      Lowest := Infinity;
+      CostRowBase := RowPos * RowStride;
+      CurRowDual := Work.RowDual[RowPos];
+      MaxRemainingPos := RemainingCount - 1;
+      for ScanPos := 0 to MaxRemainingPos do
+      begin
+        ColPos := Work.RemainingCols[ScanPos];
+        Reduced := MinVal + Cost[CostRowBase + ColPos * ColStride] -
+          CurRowDual - Work.ColDual[ColPos];
+        PathCost := Work.ShortestPathCosts[ColPos];
+        if Reduced < PathCost then
+        begin
+          Work.Path[ColPos] := RowPos;
+          PathCost := Reduced;
+          Work.ShortestPathCosts[ColPos] := PathCost;
+        end;
+        // Among equal distances prefer a free column: it ends the search.
+        if (PathCost < Lowest) or
+          ((PathCost = Lowest) and (Work.RowForCol[ColPos] < 0)) then
+        begin
+          Lowest := PathCost;
+          BestIndex := ScanPos;
+        end;
+      end;
+      if BestIndex < 0 then
+        raise Exception.Create('NeuralLinearSumAssignment: cost matrix must be finite.');
+      MinVal := Lowest;
+      ColPos := Work.RemainingCols[BestIndex];
+      if Work.RowForCol[ColPos] < 0 then
+        Sink := ColPos
+      else
+        RowPos := Work.RowForCol[ColPos];
+      Work.IsColScanned[ColPos] := True;
+      Dec(RemainingCount);
+      Work.RemainingCols[BestIndex] := Work.RemainingCols[RemainingCount];
+    end;
+    Work.RowDual[CurRow] := Work.RowDual[CurRow] + MinVal;
+    for RowPos := 0 to MaxSolveRowPos do
+      if Work.IsRowScanned[RowPos] and (RowPos <> CurRow) then
+        Work.RowDual[RowPos] := Work.RowDual[RowPos] + MinVal -
+          Work.ShortestPathCosts[Work.ColForRow[RowPos]];
+    for ColPos := 0 to MaxSolveColPos do
+      if Work.IsColScanned[ColPos] then
+        Work.ColDual[ColPos] := Work.ColDual[ColPos] - MinVal +
+          Work.ShortestPathCosts[ColPos];
+    // Augment: flip the alternating path from Sink back to CurRow.
+    ColPos := Sink;
+    repeat
+      RowPos := Work.Path[ColPos];
+      Work.RowForCol[ColPos] := RowPos;
+      NextCol := Work.ColForRow[RowPos];
+      Work.ColForRow[RowPos] := ColPos;
+      ColPos := NextCol;
+    until RowPos = CurRow;
+  end;
+  for RowPos := 0 to MaxSolveRowPos do
+  begin
+    ColPos := Work.ColForRow[RowPos];
+    if Rows <= Cols then
+      RowToCol[RowPos] := ColPos
+    else
+      RowToCol[ColPos] := RowPos;
+    Result := Result + Cost[RowPos * RowStride + ColPos * ColStride];
+  end;
+end;
+
+function NeuralLinearSumAssignment(const Cost: array of TNeuralFloat;
+  Rows, Cols: integer; var RowToCol: array of integer): TNeuralFloat;
+var
+  Work: TNeuralAssignmentWork;
+begin
+  Result := NeuralLinearSumAssignment(Cost, Rows, Cols, RowToCol, Work);
 end;
 
 // In-place quicksort of the index array Order so that Scores[Order[0..]] ends
@@ -5417,9 +6234,17 @@ begin
   else WriteLn(' FAILED.');
 end;
 
-// Marsaglia & Tsang (2000) "A Simple Method for Generating Gamma Variables".
-// Generates a Gamma(Alpha, 1) sample using the repo's global Random RNG.
+// FPC reseeds when RandSeed differs from its last-seed marker; a Random call
+// with RandSeed = A leaves the marker at A or not(A), and A = Seed xor 1.
+procedure RestartRandSeed(Seed: cardinal);
+begin
+  RandSeed := Seed xor 1;
+  Random(2);
+  RandSeed := Seed;
+end;
+
 // Standard normal sample (Marsaglia polar) using the global Random RNG.
+// The loop runs 4 / pi = 1.273.. times on average.
 function RandomStdNormal(): TNeuralFloat;
 var
   r, x, y: TNeuralFloat;
@@ -5434,6 +6259,45 @@ begin
   Result := x * Sqrt(-2.0 * pcr_logf(r) / r);
 end;
 
+procedure StdNormalStreamInit(var Stream: TStdNormalStream; Seed: longword);
+begin
+  Stream.State := Seed;
+  Stream.Spare := 0;
+  Stream.HaveSpare := False;
+end;
+
+function StdNormalStreamUniform(var Stream: TStdNormalStream): TNeuralFloat;
+begin
+  Stream.State := (Stream.State * 1664525 + 1013904223) and $FFFFFFFF;
+  Result := (Stream.State + 1) / 4294967296.0;
+end;
+
+// Marsaglia polar on the stream's LCG; the second variate of each pair is cached.
+function StdNormalStreamNext(var Stream: TStdNormalStream): TNeuralFloat;
+var
+  r, x, y, Scale: TNeuralFloat;
+begin
+  if Stream.HaveSpare then
+  begin
+    Stream.HaveSpare := False;
+    Result := Stream.Spare;
+    Exit;
+  end;
+  r := 0;
+  while (r >= 1) or (r = 0) do
+  begin
+    x := 2.0 * StdNormalStreamUniform(Stream) - 1.0;
+    y := 2.0 * StdNormalStreamUniform(Stream) - 1.0;
+    r := x * x + y * y;
+  end;
+  Scale := Sqrt(-2.0 * pcr_logf(r) / r);
+  Stream.Spare := y * Scale;
+  Stream.HaveSpare := True;
+  Result := x * Scale;
+end;
+
+// Marsaglia & Tsang (2000) "A Simple Method for Generating Gamma Variables".
+// Generates a Gamma(Alpha, 1) sample using the repo's global Random RNG.
 function RandomGammaValue(Alpha: TNeuralFloat): TNeuralFloat;
 var
   d, c, x, v, u: TNeuralFloat;
@@ -6065,6 +6929,41 @@ begin
   until Lo > Hi;
   if Hi > iLo then QuickSortOrderByDist(Order, Dist, iLo, Hi);
   if Lo < iHi then QuickSortOrderByDist(Order, Dist, Lo, iHi);
+end;
+
+function NeuralWeightedMedian(const Values, Weights: array of TNeuralFloat;
+  var Order: array of integer; Count: integer): TNeuralFloat;
+var
+  OrderPos, MaxOrderPos: integer;
+  TotalWeight, HalfWeight, CumulativeWeight: TNeuralFloat;
+begin
+  Result := 0;
+  if Count <= 0 then Exit;
+  MaxOrderPos := Count - 1;
+  TotalWeight := 0;
+  for OrderPos := 0 to MaxOrderPos do
+  begin
+    Order[OrderPos] := OrderPos;
+    TotalWeight := TotalWeight + Weights[OrderPos];
+  end;
+  if Count > 1 then QuickSortOrderByDist(Order, Values, 0, MaxOrderPos);
+  if TotalWeight <= 0 then
+  begin
+    Result := Values[Order[MaxOrderPos div 2]];
+    Exit;
+  end;
+  HalfWeight := 0.5 * TotalWeight;
+  CumulativeWeight := 0;
+  for OrderPos := 0 to MaxOrderPos do
+  begin
+    CumulativeWeight := CumulativeWeight + Weights[Order[OrderPos]];
+    if CumulativeWeight >= HalfWeight then
+    begin
+      Result := Values[Order[OrderPos]];
+      Exit;
+    end;
+  end;
+  Result := Values[Order[MaxOrderPos]];
 end;
 
 // Hoare-partition quickselect over the index array: permutes Order[0..Count-1]
@@ -7858,9 +8757,9 @@ var
 begin
   FTokenizer.Text := '';
   NumericFormat := GetDefaultNumericFormat;
-  if Length(Volume.FData) > 0 then
+  if Volume.FSize > 0 then
   begin
-    vHigh := High(Volume.FData);
+    vHigh := Volume.FSize - 1;
     if vHigh > 0 then
     begin
       for I := 0 to vHigh do
@@ -8686,7 +9585,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := (random(a) - b) / c;
 end;
@@ -8696,7 +9595,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := RandomGaussianValue() * pMul;
 end;
@@ -8706,7 +9605,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] += RandomGaussianValue() * pMul;
@@ -8746,23 +9645,10 @@ begin
   end;
 end;
 
-// returns a random gaussivan value. This implementation is inspired on:
-//http://www.cs.princeton.edu/courses/archive/fall12/cos126/assignments/StdGaussian.java.html
+// Standard normal sample from the global Random RNG.
 function TVolume.RandomGaussianValue(): TNeuralFloat;
-var
-  r, x, y: TNeuralFloat;
 begin
-  r := 0;
-  // loop executed 4 / pi = 1.273.. times on average
-  while ( (r > 1) or (r = 0) ) do
-  begin
-    // find a uniform random point (x, y) inside unit circle
-    x := 2.0 * Random() - 1.0;
-    y := 2.0 * Random() - 1.0;
-    r := x*x + y*y;
-  end;
-
-  RandomGaussianValue := x * Sqrt(-2.0 * pcr_logf(r) / r);
+  Result := RandomStdNormal();
 end;
 
 procedure TVolume.Add(Original: TVolume);
@@ -8775,7 +9661,7 @@ begin
     raise Exception.Create('Sizes don''t match at Add: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] += Original.FData[I];
@@ -8789,7 +9675,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] += Value;
@@ -9083,7 +9969,7 @@ var
   RowBytesA, RowBytesB, ADepth: integer;
 begin
   MaxX := Max(A.FSizeX, B.FSizeX);
-  MaxY := Max(A.FSizeX, B.FSizeX);
+  MaxY := Max(A.FSizeY, B.FSizeY);
   MaxD := A.FDepth + B.FDepth;
   Resize(MaxX,MaxY,MaxD);
 
@@ -9133,7 +10019,7 @@ begin
     raise Exception.Create('Sizes don''t match at Sub: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] -= Original.FData[I];
@@ -9147,7 +10033,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] -= Value;
@@ -9167,7 +10053,7 @@ begin
     raise Exception.Create('Sizes don''t match at Diff: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxSingle := FData[I] - Original.FData[I];
@@ -9185,7 +10071,7 @@ begin
   NewX := Original.FSize div NewDepth;
   Resize(NewX,1,NewDepth);
 
-  vHigh := High(FData);
+  vHigh := FSize - 1;
 
   posX := 0;
   posD := 0;
@@ -9229,7 +10115,7 @@ begin
   NewDepth3 := NewDepth2 + NewDepth;
   NewDepth4 := NewDepth3 + NewDepth;
 
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   vHighM4 := vHigh - 4;
 
   posX := 0;
@@ -9320,7 +10206,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := Min(FData[I], Value);
 end;
@@ -9330,7 +10216,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := Max(FData[I], Value);
 end;
@@ -9345,7 +10231,7 @@ begin
     raise Exception.Create('Sizes don''t match at Mul: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] *= Original.FData[I];
@@ -9388,7 +10274,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] *= Value;
@@ -9431,7 +10317,7 @@ var
 begin
   if Value <> 1 then
   begin
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     for I := 0 to vHigh do
       FData[I] := pcr_powf(FData[I],Value);
   end;
@@ -9442,7 +10328,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     if FData[I] <> 0 then FData[I] := (1/FData[I]);
@@ -9454,7 +10340,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := pcr_sqrtf(FData[I]);
 end;
@@ -9676,7 +10562,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] /= Original.FData[I];
@@ -9690,7 +10576,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     {$IFDEF FPC}
     FData[I] /= Value;
@@ -9704,7 +10590,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := NeuronForceMinRange(FData[I], Value);
 end;
@@ -9723,7 +10609,7 @@ begin
   end;
   // A non-positive bound sits outside the kernel's contract - it early-exits
   // there - so the scalar clamp keeps handling it.
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := NeuronForceRange(FData[I], Value);
 end;
@@ -9771,7 +10657,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     if FData[I] < 0 then FData[I] := -FData[I];
 end;
@@ -9787,7 +10673,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := c;
 end;
@@ -9833,7 +10719,7 @@ var
   I: integer;
   vHigh: integer;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     FData[I] := I/100;
 end;
@@ -10560,7 +11446,7 @@ begin
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
   Result := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxDiff := FData[I] - Original.FData[I];
@@ -10577,7 +11463,7 @@ begin
   if Original.Size <> Self.Size then
     raise Exception.Create('Sizes don''t match at DebugDiff: ' +
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxDiff := FData[I] - Original.FData[I];
@@ -10596,9 +11482,9 @@ var
   vHigh: integer;
 begin
   if Size <> Original.FSize then Resize(Original);
-  if Length(Original.FData) > 0 then
+  if Original.FSize > 0 then
   begin
-    vHigh := High(Original.FData);
+    vHigh := Original.FSize - 1;
     FData[0] := Original.FData[0];
     for I := 1 to vHigh do
       FData[I] := FData[I-1] + Original.FData[I];
@@ -10617,7 +11503,7 @@ begin
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + ' .');
   {$ENDIF}
   Result := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     AuxDiff := FData[I] - Original.FData[I];
@@ -10697,11 +11583,11 @@ var
   vHigh: integer;
   v: T;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0];
     FLastPos := 0;
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -10727,9 +11613,9 @@ var
   vHigh: integer;
 begin
   Result := 0;
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     for I := 0 to vHigh do
     begin
       if FData[I] <> 0 then Inc(Result);
@@ -10743,7 +11629,7 @@ var
   vHigh: integer;
   auxSingle: single;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     auxSingle := FData[0];
     FLastPos := 0;
@@ -10754,7 +11640,7 @@ begin
     // ForceMaxAbs / NormalizeMax / int8 quantization / backprop overflow
     // protection - that all expect a true non-negative magnitude).
     Result := auxSingle;
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -10781,11 +11667,11 @@ var
   vHigh: integer;
   v: T;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0];
     FLastPos := 0;
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -10843,10 +11729,10 @@ var
   I: integer;
   vHigh: integer;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0];
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     // Eight accumulations per iteration into the one left-associated chain, so
     // the summation order - and therefore the result - is exactly the
     // element-at-a-time loop's, at a fraction of the loop overhead. This is the
@@ -10878,7 +11764,7 @@ begin
   // Abs clears the sign bit; the sign test it replaces was a data-dependent
   // branch taken once per element.
   Result := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
     Result := Result + Abs(FData[I]);
 end;
@@ -10888,10 +11774,10 @@ var
   I: integer;
   vHigh: integer;
 begin
-  if Length(FData) > 0 then
+  if FSize > 0 then
   begin
     Result := FData[0] * FData[0];
-    vHigh := High(FData);
+    vHigh := FSize - 1;
     if vHigh > 0 then
     begin
       for I := 1 to vHigh do
@@ -11162,7 +12048,7 @@ var
   vHigh: integer;
   Value: TNeuralFloat;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   for I := 0 to vHigh do
   begin
     Value := FData[I];
@@ -11356,7 +12242,7 @@ end;
 
 procedure TVolume.SetClass(pClass: integer; value: T);
 begin
-  if (pClass >= 0) and (pClass <= High(FData)) then
+  if (pClass >= 0) and (pClass <= FSize - 1) then
   begin
     Fill(-value);
     FData[pClass] := value;
@@ -11369,7 +12255,7 @@ end;
 
 procedure TVolume.SetClass(pClass: integer; TrueValue, FalseValue: T);
 begin
-  if (pClass >= 0) and (pClass <= High(FData)) then
+  if (pClass >= 0) and (pClass <= FSize - 1) then
   begin
     Fill(FalseValue);
     FData[pClass] := TrueValue;
@@ -11404,7 +12290,7 @@ var
   vMax: T;
   v: T;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   if (vHigh>0) then
   begin
     Result := 0;
@@ -11461,7 +12347,7 @@ var
   MinValue, MaxValue, ShiftedMin: T;
 begin
   TotalSum := 0;
-  vHigh := High(FData);
+  vHigh := FSize - 1;
 
   if vHigh >= 0 then
   begin
@@ -11674,6 +12560,30 @@ begin
 end;
 {$ENDIF}
 {$UNDEF HASAVXADDSCALAR}
+
+{$IFDEF AVX2}{$IFDEF AVX64}{$DEFINE HASAVXADDSCALEDDIFFERENCE}{$ENDIF}{$ENDIF}
+{$IFDEF HASAVXADDSCALEDDIFFERENCE}
+// Defined later in this file inside the AVX64 asm block.
+procedure AVXAddScaledDifference(PtrDst, PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
+  Scale: TNeuralFloat; NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.AddScaledDifference(PtrDst, PtrA, PtrB,
+  PtrC: TNeuralFloatArrPtr; Scale: TNeuralFloat; pSize: integer);
+{$IFDEF HASAVXADDSCALEDDIFFERENCE}
+begin
+  if pSize <= 0 then exit;
+  AVXAddScaledDifference(PtrDst, PtrA, PtrB, PtrC, Scale, pSize);
+end;
+{$ELSE}
+var
+  I, MaxElementPos: integer;
+begin
+  MaxElementPos := pSize - 1;
+  for I := 0 to MaxElementPos do
+    PtrDst^[I] := PtrA^[I] + Scale * (PtrB^[I] - PtrC^[I]);
+end;
+{$ENDIF}
+{$UNDEF HASAVXADDSCALEDDIFFERENCE}
 
 class procedure TNNetVolume.Exp(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
@@ -12266,18 +13176,25 @@ end;
 class procedure TNNetVolume.ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
-  X: TNeuralFloat;
+  X, AX, A: TNeuralFloat;
 begin
   if N <= 0 then exit;
   NM1 := N - 1;
-  // arcsinh(x) = ln(x + sqrt(x^2 + 1)). The argument x + sqrt(x^2+1) is always >= 1
-  // and is built directly into pDst; pSrc^[I] is read before pDst^[I] is written at
-  // the same index, so dst may alias src elementwise. Ln then supplies the
-  // AVX2 ln pass in place.
+  // arcsinh(x) = sign(x) * ln(A), A = |x| + sqrt(x^2 + 1) >= 1; the unsigned form
+  // cancels for x << 0. A negative x stores 1/A so Ln yields -ln(A) directly, and
+  // pSrc^[I] is read before pDst^[I] is written, so dst may alias src.
   for I := 0 to NM1 do
   begin
     X := pSrc^[I];
-    pDst^[I] := X + Sqrt(X * X + 1.0);
+    AX := Abs(X);
+    if AX < csArcSinhSquareCap then
+      A := AX + Sqrt(AX * AX + 1.0)
+    else if AX >= csArcSinhMagnitudeCap then
+      A := csArcSinhMagnitudeCap + csArcSinhMagnitudeCap
+    else
+      A := AX + AX;
+    if X < 0 then A := 1.0 / A;
+    pDst^[I] := A;
   end;
   Ln(pDst, pDst, N);
 end;
@@ -13003,7 +13920,7 @@ begin
   begin
     if FSize > 1 then
     begin
-      VMax := High(FData);
+      VMax := FSize - 1;
       VMin := Low(FData) + Positions;
       if ( (VMin <= VMax) and (VMin > 0) ) then
       begin
@@ -13022,7 +13939,7 @@ begin
     if FSize > 1 then
       // memmove semantics handle the overlapping copy toward lower indices.
       Move(FData[1], FData[0], (FSize - 1) * csNeuralFloatSize);
-    FData[High(FData)] := 0;
+    FData[FSize - 1] := 0;
   end;
 end;
 
@@ -13032,7 +13949,7 @@ var
   vHigh: integer;
   AuxData: Single;
 begin
-  vHigh := High(FData);
+  vHigh := FSize - 1;
   Write('(',SizeX,',',SizeY,',',Depth,') - ');
   for I := 0 to vHigh do
   begin
@@ -13202,7 +14119,7 @@ begin
   S.Add( IntToStr(FSizeY) );
   S.Add( IntToStr(FDepth) );
 
-  Hi := High(FData);
+  Hi := FSize - 1;
   Lo := Low(FData);
   for I := Lo to Hi do
   begin
@@ -13287,13 +14204,42 @@ begin
   FDataPtr := Original.FDataPtr;
 end;
 
-// SetLength copies a dynamic array referenced more than once and leaves one
-// referenced only here in place.
+procedure TNNetVolume.ShareDataPrefixWith(Original: TNNetVolume);
+begin
+  if Length(Original.FData) < FSize then
+    raise Exception.Create('TNNetVolume.ShareDataPrefixWith: ' +
+      IntToStr(Length(Original.FData)) + ' elements cannot hold ' +
+      IntToStr(FSize) + '.');
+  FData := Original.FData;
+  FDataPtr := Original.FDataPtr;
+end;
+
+procedure TNNetVolume.AllocateData(Capacity: integer);
+begin
+  FData := nil;
+  SetLength(FData, Max(Capacity, FSize));
+  if Length(FData) > 0 then FDataPtr := Addr(FData[0])
+  else FDataPtr := nil;
+end;
+
+// SetLength copies a dynamic array referenced more than once (only its first
+// Size elements) and trims one referenced only here in place.
 procedure TNNetVolume.UnshareData();
 begin
   SetLength(FData, FSize);
   if FSize > 0 then FDataPtr := Addr(FData[0])
   else FDataPtr := nil;
+end;
+
+procedure TNNetVolume.ReleaseData();
+begin
+  FData := nil;
+  FDataPtr := nil;
+end;
+
+function TNNetVolume.HasData(): boolean;
+begin
+  Result := Length(FData) >= FSize;
 end;
 
 function TNNetVolume.GetMemSize(): integer;
@@ -14020,7 +14966,7 @@ begin
   DotProductsTiled(NumAs, 0, NumBs-1, VectorSize, VAs, VBs, TileSizeA, TileSizeB);
 end;
 
-procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
+procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1; ResultBOffset: integer = 0);
 var
   CntA, CntB: Integer;
   RowBase, AOfs, BPos: integer;
@@ -14068,7 +15014,7 @@ begin
       EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
       TileAOfs0 := StartTileA * VectorSize; // #5: hoisted, invariant across CntB
       BPos := StartTileB * VectorSize;   // #12: carried CntB*VectorSize
-      RowBase := StartTileB * NumAs;     // #12: carried CntB*NumAs
+      RowBase := (StartTileB - ResultBOffset) * NumAs; // #12: carried
       for CntB := StartTileB to EndTileB do
       begin
         PtrB := VBs.GetRawPtr(BPos);
@@ -14460,6 +15406,63 @@ begin
       end;
     end;
     TileStart := TileEnd;
+  end;
+end;
+
+class procedure TNNetVolume.AddDotProductRows(PtrC, PtrRows: TNeuralFloatArrPtr;
+  RowStride, NumRows: integer; PtrB: TNeuralFloatArrPtr; VectorSize: integer);
+var
+  RowPos, FirstTailRowPos, MaxRowPos, RowOfs: integer;
+  {$IFDEF AVX2}{$IFDEF AVX64}
+  QuadPos, MaxQuadPos, BodyElements, ElementPos, MaxElementPos: integer;
+  Row0, Row1, Row2, Row3: TNeuralFloatArrPtr;
+  BValue, Sum0, Sum1, Sum2, Sum3: TNeuralFloat;
+  {$ENDIF}{$ENDIF}
+begin
+  if (NumRows <= 0) or (VectorSize <= 0) then exit;
+  FirstTailRowPos := 0;
+  RowOfs := 0;
+  {$IFDEF AVX2}{$IFDEF AVX64}
+  BodyElements := VectorSize and (not 7);
+  if BodyElements > 0 then
+  begin
+    MaxQuadPos := (NumRows shr 2) - 1;
+    MaxElementPos := VectorSize - 1;
+    for QuadPos := 0 to MaxQuadPos do
+    begin
+      Row0 := @PtrRows^[RowOfs];
+      Row1 := @PtrRows^[RowOfs + RowStride];
+      Row2 := @PtrRows^[RowOfs + 2 * RowStride];
+      Row3 := @PtrRows^[RowOfs + 3 * RowStride];
+      AVXAddDotProductRows4(@PtrC^[FirstTailRowPos], Row0, Row1, Row2, Row3,
+        PtrB, BodyElements);
+      if BodyElements < VectorSize then
+      begin
+        Sum0 := 0; Sum1 := 0; Sum2 := 0; Sum3 := 0;
+        for ElementPos := BodyElements to MaxElementPos do
+        begin
+          BValue := PtrB^[ElementPos];
+          Sum0 := Sum0 + Row0^[ElementPos] * BValue;
+          Sum1 := Sum1 + Row1^[ElementPos] * BValue;
+          Sum2 := Sum2 + Row2^[ElementPos] * BValue;
+          Sum3 := Sum3 + Row3^[ElementPos] * BValue;
+        end;
+        PtrC^[FirstTailRowPos] := PtrC^[FirstTailRowPos] + Sum0;
+        PtrC^[FirstTailRowPos + 1] := PtrC^[FirstTailRowPos + 1] + Sum1;
+        PtrC^[FirstTailRowPos + 2] := PtrC^[FirstTailRowPos + 2] + Sum2;
+        PtrC^[FirstTailRowPos + 3] := PtrC^[FirstTailRowPos + 3] + Sum3;
+      end;
+      Inc(FirstTailRowPos, 4);
+      Inc(RowOfs, 4 * RowStride);
+    end;
+  end;
+  {$ENDIF}{$ENDIF}
+  MaxRowPos := NumRows - 1;
+  for RowPos := FirstTailRowPos to MaxRowPos do
+  begin
+    PtrC^[RowPos] := PtrC^[RowPos] +
+      DotProduct(@PtrRows^[RowOfs], PtrB, VectorSize);
+    Inc(RowOfs, RowStride);
   end;
 end;
 
@@ -19298,6 +20301,98 @@ end;
 {$ENDIF}
 {$ENDIF}
 
+{ AVXAddScaledDifference: dst := a + Scale * (b - c), one vsubps + one FMA per
+  8 lanes; 32 elements per iteration through four independent chains, then 8 at
+  a time, then a scalar tail. The parameters go through locals (the
+  AVXDotProductsPacked6x16 idiom) so no load reads an argument register the
+  block already overwrote; Scale is broadcast through a pointer (PIC-safe). }
+{$IFDEF AVX2}
+{$IFDEF AVX64}
+procedure AVXAddScaledDifference(PtrDst, PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
+  Scale: TNeuralFloat; NumElements: integer);
+var
+  localNumElements, I, NumElementsM1: integer;
+  LocalDst, LocalA, LocalB, LocalC, ScalePtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  NumElementsM1 := NumElements - 1;
+  if localNumElements > 0 then
+  begin
+    LocalDst := PtrDst;
+    LocalA := PtrA;
+    LocalB := PtrB;
+    LocalC := PtrC;
+    ScalePtr := Addr(Scale);
+  asm
+  mov rax, LocalA
+  mov r8, LocalB
+  mov r9, LocalC
+  mov rdx, LocalDst
+  mov r10, ScalePtr
+  mov ecx, localNumElements
+  vbroadcastss ymm7, [r10]
+
+  push rcx
+  shr ecx, 5                       // large iterations = elements / 32
+  jz @SkipLargeASDLoop
+@LargeASDLoop:
+  vmovups   ymm0, [r8]
+  vmovups   ymm1, [r8+32]
+  vmovups   ymm2, [r8+64]
+  vmovups   ymm3, [r8+96]
+
+  vsubps    ymm0, ymm0, [r9]
+  vsubps    ymm1, ymm1, [r9+32]
+  vsubps    ymm2, ymm2, [r9+64]
+  vsubps    ymm3, ymm3, [r9+96]
+
+  vfmadd213ps ymm0, ymm7, [rax]    // ymm0 := Scale * (b - c) + a
+  vfmadd213ps ymm1, ymm7, [rax+32]
+  vfmadd213ps ymm2, ymm7, [rax+64]
+  vfmadd213ps ymm3, ymm7, [rax+96]
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm2
+  vmovups   [rdx+96], ymm3
+
+  add rax, 128
+  add r8, 128
+  add r9, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeASDLoop
+
+@SkipLargeASDLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndASD
+  shr ecx, 3                       // small iterations = (elements mod 32) / 8
+@SmallASDLoop:
+  vmovups   ymm0, [r8]
+  vsubps    ymm0, ymm0, [r9]
+  vfmadd213ps ymm0, ymm7, [rax]
+  vmovups   [rdx], ymm0
+  add rax, 32
+  add r8, 32
+  add r9, 32
+  add rdx, 32
+  dec ecx
+  jnz @SmallASDLoop
+
+@EndASD:
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'R9', 'R10', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm7'
+  ];
+  end;
+  for I := localNumElements to NumElementsM1 do
+    PtrDst^[I] := PtrA^[I] + Scale * (PtrB^[I] - PtrC^[I]);
+end;
+{$ENDIF}
+{$ENDIF}
+
 { AVXExp: dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 polynomial body plus a
   scalar NeuralExp remainder for the (N mod 8) tail. Under plain-AVX (no AVX2)
   the whole thing degrades to a scalar NeuralExp loop. }
@@ -20008,7 +21103,7 @@ begin
     else
     begin
       Result := 0;
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += FData[I] * Original.FData[I];
     end;
@@ -20024,7 +21119,7 @@ begin
     else
     begin
       Result := 0;
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += FData[I];
     end;
@@ -20096,7 +21191,7 @@ begin
     then Result := AVXDistanceSqr(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += Sqr(Original.FData[I]-FData[I]);
     end;
@@ -20128,7 +21223,7 @@ begin
     then Result := AVXSumDiff(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         Result += Abs(Original.FData[I]-FData[I]);
     end;
@@ -20159,7 +21254,7 @@ begin
     then AVXMul(FDataPtr, Value, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         FData[I] *= Value;
     end;
@@ -20310,7 +21405,7 @@ begin
     then AVXAdd(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         FData[I] += Original.FData[I];
     end;
@@ -20346,7 +21441,7 @@ begin
     then AVXSub(FDataPtr, Original.FDataPtr, FSize)
     else
     begin
-      vHigh := High(FData);
+      vHigh := FSize - 1;
       for I := 0 to vHigh do
         FData[I] -= Original.FData[I];
     end;

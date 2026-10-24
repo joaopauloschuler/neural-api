@@ -21,12 +21,16 @@ type
     procedure TestVolumeMul;
     procedure TestVolumeDiv;
     procedure TestVolumeResize;
+    // ShareDataPrefixWith: a volume viewing the prefix of larger storage reads
+    // and writes only its Size elements; ReSize/UnshareData detach it.
+    procedure TestVolumeSharePrefixView;
     procedure TestVolumeStatistics;
     procedure TestVolumeMinMax;
     procedure TestVolumeMaxAbsNegativeFirst;
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeAddScalarParity;
+    procedure TestVolumeAddScaledDifferenceParity;
     procedure TestVolumeSumSqrCenteredParity;
     procedure TestVolumeReluGateMaskParity;
     procedure TestVolumeReluGradParity;
@@ -83,9 +87,13 @@ type
     procedure TestAssertFiniteDetectsInf;
     procedure TestAssertFiniteNilVolume;
     procedure TestNeuralBoxIoU;
+    procedure TestNeuralLinearSumAssignment;
     procedure TestNeuralGreedyNMS;
     procedure TestLocalResponse2DMatchesReference;
     procedure TestLocalResponseDepthMatchesReference;
+    procedure TestStdNormalStreamDeterministicAndPrivate;
+    procedure TestRandomStdNormalMoments;
+    procedure TestAddLayersDepthConcatNonSquare;
   end;
 
   // TNNetVolumeQuant8 holds int8 codes under the TNNetVolume geometry
@@ -144,6 +152,73 @@ type
 
 implementation
 
+procedure TTestNeuralVolume.TestStdNormalStreamDeterministicAndPrivate;
+const
+  cCount = 20000;
+var
+  A, B: TStdNormalStream;
+  I: integer;
+  V, Sum, SumSq, Mean, Variance: double;
+  SavedSeed: longword;
+begin
+  RandSeed := 31337;
+  SavedSeed := RandSeed;
+  StdNormalStreamInit(A, 42);
+  StdNormalStreamInit(B, 42);
+  Sum := 0;
+  SumSq := 0;
+  for I := 0 to cCount - 1 do
+  begin
+    V := StdNormalStreamNext(A);
+    AssertEquals('same seed gives the same sequence', V, StdNormalStreamNext(B), 0);
+    Sum := Sum + V;
+    SumSq := SumSq + V * V;
+  end;
+  AssertTrue('the stream must not move the global RNG', SavedSeed = RandSeed);
+  Mean := Sum / cCount;
+  Variance := SumSq / cCount - Mean * Mean;
+  AssertEquals('stream mean ~ 0', 0.0, Mean, 0.05);
+  AssertEquals('stream variance ~ 1', 1.0, Variance, 0.05);
+  StdNormalStreamInit(B, 43);
+  StdNormalStreamInit(A, 42);
+  AssertTrue('different seeds differ',
+    StdNormalStreamNext(A) <> StdNormalStreamNext(B));
+end;
+
+procedure TTestNeuralVolume.TestRandomStdNormalMoments;
+const
+  cCount = 20000;
+var
+  I: integer;
+  V, Sum, SumSq, Mean, Variance: double;
+  Vol: TNNetVolume;
+begin
+  RandSeed := 2718;
+  Sum := 0;
+  SumSq := 0;
+  for I := 0 to cCount - 1 do
+  begin
+    V := RandomStdNormal();
+    Sum := Sum + V;
+    SumSq := SumSq + V * V;
+  end;
+  Mean := Sum / cCount;
+  Variance := SumSq / cCount - Mean * Mean;
+  AssertEquals('RandomStdNormal mean ~ 0', 0.0, Mean, 0.05);
+  AssertEquals('RandomStdNormal variance ~ 1', 1.0, Variance, 0.05);
+  // TVolume.RandomGaussianValue is the same draw on the global RNG.
+  Vol := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 99;
+    V := RandomStdNormal();
+    RandSeed := 99;
+    AssertEquals('RandomGaussianValue shares RandomStdNormal', V,
+      Vol.RandomGaussianValue(), 0);
+  finally
+    Vol.Free;
+  end;
+end;
+
 procedure TTestNeuralVolume.TestVolumeCreation;
 var
   V: TNNetVolume;
@@ -171,6 +246,40 @@ begin
       AssertEquals('All values should be 5.0', 5.0, V.Raw[I], 0.0001);
   finally
     V.Free;
+  end;
+end;
+
+// AddLayers(A, B) is a depth concat: A's channels first, then B's, on a
+// non-square grid.
+procedure TTestNeuralVolume.TestAddLayersDepthConcatNonSquare;
+var
+  A, B, Dst: TNNetVolume;
+  X, Y, D: integer;
+begin
+  A := TNNetVolume.Create(3, 2, 2);
+  B := TNNetVolume.Create(3, 2, 3);
+  Dst := TNNetVolume.Create;
+  try
+    for X := 0 to 2 do
+      for Y := 0 to 1 do
+      begin
+        for D := 0 to 1 do A[X, Y, D] := 100 * X + 10 * Y + D;
+        for D := 0 to 2 do B[X, Y, D] := -(100 * X + 10 * Y + D);
+      end;
+    Dst.AddLayers(A, B);
+    AssertEquals('SizeX', 3, Dst.SizeX);
+    AssertEquals('SizeY', 2, Dst.SizeY);
+    AssertEquals('Depth', 5, Dst.Depth);
+    for X := 0 to 2 do
+      for Y := 0 to 1 do
+      begin
+        for D := 0 to 1 do
+          AssertEquals('A part', A[X, Y, D], Dst[X, Y, D], 0.0);
+        for D := 0 to 2 do
+          AssertEquals('B part', B[X, Y, D], Dst[X, Y, D + 2], 0.0);
+      end;
+  finally
+    A.Free; B.Free; Dst.Free;
   end;
 end;
 
@@ -337,6 +446,84 @@ begin
     AssertEquals('After resize total size should be 1500', 1500, V.Size);
   finally
     V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSharePrefixView;
+var
+  Storage, View, Private, Copied: TNNetVolume;
+  ElementPos, MaxElementPos: integer;
+  Raised: boolean;
+begin
+  Storage := TNNetVolume.Create(4, 3, 2);
+  View := TNNetVolume.Create(3, 2, 2);
+  Private := TNNetVolume.Create(3, 2, 2);
+  Copied := TNNetVolume.Create();
+  try
+    Storage.AllocateData(40);
+    AssertEquals('AllocateData capacity', 40, Length(Storage.FData));
+    AssertEquals('AllocateData keeps Size', 24, Storage.Size);
+    AssertTrue('HasData with spare capacity', Storage.HasData());
+    MaxElementPos := Length(Storage.FData) - 1;
+    for ElementPos := 0 to MaxElementPos do
+      Storage.FData[ElementPos] := 1000 + ElementPos;
+    View.ShareDataPrefixWith(Storage);
+    AssertTrue('same storage', Pointer(View.FData) = Pointer(Storage.FData));
+    AssertTrue('DataPtr follows', View.DataPtr = Storage.DataPtr);
+    MaxElementPos := View.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+    begin
+      View.FData[ElementPos] := ElementPos - 5.5;
+      Private.FData[ElementPos] := ElementPos - 5.5;
+    end;
+    AssertEquals('a write reaches the storage', -5.5, Storage.FData[0], 0);
+    AssertEquals('GetSum reads Size', Private.GetSum(), View.GetSum(), 0);
+    AssertEquals('GetSumSqr reads Size', Private.GetSumSqr(), View.GetSumSqr(), 0);
+    AssertEquals('GetMax reads Size', Private.GetMax(), View.GetMax(), 0);
+    AssertEquals('GetMin reads Size', Private.GetMin(), View.GetMin(), 0);
+    AssertEquals('GetMaxAbs reads Size', Private.GetMaxAbs(), View.GetMaxAbs(), 0);
+    AssertEquals('GetNonZero reads Size', Private.GetNonZero(), View.GetNonZero());
+    AssertEquals('GetClass reads Size', Private.GetClass(), View.GetClass());
+    AssertEquals('SaveToString reads Size', Private.SaveToString(),
+      View.SaveToString());
+    Copied.Copy(View);
+    AssertEquals('Copy takes Size elements', 12, Length(Copied.FData));
+    AssertEquals('Copy matches', 0, Copied.SumDiff(Private), 0);
+    View.Fill(2);
+    View.Add(Private);
+    View.Mul(3);
+    View.Sub(Private);
+    View.Divi(2);
+    AssertEquals('bulk ops stop at Size', 1000 + 12, Storage.FData[12], 0);
+    AssertEquals('bulk ops stop at the last element', 1000 + 39,
+      Storage.FData[39], 0);
+    Raised := false;
+    try
+      Private.ReSize(10, 5, 1);
+      Private.ShareDataPrefixWith(Storage);
+    except
+      Raised := true;
+    end;
+    AssertTrue('storage smaller than Size raises', Raised);
+    // A ReSize to another size gives the view its own copy of the prefix.
+    View.ReSize(2, 2, 2);
+    AssertTrue('ReSize detaches', Pointer(View.FData) <> Pointer(Storage.FData));
+    AssertEquals('detached length', 8, Length(View.FData));
+    View.ReSize(3, 2, 2);
+    View.ShareDataPrefixWith(Storage);
+    View.UnshareData();
+    AssertTrue('UnshareData detaches', Pointer(View.FData) <> Pointer(Storage.FData));
+    AssertEquals('UnshareData takes Size elements', 12, Length(View.FData));
+    View.ShareDataPrefixWith(Storage);
+    View.FData[0] := 7;
+    Storage.UnshareData();
+    AssertEquals('UnshareData trims the storage', 24, Length(Storage.FData));
+    AssertEquals('the view keeps the old storage', 7, View.FData[0], 0);
+  finally
+    Copied.Free;
+    Private.Free;
+    View.Free;
+    Storage.Free;
   end;
 end;
 
@@ -517,6 +704,48 @@ begin
   Buf[0] := 5.0;
   TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
   AssertEquals('empty run', 5.0, Buf[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeAddScaledDifferenceParity;
+// Dst := A + Scale * (B - C). The AVX2 lanes fuse the multiply-add, so the
+// tolerance is a rounding step; Dst aliasing A is the running-sum use.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 31, 32, 33, 39, 64, 65, 97, 1000);
+  cScale = 0.04;
+var
+  A, B, C, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(A, N);
+    SetLength(B, N);
+    SetLength(C, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      A[K] := (Random - 0.5) * 8;
+      B[K] := (Random - 0.5) * 8;
+      C[K] := (Random - 0.5) * 8;
+      Ref[K] := A[K] + cScale * (B[K] - C[K]);
+      Dst[K] := 12345;
+    end;
+    TNNetVolume.AddScaledDifference(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@A[0]), TNeuralFloatArrPtr(@B[0]),
+      TNeuralFloatArrPtr(@C[0]), cScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('AddScaledDifference[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 1e-6);
+    TNNetVolume.AddScaledDifference(TNeuralFloatArrPtr(@A[0]),
+      TNeuralFloatArrPtr(@A[0]), TNeuralFloatArrPtr(@B[0]),
+      TNeuralFloatArrPtr(@C[0]), cScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('AddScaledDifference in place[' + IntToStr(K) + '] (N=' +
+        IntToStr(N) + ')', Ref[K], A[K], 1e-6);
+  end;
 end;
 
 procedure TTestNeuralVolume.TestVolumeSumSqrCenteredParity;
@@ -2787,6 +3016,117 @@ begin
   // Degenerate (zero-area) box -> 0.
   AssertEquals('Degenerate box IoU', 0.0,
     NeuralBoxIoU(5, 5, 5, 5, 0, 0, 10, 10), 1e-5);
+end;
+
+procedure TTestNeuralVolume.TestNeuralLinearSumAssignment;
+var
+  Cost: array of TNeuralFloat;
+  RowToCol: array of integer;
+  ColUsed: array of boolean;
+  Work: TNeuralAssignmentWork;
+  Rows, Cols, Trial, RowPos, ColPos, AssignedCount: integer;
+  Total, BruteBest, CheckSum: TNeuralFloat;
+  SizeLabel: string;
+
+  // Exhaustive optimum: every row takes a distinct column, or is skipped when
+  // Rows > Cols (exactly Rows - Cols skips).
+  procedure BruteForce(Row, SkipsLeft: integer; Acc: TNeuralFloat);
+  var
+    Col: integer;
+  begin
+    if Row = Rows then
+    begin
+      if (SkipsLeft = 0) and (Acc < BruteBest) then BruteBest := Acc;
+      Exit;
+    end;
+    for Col := 0 to Cols - 1 do
+      if not ColUsed[Col] then
+      begin
+        ColUsed[Col] := True;
+        BruteForce(Row + 1, SkipsLeft, Acc + Cost[Row * Cols + Col]);
+        ColUsed[Col] := False;
+      end;
+    if SkipsLeft > 0 then BruteForce(Row + 1, SkipsLeft - 1, Acc);
+  end;
+
+  procedure CheckAgainstBruteForce(const What: string);
+  var
+    CellRow, CellCol: integer;
+  begin
+    SetLength(RowToCol, Rows);
+    SetLength(ColUsed, Cols);
+    Total := NeuralLinearSumAssignment(Cost, Rows, Cols, RowToCol, Work);
+    AssignedCount := 0;
+    CheckSum := 0;
+    for CellCol := 0 to Cols - 1 do ColUsed[CellCol] := False;
+    for CellRow := 0 to Rows - 1 do
+      if RowToCol[CellRow] >= 0 then
+      begin
+        AssertTrue(What + ' column in range', RowToCol[CellRow] < Cols);
+        AssertFalse(What + ' column used twice', ColUsed[RowToCol[CellRow]]);
+        ColUsed[RowToCol[CellRow]] := True;
+        Inc(AssignedCount);
+        CheckSum := CheckSum + Cost[CellRow * Cols + RowToCol[CellRow]];
+      end;
+    AssertEquals(What + ' assigned count', Min(Rows, Cols), AssignedCount);
+    AssertEquals(What + ' total = sum of assigned cells', CheckSum, Total, 1e-4);
+    for CellCol := 0 to Cols - 1 do ColUsed[CellCol] := False;
+    BruteBest := MaxSingle;
+    BruteForce(0, Max(0, Rows - Cols), 0);
+    AssertEquals(What + ' total = brute-force optimum', BruteBest, Total, 1e-4);
+  end;
+
+begin
+  RandSeed := 20261023;
+  // Random real-valued (incl. negative) matrices, both N < M and N > M, one
+  // Work reused across all sizes so it grows and is then reused smaller.
+  for Rows := 1 to 6 do
+    for Cols := 1 to 6 do
+      for Trial := 1 to 4 do
+      begin
+        SetLength(Cost, Rows * Cols);
+        for RowPos := 0 to Rows * Cols - 1 do Cost[RowPos] := Random * 10 - 3;
+        SizeLabel := IntToStr(Rows) + 'x' + IntToStr(Cols) + ' #' + IntToStr(Trial);
+        CheckAgainstBruteForce('Random ' + SizeLabel);
+        // Small-integer costs: many ties.
+        for RowPos := 0 to Rows * Cols - 1 do Cost[RowPos] := Random(3);
+        CheckAgainstBruteForce('Ties ' + SizeLabel);
+      end;
+  // All-equal 4x5 matrix: every full assignment is optimal.
+  Rows := 4; Cols := 5;
+  SetLength(Cost, Rows * Cols);
+  for RowPos := 0 to Rows * Cols - 1 do Cost[RowPos] := 1;
+  CheckAgainstBruteForce('All-equal 4x5');
+  AssertEquals('All-equal 4x5 total', 4.0, Total, 1e-6);
+  // Known 3x3 (scipy docs example): rows -> [1, 0, 2], total 5.
+  Rows := 3; Cols := 3;
+  SetLength(Cost, 9);
+  Cost[0] := 4; Cost[1] := 1; Cost[2] := 3;
+  Cost[3] := 2; Cost[4] := 0; Cost[5] := 5;
+  Cost[6] := 3; Cost[7] := 2; Cost[8] := 2;
+  CheckAgainstBruteForce('scipy 3x3');
+  AssertEquals('scipy 3x3 row 0', 1, RowToCol[0]);
+  AssertEquals('scipy 3x3 row 1', 0, RowToCol[1]);
+  AssertEquals('scipy 3x3 row 2', 2, RowToCol[2]);
+  AssertEquals('scipy 3x3 total', 5.0, Total, 1e-6);
+  // 1x1.
+  SetLength(Cost, 1);
+  Cost[0] := -2.5;
+  SetLength(RowToCol, 1);
+  Total := NeuralLinearSumAssignment(Cost, 1, 1, RowToCol);
+  AssertEquals('1x1 assignment', 0, RowToCol[0]);
+  AssertEquals('1x1 total', -2.5, Total, 1e-6);
+  // 0-size: no columns leaves every row unassigned; no rows is a no-op.
+  SetLength(Cost, 0);
+  SetLength(RowToCol, 3);
+  RowToCol[0] := 7; RowToCol[1] := 7; RowToCol[2] := 7;
+  Total := NeuralLinearSumAssignment(Cost, 3, 0, RowToCol, Work);
+  AssertEquals('3x0 total', 0.0, Total, 1e-6);
+  for RowPos := 0 to 2 do
+    AssertEquals('3x0 row unassigned', -1, RowToCol[RowPos]);
+  SetLength(RowToCol, 0);
+  Total := NeuralLinearSumAssignment(Cost, 0, 4, RowToCol, Work);
+  AssertEquals('0x4 total', 0.0, Total, 1e-6);
 end;
 
 procedure TTestNeuralVolume.TestNeuralGreedyNMS;

@@ -18,12 +18,13 @@ uses
   TestNeuralLengthGrouped,
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
-  TestNeuralTokenizer, TestNeuralImagePreprocess,
+  TestNeuralTokenizer, TestNeuralImagePreprocess, TestNeuralGIF,
   TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
   TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks,
   TestNeuralSWA, TestNeuralFusedSDPA, TestNeuralABFun, TestNeuralReduction,
   TestNeuralBytePrediction, TestNeuralG2P, TestNeuralPlainOps,
-  TestNeuralDecision, TestNeuralAnyJev, TestNeuralDecisionHeads{$IFDEF OpenCL}, neuralopencl{$ENDIF};
+  TestNeuralDecision, TestNeuralAnyJev, TestNeuralDecisionHeads,
+  TestNeuralGaussianSplat, TestNeuralMesh{$IFDEF OpenCL}, neuralopencl{$ENDIF};
 
 type
   TMyTestRunner = class(TTestRunner)
