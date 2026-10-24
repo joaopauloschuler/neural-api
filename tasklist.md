@@ -1960,10 +1960,6 @@ rather than acted on.
               ShareHostOutputsByLiveness on (80 MB of weights); profile which
               layers hold it (stem convs at 320 x 320, the valid-mask
               TNNetCellMul table of 8400 x 256) and trim.
-        - [ ] TNNetInverseSigmoid OpenCL forward: the box-refinement chain
-              (inverse_sigmoid -> TNNetSum -> TNNetSigmoid) runs on the host, so
-              from decoder layer 1 on the deformable attention uploads its
-              reference source (TestRtDetrOpenCL prints it).
         - [ ] GPU-box timing of the RT-DETR OpenCL forward (r18vd/r50vd at
               640 x 640) against the CPU; PoCL on the 1-core VM is not
               representative.
@@ -1971,9 +1967,12 @@ rather than acted on.
               and the auxiliary per-layer losses (inference-only now; the
               decoder computes only the last layer's class head).
         - [ ] Unsupported config options raise: normalize_before = true,
-              learn_initial_query = true, use_timm_backbone; RT-DETRv2
-              (model_type rt_detr_v2: per-level point counts, discrete
-              sampling) is a separate importer.
+              learn_initial_query = true, use_timm_backbone.
+        - [ ] RT-DETRv2 importer (model_type rt_detr_v2): per-level point
+              counts are now in TNNetMultiScaleDeformableAttention (bba33083)
+              and the encoder/decoder helpers live on TRtDetrNetBuilder, so the
+              new code is the discrete sampling method (shared with D-FINE's
+              decoder_method "discrete") and the config reader.
 
 - [X] D-FINE detector importer (BuildDFineFromSafeTensors[Ex], transformers
       model_type "d_fine", DFineForObjectDetection; Apache-2.0 checkpoints
@@ -1995,7 +1994,14 @@ rather than acted on.
         - [ ] Agent or user check on a real ustc-community/dfine-* checkpoint
               (dfine-nano-coco at 640 x 640 under the 2 GB cap): same
               detections as transformers. Not run on the dev box.
-        - [ ] decoder_method "discrete" (rejected at load now).
+        - [ ] decoder_method "discrete" (rejected at load now): integer-
+              rounded sampling positions instead of bilinear; add it as an
+              option of TNNetMultiScaleDeformableAttention (CPU + the
+              cai_ms_deformable_attn kernel), not a second layer.
+        - [ ] DEIM detector (same HGNetV2 + D-FINE decoder, different
+              training): check whether its checkpoints load through
+              BuildDFineFromSafeTensors unchanged; if so, list them in
+              examples/ObjectDetection/README.md as planned (coded).
         - Inference only; training (FDR/GO-LSD distillation losses) is out of
           scope.
 
