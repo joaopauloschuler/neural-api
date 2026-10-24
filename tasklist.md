@@ -1558,6 +1558,36 @@ rather than acted on.
   - [ ] tensor-name mapping targets the transformers 5.11 layout
         (encoder.layers.N.attention.q_proj, decoder.model.decoder.*); add the published
         checkpoints' older DeiT naming if it differs (the fixture is the parity contract).
+- [ ] Text detection for whole pages and photos: DBNet importer (Liao et al., AAAI 2020,
+      arXiv:1911.08947, "Real-time Scene Text Detection with Differentiable
+      Binarization"; the detector in docTR, PaddleOCR and mmocr) + examples/DocumentOCR.
+      Today examples/OCRTranscribe reads ONE cropped text line; nothing in neural/ finds
+      the lines on a page or in a photo, so TrOCR cannot be used on a real document.
+      - Model: docTR `db_mobilenet_v3_large` (and `db_resnet50`), the released torch
+        weights converted to .safetensors in the ~/x venv. Backbone: reuse
+        `BuildMobileNetV3` / `BuildResNet` with their stage outputs exposed (no copy of
+        either). Neck: the DBNet FPN (1x1 lateral convs, top-down add, 3x3 out convs,
+        upsample to 1/4 and concat). Head: conv3x3-BN-ReLU, two stride-2
+        `TNNetDeconvolution` 2x2 (BN-ReLU between), sigmoid -> probability map. Read
+        mean/std and the thresholds from the docTR config, do not hard-code them.
+      - `BuildDBNetFromSafeTensors[Ex]` + `TDBNetConfig` in neuralpretrained.pas, a pico
+        fixture under tests/fixtures and a probability-map parity test (< 1e-4) against
+        docTR in the ~/x venv (put the HF/docTR oracle first, per the test-ordering
+        rule).
+      - Post-processing as reusable routines in neural/ (not in the example): binarize
+        at bin_thresh, 8-connected component labelling, per-component mean probability
+        (box_thresh), axis-aligned box expansion by the DB unclip rule
+        (offset = area * unclip_ratio / perimeter), returned in input-image pixels.
+        Rotated boxes (min-area rectangle) as a second step; check first whether a
+        connected-component or box routine already exists (FastSAM / SAM / Canny code).
+      - examples/DocumentOCR (.lpr + .lpi + README.md, cthreads first): image in ->
+        DBNet boxes -> sort into reading order (top-to-bottom, then left-to-right) ->
+        crop + resize each line -> existing TrOCR (`microsoft/trocr-small-printed`)
+        -> text out, plus `--boxes out.png` drawing the boxes with the existing
+        drawing helpers. Pico fixtures make it run offline; `--gpu` and `--int8` follow
+        the other vision examples.
+      - Real-checkpoint run on a scanned page and a street photo before README.md lists
+        it as supported.
 - [ ] EfficientNet (timm / torchvision efficientnet_b0..b7) importer follow-up
       (BuildEfficientNetFromSafeTensors LANDED, commit d35970c; AddEfficientNetMBConv
       reusing MobileNetV3 MBConv + conv-BN fold, b0..b7 share one JSON-driven builder,
