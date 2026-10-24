@@ -244,13 +244,25 @@ type
     procedure TestMultiScaleDeformableAttentionForward;
     procedure TestMultiScaleDeformableAttentionGradients;
     procedure TestMultiScaleDeformableAttentionSaveLoad;
+    // D-FINE options: equal per-level counts with OffsetScale 0.5 are the old
+    // layer bit for bit; per-level counts (3, 1) with OffsetScale 0.7 against
+    // the naive reference, gradients, save/load and loading an old save.
+    procedure TestMultiScaleDeformableAttentionEqualLevelPointsUnchanged;
+    procedure TestMultiScaleDeformableAttentionPerLevelPointsForward;
+    procedure TestMultiScaleDeformableAttentionPerLevelPointsGradients;
+    procedure TestMultiScaleDeformableAttentionPerLevelPointsSaveLoad;
+    procedure TestMultiScaleDeformableAttentionLoadsOldSave;
     // TNNetTopKGatherTokens: score order, error scatter and save/load.
     procedure TestTopKGatherTokens;
   private
     // Builds offsets|logits input (layer 0), value input and reference input
-    // with deterministic values, then the deformable attention layer.
+    // with deterministic values, then the deformable attention layer built as
+    // Mode says (csDeformMode*).
     procedure BuildDeformableAttentionNet(NN: TNNet; ReferenceDepth: integer;
-      Offsets, Values, References: TNNetVolume);
+      Offsets, Values, References: TNNetVolume; Mode: integer = 0);
+    procedure AssertDeformableForwardMatchesReference(Mode: integer);
+    procedure AssertDeformableGradientsMatchFiniteDifferences(Mode: integer);
+    procedure AssertDeformableSaveLoadRoundTrip(Mode: integer);
     // Naive per-tap reference for a padded dilated convolution.
     procedure AssertConvolutionDilatedMatchesReference(Padding, Stride,
       Dilation: integer; UseReLU: boolean; FeatureSizeX: integer = 3;
@@ -9797,14 +9809,37 @@ const
   csDeformHeadDim = 3;
   csDeformLevelShapes: array[0..3] of integer = (3, 4, 2, 2); // (H, W) pairs
   csDeformTokens = 3 * 4 + 2 * 2;
+  // BuildDeformableAttentionNet modes: the (Points, LevelShapes) constructor,
+  // the per-level constructor with equal counts and OffsetScale 0.5, and the
+  // per-level constructor with csDeformLevelPoints and csDeformOffsetScale.
+  csDeformModeLegacy = 0;
+  csDeformModeEqualLevelPoints = 1;
+  csDeformModePerLevelPoints = 2;
+  csDeformLevelPoints: array[0..1] of integer = (3, 1);
+  csDeformOffsetScale = 0.7;
+
+// P_l of level Level and the OffsetScale a csDeformMode* net is built with.
+function DeformLevelPoints(Mode, Level: integer): integer;
+begin
+  if Mode = csDeformModePerLevelPoints then Result := csDeformLevelPoints[Level]
+  else Result := csDeformPoints;
+end;
+
+function DeformOffsetScale(Mode: integer): TNeuralFloat;
+begin
+  if Mode = csDeformModePerLevelPoints then Result := csDeformOffsetScale
+  else Result := 0.5;
+end;
 
 procedure TTestNeuralLayersExtra.BuildDeformableAttentionNet(NN: TNNet;
-  ReferenceDepth: integer; Offsets, Values, References: TNNetVolume);
+  ReferenceDepth: integer; Offsets, Values, References: TNNetVolume;
+  Mode: integer);
 var
-  OffsetInput, ValueInput, ReferenceInput: TNNetLayer;
-  Pos, Query: integer;
+  OffsetInput, ValueInput, ReferenceInput, Deformable: TNNetLayer;
+  Pos, Query, SampleCount: integer;
 begin
-  Offsets.ReSize(csDeformQueries, 1, csDeformHeads * 2 * csDeformPoints * 3);
+  SampleCount := DeformLevelPoints(Mode, 0) + DeformLevelPoints(Mode, 1);
+  Offsets.ReSize(csDeformQueries, 1, csDeformHeads * SampleCount * 3);
   Values.ReSize(csDeformTokens, 1, csDeformHeads * csDeformHeadDim);
   References.ReSize(csDeformQueries, 1, ReferenceDepth);
   for Pos := 0 to Offsets.Size - 1 do
@@ -9826,25 +9861,35 @@ begin
     Values.Depth, 1), 0);
   ReferenceInput := NN.AddLayerAfter(TNNetInput.Create(csDeformQueries, 1,
     ReferenceDepth, 1), 0);
-  NN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(csDeformHeads,
-    csDeformPoints, csDeformLevelShapes, ValueInput, ReferenceInput), OffsetInput);
+  if Mode = csDeformModeLegacy then
+    Deformable := TNNetMultiScaleDeformableAttention.Create(csDeformHeads,
+      csDeformPoints, csDeformLevelShapes, ValueInput, ReferenceInput)
+  else
+    Deformable := TNNetMultiScaleDeformableAttention.Create(csDeformHeads,
+      [DeformLevelPoints(Mode, 0), DeformLevelPoints(Mode, 1)],
+      csDeformLevelShapes, ValueInput, ReferenceInput, DeformOffsetScale(Mode));
+  NN.AddLayerAfter(Deformable, OffsetInput);
   ValueInput.Output.Copy(Values);
   ReferenceInput.Output.Copy(References);
 end;
 
-// Naive reference: softmax per (query, head), loc = ref + offset scaled, then
-// grid_sample(align_corners=False, zeros) corner by corner.
-procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionForward;
+// Naive reference: softmax per (query, head) over every level's points,
+// loc = ref + offset scaled, then grid_sample(align_corners=False, zeros)
+// corner by corner.
+procedure TTestNeuralLayersExtra.AssertDeformableForwardMatchesReference(
+  Mode: integer);
 var
   NN: TNNet;
   Offsets, Values, References: TNNetVolume;
   ReferenceDepth, Query, Head, Level, Point, Channel, Sample, CornerX, CornerY: integer;
   LevelStart, LevelW, LevelH, SampleCount, X0, Y0, Depth: integer;
-  Logits: array[0..3] of double;
+  LevelPoints, LevelSampleStart: integer;
+  Logits: array[0..7] of double;
   MaxLogit, ExpSum, LocX, LocY, PixelX, PixelY, Weight, Expected, MaxDiff: double;
-  OffsetX, OffsetY: double;
+  OffsetX, OffsetY, OffsetScale: double;
 begin
-  SampleCount := 2 * csDeformPoints;
+  SampleCount := DeformLevelPoints(Mode, 0) + DeformLevelPoints(Mode, 1);
+  OffsetScale := DeformOffsetScale(Mode);
   Depth := csDeformHeads * SampleCount * 3;
   for ReferenceDepth := 2 to 4 do
   begin
@@ -9854,7 +9899,8 @@ begin
     Values := TNNetVolume.Create();
     References := TNNetVolume.Create();
     try
-      BuildDeformableAttentionNet(NN, ReferenceDepth, Offsets, Values, References);
+      BuildDeformableAttentionNet(NN, ReferenceDepth, Offsets, Values, References,
+        Mode);
       NN.Compute(Offsets);
       MaxDiff := 0;
       for Query := 0 to csDeformQueries - 1 do
@@ -9877,21 +9923,23 @@ begin
           begin
             Expected := 0;
             LevelStart := 0;
+            LevelSampleStart := 0;
             for Level := 0 to 1 do
             begin
               LevelH := csDeformLevelShapes[2 * Level];
               LevelW := csDeformLevelShapes[2 * Level + 1];
-              for Point := 0 to csDeformPoints - 1 do
+              LevelPoints := DeformLevelPoints(Mode, Level);
+              for Point := 0 to LevelPoints - 1 do
               begin
-                Sample := Level * csDeformPoints + Point;
+                Sample := LevelSampleStart + Point;
                 OffsetX := Offsets.Raw[Query * Depth + (Head * SampleCount + Sample) * 2];
                 OffsetY := Offsets.Raw[Query * Depth + (Head * SampleCount + Sample) * 2 + 1];
                 if ReferenceDepth = 4 then
                 begin
-                  LocX := References.Raw[Query * 4] + OffsetX / csDeformPoints *
-                    References.Raw[Query * 4 + 2] * 0.5;
-                  LocY := References.Raw[Query * 4 + 1] + OffsetY / csDeformPoints *
-                    References.Raw[Query * 4 + 3] * 0.5;
+                  LocX := References.Raw[Query * 4] + OffsetX / LevelPoints *
+                    References.Raw[Query * 4 + 2] * OffsetScale;
+                  LocY := References.Raw[Query * 4 + 1] + OffsetY / LevelPoints *
+                    References.Raw[Query * 4 + 3] * OffsetScale;
                 end
                 else
                 begin
@@ -9915,14 +9963,16 @@ begin
                   end;
               end;
               Inc(LevelStart, LevelW * LevelH);
+              Inc(LevelSampleStart, LevelPoints);
             end;
             MaxDiff := Max(MaxDiff, Abs(Expected - NN.GetLastLayer.Output.Raw[
               Query * csDeformHeads * csDeformHeadDim + Head * csDeformHeadDim +
               Channel]));
           end;
         end;
-      AssertTrue('reference depth ' + IntToStr(ReferenceDepth) + ' max |diff| = ' +
-        FloatToStr(MaxDiff), MaxDiff < 1e-5);
+      AssertTrue('mode ' + IntToStr(Mode) + ' reference depth ' +
+        IntToStr(ReferenceDepth) + ' max |diff| = ' + FloatToStr(MaxDiff),
+        MaxDiff < 1e-5);
     finally
       References.Free;
       Values.Free;
@@ -9932,7 +9982,13 @@ begin
   end;
 end;
 
-procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionGradients;
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionForward;
+begin
+  AssertDeformableForwardMatchesReference(csDeformModeLegacy);
+end;
+
+procedure TTestNeuralLayersExtra.AssertDeformableGradientsMatchFiniteDifferences(
+  Mode: integer);
 const
   Epsilon = 0.0005;
 var
@@ -9964,7 +10020,7 @@ begin
   Desired := TNNetVolume.Create();
   Probe := TNNetVolume.Create();
   try
-    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References);
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References, Mode);
     NN.Layers[0].Output.Copy(Offsets);
     for SourcePos := 0 to 2 do Sources[SourcePos] := NN.Layers[SourcePos];
     NN.SetLearningRate(1.0, 0.0);
@@ -9990,9 +10046,9 @@ begin
         NN.Backpropagate(Desired);
         Analytical := Sources[SourcePos].OutputError.Raw[Pos];
         MaxError := Max(MaxError, Abs(Numerical - Analytical));
-        AssertTrue('source ' + IntToStr(SourcePos) + ' element ' + IntToStr(Pos) +
-          ' numerical ' + FloatToStr(Numerical) + ' analytical ' +
-          FloatToStr(Analytical), Abs(Numerical - Analytical) < 0.01);
+        AssertTrue('mode ' + IntToStr(Mode) + ' source ' + IntToStr(SourcePos) +
+          ' element ' + IntToStr(Pos) + ' numerical ' + FloatToStr(Numerical) +
+          ' analytical ' + FloatToStr(Analytical), Abs(Numerical - Analytical) < 0.01);
         Inc(Checked);
       end;
     AssertTrue('every source element checked', Checked > 100);
@@ -10006,7 +10062,12 @@ begin
   end;
 end;
 
-procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionSaveLoad;
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionGradients;
+begin
+  AssertDeformableGradientsMatchFiniteDifferences(csDeformModeLegacy);
+end;
+
+procedure TTestNeuralLayersExtra.AssertDeformableSaveLoadRoundTrip(Mode: integer);
 var
   NN, Loaded: TNNet;
   Offsets, Values, References: TNNetVolume;
@@ -10019,7 +10080,7 @@ begin
   Values := TNNetVolume.Create();
   References := TNNetVolume.Create();
   try
-    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References);
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References, Mode);
     NN.Compute(Offsets);
     Saved := NN.SaveToString();
     Loaded.LoadFromString(Saved);
@@ -10032,6 +10093,107 @@ begin
     for Pos := 0 to NN.GetLastLayer.Output.Size - 1 do
       AssertEquals('output ' + IntToStr(Pos), NN.GetLastLayer.Output.Raw[Pos],
         Loaded.GetLastLayer.Output.Raw[Pos], 1e-6);
+  finally
+    References.Free;
+    Values.Free;
+    Offsets.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionSaveLoad;
+begin
+  AssertDeformableSaveLoadRoundTrip(csDeformModeLegacy);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionEqualLevelPointsUnchanged;
+var
+  LegacyNN, LevelPointsNN: TNNet;
+  Offsets, Values, References: TNNetVolume;
+  ReferenceDepth, Pos: integer;
+begin
+  for ReferenceDepth := 2 to 4 do
+  begin
+    if ReferenceDepth = 3 then continue;
+    LegacyNN := TNNet.Create();
+    LevelPointsNN := TNNet.Create();
+    Offsets := TNNetVolume.Create();
+    Values := TNNetVolume.Create();
+    References := TNNetVolume.Create();
+    try
+      BuildDeformableAttentionNet(LegacyNN, ReferenceDepth, Offsets, Values,
+        References, csDeformModeLegacy);
+      BuildDeformableAttentionNet(LevelPointsNN, ReferenceDepth, Offsets, Values,
+        References, csDeformModeEqualLevelPoints);
+      LegacyNN.Compute(Offsets);
+      LevelPointsNN.Compute(Offsets);
+      AssertEquals('same saved structure', LegacyNN.SaveStructureToString(),
+        LevelPointsNN.SaveStructureToString());
+      for Pos := 0 to LegacyNN.GetLastLayer.Output.Size - 1 do
+        AssertTrue('reference depth ' + IntToStr(ReferenceDepth) + ' output ' +
+          IntToStr(Pos) + ' must be bit-identical',
+          LegacyNN.GetLastLayer.Output.Raw[Pos] =
+          LevelPointsNN.GetLastLayer.Output.Raw[Pos]);
+    finally
+      References.Free;
+      Values.Free;
+      Offsets.Free;
+      LevelPointsNN.Free;
+      LegacyNN.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionPerLevelPointsForward;
+begin
+  AssertDeformableForwardMatchesReference(csDeformModePerLevelPoints);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionPerLevelPointsGradients;
+begin
+  AssertDeformableGradientsMatchFiniteDifferences(csDeformModePerLevelPoints);
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionPerLevelPointsSaveLoad;
+begin
+  AssertDeformableSaveLoadRoundTrip(csDeformModePerLevelPoints);
+end;
+
+// A structure saved before the per-level counts existed carries all-zero
+// floats; it must load as Points on every level and OffsetScale 0.5.
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionLoadsOldSave;
+var
+  NN, Loaded: TNNet;
+  Offsets, Values, References: TNNetVolume;
+  Structure, OldStructure: string;
+  Pos: integer;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Offsets := TNNetVolume.Create();
+  Values := TNNetVolume.Create();
+  References := TNNetVolume.Create();
+  try
+    BuildDeformableAttentionNet(NN, 4, Offsets, Values, References,
+      csDeformModeLegacy);
+    NN.Compute(Offsets);
+    Structure := NN.SaveStructureToString();
+    // The deformable layer is the last one, so its floats close the string.
+    Pos := Length(Structure);
+    while (Pos > 0) and (Structure[Pos] <> ':') do Dec(Pos);
+    AssertTrue('float section found', Pos > 0);
+    OldStructure := Copy(Structure, 1, Pos) + '0;0;0;0;0;0;0;0';
+    AssertFalse('the old save differs from the new one', OldStructure = Structure);
+    Loaded.LoadStructureFromString(OldStructure);
+    AssertEquals('an old save re-saves with the new floats', Structure,
+      Loaded.SaveStructureToString());
+    Loaded.Layers[1].Output.Copy(Values);
+    Loaded.Layers[2].Output.Copy(References);
+    Loaded.Compute(Offsets);
+    for Pos := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('output ' + IntToStr(Pos) + ' must be bit-identical',
+        NN.GetLastLayer.Output.Raw[Pos] = Loaded.GetLastLayer.Output.Raw[Pos]);
   finally
     References.Free;
     Values.Free;

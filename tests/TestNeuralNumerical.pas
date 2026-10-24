@@ -72994,6 +72994,9 @@ const
   csLevelShapes: array[0..3] of integer = (3, 4, 2, 2);
   csTokens = 3 * 4 + 2 * 2;
   csQueryTokens: array[0..4] of integer = (0, 3, 7, 11, 15);
+  // D-FINE's options: one point count per level and decoder_offset_scale.
+  csLevelPoints: array[0..1] of integer = (4, 1);
+  csOffsetScale = 0.7;
 var
   NN: TNNet;
   Inputs: array[0..1] of TNNetVolume;
@@ -73003,6 +73006,8 @@ var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   ReferenceDepth, InputPos, Pos, MaxPos, SentinelSurvivors, SentinelTotal: integer;
+  SampleCount: integer;
+  HasLevelPoints: boolean;
   MaxDiff: TNeuralFloat;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
@@ -73016,10 +73021,13 @@ begin
     OutCPU[InputPos] := TNNetVolume.Create();
   end;
   try
+    for HasLevelPoints := false to true do
     for ReferenceDepth := 2 to 4 do
     begin
       if ReferenceDepth = 3 then continue;
       RandSeed := 20261024 + ReferenceDepth;
+      if HasLevelPoints then SampleCount := csLevelPoints[0] + csLevelPoints[1]
+      else SampleCount := 2 * csPoints;
       NN := TNNet.Create();
       try
         InputLayer := NN.AddLayer(TNNetInput.Create(csTokens, 1, csInputDepth));
@@ -73030,9 +73038,13 @@ begin
         NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(ReferenceDepth), Queries);
         References := NN.AddLayer(TNNetSigmoid.Create());
         Offsets := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
-          csHeads * 2 * csPoints * 3), Queries);
-        Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads, csPoints,
-          csLevelShapes, Values, References);
+          csHeads * SampleCount * 3), Queries);
+        if HasLevelPoints then
+          Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads,
+            csLevelPoints, csLevelShapes, Values, References, csOffsetScale)
+        else
+          Deformable := TNNetMultiScaleDeformableAttention.Create(csHeads,
+            csPoints, csLevelShapes, Values, References);
         NN.AddLayerAfter(Deformable, Offsets);
         NN.SetTrainable(False, False);
         // Wide offsets push some samples across and past the level borders.
@@ -73079,7 +73091,8 @@ begin
           NN.ForceOpenCL(False);
         end;
         WriteLn('  MultiScaleDeformableAttention OpenCL parity (reference depth ',
-          ReferenceDepth, '): max|diff|=', MaxDiff:0:9,
+          ReferenceDepth, ', per-level points ', HasLevelPoints, '): max|diff|=',
+          MaxDiff:0:9,
           ' gpu forwards=', Deformable.ForwardGPUCnt,
           ' source sentinels=', SentinelSurvivors, '/', SentinelTotal);
         AssertTrue('deformable attention must reach OpenCL',
@@ -75440,7 +75453,7 @@ end;
 // The activations TestActivationOpenCLParity and TestActivationOpenCLExtremeInputs
 // cover, one per variant: adding one is a name here and a line in CreateParityActivation.
 const
-  csActivationParityNames: array[0..75] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  csActivationParityNames: array[0..77] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
@@ -75455,7 +75468,7 @@ const
     'LogCoshActivation', 'TanhExp', 'LeCunTanh', 'PenalizedTanh',
     'SoftExponential alpha 0', 'SoftExponential alpha 0.5',
     'SoftExponential alpha -0.1', 'ISRLU', 'ESwish', 'Swish6', 'ReLUSqrt',
-    'RReLU inference');
+    'RReLU inference', 'InverseSigmoid', 'InverseSigmoid eps 0.01');
 
 function CreateParityActivation(Variant: integer): TNNetLayer;
 begin
@@ -75549,6 +75562,8 @@ begin
       Result := TNNetRReLU.Create();
       TNNetRReLU(Result).Enabled := false;
     end;
+    76: Result := TNNetInverseSigmoid.Create();
+    77: Result := TNNetInverseSigmoid.Create(0.01);
   else Result := nil;
   end;
 end;

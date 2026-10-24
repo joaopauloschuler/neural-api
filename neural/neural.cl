@@ -4173,7 +4173,7 @@ __kernel void cai_softmax
 // 44..46 = the per-channel affine glue (AddChannel, MulChannel, ChannelAffine),
 // 47 = SubMulConstant (TNNetMovingStdNormalization),
 // 48/49 = SwishBeta/MishAlpha, 50..55 = the per-channel learnable activations,
-// 56..72 = the remaining TNNetReLUBase activations (ArcSinh through ReLUSqrt).
+// 56..73 = the remaining TNNetReLUBase activations (ArcSinh through InverseSigmoid).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA,
 // FParamB and FParamC carry the per-layer constants of the parameterized
@@ -4453,7 +4453,7 @@ __kernel void cai_activation
       y = y0 + (SegmentPos - (float)seg) * (y1 - y0);
       break;
     }
-    // 56..72 mirror the host Compute forms, thresholds included.
+    // 56..73 mirror the host Compute forms, thresholds included.
     case 56: // ArcSinh: sign(x) * ln(|x| + sqrt(x^2 + 1)), |x| saturating at 2^125
     {
       const float a = fmin(fabs(x), 0x1p125f);
@@ -4561,6 +4561,13 @@ __kernel void cai_activation
     case 72: // ReLUSqrt: sqrt(max(x, 0))
       y = sqrt(fmax(x, 0.0f));
       break;
+    case 73: // InverseSigmoid: ln(max(c, eps) / max(1 - c, eps)), c = clamp(x, 0, 1).
+    {        // FParamA = eps; FLT_MIN keeps the divide finite when eps = 0 is speculated.
+      const float c = clamp(x, 0.0f, 1.0f);
+      const float EpsFloor = fmax(FParamA, FLT_MIN);
+      y = cai_log(fmax(c, EpsFloor) / fmax(1.0f - c, EpsFloor));
+      break;
+    }
     default: // csActNone / unknown: pass through
       y = x;
   }
@@ -4650,10 +4657,11 @@ __kernel void cai_row_dot_products
 
 // CAI multi-scale deformable attention (TNNetMultiScaleDeformableAttention
 // forward). One work-item per (query, head, group of 4 channels): the softmax of
-// the head's Levels*Points logits, then grid_sample (align_corners=False, zero
-// padding) of each sampling location, weighted by its probability. FOffsets is
-// (Queries, Heads*Levels*Points*3) offsets|logits, FValue (Tokens, Heads*FHeadDim),
-// FRef (Queries, FRefDepth = 2 or 4), FLevelTable (H, W, first token) per level.
+// the head's FSampleCount = sum_l P_l logits, then grid_sample (align_corners=False,
+// zero padding) of each sampling location, weighted by its probability. FOffsets is
+// (Queries, Heads*FSampleCount*3) offsets|logits, FValue (Tokens, Heads*FHeadDim),
+// FRef (Queries, FRefDepth = 2 or 4), FLevelTable (H, W, first token, P_l) per level.
+// A box reference scales an offset by (w, h) * FOffsetScale / P_l.
 // Coded by Claude (AI).
 #define CAI_DEFORM_GROUP 4
 __kernel void cai_ms_deformable_attn
@@ -4661,10 +4669,10 @@ __kernel void cai_ms_deformable_attn
   const int FQueryCount,
   const int FHeads,
   const int FLevels,
-  const int FPoints,
+  const int FSampleCount,
   const int FHeadDim,
   const int FRefDepth,
-  const float FHalfOverPoints,
+  const float FOffsetScale,
   __global const int* FLevelTable,
   __global const float* FOffsets,
   __global const float* FValue,
@@ -4681,7 +4689,7 @@ __kernel void cai_ms_deformable_attn
   const int h = HeadGroup / GroupCount;
   const int c0 = (HeadGroup - h * GroupCount) * CAI_DEFORM_GROUP;
   const int ChannelCount = min(CAI_DEFORM_GROUP, FHeadDim - c0);
-  const int SampleCount = FLevels * FPoints;
+  const int SampleCount = FSampleCount;
   const int ValueDepth = FHeads * FHeadDim;
   __global const float* Row = FOffsets + q * FHeads * SampleCount * 3;
   __global const float* Offs = Row + h * SampleCount * 2;
@@ -4699,12 +4707,14 @@ __kernel void cai_ms_deformable_attn
   int s = 0;
   for (int l = 0; l < FLevels; l++)
   {
-    const int H = FLevelTable[3 * l];
-    const int W = FLevelTable[3 * l + 1];
-    const int Start = FLevelTable[3 * l + 2];
-    const float dLocX = (FRefDepth == 4) ? Ref[2] * FHalfOverPoints : 1.0f / W;
-    const float dLocY = (FRefDepth == 4) ? Ref[3] * FHalfOverPoints : 1.0f / H;
-    for (int p = 0; p < FPoints; p++, s++)
+    const int H = FLevelTable[4 * l];
+    const int W = FLevelTable[4 * l + 1];
+    const int Start = FLevelTable[4 * l + 2];
+    const int Points = FLevelTable[4 * l + 3];
+    const float LevelOffsetScale = FOffsetScale / (float)Points;
+    const float dLocX = (FRefDepth == 4) ? Ref[2] * LevelOffsetScale : 1.0f / W;
+    const float dLocY = (FRefDepth == 4) ? Ref[3] * LevelOffsetScale : 1.0f / H;
+    for (int p = 0; p < Points; p++, s++)
     {
       const float px = (Ref[0] + Offs[2 * s] * dLocX) * W - 0.5f;
       const float py = (Ref[1] + Offs[2 * s + 1] * dLocY) * H - 0.5f;

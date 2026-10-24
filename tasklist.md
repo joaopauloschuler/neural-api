@@ -1991,11 +1991,13 @@ rather than acted on.
           and DEIM checkpoints can reuse it later.
         - Neck blocks DFineRepNCSPELAN4 (RepVgg + CSP) and DFineSCDown
           (pointwise + strided depthwise) in place of the RT-DETR CCFM convs.
-        - Deformable attention with one point count per level
+        - [x] Deformable attention with one point count per level
           (decoder_n_points as a list, num_points_scale = 1/n per point) and
-          decoder_offset_scale. Extend TNNetMultiScaleDeformableAttention and
-          its OpenCL kernel with this option rather than adding a second
-          layer; with equal counts it must give the same result as now.
+          decoder_offset_scale: DONE, the per-level Create overload of
+          TNNetMultiScaleDeformableAttention (FFloatSt [0] scale, [1+l]
+          counts; old saves load unchanged) and cai_ms_deformable_attn.
+          decoder_method "discrete" is not implemented (default is
+          "default"). TNNetInverseSigmoid also runs in OpenCL now (opcode 73).
         - Decoder gate (DFineGate: sigmoid(Linear(concat)) mixes the residual
           and the cross-attention output, then LayerNorm).
         - Fine-grained Distribution Refinement: each layer predicts 4 x
@@ -2565,7 +2567,7 @@ rather than acted on.
 Forward pass only; device backward is limited to `TNNetFullConnect`,
 `TNNetPixelShuffle` and `TNNetBicubicUpsample` (convolution: see "Convolution
 training on OpenCL"). About 69 of the 528 `TNNet*` classes in `neuralnetwork.pas` (2026-10-22)
-declare a `ComputeOpenCL`, and `cai_activation` covers 72 elementwise opcodes on top of
+declare a `ComputeOpenCL`, and `cai_activation` covers 73 elementwise opcodes on top of
 that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
 only when its source is ALREADY resident — which is why the ranking below is by
 "does this layer evict a resident chain to RAM", not by FLOPs.
@@ -2787,7 +2789,7 @@ in-register after the bias add through `cai_fused_act`, which implements the
 eight parameterless opcodes 1-8. `TNNetLayer.IsActivationFunctionInOpenCL` maps
 five host activation functions onto them (ReLU, Sigmoid, Tanh, Swish,
 HardSwish) and returns false for everything else. (2) The STANDALONE
-`cai_activation` kernel, which has 72 opcodes, each wired to its layer classes
+`cai_activation` kernel, which has 73 opcodes, each wired to its layer classes
 through `ComputeActivationOnOpenCL()`. Every elementwise `TNNetReLUBase`
 activation now has one (`TNNetRReLU` reuses 15 = LeakyReLU, device path only
 while `Enabled = false`, i.e. at its fixed inference slope).
