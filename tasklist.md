@@ -1668,6 +1668,12 @@ rather than acted on.
         zq branches so their storage is reused. Left: exact-size slots keep the
         256-channel and 128-channel full-resolution phases in separate storage
         (growable host slots would cut ~1/3 more); no in-place layers.
+  - [ ] VAE follow-up: let a smaller host output reuse a larger free slot in
+        the ShareHostOutputsByLiveness plan (today slots match by exact size),
+        so the 256-channel and 128-channel full-resolution phases share
+        storage; estimated ~1/3 less activation RAM per latent cell (~6 GB for
+        a 30x45 tile). Needs a TNNetVolume that can view a prefix of a larger
+        buffer; check every consumer of shared outputs reads only Size elements.
   - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (TCogVideoXVaeDecoder.Create
         on the downloaded vae folder, a 2-3 latent-frame low-res slice against
         diffusers decode); check the encoder tensors are ignored and no decoder
@@ -1941,6 +1947,13 @@ rather than acted on.
               smoke runs on CPU and PoCL.
         - [ ] Real INRIA scene check (small scene on the dev box, big ones on
               the user's GPU box), including a `--cameras cameras.json` run.
+        - [ ] Device-side sort + binning (radix sort on (tile, depth) keys,
+              then per-tile ranges) so a frame needs no host round-trip; time
+              it against the host BinTiles on a real 1-6 M Gaussian scene first.
+        - [ ] GaussianSplatView orbit target: the centroid of all means is
+              pulled off the object by far background Gaussians on real scenes;
+              use an opacity-weighted median (or the cameras.json look-at
+              centre) as the default target.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
