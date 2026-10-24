@@ -686,6 +686,7 @@ type
     // TNNetTopKGatherTokens on OpenCL vs the CPU over two inputs with different
     // top-K tokens; the gathered features are bound, not downloaded.
     procedure TestTopKGatherTokensOpenCLParity;
+    procedure TestTopKGatherTokensOpenCLSelection;
     // TNNetAttentiveStatsPooling on OpenCL vs the CPU for (T, C) = (1, 3), (7, 5)
     // and (300, 6), one layer per source placement, plus a resident-output consumer.
     procedure TestAttentiveStatsPoolingOpenCLParity;
@@ -73219,6 +73220,164 @@ begin
       Inputs[InputPos].Free;
     end;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The top-K selection runs in OpenCL: the same indices (score descending,
+// lower index first on ties) and gathered values as the host, with neither
+// source nor the gathered tokens read back to RAM.
+procedure TTestNeuralNumerical.TestTopKGatherTokensOpenCLSelection;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  CaseCnt = 6;
+  CaseTokens: array[0..CaseCnt - 1] of integer = (12, 40, 40, 40, 37, 300);
+  CaseDepths: array[0..CaseCnt - 1] of integer = (3, 1, 4, 4, 6, 5);
+  CaseKs: array[0..CaseCnt - 1] of integer = (4, 7, 39, 40, 1, 50);
+  // Rounded scores: many tokens share their maximum.
+  CaseTies: array[0..CaseCnt - 1] of boolean = (false, true, true, true, true, false);
+var
+  NN: TNNet;
+  Inputs, OutCPU, GatheredCPU: array[0..1] of TNNetVolume;
+  TokensCPU: array[0..1] of TNeuralIntegerArray;
+  InputLayer, Features, Scores, Consumer: TNNetLayer;
+  TopK: TNNetTopKGatherTokens;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, InputPos, Pos, MaxPos, Depth, NeuronPos, SentinelSurvivors,
+    SentinelTotal, TokenMismatches, TieCount: integer;
+  MaxDiff, GatherDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for InputPos := 0 to 1 do
+  begin
+    Inputs[InputPos] := TNNetVolume.Create();
+    OutCPU[InputPos] := TNNetVolume.Create();
+    GatheredCPU[InputPos] := TNNetVolume.Create();
+  end;
+  try
+    for CasePos := 0 to CaseCnt - 1 do
+    begin
+      RandSeed := 20261024 + CasePos;
+      Depth := CaseDepths[CasePos];
+      NN := TNNet.Create();
+      try
+        InputLayer := NN.AddLayer(TNNetInput.Create(CaseTokens[CasePos], 1, Depth));
+        // Identity weights: the scores are the (possibly rounded) inputs exactly.
+        Scores := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth), InputLayer);
+        for NeuronPos := 0 to Depth - 1 do
+        begin
+          Scores.Neurons[NeuronPos].Weights.Fill(0);
+          Scores.Neurons[NeuronPos].Weights.Raw[NeuronPos] := 1;
+          Scores.Neurons[NeuronPos].BiasWeight := 0;
+        end;
+        Scores.FlushWeightCache();
+        Features := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(5), InputLayer);
+        TopK := TNNetTopKGatherTokens.Create(CaseKs[CasePos], Scores);
+        NN.AddLayerAfter(TopK, Features);
+        Consumer := NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
+        NN.SetTrainable(False, False);
+        TieCount := 0;
+        for InputPos := 0 to 1 do
+        begin
+          Inputs[InputPos].ReSize(CaseTokens[CasePos], 1, Depth);
+          Inputs[InputPos].RandomizeGaussian();
+          if CaseTies[CasePos] then
+            for Pos := 0 to Inputs[InputPos].Size - 1 do
+              Inputs[InputPos].Raw[Pos] := Round(Inputs[InputPos].Raw[Pos]);
+          NN.Compute(Inputs[InputPos]);
+          OutCPU[InputPos].Copy(Consumer.Output);
+          GatheredCPU[InputPos].Copy(TopK.Output);
+          TokensCPU[InputPos] := Copy(TopK.Tokens, 0, CaseKs[CasePos]);
+          for Pos := 1 to CaseKs[CasePos] - 1 do
+            if TNNetVolume.MaxValue(Inputs[InputPos].GetRawPtr(
+                 TokensCPU[InputPos][Pos] * Depth), Depth) =
+               TNNetVolume.MaxValue(Inputs[InputPos].GetRawPtr(
+                 TokensCPU[InputPos][Pos - 1] * Depth), Depth) then
+              Inc(TieCount);
+        end;
+        AssertEquals('top-K ran on the CPU before EnableOpenCL', 0, TopK.ForwardGPUCnt);
+
+        NN.EnableOpenCL(PlatformId, DeviceId);
+        NN.ForceOpenCL(True);
+        MaxDiff := 0;
+        GatherDiff := 0;
+        TokenMismatches := 0;
+        try
+          NN.Compute(Inputs[1]);
+          // Parity cannot tell a bind from a download: the forwards below must
+          // leave the host copies of both sources and of the gather untouched.
+          Scores.Output.Fill(csSentinel);
+          Features.Output.Fill(csSentinel);
+          TopK.Output.Fill(csSentinel);
+          for InputPos := 0 to 1 do
+          begin
+            NN.Compute(Inputs[InputPos]);
+            AssertEquals('output size match', OutCPU[InputPos].Size,
+              Consumer.Output.Size);
+            MaxPos := OutCPU[InputPos].Size - 1;
+            for Pos := 0 to MaxPos do
+              MaxDiff := Max(MaxDiff, Abs(OutCPU[InputPos].Raw[Pos] -
+                Consumer.Output.Raw[Pos]));
+            AssertEquals('token count', CaseKs[CasePos], Length(TopK.Tokens));
+            for Pos := 0 to CaseKs[CasePos] - 1 do
+              if TopK.Tokens[Pos] <> TokensCPU[InputPos][Pos] then
+                Inc(TokenMismatches);
+          end;
+          SentinelSurvivors := 0;
+          SentinelTotal := Scores.Output.Size + Features.Output.Size +
+            TopK.Output.Size;
+          for Pos := 0 to Scores.Output.Size - 1 do
+            if Scores.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          for Pos := 0 to Features.Output.Size - 1 do
+            if Features.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          for Pos := 0 to TopK.Output.Size - 1 do
+            if TopK.Output.Raw[Pos] = csSentinel then Inc(SentinelSurvivors);
+          AssertTrue('the gathered tokens stay in OpenCL memory',
+            TopK.OutputBindableOnOpenCL());
+          TopK.ForceOutputOnRAM();
+          for Pos := 0 to GatheredCPU[1].Size - 1 do
+            GatherDiff := Max(GatherDiff, Abs(GatheredCPU[1].Raw[Pos] -
+              TopK.Output.Raw[Pos]));
+        finally
+          NN.ForceOpenCL(False);
+        end;
+        WriteLn('  TopKGatherTokens OpenCL selection (tokens ', CaseTokens[CasePos],
+          ', depth ', Depth, ', K ', CaseKs[CasePos], ', adjacent ties ', TieCount,
+          '): token mismatches=', TokenMismatches, ' gathered max|diff|=',
+          GatherDiff:0:9, ' consumer max|diff|=', MaxDiff:0:9,
+          ' gpu forwards=', TopK.ForwardGPUCnt,
+          ' sentinels=', SentinelSurvivors, '/', SentinelTotal);
+        // K = 1 has no adjacent pair to compare.
+        if CaseTies[CasePos] and (CaseKs[CasePos] > 1) then
+          AssertTrue('the rounded scores tie', TieCount > 0);
+        AssertTrue('top-K gather must reach OpenCL', TopK.ForwardGPUCnt > 0);
+        AssertEquals('OpenCL indices match the host', 0, TokenMismatches);
+        AssertEquals('gathered tokens match the host exactly', 0, GatherDiff);
+        AssertEquals('no source nor the gather is downloaded', SentinelTotal,
+          SentinelSurvivors);
+        AssertTrue('consumer OpenCL vs CPU parity: max |diff| = ' +
+          FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    for InputPos := 0 to 1 do
+    begin
+      GatheredCPU[InputPos].Free;
+      OutCPU[InputPos].Free;
+      Inputs[InputPos].Free;
+    end;
   end;
 end;
 {$ELSE}

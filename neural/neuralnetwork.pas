@@ -5929,6 +5929,12 @@ type
     // Makes the next EnsurePlan rebuild and upload the plan: for a consumer whose
     // source offsets change every forward (TNNetTopKGatherTokens).
     procedure InvalidatePlan();
+    // The uploaded plan, and the int position in it of axis AxisPos's table: a
+    // kernel on OutputKernel's queue may rewrite that table between forwards.
+    function PlanBuffer(): cl_mem;
+    function AxisTableOffset(AxisPos: integer): integer;
+    // Downloads (blocking) the Extent source offsets of axis AxisPos's uploaded table.
+    procedure ReadAxisTable(AxisPos: integer; var Offsets: TNeuralIntegerArray);
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
     function BufferBytes(): int64; override;
@@ -5938,6 +5944,26 @@ type
     // Copies Consumer.PrevLayer's output into Consumer.Output per the plan:
     // binds a resident source and keeps the result in OpenCL memory unless trainable.
     procedure GatherFromPrevLayer(Consumer: TNNetLayer);
+  end;
+
+  /// OpenCL top-K token selection of TNNetTopKGatherTokens on the queue of its
+  // TNNetGatherCopyCL: cai_token_max_score, then cai_topk_token_rank writes the
+  // selected token offsets into the gather plan's token table. Coded by Claude (AI).
+  TNNetTopKTokensCL = class(TMObject)
+  private
+    FKernel: TNeuralKernel; // the gather's, not owned
+    FMaxScoreKernel, FRankKernel: cl_kernel;
+    FBufTokenMax, FBufScores: cl_mem;
+    FCapTokenMax, FCapScores: csize_t;
+  public
+    constructor Create(Gather: TNNetGatherCopyCL);
+    destructor Destroy(); override;
+    // Points Gather's axis-0 table at the TopK tokens of ScoreLayer (score =
+    // max over Depth), largest first, ties lower index first; binds a resident
+    // ScoreLayer, else uploads it. Gather's plan must be uploaded already.
+    procedure Select(ScoreLayer: TNNetLayer; TopK, TokenStride: integer;
+      Gather: TNNetGatherCopyCL);
+    function BufferBytes(): int64;
   end;
 
   /// OpenCL forward of TNNetRealFFT2D / TNNetInverseRealFFT2D: two direct-DFT
@@ -14736,6 +14762,7 @@ type
     protected
       // The ';'-separated layer-index segment SaveStructureToString writes.
       function IndexSegment(): string; virtual;
+      function GetTokens(): TNeuralIntegerArray; virtual;
     public
       constructor Create(); overload; override;
       constructor Create(pTokens: array of integer); reintroduce; overload;
@@ -14746,7 +14773,7 @@ type
 
       function SaveStructureToString(): string; override;
       // The source token index of each output token (-1 = zero token).
-      property Tokens: TNeuralIntegerArray read FTokens;
+      property Tokens: TNeuralIntegerArray read GetTokens;
   end;
 
   /// Data-dependent token gather: the K tokens with the largest score, where a
@@ -14758,8 +14785,9 @@ type
   // ScoreSource are (SeqLen, 1, Depth) sequences of the same SeqLen. Backward
   // scatters the output error onto the selected input tokens (TNNetGatherTokens);
   // the selection itself is locally constant, so ScoreSource gets no gradient.
-  // With OpenCL the host picks the K tokens from the scores and cai_gather_copy
-  // gathers them from a resident PrevLayer.
+  // With OpenCL and not trainable, TNNetTopKTokensCL selects the K tokens and
+  // cai_gather_copy gathers them, so neither source leaves OpenCL memory; Tokens
+  // then downloads the indices when read. Scores must be finite on OpenCL.
   // K is stored in FStruct[0].
   // Coded by Claude (AI).
   TNNetTopKGatherTokens = class(TNNetGatherTokens)
@@ -14768,15 +14796,32 @@ type
       FTokenScores: array of TNeuralFloat; // per-token max score
       FKeptTokens: array of boolean;       // NeuralMarkTopK output
       FTopScores: array of TNeuralFloat;   // NeuralMarkTopK scratch
+      {$IFDEF OpenCL}
+      // nil until EnableOpenCL arms the gather.
+      FTopKTokensCL: TNNetTopKTokensCL;
+      // FTokens is stale: the last selection ran in OpenCL.
+      FTokensOnOpenCL: boolean;
+      function SelectsOnOpenCL(): boolean;
+      procedure DownloadTokens();
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     protected
       function IndexSegment(): string; override;
+      function GetTokens(): TNeuralIntegerArray; override;
     public
       constructor Create(pK: integer; ScoreSource: TNNetLayer); reintroduce; overload;
+      destructor Destroy(); override;
       procedure Compute(); override;
       // The scatter, then the score source's backward (it receives no error).
       procedure Backpropagate(); override;
       procedure AppendInputLayers(pList: TList); override;
+      {$IFDEF OpenCL}
+      // Also true for a resident ScoreSource when PrevLayer is on the host.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
       property ScoreSource: TNNetLayer read FScoreLayer;
   end;
 
@@ -42400,7 +42445,8 @@ begin
       'covers ' + IntToStr(OutCount) + ' of ' + IntToStr(Y.Size) + ' outputs.');
   PlanLen := PackGatherCopyPlan(FAxisCount, FAxisExtent, FAxisTableStart,
     FTable, FTableLen, FPlanHost);
-  FKernel.EnsureBuffer(FPlanBuf, FCapPlan, CL_MEM_READ_ONLY,
+  // Read-write: TNNetTopKTokensCL rewrites the token table on the device.
+  FKernel.EnsureBuffer(FPlanBuf, FCapPlan, CL_MEM_READ_WRITE,
     PlanLen * csLongintSize);
   FKernel.WriteBuffer(FPlanBuf, PlanLen * csLongintSize, @FPlanHost[0], CL_TRUE);
   FPlanShape[0] := Src.SizeX;
@@ -42414,6 +42460,27 @@ end;
 procedure TNNetGatherCopyCL.InvalidatePlan();
 begin
   FPlanShape[0] := 0;
+end;
+
+function TNNetGatherCopyCL.PlanBuffer(): cl_mem;
+begin
+  Result := FPlanBuf;
+end;
+
+function TNNetGatherCopyCL.AxisTableOffset(AxisPos: integer): integer;
+begin
+  Result := 1 + 2 * FAxisCount + FAxisTableStart[AxisPos];
+end;
+
+procedure TNNetGatherCopyCL.ReadAxisTable(AxisPos: integer;
+  var Offsets: TNeuralIntegerArray);
+var
+  Extent: integer;
+begin
+  Extent := FAxisExtent[AxisPos];
+  if Length(Offsets) < Extent then SetLength(Offsets, Extent);
+  FKernel.ReadBufferAt(FPlanBuf, AxisTableOffset(AxisPos) * csLongintSize,
+    Extent * csLongintSize, @Offsets[0], CL_TRUE);
 end;
 
 function TNNetGatherCopyCL.ResultBuffer(): cl_mem;
@@ -42480,6 +42547,68 @@ begin
     Consumer.FOutputOnOpenCL := false;
     Consumer.FOutputOnRAM := true;
   end;
+end;
+
+{ TNNetTopKTokensCL }
+
+constructor TNNetTopKTokensCL.Create(Gather: TNNetGatherCopyCL);
+begin
+  inherited Create();
+  FKernel := Gather.OutputKernel();
+  FMaxScoreKernel := FKernel.CreateKernel('cai_token_max_score');
+  FRankKernel := FKernel.CreateKernel('cai_topk_token_rank');
+end;
+
+destructor TNNetTopKTokensCL.Destroy();
+begin
+  if Assigned(FMaxScoreKernel) then clReleaseKernel(FMaxScoreKernel);
+  if Assigned(FRankKernel) then clReleaseKernel(FRankKernel);
+  if Assigned(FBufTokenMax) then clReleaseMemObject(FBufTokenMax);
+  if Assigned(FBufScores) then clReleaseMemObject(FBufScores);
+  inherited Destroy();
+end;
+
+procedure TNNetTopKTokensCL.Select(ScoreLayer: TNNetLayer; TopK,
+  TokenStride: integer; Gather: TNNetGatherCopyCL);
+var
+  bufScores, bufPlan: cl_mem;
+  TokenCount, ScoreDepth, TableOffset: longint;
+begin
+  if ScoreLayer.OutputBindableOnOpenCL() then
+  begin
+    ScoreLayer.OpenCLWaitOutputIfAnotherQueue(FKernel);
+    bufScores := ScoreLayer.OpenCLOutputBuffer();
+  end
+  else
+  begin
+    ScoreLayer.ForceOutputOnRAM();
+    // Blocking: the next forward rewrites the host scores.
+    bufScores := FKernel.EnsureWriteBuffer(FBufScores, FCapScores,
+      ScoreLayer.FOutput, {DoWrite=}true, {pBlocking=}true);
+  end;
+  TokenCount := ScoreLayer.FOutput.SizeX;
+  ScoreDepth := ScoreLayer.FOutput.Depth;
+  FKernel.EnsureBuffer(FBufTokenMax, FCapTokenMax, CL_MEM_READ_WRITE,
+    TokenCount * csNeuralFloatSize);
+  clSetKernelArg(FMaxScoreKernel, 0, csLongintSize, @TokenCount);
+  clSetKernelArg(FMaxScoreKernel, 1, csLongintSize, @ScoreDepth);
+  clSetKernelArg(FMaxScoreKernel, 2, csCLMemSize, @bufScores);
+  clSetKernelArg(FMaxScoreKernel, 3, csCLMemSize, @FBufTokenMax);
+  FKernel.RunKernel(FMaxScoreKernel, TokenCount);
+  bufPlan := Gather.PlanBuffer();
+  TableOffset := Gather.AxisTableOffset(0);
+  clSetKernelArg(FRankKernel, 0, csLongintSize, @TokenCount);
+  clSetKernelArg(FRankKernel, 1, csLongintSize, @TopK);
+  clSetKernelArg(FRankKernel, 2, csLongintSize, @TokenStride);
+  clSetKernelArg(FRankKernel, 3, csLongintSize, @TableOffset);
+  clSetKernelArg(FRankKernel, 4, csCLMemSize, @FBufTokenMax);
+  clSetKernelArg(FRankKernel, 5, csCLMemSize, @bufPlan);
+  FKernel.RunKernel(FRankKernel, TokenCount);
+end;
+
+function TNNetTopKTokensCL.BufferBytes(): int64;
+begin
+  Result := OpenCLMemBytes(FBufTokenMax) + OpenCLMemBytes(FBufScores);
 end;
 
 { TNNetRealFFT2DCL }
@@ -61330,6 +61459,11 @@ begin
   end;
 end;
 
+function TNNetGatherTokens.GetTokens(): TNeuralIntegerArray;
+begin
+  Result := FTokens;
+end;
+
 function TNNetGatherTokens.SaveStructureToString(): string;
 begin
   Result := StringReplace(inherited SaveStructureToString, '::',
@@ -61378,12 +61512,89 @@ begin
   Result := IntToStr(FScoreLayer.LayerIdx);
 end;
 
+destructor TNNetTopKGatherTokens.Destroy();
+begin
+  {$IFDEF OpenCL} FreeAndNil(FTopKTokensCL); {$ENDIF}
+  inherited Destroy();
+end;
+
+{$IFDEF OpenCL}
+function TNNetTopKGatherTokens.WillOpenCL(): boolean;
+begin
+  Result := inherited WillOpenCL() or (Assigned(FTopKTokensCL) and FHasOpenCL and
+    (not FIsTrainable) and FScoreLayer.OutputBindableOnOpenCL());
+end;
+
+// Training keeps the host selection: the backward scatters through FTokens.
+function TNNetTopKGatherTokens.SelectsOnOpenCL(): boolean;
+begin
+  Result := Assigned(FTopKTokensCL) and (not FIsTrainable) and WillOpenCL();
+end;
+
+procedure TNNetTopKGatherTokens.DownloadTokens();
+var
+  TokenPos, MaxTokenPos, TokenStride: integer;
+begin
+  if not FTokensOnOpenCL then exit;
+  FGatherCopyCL.ReadAxisTable(0, FTokens);
+  TokenStride := FOutput.Depth;
+  MaxTokenPos := FStruct[0] - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    FTokens[TokenPos] := FTokens[TokenPos] div TokenStride;
+  FTokensOnOpenCL := false;
+end;
+
+procedure TNNetTopKGatherTokens.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // TNNetIdentity's chain arms FGatherCopyCL (no activation opcode here).
+  inherited EnableOpenCL(DotProductKernel);
+  if Assigned(FGatherCopyCL) and not Assigned(FTopKTokensCL) then
+    FTopKTokensCL := TNNetTopKTokensCL.Create(FGatherCopyCL);
+end;
+
+procedure TNNetTopKGatherTokens.DisableOpenCL();
+begin
+  // The selected indices live in FGatherCopyCL's plan buffer.
+  if Assigned(FGatherCopyCL) then DownloadTokens();
+  FreeAndNil(FTopKTokensCL);
+  inherited DisableOpenCL();
+end;
+
+function TNNetTopKGatherTokens.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTopKTokensCL) then Result := Result + FTopKTokensCL.BufferBytes();
+end;
+{$ENDIF}
+
+function TNNetTopKGatherTokens.GetTokens(): TNeuralIntegerArray;
+begin
+  {$IFDEF OpenCL} DownloadTokens(); {$ENDIF}
+  Result := FTokens;
+end;
+
 procedure TNNetTopKGatherTokens.Compute();
 var
   Scores: TNNetVolume;
   TokenPos, MaxTokenPos, ScoreDepth: integer;
+  {$IFDEF OpenCL}
+  StartTime: double;
+  {$ENDIF}
 begin
   {$IFDEF OpenCL}
+  if SelectsOnOpenCL() then
+  begin
+    StartTime := Now();
+    // The selection rewrites the uploaded token table, so the plan goes first.
+    FGatherCopyCL.EnsurePlan(Self);
+    FTopKTokensCL.Select(FScoreLayer, FStruct[0], FOutput.Depth, FGatherCopyCL);
+    FTokensOnOpenCL := true;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    inherited Compute();
+    exit;
+  end;
+  // The host selection below rewrites FTokens.
+  FTokensOnOpenCL := false;
   // Only the scores come to RAM; the inherited gather binds a resident source.
   FScoreLayer.ForceOutputOnRAM();
   if Assigned(FGatherCopyCL) then FGatherCopyCL.InvalidatePlan();
@@ -61406,6 +61617,7 @@ var
   RunsNow: boolean;
 begin
   RunsNow := FBackPropCallCurrentCnt + 1 >= FDepartingBranchesCnt;
+  {$IFDEF OpenCL} DownloadTokens(); {$ENDIF}
   inherited Backpropagate();
   if RunsNow and (FScoreLayer.OutputError.Size = FScoreLayer.Output.Size) then
     FScoreLayer.Backpropagate();

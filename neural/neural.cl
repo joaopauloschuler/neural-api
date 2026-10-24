@@ -2620,6 +2620,56 @@ __kernel void cai_gather_copy
   FDst[g_id] = IsZero ? 0.0f : FSrc[SrcPos];
 }
 
+// TNNetTopKGatherTokens selection, step 1: FTokenMax[t] := the maximum of the
+// FDepth scores of token t. One work-item per token. Coded by Claude (AI).
+__kernel void cai_token_max_score
+(
+  const int FTokenCnt,
+  const int FDepth,
+  __global const float* FScores,
+  __global float* FTokenMax
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FTokenCnt) return;
+  const int base = t * FDepth;
+  float best = FScores[base];
+  for (int d = 1; d < FDepth; d++)
+  {
+    const float val = FScores[base + d];
+    if (val > best) best = val;
+  }
+  FTokenMax[t] = best;
+}
+
+// TNNetTopKGatherTokens selection, step 2: token t's rank in the order
+// (score DESCENDING, index ASCENDING) of the host NeuralMarkTopK is the count of
+// earlier tokens scoring >= and later tokens scoring >; a rank below FTopK
+// writes t * FTokenStride into the cai_gather_copy token table at
+// FPlan[FTableOffset + rank]. Counting stops at FTopK, so the cost is O(N^2)
+// at worst. Scores must be finite (a NaN breaks the total order). One
+// work-item per token. Coded by Claude (AI).
+__kernel void cai_topk_token_rank
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FTokenStride,
+  const int FTableOffset,
+  __global const float* FTokenMax,
+  __global int* FPlan
+)
+{
+  const int t = get_global_id(0);
+  if (t >= FTokenCnt) return;
+  const float score = FTokenMax[t];
+  int rank = 0;
+  for (int j = 0; (j < t) && (rank < FTopK); j++)
+    if (FTokenMax[j] >= score) rank++;
+  for (int j = t + 1; (j < FTokenCnt) && (rank < FTopK); j++)
+    if (FTokenMax[j] > score) rank++;
+  if (rank < FTopK) FPlan[FTableOffset + rank] = t * FTokenStride;
+}
+
 // rfft2 / irfft2 (TNNetRealFFT2D / TNNetInverseRealFFT2D, TNNetRealFFT2DCL) as
 // direct DFTs, one work-item per output element, channel index fastest. Any
 // W and H: O(N) per element, O(N^2) per line. A real volume is (W, H, C) at

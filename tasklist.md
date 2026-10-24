@@ -1951,7 +1951,9 @@ rather than acted on.
       ObjectDetection --rtdetr [--image]. Parity < 1e-4 on two pico fixtures
       (tools/make_pico_rtdetr_fixture.py); agent run of PekingU/rtdetr_r18vd
       at 640 x 640: logits 3.4e-5, boxes 2.7e-4 over all 300 queries, same 5
-      detections as transformers.
+      detections as transformers. Under OpenCL the query selection
+      (cai_token_max_score, cai_topk_token_rank) and its gather keep the score
+      map and the selected tokens in OpenCL memory.
         - [ ] User run of a real checkpoint (r18vd and r50vd/r101vd; only r18vd
               was run, by the agent).
         - [ ] RAM: r18vd at 640 x 640 peaks at 1.86 GB RSS with
@@ -1962,8 +1964,6 @@ rather than acted on.
               (inverse_sigmoid -> TNNetSum -> TNNetSigmoid) runs on the host, so
               from decoder layer 1 on the deformable attention uploads its
               reference source (TestRtDetrOpenCL prints it).
-        - [ ] OpenCL top-K selection (per-token max + top-K in a kernel) so the
-              (tokens x classes) score map no longer comes to RAM each forward.
         - [ ] GPU-box timing of the RT-DETR OpenCL forward (r18vd/r50vd at
               640 x 640) against the CPU; PoCL on the 1-core VM is not
               representative.

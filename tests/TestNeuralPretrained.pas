@@ -59135,8 +59135,8 @@ end;
 // Builds the pico RT-DETR of Name, runs the stored image and compares against
 // the transformers float64 logits, pred_boxes and post-processed detections.
 {$IFDEF OpenCL}
-// Asserts both RT-DETR OpenCL layers ran there and prints their residency
-// counts plus the classes, from the top-K on, whose forward pulled a source to RAM.
+// Asserts both RT-DETR OpenCL layers ran there, prints their residency counts,
+// and asserts that no forward from the top-K on pulled a source to RAM.
 procedure ReportRtDetrResidency(ATest: TTestNeuralPretrained; NN: TNNet;
   const Name: string);
 var
@@ -59178,6 +59178,10 @@ begin
         '; sources:', SourceReport);
       ATest.AssertTrue(Name + ' ' + Layer.ClassName + ' #' + IntToStr(LayerPos) +
         ' must reach OpenCL', Layer.ForwardGPUCnt > 0);
+      // The top-K selection reads the scores where they lie.
+      if Layer is TNNetTopKGatherTokens then
+        ATest.AssertTrue(Name + ' TNNetTopKGatherTokens #' + IntToStr(LayerPos) +
+          ' binds its resident sources', Layer.ProfiledResidency.SourceBoundCnt > 0);
     end;
     // The D-FINE LQE head reads the bin probabilities where they lie.
     if Layer is TNNetTopKValues then
@@ -59195,6 +59199,8 @@ begin
   end;
   WriteLn('  ', Name, ' OpenCL: layers from the top-K on that pulled a source to RAM:',
     Pulled);
+  ATest.AssertEquals(Name + ' OpenCL: layers from the top-K on that pulled a ' +
+    'source to RAM', '', Pulled);
 end;
 {$ENDIF}
 
