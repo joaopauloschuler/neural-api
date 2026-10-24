@@ -17307,6 +17307,57 @@ function DecodeMask2FormerPanoptic(ClassLogits, MaskLogits: TNNetVolume;
 procedure FreeMask2Former(NN: TNNet);
 
 // ---------------------------------------------------------------------------
+// EoMT UNIVERSAL-SEGMENTATION IMPORT (Kerssies et al. CVPR 2025, arXiv:
+// 2503.19108; transformers EomtForUniversalSegmentation, model_type "eomt",
+// tue-mps/*_eomt_*). Encoder-only: a DINOv2-with-registers ViT runs from pixels,
+// and num_queries learned query tokens are prepended before the last num_blocks
+// blocks. After the final LayerNorm, the query tokens feed class_predictor and a
+// 3-Linear mask head; the patch tokens, reshaped to the grid, go through
+// num_upscale_blocks x (ConvTranspose2d k2 s2 -> act -> depthwise 3x3 ->
+// LayerNorm2d). Mask logits are mask_embed . pixel_features per pixel
+// (TNNetDotProducts, the Mask2FormerMaskEinsum layout). The net has no
+// masked attention: the builder requires every attn_mask_probs entry to be 0,
+// which is the value inference checkpoints carry.
+// Coded by Claude (AI).
+type
+  TEoMTConfig = record
+    Backbone: TDINOv2Config;    // the ViT fields (Backbone.ModelType = 'eomt')
+    HiddenActName: string;      // hidden_act of the mask head and upscale blocks
+    NumQueries: integer;        // num_queries
+    NumBlocks: integer;         // num_blocks: trailing layers that see the queries
+    NumUpscaleBlocks: integer;  // num_upscale_blocks (each doubles the grid)
+    NumLabels: integer;         // num_labels (len(id2label)), without no-object
+  end;
+
+// Reads a HF EoMT config.json; missing fields take the EomtConfig defaults
+// (hidden 1024, 24 layers, 16 heads, image 640, patch 16, 4 registers, ...).
+function ReadEoMTConfigFromJSONFile(const FileName: string): TEoMTConfig;
+
+function EoMTConfigToString(const Config: TEoMTConfig): string;
+
+// Side of the square mask-logit grid: (image_size div patch_size) shl
+// num_upscale_blocks.
+function EoMTMaskGridSize(const Config: TEoMTConfig): integer;
+
+// Input (ImageSize, ImageSize, NumChannels) normalized RGB; output (NumQueries,
+// 1, NumLabels + 1 + MaskGrid^2) = class logits | mask logits, see SplitEoMTOutput.
+function BuildEoMTFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TEoMTConfig; pTrainable: boolean = false): TNNet; overload;
+
+function BuildEoMTFromSafeTensorsEx(const FileName: string;
+  const Config: TEoMTConfig; pTrainable: boolean = false): TNNet;
+
+// Config is read from ConfigFileName ('' = "config.json" beside FileName).
+function BuildEoMTFromSafeTensors(const FileName: string;
+  out Config: TEoMTConfig; pTrainable: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// Splits a BuildEoMT output into ClassLogits (NumQueries, 1, NumLabels + 1) and
+// MaskLogits (NumQueries, 1, MaskGrid^2), the DecodeMask2Former* input layout.
+procedure SplitEoMTOutput(Output: TNNetVolume; const Config: TEoMTConfig;
+  ClassLogits, MaskLogits: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // DDCOLOR PHOTO-COLORIZATION IMPORT (Kang et al., ICCV 2023, arXiv:2212.11613;
 // piddnad/DDColor basicsr/archs/ddcolor_arch.py, e.g. piddnad/ddcolor_paper_tiny
 // and ddcolor_modelscope). Input: a grayscale RGB image (L of the photo, a*b*=0,
@@ -90096,24 +90147,16 @@ begin
   if not pTrainable then NN.SetTrainable();
 end;
 
-// Loads one DINOv2 encoder block. BERT-style attention names (same as ViT's
-// legacy scheme: attention.attention.{query,key,value}, attention.output.
-// dense) into the fused Q|K|V slab + biased out/fc1/fc2, the two biased
-// LayerNorms (norm1 = pre-attn, norm2 = pre-MLP) and the two LayerScales.
-// BlockPrefix is the prefix THROUGH the per-layer index
-// ('dinov2.encoder.layer.N.').
-procedure LoadDINOv2EncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+// Loads one DINOv2 encoder block into the fused Q|K|V slab + biased out/fc1/fc2,
+// norm1/norm2 and the two LayerScales; QName..ONm are the full attention Linear names.
+procedure LoadDINOv2EncoderBlockWeightsNamed(Reader: TNNetSafeTensorsReader;
   const Block: TDINOv2BlockLayers; const BlockPrefix: string;
-  const Config: TDINOv2Config);
+  const Config: TDINOv2Config; const QName, KName, VName, ONm: string);
 var
   d, FFN: integer;
-  QName, KName, VName, ONm, InName, OutName: string;
+  InName, OutName: string;
 begin
   d := Config.HiddenSize;
-  QName := BlockPrefix + 'attention.attention.query';
-  KName := BlockPrefix + 'attention.attention.key';
-  VName := BlockPrefix + 'attention.attention.value';
-  ONm := BlockPrefix + 'attention.output.dense';
   LoadLayerNormWeights(Reader, Block.LN1,
     BlockPrefix + 'norm1.weight', BlockPrefix + 'norm1.bias', d);
   LoadLlamaLinearWeights(Reader, Block.QKV,
@@ -90154,19 +90197,64 @@ begin
     BlockPrefix + 'layer_scale2.lambda1', d);
 end;
 
+// Loads one DINOv2 encoder block with the BERT-style attention names
+// (attention.attention.{query,key,value}, attention.output.dense).
+// BlockPrefix is the prefix THROUGH the per-layer index
+// ('dinov2.encoder.layer.N.').
+procedure LoadDINOv2EncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TDINOv2BlockLayers; const BlockPrefix: string;
+  const Config: TDINOv2Config);
+begin
+  LoadDINOv2EncoderBlockWeightsNamed(Reader, Block, BlockPrefix, Config,
+    BlockPrefix + 'attention.attention.query',
+    BlockPrefix + 'attention.attention.key',
+    BlockPrefix + 'attention.attention.value',
+    BlockPrefix + 'attention.output.dense');
+end;
+
+// Loads a biased ViT patch conv (<Prefix>.weight [Hidden, Channels, P, P] and
+// <Prefix>.bias [Hidden]) into PatchConv; Ctx prefixes the errors.
+procedure LoadBiasedPatchConv(Reader: TNNetSafeTensorsReader;
+  PatchConv: TNNetLayer; const Prefix: string; NumChannels, PatchSize,
+  Hidden: integer; const Ctx: string);
+var
+  Tmp: TNNetVolume;
+  BiasName: string;
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  // LoadClipPatchConv zeroes the bias, so it is loaded afterwards.
+  LoadClipPatchConv(Reader, PatchConv, Prefix + '.weight', NumChannels,
+    PatchSize, Hidden);
+  BiasName := Prefix + '.bias';
+  if not Reader.HasTensor(BiasName) then
+    ImportError(Ctx + ': missing tensor "' + BiasName + '".');
+  if (Reader.DimCount(BiasName) <> 1) or
+     (Reader.DimSize(BiasName, 0) <> Hidden) then
+    ImportError(Ctx + ': "' + BiasName + '" must have shape [' +
+      IntToStr(Hidden) + '], got ' + Reader.ShapeAsString(BiasName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BiasName, Tmp);
+    MaxNeuronPos := Hidden - 1;
+    for NeuronPos := 0 to MaxNeuronPos do
+      PatchConv.FArrNeurons[NeuronPos].BiasWeight := Tmp.FData[NeuronPos];
+    PatchConv.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
 function BuildDINOv2FromSafeTensors(Reader: TNNetSafeTensorsReader;
   const Config: TDINOv2Config; pTrainable: boolean = true): TNNet;
 var
   NN: TNNet;
   PatchConv, PosEmb, FinalLN: TNNetLayer;
   Blocks: TDINOv2BlockLayersArray;
-  Tmp: TNNetVolume;
-  Grid, NumPatches, NumPrefix, NumTokens, BlockCnt, ci, d: integer;
-  DM1, LayersM1: integer;
-  PatchBiasName, Pfx: string;
+  Grid, NumPatches, NumPrefix, NumTokens, BlockCnt, d: integer;
+  LayersM1: integer;
+  Pfx: string;
 begin
   d := Config.HiddenSize;
-  DM1 := d - 1;
   LayersM1 := Config.NumLayers - 1;
   if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
     ImportError('DINOv2 import: hidden_size=' + IntToStr(d) +
@@ -90221,27 +90309,9 @@ begin
       Pfx := 'dinov2_with_registers.'
     else
       Pfx := '';
-    LoadClipPatchConv(Reader, PatchConv,
-      Pfx + 'embeddings.patch_embeddings.projection.weight',
-      Config.NumChannels, Config.PatchSize, d);
-    // DINOv2's patch conv IS biased (LoadClipPatchConv zeroes the bias);
-    // load the per-output-channel bias into each neuron's BiasWeight.
-    PatchBiasName := Pfx + 'embeddings.patch_embeddings.projection.bias';
-    if not Reader.HasTensor(PatchBiasName) then
-      ImportError('DINOv2 import: missing tensor "' + PatchBiasName + '".');
-    if (Reader.DimCount(PatchBiasName) <> 1) or
-       (Reader.DimSize(PatchBiasName, 0) <> d) then
-      ImportError('DINOv2 import: "' + PatchBiasName + '" must have shape [' +
-        IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
-    Tmp := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(PatchBiasName, Tmp);
-      for ci := 0 to DM1 do
-        PatchConv.FArrNeurons[ci].BiasWeight := Tmp.FData[ci];
-      PatchConv.FlushWeightCache();
-    finally
-      Tmp.Free;
-    end;
+    LoadBiasedPatchConv(Reader, PatchConv,
+      Pfx + 'embeddings.patch_embeddings.projection', Config.NumChannels,
+      Config.PatchSize, d, 'DINOv2 import');
     // HF's interpolate_pos_encoding returns position_embeddings unchanged at
     // the native square resolution, the only one this builder supports.
     LoadViTPositionTable(Reader, PosEmb, Pfx + 'embeddings.', Grid, Grid, Grid,
@@ -99365,6 +99435,383 @@ begin
   end;
   UnregisterMask2Former(NN);
   M2F.Free;  // frees InitNet.NN (== container), every layer net, the tables.
+end;
+
+// ===========================================================================
+// EoMT UNIVERSAL-SEGMENTATION IMPORT
+// ===========================================================================
+const
+  csEoMTImporter = 'EoMT import';
+  // EomtLayerNorm2d is built with its default eps, not config.layer_norm_eps.
+  cEoMTLayerNorm2dEps = 0.000001;
+
+function ReadEoMTConfigFromJSONFile(const FileName: string): TEoMTConfig;
+var
+  JsonText: TStringList;
+  Root, LabelData: TJSONData;
+  Obj: TJSONObject;
+
+  function PositiveInt(const FieldName: string; DefaultValue: integer): integer;
+  begin
+    Result := Obj.Get(FieldName, DefaultValue);
+    if Result <= 0 then
+      ImportError(csEoMTImporter + ': config field "' + FieldName +
+        '" must be a positive integer, got ' + IntToStr(Result) + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError(csEoMTImporter + ': config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    LoadImportJSONText(JsonText, FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError(csEoMTImporter + ': config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError(csEoMTImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.Backbone.ModelType := Obj.Get('model_type', 'eomt');
+    if Result.Backbone.ModelType <> 'eomt' then
+      ImportError(csEoMTImporter + ': config model_type is "' +
+        Result.Backbone.ModelType + '" - only "eomt" is supported.');
+    Result.Backbone.HiddenSize := PositiveInt('hidden_size', 1024);
+    Result.Backbone.NumLayers := PositiveInt('num_hidden_layers', 24);
+    Result.Backbone.NumHeads := PositiveInt('num_attention_heads', 16);
+    Result.Backbone.ImageSize := PositiveInt('image_size', 640);
+    Result.Backbone.PatchSize := PositiveInt('patch_size', 16);
+    Result.Backbone.NumChannels := PositiveInt('num_channels', 3);
+    Result.Backbone.MlpRatio := PositiveInt('mlp_ratio', 4);
+    Result.Backbone.LayerNormEps := Obj.Get('layer_norm_eps', 0.000001);
+    Result.HiddenActName := Obj.Get('hidden_act', 'gelu');
+    Result.Backbone.HiddenAct := ClipHiddenActFromString(Result.HiddenActName);
+    Result.Backbone.NumRegisterTokens := Obj.Get('num_register_tokens', 4);
+    if Result.Backbone.NumRegisterTokens < 0 then
+      ImportError(csEoMTImporter + ': num_register_tokens must be >= 0.');
+    Result.Backbone.UseSwiGLUFFN := Obj.Get('use_swiglu_ffn', false);
+    Result.Backbone.IntermediateSize := DINOv2FFNHiddenSize(
+      Result.Backbone.HiddenSize, Result.Backbone.MlpRatio,
+      Result.Backbone.UseSwiGLUFFN);
+    Result.NumQueries := PositiveInt('num_queries', 200);
+    Result.NumBlocks := PositiveInt('num_blocks', 4);
+    Result.NumUpscaleBlocks := Obj.Get('num_upscale_blocks', 2);
+    if Result.NumUpscaleBlocks < 0 then
+      ImportError(csEoMTImporter + ': num_upscale_blocks must be >= 0.');
+    // PreTrainedConfig derives num_labels from id2label (2 when absent).
+    LabelData := Obj.Find('id2label');
+    if LabelData is TJSONObject then
+      Result.NumLabels := TJSONObject(LabelData).Count
+    else
+      Result.NumLabels := Obj.Get('num_labels', 2);
+    if Result.NumLabels <= 0 then
+      ImportError(csEoMTImporter + ': the config declares no labels.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function EoMTConfigToString(const Config: TEoMTConfig): string;
+begin
+  Result := DINOv2ConfigToString(Config.Backbone) +
+    ', queries=' + IntToStr(Config.NumQueries) +
+    ', num_blocks=' + IntToStr(Config.NumBlocks) +
+    ', upscale_blocks=' + IntToStr(Config.NumUpscaleBlocks) +
+    ', labels=' + IntToStr(Config.NumLabels) +
+    ', mask_grid=' + IntToStr(EoMTMaskGridSize(Config));
+end;
+
+function EoMTMaskGridSize(const Config: TEoMTConfig): integer;
+begin
+  Result := (Config.Backbone.ImageSize div Config.Backbone.PatchSize) shl
+    Config.NumUpscaleBlocks;
+end;
+
+// Rejects a checkpoint whose attn_mask_probs (one entry per query block) is
+// missing or nonzero: both make transformers run masked attention.
+procedure CheckEoMTAttnMaskProbsZero(Reader: TNNetSafeTensorsReader;
+  NumBlocks: integer);
+const
+  cName = 'attn_mask_probs';
+var
+  Probs: TNNetVolume;
+  BlockPos, MaxBlockPos: integer;
+begin
+  if not Reader.HasTensor(cName) then
+    ImportError(csEoMTImporter + ': missing tensor "' + cName + '" (without ' +
+      'it transformers initializes it to 1 and runs masked attention).');
+  if Reader.ElementCount(cName) <> NumBlocks then
+    ImportError(csEoMTImporter + ': "' + cName + '" must have ' +
+      IntToStr(NumBlocks) + ' elements (num_blocks), got ' +
+      Reader.ShapeAsString(cName) + '.');
+  Probs := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(cName, Probs);
+    MaxBlockPos := NumBlocks - 1;
+    for BlockPos := 0 to MaxBlockPos do
+      if Probs.FData[BlockPos] <> 0 then
+        ImportError(csEoMTImporter + ': ' + cName + '[' + IntToStr(BlockPos) +
+          '] = ' + FloatToStr(Probs.FData[BlockPos]) + ' is nonzero. Masked ' +
+          'attention (a training-time annealing step) is not supported; only ' +
+          'checkpoints with every attn_mask_probs entry at 0 load.');
+  finally
+    Probs.Free;
+  end;
+end;
+
+// Loads a [Rows, Hidden] embedding table into the first Rows rows of a
+// TNNetLearnedPositionalEmbedding and zeroes the remaining rows.
+procedure LoadEoMTLeadingRows(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const TName: string; Rows, Hidden: integer);
+var
+  Table, Weights: TNNetVolume;
+begin
+  if not Reader.HasTensor(TName) then
+    ImportError(csEoMTImporter + ': missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 2) or (Reader.DimSize(TName, 0) <> Rows) or
+     (Reader.DimSize(TName, 1) <> Hidden) then
+    ImportError(csEoMTImporter + ': "' + TName + '" must have shape [' +
+      IntToStr(Rows) + ', ' + IntToStr(Hidden) + '], got ' +
+      Reader.ShapeAsString(TName));
+  Weights := Layer.FArrNeurons[0].Weights;
+  Table := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TName, Table);
+    Weights.Fill(0);
+    Move(Table.FData[0], Weights.FData[0], Rows * Hidden * csNeuralFloatSize);
+  finally
+    Table.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads the token table [CLS][registers][patches]: position_embeddings.weight
+// on the patch rows only (CLS and registers carry no position), then the tokens.
+procedure LoadEoMTPositionTable(Reader: TNNetSafeTensorsReader;
+  PosEmb: TNNetLayer; NumPatches, NumRegisterTokens, Hidden: integer);
+const
+  cName = 'embeddings.position_embeddings.weight';
+var
+  Table, Weights: TNNetVolume;
+  PrefixSize: integer;
+begin
+  if not Reader.HasTensor(cName) then
+    ImportError(csEoMTImporter + ': missing tensor "' + cName + '".');
+  if (Reader.DimCount(cName) <> 2) or
+     (Reader.DimSize(cName, 0) <> NumPatches) or
+     (Reader.DimSize(cName, 1) <> Hidden) then
+    ImportError(csEoMTImporter + ': "' + cName + '" must have shape [' +
+      IntToStr(NumPatches) + ', ' + IntToStr(Hidden) +
+      '] ((image_size / patch_size)^2 rows), got ' + Reader.ShapeAsString(cName));
+  PrefixSize := (1 + NumRegisterTokens) * Hidden;
+  Weights := PosEmb.FArrNeurons[0].Weights;
+  Table := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(cName, Table);
+    FillChar(Weights.FData[0], PrefixSize * csNeuralFloatSize, 0);
+    Move(Table.FData[0], Weights.FData[PrefixSize],
+      NumPatches * Hidden * csNeuralFloatSize);
+  finally
+    Table.Free;
+  end;
+  AddDINOPrefixTokens(Reader, Weights, 'embeddings.', NumRegisterTokens, Hidden,
+    csEoMTImporter);
+  PosEmb.FlushWeightCache();
+end;
+
+type
+  TEoMTUpscaleLayers = record
+    Deconv, DepthwiseConv, Norm: TNNetLayer;
+  end;
+
+function BuildEoMTFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TEoMTConfig; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  Bk: TDINOv2Config;
+  PatchConv, PosEmb, QueryEmb, FinalLN, QueryRows, ClassHead: TNNetLayer;
+  MaskFc: array[0..2] of TNNetLayer;
+  Blocks: TDINOv2BlockLayersArray;
+  Upscale: array of TEoMTUpscaleLayers;
+  Grid, NumPatches, NumPrefix, NumTokens, d, BlockPos, MaxBlockPos,
+    FirstQueryBlockPos, UpscalePos, MaxUpscalePos, FcPos: integer;
+  BlockPfx, UpPfx, FcName: string;
+begin
+  Bk := Config.Backbone;
+  d := Bk.HiddenSize;
+  if (Bk.NumHeads < 1) or ((d mod Bk.NumHeads) <> 0) then
+    ImportError(csEoMTImporter + ': hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' + IntToStr(Bk.NumHeads) + '.');
+  if (Bk.PatchSize < 1) or ((Bk.ImageSize mod Bk.PatchSize) <> 0) then
+    ImportError(csEoMTImporter + ': image_size=' + IntToStr(Bk.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Bk.PatchSize) + '.');
+  if (Config.NumBlocks < 1) or (Config.NumBlocks > Bk.NumLayers) then
+    ImportError(csEoMTImporter + ': num_blocks=' + IntToStr(Config.NumBlocks) +
+      ' must be in 1..num_hidden_layers (' + IntToStr(Bk.NumLayers) + ').');
+  CheckEoMTAttnMaskProbsZero(Reader, Config.NumBlocks);
+  Grid := Bk.ImageSize div Bk.PatchSize;
+  NumPatches := Grid * Grid;
+  NumPrefix := 1 + Bk.NumRegisterTokens;
+  NumTokens := NumPrefix + NumPatches;
+  MaxBlockPos := Bk.NumLayers - 1;
+  FirstQueryBlockPos := Bk.NumLayers - Config.NumBlocks;
+  MaxUpscalePos := Config.NumUpscaleBlocks - 1;
+  QueryEmb := nil;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Bk.ImageSize, Bk.ImageSize, Bk.NumChannels) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(d, Bk.PatchSize,
+      {pInputPadding=}0, {pStride=}Bk.PatchSize,
+      {pSuppressBias=}0).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    NN.AddLayer( TNNetPadXY.Create(NumPrefix, 0, pmZero, {Trailing=}0) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(
+      NumTokens).SetTrainable(pTrainable) );
+    if not pTrainable then NN.SetTrainable();
+    SetLength(Blocks, Bk.NumLayers);
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      if BlockPos = FirstQueryBlockPos then
+      begin
+        // The query tokens go in front: [queries][CLS][registers][patches].
+        NN.AddLayer( TNNetPadXY.Create(Config.NumQueries, 0, pmZero, 0) );
+        QueryEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(
+          Config.NumQueries + NumTokens).SetTrainable(pTrainable) );
+        if not pTrainable then NN.SetTrainable();
+      end;
+      AddDINOv2EncoderBlock(NN, Bk, Blocks[BlockPos], pTrainable);
+    end;
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(
+      Bk.LayerNormEps).SetTrainable(pTrainable) );
+    // Class head and mask head on the query rows.
+    QueryRows := NN.AddLayerAfter( TNNetCrop.Create(0, 0, Config.NumQueries, 1),
+      FinalLN );
+    ClassHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+      Config.NumLabels + 1).SetTrainable(pTrainable) );
+    MaskFc[0] := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(
+      d).SetTrainable(pTrainable), QueryRows );
+    NN.AddLayer( CreateHFActivationLayer(Config.HiddenActName, csEoMTImporter) );
+    MaskFc[1] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+    NN.AddLayer( CreateHFActivationLayer(Config.HiddenActName, csEoMTImporter) );
+    MaskFc[2] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable) );
+    // Pixel features: the patch rows as the (Grid, Grid, d) map, upscaled.
+    NN.AddLayerAfter( TNNetCrop.Create(Config.NumQueries + NumPrefix, 0,
+      NumPatches, 1), FinalLN );
+    NN.AddLayer( TNNetReshape.Create(Grid, Grid, d) );
+    SetLength(Upscale, Config.NumUpscaleBlocks);
+    for UpscalePos := 0 to MaxUpscalePos do
+    begin
+      Upscale[UpscalePos].Deconv := NN.AddLayer( TNNetDeconvolutionLinear.Create(
+        d, 2, {pStride=}2, {pPadding=}0, {pOutputPadding=}0,
+        {pSuppressBias=}0).SetTrainable(pTrainable) );
+      NN.AddLayer( CreateHFActivationLayer(Config.HiddenActName, csEoMTImporter) );
+      Upscale[UpscalePos].DepthwiseConv := NN.AddLayer(
+        TNNetDepthwiseConvLinear.Create(1, 3, 1, 1).SetTrainable(pTrainable) );
+      Upscale[UpscalePos].Norm := NN.AddLayer( TNNetTokenLayerNorm.Create(
+        cEoMTLayerNorm2dEps).SetTrainable(pTrainable) );
+    end;
+    // mask[q, pixel] = mask_embed[q] . pixel_features[pixel].
+    NN.AddLayer( TNNetDotProducts.Create(NN.GetLastLayer(), MaskFc[2]) );
+    NN.AddLayer( TNNetDeepConcat.Create([ClassHead, NN.GetLastLayer()]) );
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights ----------------
+    LoadBiasedPatchConv(Reader, PatchConv,
+      'embeddings.patch_embeddings.projection', Bk.NumChannels, Bk.PatchSize, d,
+      csEoMTImporter);
+    LoadEoMTPositionTable(Reader, PosEmb, NumPatches, Bk.NumRegisterTokens, d);
+    LoadEoMTLeadingRows(Reader, QueryEmb, 'query.weight', Config.NumQueries, d);
+    for BlockPos := 0 to MaxBlockPos do
+    begin
+      BlockPfx := 'layers.' + IntToStr(BlockPos) + '.';
+      LoadDINOv2EncoderBlockWeightsNamed(Reader, Blocks[BlockPos], BlockPfx, Bk,
+        BlockPfx + 'attention.q_proj', BlockPfx + 'attention.k_proj',
+        BlockPfx + 'attention.v_proj', BlockPfx + 'attention.out_proj');
+    end;
+    LoadLayerNormWeights(Reader, FinalLN, 'layernorm.weight', 'layernorm.bias', d);
+    LoadLlamaLinearWeights(Reader, ClassHead, 'class_predictor.weight', d,
+      Config.NumLabels + 1, 0, -1, 0, 'class_predictor.bias');
+    for FcPos := 0 to 2 do
+    begin
+      FcName := 'mask_head.fc' + IntToStr(FcPos + 1);
+      LoadLlamaLinearWeights(Reader, MaskFc[FcPos], FcName + '.weight', d, d,
+        0, -1, 0, FcName + '.bias');
+    end;
+    for UpscalePos := 0 to MaxUpscalePos do
+    begin
+      UpPfx := 'upscale_block.block.' + IntToStr(UpscalePos) + '.';
+      LoadConvTranspose2DFoldBN(Reader, Upscale[UpscalePos].Deconv,
+        UpPfx + 'conv1.weight', UpPfx + 'conv1.bias', d, d, 2);
+      LoadConvNeXtDepthwise(Reader, Upscale[UpscalePos].DepthwiseConv,
+        UpPfx + 'conv2.weight', {no bias}'', d, 3);
+      LoadLayerNormWeights(Reader, Upscale[UpscalePos].Norm,
+        UpPfx + 'layernorm2d.weight', UpPfx + 'layernorm2d.bias', d);
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildEoMTFromSafeTensorsEx(const FileName: string;
+  const Config: TEoMTConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildEoMTFromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildEoMTFromSafeTensors(const FileName: string;
+  out Config: TEoMTConfig; pTrainable: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadEoMTConfigFromJSONFile(ConfigPath);
+  Result := BuildEoMTFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure SplitEoMTOutput(Output: TNNetVolume; const Config: TEoMTConfig;
+  ClassLogits, MaskLogits: TNNetVolume);
+var
+  ClassCount, PixelCount, QueryPos, MaxQueryPos, SourcePos: integer;
+begin
+  ClassCount := Config.NumLabels + 1;
+  PixelCount := Sqr(EoMTMaskGridSize(Config));
+  if (Output.SizeX <> Config.NumQueries) or (Output.SizeY <> 1) or
+     (Output.Depth <> ClassCount + PixelCount) then
+    raise Exception.Create('SplitEoMTOutput: Output is not a (' +
+      IntToStr(Config.NumQueries) + ', 1, ' + IntToStr(ClassCount + PixelCount) +
+      ') BuildEoMT output.');
+  ClassLogits.ReSize(Config.NumQueries, 1, ClassCount);
+  MaskLogits.ReSize(Config.NumQueries, 1, PixelCount);
+  MaxQueryPos := Config.NumQueries - 1;
+  SourcePos := 0;
+  for QueryPos := 0 to MaxQueryPos do
+  begin
+    Move(Output.FData[SourcePos], ClassLogits.FData[QueryPos * ClassCount],
+      ClassCount * csNeuralFloatSize);
+    Move(Output.FData[SourcePos + ClassCount],
+      MaskLogits.FData[QueryPos * PixelCount], PixelCount * csNeuralFloatSize);
+    Inc(SourcePos, ClassCount + PixelCount);
+  end;
 end;
 
 // ===========================================================================

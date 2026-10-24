@@ -1710,6 +1710,11 @@ type
     procedure TestDFineParity;
     procedure TestDFineOpenCL;
     procedure TestDFineSkipsLayersAfterEvalIdx;
+    // EoMT (eomt): class and mask logits against transformers on the MLP and
+    // SwiGLU pico fixtures; a nonzero attn_mask_probs is rejected.
+    procedure TestEoMTConfigFromJSONFile;
+    procedure TestEoMTParity;
+    procedure TestEoMTRejectsNonzeroAttnMaskProbs;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -59811,6 +59816,144 @@ begin
   finally
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestEoMTConfigFromJSONFile;
+var
+  Config: TEoMTConfig;
+begin
+  Config := ReadEoMTConfigFromJSONFile(FixturePath('tiny_eomt_config.json'));
+  AssertEquals('hidden', 16, Config.Backbone.HiddenSize);
+  AssertEquals('layers', 3, Config.Backbone.NumLayers);
+  AssertEquals('registers', 2, Config.Backbone.NumRegisterTokens);
+  AssertEquals('queries', 5, Config.NumQueries);
+  AssertEquals('num_blocks', 2, Config.NumBlocks);
+  AssertEquals('labels from id2label', 4, Config.NumLabels);
+  AssertEquals('mask grid', 16, EoMTMaskGridSize(Config));
+  AssertFalse('mlp ffn', Config.Backbone.UseSwiGLUFFN);
+  Config := ReadEoMTConfigFromJSONFile(FixturePath('tiny_eomt_swiglu_config.json'));
+  AssertTrue('swiglu ffn', Config.Backbone.UseSwiGLUFFN);
+  AssertEquals('swiglu half width', 24, Config.Backbone.IntermediateSize);
+  AssertEquals('swiglu mask grid', 12, EoMTMaskGridSize(Config));
+end;
+
+// The pico EoMT of Name against the transformers class and mask logits.
+procedure RunEoMTParity(ATest: TTestNeuralPretrained; const Name: string);
+var
+  Config: TEoMTConfig;
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image, ClassLogits, MaskLogits, Expected: TNNetVolume;
+  SemanticMap: TMask2FormerLabelMap;
+  ClassDiff, MaskDiff: double;
+  ElementPos, MaxElementPos, MaskGrid: integer;
+begin
+  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  ClassLogits := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NN := nil;
+  try
+    IO.LoadTensorFlat('pixel_values', Expected);
+    Image.ReSize(IO.DimSize('pixel_values', 1), IO.DimSize('pixel_values', 0), 3);
+    Image.CopyNoChecks(Expected);
+    NN := BuildEoMTFromSafeTensors(ATest.FixturePath(Name + '.safetensors'),
+      Config, {pTrainable=}false, ATest.FixturePath(Name + '_config.json'));
+    NN.Compute(Image);
+    SplitEoMTOutput(NN.GetLastLayer.Output, Config, ClassLogits, MaskLogits);
+    MaskGrid := EoMTMaskGridSize(Config);
+    IO.LoadTensorFlat('class_queries_logits', Expected);
+    ATest.AssertEquals(Name + ' class logits size', Expected.Size, ClassLogits.Size);
+    ClassDiff := 0;
+    MaxElementPos := Expected.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      ClassDiff := Max(ClassDiff,
+        Abs(Expected.FData[ElementPos] - ClassLogits.FData[ElementPos]));
+    IO.LoadTensorFlat('masks_queries_logits', Expected);
+    ATest.AssertEquals(Name + ' mask grid', MaskGrid,
+      IO.DimSize('masks_queries_logits', 2));
+    ATest.AssertEquals(Name + ' mask logits size', Expected.Size, MaskLogits.Size);
+    MaskDiff := 0;
+    MaxElementPos := Expected.Size - 1;
+    for ElementPos := 0 to MaxElementPos do
+      MaskDiff := Max(MaskDiff,
+        Abs(Expected.FData[ElementPos] - MaskLogits.FData[ElementPos]));
+    WriteLn('  ', Name, ' class logits max |diff| ', FloatToStr(ClassDiff),
+      ', mask logits max |diff| ', FloatToStr(MaskDiff));
+    ATest.AssertTrue(Name + ' class logits max |diff| = ' + FloatToStr(ClassDiff),
+      ClassDiff < 1e-4);
+    ATest.AssertTrue(Name + ' mask logits max |diff| = ' + FloatToStr(MaskDiff),
+      MaskDiff < 1e-4);
+    SemanticMap := DecodeMask2FormerSemantic(ClassLogits, MaskLogits,
+      Config.NumLabels, MaskGrid, MaskGrid, MaskGrid, MaskGrid);
+    ATest.AssertEquals(Name + ' semantic map size', MaskGrid * MaskGrid,
+      Length(SemanticMap));
+  finally
+    NN.Free;
+    Expected.Free;
+    MaskLogits.Free;
+    ClassLogits.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestEoMTParity;
+begin
+  RunEoMTParity(Self, 'tiny_eomt');
+  RunEoMTParity(Self, 'tiny_eomt_swiglu');
+end;
+
+// tiny_eomt rewritten with attn_mask_probs = [0, 0.5]: the builder must refuse
+// it, since transformers would run masked attention in the second query block.
+procedure TTestNeuralPretrained.TestEoMTRejectsNonzeroAttnMaskProbs;
+var
+  Source: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Tensor: TNNetVolume;
+  Shape: array of Int64;
+  Config: TEoMTConfig;
+  TempPath, TensorName, ErrorText: string;
+  TensorPos, MaxTensorPos, DimPos, MaxDimPos: integer;
+begin
+  TempPath := GetTempDir(false) + 'cai_eomt_masked_' + IntToStr(Random(1000000)) +
+    '.safetensors';
+  Source := TNNetSafeTensorsReader.Create(FixturePath('tiny_eomt.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(TempPath);
+  Tensor := TNNetVolume.Create;
+  try
+    MaxTensorPos := Source.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+    begin
+      TensorName := Source.TensorName(TensorPos);
+      Source.LoadTensorFlat(TensorName, Tensor);
+      if TensorName = 'attn_mask_probs' then Tensor.FData[1] := 0.5;
+      MaxDimPos := Source.DimCount(TensorName) - 1;
+      SetLength(Shape, MaxDimPos + 1);
+      for DimPos := 0 to MaxDimPos do
+        Shape[DimPos] := Source.DimSize(TensorName, DimPos);
+      Writer.AddTensorFlat(TensorName, Shape, Tensor);
+    end;
+    Writer.SaveToFile;
+  finally
+    Tensor.Free;
+    Writer.Free;
+    Source.Free;
+  end;
+  ErrorText := '';
+  try
+    try
+      BuildEoMTFromSafeTensors(TempPath, Config, false,
+        FixturePath('tiny_eomt_config.json')).Free;
+    except
+      on E: EPretrainedImportError do ErrorText := E.Message;
+    end;
+  finally
+    DeleteFile(TempPath);
+  end;
+  AssertTrue('nonzero attn_mask_probs rejected: "' + ErrorText + '"',
+    Pos('attn_mask_probs[1]', ErrorText) > 0);
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;

@@ -932,30 +932,63 @@ rather than acted on.
           `TestMask2FormerSemanticDecodeReference` carry it); a fixture with varied
           output would make the real-forward check meaningful.
 - [ ] EoMT (Encoder-only Mask Transformer, Kerssies et al. CVPR 2025,
-      arXiv:2503.19108) universal-segmentation importer:
-      BuildEoMTFromSafeTensors[Ex] for transformers' EomtForUniversalSegmentation
-      (model_type "eomt", tue-mps/coco_panoptic_eomt_*_640,
-      tue-mps/ade20k_semantic_eomt_*_512, tue-mps/coco_instance_eomt_*_640),
-      wired into examples/UniversalSegmentation as a second `--model` route.
-      Unlike Mask2Former, it runs end to end from pixels, with no backbone
-      precompute: a plain DINOv2-with-registers ViT (reuse BuildDINOv2 /
-      AddDINOv2EncoderBlock; register tokens and the SwiGLU FFN landed in
-      b205c2fd) where `num_queries` learned query tokens are prepended
-      before the last `num_blocks` (4) encoder blocks. Head (reuse only):
-      final LayerNorm -> class_predictor Linear (num_labels + 1) on the
-      query tokens; mask_head = 3 Linear with GELU between; upscale_block =
-      `num_upscale_blocks` x (ConvTranspose2d k2 s2 -> GELU -> depthwise 3x3
-      no-bias -> LayerNorm2d) on the patch tokens reshaped to the grid;
-      mask logits through the existing Mask2FormerMaskEinsum, and the
-      semantic/instance/panoptic outputs through DecodeMask2FormerSemantic /
-      Instance / Panoptic. Masked attention in the last blocks is a
-      training-time annealing aid: inference skips it when the checkpoint's
-      `attn_mask_probs` buffer is 0, so v1 checks the loaded buffer and
-      rejects nonzero values instead of porting the mask. Preprocess:
-      resize the long side, pad to the square `image_size`, plus the
-      sliding-window split / merge_image_patches for the ADE20K semantic
-      checkpoints. Parity: a pico fixture against transformers' modeling_eomt
-      needs a NEW Python oracle script in tools/, so ask the user first.
+      arXiv:2503.19108) universal-segmentation importer for transformers'
+      EomtForUniversalSegmentation (model_type "eomt",
+      tue-mps/coco_panoptic_eomt_*_640, tue-mps/ade20k_semantic_eomt_*_512,
+      tue-mps/coco_instance_eomt_*_640):
+  - [X] Model core in neural/neuralpretrained.pas: `TEoMTConfig`,
+        `ReadEoMTConfigFromJSONFile` (EomtConfig defaults for omitted fields,
+        num_labels from id2label), `EoMTMaskGridSize`,
+        `BuildEoMTFromSafeTensors[Ex]` and `SplitEoMTOutput`. One TNNet from
+        pixels: DINOv2-with-registers trunk (AddDINOv2EncoderBlock,
+        LoadDINOv2EncoderBlockWeightsNamed for the q/k/v/out_proj names; the
+        position table covers the patch rows only), the query tokens prepended
+        by a TNNetPadXY + TNNetLearnedPositionalEmbedding before the last
+        num_blocks blocks, class_predictor + 3-Linear mask head on the query
+        rows, num_upscale_blocks x (TNNetDeconvolutionLinear k2 s2 -> act ->
+        depthwise 3x3 -> TNNetTokenLayerNorm eps 1e-6) on the patch grid, and
+        the mask logits by TNNetDotProducts (the Mask2FormerMaskEinsum layout).
+        Output (NumQueries, 1, NumLabels + 1 + MaskGrid^2) = class | mask
+        logits; SplitEoMTOutput gives the (Q,1,NumLabels+1) / (Q,1,MaskGrid^2)
+        pair the DecodeMask2Former* routines take. The builder rejects a missing
+        or nonzero `attn_mask_probs` (masked attention is not ported).
+  - [X] Pico parity: tools/make_pico_eomt_fixture.py writes
+        tests/fixtures/tiny_eomt{,_swiglu}{.safetensors,_config.json,
+        _io.safetensors} (float64 transformers oracle; MLP and SwiGLU FFN).
+        TestEoMTParity < 1e-4 on class and mask logits (about 2e-6 measured),
+        TestEoMTConfigFromJSONFile, TestEoMTRejectsNonzeroAttnMaskProbs.
+  - [ ] Preprocessing helper (not written): EomtImageProcessor resizes so the
+        long side is size.longest_edge (640 / 512; bilinear, antialias),
+        rescales 1/255, normalizes with the ImageNet mean/std, then either pads
+        bottom/right with 0 to the square image_size (do_pad, panoptic and
+        instance checkpoints) or, for the ADE20K semantic checkpoints
+        (do_split_image), slices the long side into ceil(long / size) square
+        windows with an even overlap (`_split_image`: start = int(i * (size -
+        overlap_per_patch))). Read each checkpoint's preprocessor_config.json
+        for do_pad / do_split_image.
+  - [ ] Post-processing differs from Mask2Former's, so the example needs EoMT
+        variants or extra parameters on the DecodeMask2Former* routines:
+        every mode first resizes the mask logits bilinearly (align_corners
+        false) to the padded image_size; panoptic and instance then crop to the
+        unpadded resized region (`unpad_image`) and resize to the original
+        size. Semantic: segmentation = sum_q softmax(class)[q, :-1] *
+        sigmoid(mask)[q], resized to the target size, argmax; with
+        do_split_image the per-window class maps are summed and divided by the
+        per-pixel window count (`merge_image_patches`) before the resize.
+        Instance: no top-k - every query whose (softmax-without-null max) x
+        (mean sigmoid over mask > 0 pixels) >= threshold (0.8) is kept in query
+        order. Panoptic: threshold 0.8 default, compute_segments with
+        stuff_classes. Port and pin these against the HF processor on the pico
+        fixture before wiring the example.
+  - [ ] examples/UniversalSegmentation: a second `--model eomt` route that
+        reads config.json + preprocessor_config.json, calls
+        BuildEoMTFromSafeTensors(FileName, Config, false), runs NN.Compute on
+        the preprocessed (ImageSize, ImageSize, 3) volume (once per window for
+        the semantic split), then SplitEoMTOutput and the EoMT post-process
+        above.
+  - [ ] Real-checkpoint smoke (no EoMT checkpoint was run; the importer
+        assumes the transformers key names without a prefix, as
+        EomtForUniversalSegmentation.save_pretrained writes them).
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
