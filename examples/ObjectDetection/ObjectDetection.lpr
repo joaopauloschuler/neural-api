@@ -19,8 +19,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 Coded by Claude (AI).
 *)
 
-// ObjectDetection -- the demo for the two DETR-family object-detection
-// importers, inference only:
+// ObjectDetection -- the demo for the DETR-family object-detection importers,
+// inference only:
 //   * DETR (BuildDetrFromSafeTensors, facebook/detr-resnet-50): a ResNet
 //     backbone + transformer encoder-decoder + learned object queries; decoded
 //     with DecodeDetrDetections (softmax, drop the "no-object" slot, threshold).
@@ -29,19 +29,24 @@ Coded by Claude (AI).
 //     top-K query selection + a multi-scale deformable-attention decoder with
 //     iterative box refinement; decoded with DecodeRtDetrDetections (sigmoid
 //     scores, top-K over query x class, threshold, no NMS).
+//   * D-FINE with --dfine (BuildDFineFromSafeTensors, ustc-community/dfine-*):
+//     an HGNetV2 backbone + the RT-DETR-style hybrid encoder + top-K query
+//     selection + a deformable decoder whose boxes come from Fine-grained
+//     Distribution Refinement; decoded with DecodeRtDetrDetections as RT-DETR.
 // It runs the forward pass on ONE image, draws the surviving boxes (with a
-// "class score" tag in RT-DETR mode) and writes the annotated image.
+// "class score" tag in RT-DETR and D-FINE mode) and writes the annotated image.
 //
 // Usage:
 //   ObjectDetection [model.safetensors] [config.json] [threshold]
-//   ObjectDetection --rtdetr [--image FILE] [--size N] [model.safetensors]
-//                   [config.json] [threshold]
+//   ObjectDetection --rtdetr|--dfine [--image FILE] [--size N]
+//                   [model.safetensors] [config.json] [threshold]
 //
 // --image resizes a photo to the N x N net input (default 640, as
 // RTDetrImageProcessor: PIL bilinear, / 255), scales the boxes back to the
-// photo and writes <name>_rtdetr.png. With no model argument each mode loads
-// its committed pico fixture (tests/fixtures/tiny_detr.* or tiny_rtdetr.*), a
-// tiny random model used by the parity tests, so the demo runs offline.
+// photo and writes <name>_rtdetr.png or <name>_dfine.png. With no model
+// argument each mode loads its committed pico fixture (tests/fixtures/
+// tiny_detr.*, tiny_rtdetr.* or tiny_dfine.*), a tiny random model used by the
+// parity tests, so the demo runs offline.
 //
 // HONEST NOTE: the pico fixtures have RANDOM weights, so their "detections" are
 // not meaningful objects -- they exercise the decode + draw pipeline and
@@ -67,7 +72,7 @@ const
 var
   ModelFile, ConfigFile, IoFile, ImageFile, Arg: string;
   Positional: array of string;
-  UseRtDetr: boolean;
+  UseRtDetr, UseDFine: boolean;
   RtDetrSize, ArgPos, MaxArgPos: integer;
   Threshold: TNeuralFloat;
   NN: TNNet;
@@ -160,24 +165,38 @@ begin
   DrawBitmapText(AImg, X0 + 1, TagTop + 1, Text, TextColor);
 end;
 
-// RT-DETR mode: forward, DecodeRtDetrDetections, draw, write.
-procedure RunRtDetr();
+// RT-DETR and D-FINE mode (IsDFine): forward, DecodeRtDetrDetections, draw,
+// write.
+procedure RunQueryDetector(IsDFine: boolean);
 var
   RtConfig: TRtDetrConfig;
+  DFineConfig: TDFineConfig;
   Net: TNNet;
   Photo, NetInput, Pinned, NetOutput: TNNetVolume;
   Reader: TNNetSafeTensorsReader;
   Detections: TDetrDetectionArray;
   PhotoW, PhotoH, DetPos, BoxX0, BoxY0, BoxX1, BoxY1, ValuePos, MaxValuePos: integer;
-  Name, OutputFile: string;
+  Name, OutputFile, Fixture, ModeName, ModeSuffix: string;
   ScoreThreshold: TNeuralFloat;
   StartTime: TDateTime;
 begin
+  if IsDFine then
+  begin
+    Fixture := 'tiny_dfine';
+    ModeName := 'D-FINE';
+    ModeSuffix := '_dfine';
+  end
+  else
+  begin
+    Fixture := 'tiny_rtdetr';
+    ModeName := 'RT-DETR';
+    ModeSuffix := '_rtdetr';
+  end;
   if Length(Positional) >= 1 then ModelFile := Positional[0]
-  else ModelFile := FixturesDir + 'tiny_rtdetr.safetensors';
+  else ModelFile := FixturesDir + Fixture + '.safetensors';
   if Length(Positional) >= 2 then ConfigFile := Positional[1]
   else ConfigFile := ExtractFilePath(ModelFile) +
-    BoolToStr(Length(Positional) = 0, 'tiny_rtdetr_config.json', 'config.json');
+    BoolToStr(Length(Positional) = 0, Fixture + '_config.json', 'config.json');
   // transformers' post-process default is 0.5; the random fixture uses 0.75.
   if Length(Positional) >= 3 then ScoreThreshold := StrToFloat(Positional[2])
   else if Length(Positional) = 0 then ScoreThreshold := 0.75
@@ -198,7 +217,7 @@ begin
     else
     begin
       // The pinned 64 x 64 fixture image (0..1), drawn on at 0..255.
-      Reader := TNNetSafeTensorsReader.Create(FixturesDir + 'tiny_rtdetr_io.safetensors');
+      Reader := TNNetSafeTensorsReader.Create(FixturesDir + Fixture + '_io.safetensors');
       try
         Reader.LoadTensorFlat('image', Pinned);
         NetInput.ReSize(Reader.DimSize('image', 1), Reader.DimSize('image', 0), 3);
@@ -210,10 +229,20 @@ begin
       Photo.Copy(NetInput);
       Photo.Mul(255);
     end;
-    WriteLn('ObjectDetection (RT-DETR): loading ', ModelFile);
-    Net := BuildRtDetrFromSafeTensors(ModelFile, RtConfig, {pTrainable=}false,
-      ConfigFile, NetInput.SizeX, NetInput.SizeY);
-    WriteLn(RtDetrConfigToString(RtConfig));
+    WriteLn('ObjectDetection (', ModeName, '): loading ', ModelFile);
+    if IsDFine then
+    begin
+      Net := BuildDFineFromSafeTensors(ModelFile, DFineConfig, {pTrainable=}false,
+        ConfigFile, NetInput.SizeX, NetInput.SizeY);
+      WriteLn(DFineConfigToString(DFineConfig));
+      RtConfig := DFineConfig.Detector;
+    end
+    else
+    begin
+      Net := BuildRtDetrFromSafeTensors(ModelFile, RtConfig, {pTrainable=}false,
+        ConfigFile, NetInput.SizeX, NetInput.SizeY);
+      WriteLn(RtDetrConfigToString(RtConfig));
+    end;
     StartTime := Now();
     Net.Compute(NetInput);
     NetOutput := Net.GetLastLayer().Output;
@@ -222,7 +251,7 @@ begin
     for ValuePos := 0 to MaxValuePos do
       if IsNan(NetOutput.FData[ValuePos]) or IsInfinite(NetOutput.FData[ValuePos]) then
       begin
-        WriteLn('ERROR: RT-DETR output contains NaN/Inf.');
+        WriteLn('ERROR: ', ModeName, ' output contains NaN/Inf.');
         Halt(1);
       end;
     Detections := DecodeRtDetrDetections(NetOutput, RtConfig.NumLabels,
@@ -258,16 +287,17 @@ begin
         [Name, Detections[DetPos].Score]), DetPos);
     end;
     if ImageFile <> '' then
-      OutputFile := ChangeFileExt(ExtractFileName(ImageFile), '') + '_rtdetr.png'
+      OutputFile := ChangeFileExt(ExtractFileName(ImageFile), '') + ModeSuffix + '.png'
     else
-      OutputFile := 'object_detection_rtdetr.png';
+      OutputFile := 'object_detection' + ModeSuffix + '.png';
     if not SaveImageFromVolumeIntoFile(Photo, OutputFile) then
       raise Exception.Create('could not save ' + OutputFile);
     WriteLn('Wrote annotated image to ', OutputFile, ' (', PhotoW, 'x', PhotoH, ').');
     if Length(Positional) = 0 then
       WriteLn('(The pico fixture has RANDOM weights, so these are not real ' +
-        'objects. PekingU/rtdetr_r18vd with --image yields real detections ' +
-        'through the same path.)');
+        'objects. A real checkpoint (', BoolToStr(IsDFine,
+        'ustc-community/dfine-nano-coco', 'PekingU/rtdetr_r18vd'),
+        ') with --image yields real detections through the same path.)');
   finally
     Net.Free;
     Pinned.Free;
@@ -279,6 +309,7 @@ end;
 begin
   ImageFile := '';
   UseRtDetr := false;
+  UseDFine := false;
   RtDetrSize := 640;
   Positional := nil;
   MaxArgPos := ParamCount;
@@ -292,6 +323,7 @@ begin
       Halt(2);
     end;
     if Arg = '--rtdetr' then UseRtDetr := true
+    else if Arg = '--dfine' then UseDFine := true
     else if Arg = '--image' then begin Inc(ArgPos); ImageFile := ParamStr(ArgPos); end
     else if Arg = '--size' then begin Inc(ArgPos); RtDetrSize := StrToInt(ParamStr(ArgPos)); end
     else
@@ -301,14 +333,19 @@ begin
     end;
     Inc(ArgPos);
   end;
-  if (ImageFile <> '') and not UseRtDetr then
+  if UseRtDetr and UseDFine then
   begin
-    WriteLn('ERROR: --image needs --rtdetr.');
+    WriteLn('ERROR: pass one of --rtdetr and --dfine.');
     Halt(2);
   end;
-  if UseRtDetr then
+  if (ImageFile <> '') and not (UseRtDetr or UseDFine) then
   begin
-    RunRtDetr();
+    WriteLn('ERROR: --image needs --rtdetr or --dfine.');
+    Halt(2);
+  end;
+  if UseRtDetr or UseDFine then
+  begin
+    RunQueryDetector(UseDFine);
     Exit;
   end;
   if Length(Positional) >= 1 then ModelFile := Positional[0]

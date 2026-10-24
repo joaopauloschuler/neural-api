@@ -17122,11 +17122,27 @@ type
 function ReadDFineConfigFromJSONFile(const FileName: string;
   ImageWidth: integer = 640; ImageHeight: integer = 640): TDFineConfig;
 
+function DFineConfigToString(const Config: TDFineConfig): string;
+
 // Adds the backbone, hybrid encoder and query selection after Source (the
 // RGB input) and loads them from Reader; the decoder is not added.
 function BuildDFineEncoder(NN: TNNet; Reader: TNNetSafeTensorsReader;
   const Config: TDFineConfig; Source: TNNetLayer;
   pTrainable: boolean = false): TDFineEncoderLayers;
+
+// Input (ImageWidth, ImageHeight, 3) RGB in 0..1; output (NumQueries, 1,
+// NumLabels + 4) = transformers logits | pred_boxes, for DecodeRtDetrDetections.
+function BuildDFineFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDFineConfig; pTrainable: boolean = false): TNNet; overload;
+
+function BuildDFineFromSafeTensorsEx(const FileName: string;
+  const Config: TDFineConfig; pTrainable: boolean = false): TNNet;
+
+// Config is read from ConfigFileName ('' = "config.json" beside FileName).
+function BuildDFineFromSafeTensors(const FileName: string;
+  out Config: TDFineConfig; pTrainable: boolean = false;
+  const ConfigFileName: string = ''; ImageWidth: integer = 640;
+  ImageHeight: integer = 640): TNNet; overload;
 
 // ---------------------------------------------------------------------------
 // MASK2FORMER UNIVERSAL-SEGMENTATION IMPORT (HF "mask2former", e.g.
@@ -18790,6 +18806,28 @@ begin
   else if (Layer is TNNetEmbedding) and
      TNNetEmbedding(Layer).WeightsQuantizedInt8 then
     TNNetEmbedding(Layer).DequantizeWeightsInt8();
+end;
+
+// Writes the constant 1x1 conv Out[o] = sum_c Coefs[o * InCh + c] * In[c] +
+// Biases[o]; an empty Biases means no bias.
+procedure WriteFixedPointwise(Layer: TNNetLayer;
+  const Coefs: array of TNeuralFloat; OutCh, InCh: integer;
+  const Biases: array of TNeuralFloat);
+var
+  OutPos, MaxOutPos: integer;
+  HasBias: boolean;
+begin
+  EnsureWritableImportWeights(Layer);
+  HasBias := Length(Biases) > 0;
+  MaxOutPos := OutCh - 1;
+  for OutPos := 0 to MaxOutPos do
+  begin
+    Move(Coefs[OutPos * InCh], Layer.FArrNeurons[OutPos].Weights.FData[0],
+      InCh * csNeuralFloatSize);
+    if HasBias then Layer.FArrNeurons[OutPos].BiasWeight := Biases[OutPos]
+    else Layer.FArrNeurons[OutPos].BiasWeight := 0;
+  end;
+  Layer.FlushWeightCache();
 end;
 
 // Replicates already-imported weights onto a second layer built from the same
@@ -96367,6 +96405,10 @@ type
     // Two-Linear MLP + residual + post LayerNorm (LayerPrefix ends with '.').
     function AddFeedForward(Source: TNNetLayer; Dim, FFNDim: integer;
       const ActivationName, LayerPrefix: string): TNNetLayer;
+    // AttnPrefix sampling_offsets | attention_weights as one Linear, the
+    // (queries, 1, 3 * SampleChannels) TNNetMultiScaleDeformableAttention input.
+    function AddSamplingOffsetsAndLogits(Source: TNNetLayer;
+      SampleChannels: integer; const AttnPrefix: string): TNNetLayer;
     // CSPRepLayer: conv3(RepVGG^BlockCount(conv1(x)) + conv2(x)); every RepVGG
     // block folds into one 3x3 conv; conv3 only when HiddenCh <> OutCh.
     function AddCSPRepLayer(Source: TNNetLayer; HiddenCh, OutCh,
@@ -96519,6 +96561,19 @@ begin
     LayerPrefix + 'fc2', LayerPrefix + 'mlp.layers.1']));
   Result := FNN.AddLayer(TNNetSum.Create([Result, Source]).SetTrainable(FTrainable));
   Result := AddLayerNorm(Result, LayerPrefix + 'final_layer_norm');
+end;
+
+function TRtDetrNetBuilder.AddSamplingOffsetsAndLogits(Source: TNNetLayer;
+  SampleChannels: integer; const AttnPrefix: string): TNNetLayer;
+begin
+  Result := FNN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+    3 * SampleChannels, 0).SetTrainable(FTrainable), Source);
+  LoadLlamaLinearWeights(FReader, Result, AttnPrefix + 'sampling_offsets.weight',
+    FConfig.DModel, 2 * SampleChannels, 0, 3 * SampleChannels, 0,
+    AttnPrefix + 'sampling_offsets.bias');
+  LoadLlamaLinearWeights(FReader, Result, AttnPrefix + 'attention_weights.weight',
+    FConfig.DModel, SampleChannels, 2 * SampleChannels, 3 * SampleChannels, 0,
+    AttnPrefix + 'attention_weights.bias');
 end;
 
 function TRtDetrNetBuilder.AddCSPRepLayer(Source: TNNetLayer; HiddenCh, OutCh,
@@ -96957,16 +97012,8 @@ begin
         .SetTrainable(pTrainable));
       Values := Builder.AddLinear(SourceFlat, DModel, DModel,
         Prefix + 'encoder_attn.value_proj');
-      OffsetsLogits := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
-        3 * SampleChannels, 0).SetTrainable(pTrainable), QueryKey);
-      LoadLlamaLinearWeights(Reader, OffsetsLogits,
-        Prefix + 'encoder_attn.sampling_offsets.weight', DModel,
-        2 * SampleChannels, 0, 3 * SampleChannels, 0,
-        Prefix + 'encoder_attn.sampling_offsets.bias');
-      LoadLlamaLinearWeights(Reader, OffsetsLogits,
-        Prefix + 'encoder_attn.attention_weights.weight', DModel,
-        SampleChannels, 2 * SampleChannels, 3 * SampleChannels, 0,
-        Prefix + 'encoder_attn.attention_weights.bias');
+      OffsetsLogits := Builder.AddSamplingOffsetsAndLogits(QueryKey,
+        SampleChannels, Prefix + 'encoder_attn.');
       Attention := NN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(
         Config.DecoderHeads, Config.DecoderPoints, LevelShapes, Values,
         Reference).SetTrainable(pTrainable), OffsetsLogits);
@@ -97422,6 +97469,38 @@ begin
   end;
 end;
 
+function DFineConfigToString(const Config: TDFineConfig): string;
+
+  function JoinIntegers(const Values: TNeuralIntegerArray): string;
+  var
+    ValuePos, MaxValuePos: integer;
+  begin
+    Result := '';
+    MaxValuePos := High(Values);
+    for ValuePos := 0 to MaxValuePos do
+    begin
+      if ValuePos > 0 then Result := Result + ',';
+      Result := Result + IntToStr(Values[ValuePos]);
+    end;
+  end;
+
+begin
+  Result := 'd_fine config: backbone hgnet_v2 stages=[' +
+    JoinIntegers(Config.Backbone.StageOutChannels) + '] blocks=[' +
+    JoinIntegers(Config.Backbone.StageNumBlocks) + ']' +
+    ', encoder hidden=' + IntToStr(Config.Detector.EncoderHiddenDim) +
+    ' depth_mult=' + FloatToStr(Config.DepthMult) +
+    ', d_model=' + IntToStr(Config.Detector.DModel) +
+    ', decoder=' + IntToStr(Config.Detector.DecoderLayers) + 'x' +
+    IntToStr(Config.Detector.DecoderHeads) + 'h points=[' +
+    JoinIntegers(Config.DecoderPointsPerLevel) + '] eval_idx=' +
+    IntToStr(Config.EvalIdx) + ' bins=' + IntToStr(Config.MaxNumBins) +
+    ', queries=' + IntToStr(Config.Detector.NumQueries) +
+    ', labels=' + IntToStr(Config.Detector.NumLabels) +
+    ', input=' + IntToStr(Config.Detector.ImageWidth) + 'x' +
+    IntToStr(Config.Detector.ImageHeight);
+end;
+
 type
   // The D-FINE neck: a lateral conv without activation, DFineSCDown
   // downsampling and DFineRepNCSPELAN4 fusion blocks.
@@ -97429,18 +97508,65 @@ type
   protected
     FCSPBlockCount: integer; // round(3 * depth_mult) RepVGG blocks per CSPRepLayer
     FBranchWidth: integer;   // the RepNCSPELAN4 branch width (conv4_dim)
+    FDFineConfig: TDFineConfig;
+    // 'model.decoder.' + Name when the checkpoint holds that copy of a tied
+    // head (TensorSuffix names one of its tensors), else Name.
+    function DecoderHeadName(const Name, TensorSuffix: string): string;
   public
     constructor Create(NN: TNNet; Reader: TNNetSafeTensorsReader;
       const Config: TDFineConfig; pTrainable: boolean);
     function AddLateralConv(Source: TNNetLayer; LevelPos: integer): TNNetLayer; override;
     function AddDownsampleConv(Source: TNNetLayer; LevelPos: integer): TNNetLayer; override;
     function AddFusionBlock(Source: TNNetLayer; const BlockPrefix: string): TNNetLayer; override;
+    // DFineGate: sigmoid(gate(concat(Residual, Cross))) weighs Residual and
+    // Cross, then LayerNorm.
+    function AddGate(Residual, Cross: TNNetLayer; const GatePrefix: string): TNNetLayer;
+    // The softmax over the max_num_bins + 1 bins of every box side of the
+    // (queries, 1, 4 * bins) Corners: (4 * queries, 1, bins).
+    function AddBinProbabilities(Corners: TNNetLayer): TNNetLayer;
+    // DFineIntegral + distance2bbox: the cxcywh box from the bin Probabilities
+    // and the initial box as BoxScale (w, h, w, h) and BoxCentre (cx, cy, 0, 0).
+    function AddDistributionBox(Probabilities, BoxScale,
+      BoxCentre: TNNetLayer): TNNetLayer;
+    // DFineLQE: ClassLogits + reg_conf(top-k bin probabilities of every side
+    // and their mean), the mean folded into the first Linear.
+    function AddLocationQuality(ClassLogits, Probabilities: TNNetLayer;
+      const LqePrefix: string): TNNetLayer;
+    // Decoder layers 0..eval_idx with Fine-grained Distribution Refinement and
+    // the eval_idx heads; returns (queries, 1, num_labels + 4).
+    function AddDecoder(const Encoder: TDFineEncoderLayers): TNNetLayer;
   end;
+
+// weighting_function(max_num_bins, up, reg_scale): the max_num_bins + 1 bin
+// offsets, 0 at the centre bin, +-2 * |up * reg_scale| at the ends.
+function DFineWeightingFunction(MaxNumBins: integer;
+  Up, RegScale: TNeuralFloat): TNeuralFloatDynArr;
+var
+  UpperBound, Step: double;
+  BinPos, HalfBins, MaxLeftBinPos, MaxRightBinPos: integer;
+begin
+  Result := nil;
+  SetLength(Result, MaxNumBins + 1);
+  HalfBins := MaxNumBins div 2;
+  UpperBound := Abs(Up) * Abs(RegScale);
+  Step := Power(UpperBound + 1, 2 / (MaxNumBins - 2));
+  Result[0] := -2 * UpperBound;
+  // left_values: 1 - step^i for i = HalfBins - 1 down to 1.
+  MaxLeftBinPos := HalfBins - 1;
+  for BinPos := 1 to MaxLeftBinPos do
+    Result[BinPos] := 1 - Power(Step, HalfBins - BinPos);
+  Result[HalfBins] := 0;
+  MaxRightBinPos := MaxNumBins - 1;
+  for BinPos := HalfBins + 1 to MaxRightBinPos do
+    Result[BinPos] := Power(Step, BinPos - HalfBins) - 1;
+  Result[MaxNumBins] := 2 * UpperBound;
+end;
 
 constructor TDFineNetBuilder.Create(NN: TNNet; Reader: TNNetSafeTensorsReader;
   const Config: TDFineConfig; pTrainable: boolean);
 begin
   inherited Create(NN, Reader, Config.Detector, pTrainable, 'D-FINE');
+  FDFineConfig := Config;
   // Python round() and FPC Round() both round half to even.
   FCSPBlockCount := Round(3 * Config.DepthMult);
   // round(hidden_expansion * encoder_hidden_dim // 2): a float floor division.
@@ -97497,6 +97623,287 @@ begin
     csBlockActivation);
 end;
 
+function TDFineNetBuilder.DecoderHeadName(const Name,
+  TensorSuffix: string): string;
+begin
+  if FReader.HasTensor('model.decoder.' + Name + TensorSuffix) then
+    Result := 'model.decoder.' + Name
+  else Result := Name;
+end;
+
+function TDFineNetBuilder.AddGate(Residual, Cross: TNNetLayer;
+  const GatePrefix: string): TNNetLayer;
+var
+  Gates, ResidualPart, CrossPart: TNNetLayer;
+  DModel: integer;
+begin
+  DModel := FConfig.DModel;
+  Gates := FNN.AddLayer(TNNetDeepConcat.Create([Residual, Cross])
+    .SetTrainable(FTrainable));
+  Gates := AddLinear(Gates, 2 * DModel, 2 * DModel, GatePrefix + 'gate');
+  Gates := FNN.AddLayerAfter(TNNetSigmoid.Create().SetTrainable(FTrainable), Gates);
+  ResidualPart := FNN.AddLayerAfter(TNNetSplitChannels.Create(0, DModel)
+    .SetTrainable(FTrainable), Gates);
+  ResidualPart := FNN.AddLayer(TNNetCellMulByCell.Create(ResidualPart, Residual)
+    .SetTrainable(FTrainable));
+  CrossPart := FNN.AddLayerAfter(TNNetSplitChannels.Create(DModel, DModel)
+    .SetTrainable(FTrainable), Gates);
+  CrossPart := FNN.AddLayer(TNNetCellMulByCell.Create(CrossPart, Cross)
+    .SetTrainable(FTrainable));
+  Result := FNN.AddLayer(TNNetSum.Create([ResidualPart, CrossPart])
+    .SetTrainable(FTrainable));
+  Result := AddLayerNorm(Result, GatePrefix + 'norm');
+end;
+
+function TDFineNetBuilder.AddBinProbabilities(Corners: TNNetLayer): TNNetLayer;
+var
+  BinCount: integer;
+begin
+  BinCount := FDFineConfig.MaxNumBins + 1;
+  Result := FNN.AddLayerAfter(TNNetReshape.Create(4 * Corners.Output.SizeX, 1,
+    BinCount).SetTrainable(FTrainable), Corners);
+  Result := FNN.AddLayerAfter(TNNetPointwiseSoftMax.Create()
+    .SetTrainable(FTrainable), Result);
+end;
+
+function TDFineNetBuilder.AddDistributionBox(Probabilities, BoxScale,
+  BoxCentre: TNNetLayer): TNNetLayer;
+var
+  Weighting: TNeuralFloatDynArr;
+  Coefs: array of TNeuralFloat;
+  BinCount, InDim, BinPos, MaxBinPos: integer;
+  HalfStep, FullStep, RegScale: TNeuralFloat;
+begin
+  BinCount := FDFineConfig.MaxNumBins + 1;
+  InDim := 4 * BinCount;
+  Weighting := DFineWeightingFunction(FDFineConfig.MaxNumBins,
+    FDFineConfig.Up, FDFineConfig.RegScale);
+  // distance2bbox around (cx, cy, w, h) with the side distances d0..d3:
+  // cx' = cx + w * (d2 - d0) / (2 * reg_scale), w' = w * (1 + (d0 + d2) / reg_scale),
+  // and the same for y with d1, d3; each d is the bin-weighted sum.
+  RegScale := Abs(FDFineConfig.RegScale);
+  Coefs := nil;
+  SetLength(Coefs, 4 * InDim);
+  MaxBinPos := BinCount - 1;
+  for BinPos := 0 to MaxBinPos do
+  begin
+    HalfStep := Weighting[BinPos] / (2 * RegScale);
+    FullStep := Weighting[BinPos] / RegScale;
+    Coefs[0 * InDim + 0 * BinCount + BinPos] := -HalfStep;
+    Coefs[0 * InDim + 2 * BinCount + BinPos] := HalfStep;
+    Coefs[1 * InDim + 1 * BinCount + BinPos] := -HalfStep;
+    Coefs[1 * InDim + 3 * BinCount + BinPos] := HalfStep;
+    Coefs[2 * InDim + 0 * BinCount + BinPos] := FullStep;
+    Coefs[2 * InDim + 2 * BinCount + BinPos] := FullStep;
+    Coefs[3 * InDim + 1 * BinCount + BinPos] := FullStep;
+    Coefs[3 * InDim + 3 * BinCount + BinPos] := FullStep;
+  end;
+  Result := FNN.AddLayerAfter(TNNetReshape.Create(BoxScale.Output.SizeX, 1, InDim)
+    .SetTrainable(FTrainable), Probabilities);
+  Result := FNN.AddLayerAfter(TNNetPointwiseConvLinear.Create(4, 0)
+    .SetTrainable(FTrainable), Result);
+  WriteFixedPointwise(Result, Coefs, 4, InDim, [0, 0, 1, 1]);
+  Result := FNN.AddLayer(TNNetCellMulByCell.Create(Result, BoxScale)
+    .SetTrainable(FTrainable));
+  Result := FNN.AddLayer(TNNetSum.Create([Result, BoxCentre])
+    .SetTrainable(FTrainable));
+end;
+
+function TDFineNetBuilder.AddLocationQuality(ClassLogits,
+  Probabilities: TNNetLayer; const LqePrefix: string): TNNetLayer;
+var
+  Weights, Biases: TNNetVolume;
+  Coefs, LayerBiases: array of TNeuralFloat;
+  TopCount, StatDim, LayerPos, MaxLayerPos, InDim, OutDim, OutChannels: integer;
+  Row, MaxRow, Side, ValuePos, MaxValuePos, SourceBase, LabelPos: integer;
+  MaxLabelPos, TargetBase: integer;
+  MeanShare: TNeuralFloat;
+  LayerPrefix: string;
+begin
+  TopCount := FDFineConfig.TopProbValues;
+  StatDim := 4 * (TopCount + 1);
+  Result := FNN.AddLayerAfter(TNNetTopKValues.Create(TopCount)
+    .SetTrainable(FTrainable), Probabilities);
+  Result := FNN.AddLayerAfter(TNNetReshape.Create(ClassLogits.Output.SizeX, 1,
+    4 * TopCount).SetTrainable(FTrainable), Result);
+  Weights := TNNetVolume.Create;
+  Biases := TNNetVolume.Create;
+  try
+    MaxLayerPos := FDFineConfig.LqeLayers - 1;
+    MaxLabelPos := FConfig.NumLabels - 1;
+    MaxValuePos := TopCount - 1;
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      if LayerPos = 0 then InDim := StatDim else InDim := FDFineConfig.LqeHiddenDim;
+      if LayerPos = MaxLayerPos then OutDim := 1 else OutDim := FDFineConfig.LqeHiddenDim;
+      LayerPrefix := LqePrefix + '.layers.' + IntToStr(LayerPos);
+      if not FReader.HasTensor(LayerPrefix + '.weight') or
+         not FReader.HasTensor(LayerPrefix + '.bias') then
+        ImportError('D-FINE import: missing tensor "' + LayerPrefix + '.weight" or .bias.');
+      if (FReader.DimCount(LayerPrefix + '.weight') <> 2) or
+         (FReader.DimSize(LayerPrefix + '.weight', 0) <> OutDim) or
+         (FReader.DimSize(LayerPrefix + '.weight', 1) <> InDim) then
+        ImportError('D-FINE import: "' + LayerPrefix + '.weight" must have shape [' +
+          IntToStr(OutDim) + ', ' + IntToStr(InDim) + '], got ' +
+          FReader.ShapeAsString(LayerPrefix + '.weight'));
+      FReader.LoadTensorFlat(LayerPrefix + '.weight', Weights);
+      FReader.LoadTensorFlat(LayerPrefix + '.bias', Biases);
+      if LayerPos = 0 then
+      begin
+        // stat = (top-k of side 0, their mean, top-k of side 1, ...): the mean
+        // column's weight / k joins each of its side's top-k columns.
+        InDim := 4 * TopCount;
+        Coefs := nil;
+        SetLength(Coefs, OutDim * InDim);
+        MaxRow := OutDim - 1;
+        for Row := 0 to MaxRow do
+          for Side := 0 to 3 do
+          begin
+            SourceBase := Row * StatDim + Side * (TopCount + 1);
+            TargetBase := Row * InDim + Side * TopCount;
+            MeanShare := Weights.FData[SourceBase + TopCount] / TopCount;
+            for ValuePos := 0 to MaxValuePos do
+              Coefs[TargetBase + ValuePos] :=
+                Weights.FData[SourceBase + ValuePos] + MeanShare;
+          end;
+      end
+      else
+      begin
+        Coefs := nil;
+        SetLength(Coefs, OutDim * InDim);
+        Move(Weights.FData[0], Coefs[0], OutDim * InDim * csNeuralFloatSize);
+      end;
+      LayerBiases := nil;
+      SetLength(LayerBiases, OutDim);
+      Move(Biases.FData[0], LayerBiases[0], OutDim * csNeuralFloatSize);
+      OutChannels := OutDim;
+      if LayerPos = MaxLayerPos then
+      begin
+        // The quality score is added to every class logit: one copy per class.
+        OutChannels := FConfig.NumLabels;
+        SetLength(Coefs, OutChannels * InDim);
+        SetLength(LayerBiases, OutChannels);
+        for LabelPos := 1 to MaxLabelPos do
+        begin
+          Move(Coefs[0], Coefs[LabelPos * InDim], InDim * csNeuralFloatSize);
+          LayerBiases[LabelPos] := LayerBiases[0];
+        end;
+      end;
+      Result := FNN.AddLayerAfter(TNNetPointwiseConvLinear.Create(OutChannels, 0)
+        .SetTrainable(FTrainable), Result);
+      WriteFixedPointwise(Result, Coefs, OutChannels, InDim, LayerBiases);
+      if LayerPos < MaxLayerPos then Result := ActivationAfter(Result, 'relu');
+    end;
+  finally
+    Biases.Free;
+    Weights.Free;
+  end;
+  Result := FNN.AddLayer(TNNetSum.Create([ClassLogits, Result])
+    .SetTrainable(FTrainable));
+end;
+
+function TDFineNetBuilder.AddDecoder(const Encoder: TDFineEncoderLayers): TNNetLayer;
+var
+  Hidden, PreviousHidden, Box, QueryPosition, QueryKey, AttentionNorm: TNNetLayer;
+  CrossInput, OffsetsLogits, Attention, Corners, PreviousCorners: TNNetLayer;
+  Probabilities, InitialBox, BoxScale, BoxCentre, HeadInput, Logits: TNNetLayer;
+  LayerPos, MaxLayerPos, LevelPos, MaxLevelPos, SampleChannels: integer;
+  DModel, BinCount: integer;
+  Prefix, EvalName: string;
+begin
+  DModel := FConfig.DModel;
+  BinCount := FDFineConfig.MaxNumBins + 1;
+  if (FDFineConfig.MaxNumBins < 4) or Odd(FDFineConfig.MaxNumBins) then
+    ImportError('D-FINE import: max_num_bins must be even and >= 4, got ' +
+      IntToStr(FDFineConfig.MaxNumBins) + '.');
+  if (FDFineConfig.TopProbValues < 1) or (FDFineConfig.TopProbValues > BinCount) then
+    ImportError('D-FINE import: top_prob_values must be in [1, max_num_bins + 1].');
+  if FDFineConfig.LqeLayers < 1 then
+    ImportError('D-FINE import: lqe_layers must be >= 1.');
+  if Abs(FDFineConfig.RegScale) = 0 then
+    ImportError('D-FINE import: reg_scale must not be 0.');
+  MaxLevelPos := High(FDFineConfig.DecoderPointsPerLevel);
+  SampleChannels := 0;
+  for LevelPos := 0 to MaxLevelPos do
+    Inc(SampleChannels, FDFineConfig.DecoderPointsPerLevel[LevelPos]);
+  SampleChannels := SampleChannels * FConfig.DecoderHeads;
+  Hidden := Encoder.Target;
+  Box := FNN.AddLayerAfter(TNNetSigmoid.Create().SetTrainable(FTrainable),
+    Encoder.ReferenceLogits);
+  PreviousHidden := nil;
+  PreviousCorners := nil;
+  Probabilities := nil;
+  BoxScale := nil;
+  BoxCentre := nil;
+  // The layers after eval_idx do not change the eval-mode outputs.
+  MaxLayerPos := FDFineConfig.EvalIdx;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Prefix := 'model.decoder.layers.' + IntToStr(LayerPos) + '.';
+    QueryPosition := AddMLPHead(Box, 4, 2 * DModel, DModel, 2,
+      'model.decoder.query_pos_head');
+    QueryPosition := FNN.AddLayerAfter(TNNetClamp.Create(-10, 10)
+      .SetTrainable(FTrainable), QueryPosition);
+    QueryKey := FNN.AddLayer(TNNetSum.Create([Hidden, QueryPosition])
+      .SetTrainable(FTrainable));
+    AttentionNorm := AddSelfAttention(Hidden, QueryKey, DModel,
+      FConfig.DecoderHeads, Prefix + 'self_attn.', Prefix + 'self_attn_layer_norm');
+    CrossInput := FNN.AddLayer(TNNetSum.Create([AttentionNorm, QueryPosition])
+      .SetTrainable(FTrainable));
+    OffsetsLogits := AddSamplingOffsetsAndLogits(CrossInput, SampleChannels,
+      Prefix + 'encoder_attn.');
+    // D-FINE samples the decoder memory itself: no value_proj, no output_proj.
+    Attention := FNN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(
+      FConfig.DecoderHeads, FDFineConfig.DecoderPointsPerLevel,
+      Encoder.LevelShapes, Encoder.SourceFlat, Box,
+      FDFineConfig.DecoderOffsetScale).SetTrainable(FTrainable), OffsetsLogits);
+    Hidden := AddGate(AttentionNorm, Attention, Prefix + 'gateway.');
+    Hidden := AddFeedForward(Hidden, DModel, FConfig.DecoderFFNDim,
+      FConfig.DecoderActivation, Prefix);
+    if LayerPos = 0 then
+    begin
+      // pre_bbox_head refines the query boxes once; every later box is
+      // distance2bbox around this initial box.
+      InitialBox := AddMLPHead(Hidden, DModel, DModel, 4, 3,
+        'model.decoder.pre_bbox_head');
+      HeadInput := FNN.AddLayerAfter(TNNetInverseSigmoid.Create()
+        .SetTrainable(FTrainable), Box);
+      FNN.AddLayer(TNNetSum.Create([InitialBox, HeadInput]).SetTrainable(FTrainable));
+      InitialBox := FNN.AddLayer(TNNetSigmoid.Create().SetTrainable(FTrainable));
+      BoxScale := FNN.AddLayerAfter(TNNetPointwiseConvLinear.Create(4, 0)
+        .SetTrainable(FTrainable), InitialBox);
+      WriteFixedPointwise(BoxScale, [0, 0, 1, 0,  0, 0, 0, 1,  0, 0, 1, 0,
+        0, 0, 0, 1], 4, 4, []);
+      BoxCentre := FNN.AddLayerAfter(TNNetPointwiseConvLinear.Create(4, 0)
+        .SetTrainable(FTrainable), InitialBox);
+      WriteFixedPointwise(BoxCentre, [1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0], 4, 4, []);
+      HeadInput := Hidden;
+    end
+    else
+      HeadInput := FNN.AddLayer(TNNetSum.Create([Hidden, PreviousHidden])
+        .SetTrainable(FTrainable));
+    // Fine-grained Distribution Refinement: each layer adds its corner logits
+    // to the previous layer's.
+    Corners := AddMLPHead(HeadInput, DModel, DModel, 4 * BinCount, 3,
+      DecoderHeadName('bbox_embed.' + IntToStr(LayerPos), '.layers.0.weight'));
+    if PreviousCorners <> nil then
+      Corners := FNN.AddLayer(TNNetSum.Create([Corners, PreviousCorners])
+        .SetTrainable(FTrainable));
+    Probabilities := AddBinProbabilities(Corners);
+    Box := AddDistributionBox(Probabilities, BoxScale, BoxCentre);
+    PreviousHidden := Hidden;
+    PreviousCorners := Corners;
+  end;
+  EvalName := IntToStr(MaxLayerPos);
+  Logits := AddLinear(Hidden, DModel, FConfig.NumLabels,
+    DecoderHeadName('class_embed.' + EvalName, '.weight'));
+  Logits := AddLocationQuality(Logits, Probabilities,
+    'model.decoder.lqe_layers.' + EvalName + '.reg_conf');
+  Result := FNN.AddLayer(TNNetDeepConcat.Create([Logits, Box])
+    .SetTrainable(FTrainable));
+end;
+
 function BuildDFineEncoder(NN: TNNet; Reader: TNNetSafeTensorsReader;
   const Config: TDFineConfig; Source: TNNetLayer;
   pTrainable: boolean): TDFineEncoderLayers;
@@ -97550,6 +97957,60 @@ begin
   finally
     Builder.Free;
   end;
+end;
+
+function BuildDFineFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDFineConfig; pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  Builder: TDFineNetBuilder;
+  Encoder: TDFineEncoderLayers;
+  Input: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Builder := nil;
+  try
+    if not pTrainable then NN.ShareHostOutputsByLiveness := true;
+    Input := NN.AddLayer(TNNetInput.Create(Config.Detector.ImageWidth,
+      Config.Detector.ImageHeight, Config.Detector.NumChannels)
+      .SetTrainable(pTrainable));
+    Encoder := BuildDFineEncoder(NN, Reader, Config, Input, pTrainable);
+    Builder := TDFineNetBuilder.Create(NN, Reader, Config, pTrainable);
+    Builder.AddDecoder(Encoder);
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    Builder.Free;
+    NN.Free;
+    raise;
+  end;
+  Builder.Free;
+end;
+
+function BuildDFineFromSafeTensorsEx(const FileName: string;
+  const Config: TDFineConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDFineFromSafeTensors(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDFineFromSafeTensors(const FileName: string;
+  out Config: TDFineConfig; pTrainable: boolean;
+  const ConfigFileName: string; ImageWidth: integer;
+  ImageHeight: integer): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDFineConfigFromJSONFile(ConfigPath, ImageWidth, ImageHeight);
+  Result := BuildDFineFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
 // ===========================================================================
@@ -120684,23 +121145,6 @@ begin
   end;
 end;
 
-// Writes the constant 1x1 conv Out[o] = sum_c Coefs[o * InCh + c] * In[c].
-procedure RVMWriteFixedPointwise(Layer: TNNetLayer;
-  const Coefs: array of TNeuralFloat; OutCh, InCh: integer);
-var
-  OutPos, MaxOutPos: integer;
-begin
-  EnsureWritableImportWeights(Layer);
-  MaxOutPos := OutCh - 1;
-  for OutPos := 0 to MaxOutPos do
-  begin
-    Move(Coefs[OutPos * InCh], Layer.FArrNeurons[OutPos].Weights.FData[0],
-      InCh * csNeuralFloatSize);
-    Layer.FArrNeurons[OutPos].BiasWeight := 0;
-  end;
-  Layer.FlushWeightCache();
-end;
-
 // Loads the trained DGF box filter (depthwise 3x3, no bias); Sign -1 negates it.
 procedure RVMLoadBoxFilter(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
   Sign: TNeuralFloat);
@@ -120985,12 +121429,12 @@ begin
       LoadResNetConvFoldBN(Reader, ProjMat, 'project_mat.conv.weight', '', 4,
         Config.DecoderChannels[3], 1, 0);
       LoadResNetConvBias(Reader, ProjMat, 'project_mat.conv.bias', 4);
-      RVMWriteFixedPointwise(FineSrc, csRVMWithZero, 4, 3);
+      WriteFixedPointwise(FineSrc, csRVMWithZero, 4, 3, []);
     end;
     if HasRefiner then
     begin
-      RVMWriteFixedPointwise(BaseX, csRVMWithMean, 4, 3);
-      RVMWriteFixedPointwise(FineX, csRVMWithMean, 4, 3);
+      WriteFixedPointwise(BaseX, csRVMWithMean, 4, 3, []);
+      WriteFixedPointwise(FineX, csRVMWithMean, 4, 3, []);
     end;
     if HasRefiner and not IsFastRefiner then
     begin

@@ -254,6 +254,11 @@ type
     procedure TestMultiScaleDeformableAttentionLoadsOldSave;
     // TNNetTopKGatherTokens: score order, error scatter and save/load.
     procedure TestTopKGatherTokens;
+    // A Create with no point counts and no level shapes reports the error
+    // without reading past the arrays.
+    procedure TestMultiScaleDeformableAttentionEmptyLevelPoints;
+    // TNNetTopKValues: sorted values with a tie, error scatter and save/load.
+    procedure TestTopKValues;
   private
     // Builds offsets|logits input (layer 0), value input and reference input
     // with deterministic values, then the deformable attention layer built as
@@ -10262,6 +10267,90 @@ begin
   finally
     Desired.Free;
     Rows.Free;
+    Loaded.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMultiScaleDeformableAttentionEmptyLevelPoints;
+var
+  ValueSource, ReferenceSource: TNNetLayer;
+  Layer: TNNetMultiScaleDeformableAttention;
+begin
+  ValueSource := TNNetInput.Create(4, 1, 4);
+  ReferenceSource := TNNetInput.Create(2, 1, 4);
+  Layer := nil;
+  try
+    Layer := TNNetMultiScaleDeformableAttention.Create(2, [], [], ValueSource,
+      ReferenceSource);
+    AssertTrue('the layer is built', Layer <> nil);
+  finally
+    Layer.Free;
+    ReferenceSource.Free;
+    ValueSource.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestTopKValues;
+const
+  // Two cells of depth 5; cell 0 has a tie (0.7 at depths 1 and 3).
+  Values: array[0..9] of TNeuralFloat =
+    (0.1, 0.7, 0.3, 0.7, -1,  2, -1, 0.5, 1.5, 0);
+  ExpectedValues: array[0..5] of TNeuralFloat = (0.7, 0.7, 0.3, 2, 1.5, 0.5);
+  ExpectedDepths: array[0..5] of integer = (1, 3, 2, 0, 3, 2);
+var
+  NN, Loaded: TNNet;
+  Input: TNNetLayer;
+  Source, Desired: TNNetVolume;
+  Pos, Cell, Depth, Rank: integer;
+  Saved: string;
+  Selected: boolean;
+begin
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Source := TNNetVolume.Create(2, 1, 5);
+  Desired := TNNetVolume.Create(2, 1, 3);
+  try
+    Input := NN.AddLayer(TNNetInput.Create(2, 1, 5, 1));
+    NN.AddLayer(TNNetTopKValues.Create(3));
+    for Pos := 0 to 9 do Source.Raw[Pos] := Values[Pos];
+    NN.Compute(Source);
+    AssertEquals('output depth', 3, NN.GetLastLayer.Output.Depth);
+    for Pos := 0 to 5 do
+      AssertEquals('value ' + IntToStr(Pos), ExpectedValues[Pos],
+        NN.GetLastLayer.Output.Raw[Pos], 1e-7);
+    // Backward: each output error lands on the depth it was read from.
+    NN.SetLearningRate(1.0, 0.0);
+    Desired.Fill(0);
+    Input.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for Cell := 0 to 1 do
+      for Depth := 0 to 4 do
+      begin
+        Selected := false;
+        for Rank := 0 to 2 do
+          if ExpectedDepths[Cell * 3 + Rank] = Depth then
+          begin
+            Selected := true;
+            AssertEquals('cell ' + IntToStr(Cell) + ' depth ' + IntToStr(Depth),
+              NN.GetLastLayer.OutputError.Raw[Cell * 3 + Rank],
+              Input.OutputError.Raw[Cell * 5 + Depth], 1e-7);
+          end;
+        if not Selected then
+          AssertEquals('cell ' + IntToStr(Cell) + ' depth ' + IntToStr(Depth) +
+            ' not selected', 0, Input.OutputError.Raw[Cell * 5 + Depth], 0);
+      end;
+    AssertTrue('some error flowed back', Input.OutputError.GetSumAbs() > 0);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('structure round trip', Saved, Loaded.SaveToString());
+    Loaded.Compute(Source);
+    for Pos := 0 to 5 do
+      AssertEquals('loaded value ' + IntToStr(Pos),
+        NN.GetLastLayer.Output.Raw[Pos], Loaded.GetLastLayer.Output.Raw[Pos], 0);
+  finally
+    Desired.Free;
+    Source.Free;
     Loaded.Free;
     NN.Free;
   end;

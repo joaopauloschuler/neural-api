@@ -555,6 +555,7 @@ begin
     385: begin AddImgInput(ANet); Exit(L('TNNetFreeUFourierFilter', TNNetFreeUFourierFilter.Create(0.2))); end;
     386: begin AddImgInput(ANet); Exit(L('TNNetBoxFilter', TNNetBoxFilter.Create(2))); end;
     387: begin AddImgInput(ANet); Exit(L('TNNetInverseSigmoid', TNNetInverseSigmoid.Create(0.001))); end;
+    388: begin AddImgInput(ANet); Exit(L('TNNetTopKValues', TNNetTopKValues.Create(2))); end;
     else
       Result := False;
   end;

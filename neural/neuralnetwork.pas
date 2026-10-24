@@ -16847,6 +16847,19 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// The K largest values along the depth axis of every spatial cell, largest
+  // first (a tie keeps the lower index first): output (SizeX, SizeY, K).
+  // K is stored in FStruct[0]. Gradient flows back to the selected positions.
+  // Coded by Claude (AI).
+  TNNetTopKValues = class(TNNetTopK)
+    private
+      FSelectedDepth: array of integer; // source depth of every output element
+    public
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Hard top-k gate renormalizer for sparse Mixture-of-Experts routing.
   /// Input is a (.,.,NumExperts) tensor of per-expert gate WEIGHTS (typically a
   /// SoftMax output that sums to 1 along the Depth axis). Per spatial cell the
@@ -47382,7 +47395,10 @@ begin
   FLevels := Max(Min(Min(FLevels, csDeformableMaxLevels), Length(pLevelPoints)), 1);
   FHeads := pHeads;
   FStruct[0] := pHeads;
-  FStruct[1] := pLevelPoints[0];
+  // A rejected call (no point counts or shapes) builds one 1x1 level of one
+  // point instead of reading past the arrays.
+  if Length(pLevelPoints) > 0 then FStruct[1] := pLevelPoints[0]
+  else FStruct[1] := 1;
   FStruct[2] := FLevels;
   FFloatSt[0] := pOffsetScale;
   SetLength(FLevelHeight, FLevels);
@@ -47396,16 +47412,28 @@ begin
   MaxLevel := FLevels - 1;
   for Level := 0 to MaxLevel do
   begin
-    if pLevelPoints[Level] < 1 then
-      FErrorProc('TNNetMultiScaleDeformableAttention needs Points >= 1 on ' +
-        'every level, got ' + IntToStr(pLevelPoints[Level]) + ' on level ' +
-        IntToStr(Level) + '.');
-    FLevelPoints[Level] := Max(pLevelPoints[Level], 1);
+    if Level < Length(pLevelPoints) then
+    begin
+      if pLevelPoints[Level] < 1 then
+        FErrorProc('TNNetMultiScaleDeformableAttention needs Points >= 1 on ' +
+          'every level, got ' + IntToStr(pLevelPoints[Level]) + ' on level ' +
+          IntToStr(Level) + '.');
+      FLevelPoints[Level] := Max(pLevelPoints[Level], 1);
+    end
+    else FLevelPoints[Level] := 1;
     FFloatSt[1 + Level] := FLevelPoints[Level];
     FLevelOffsetScale[Level] := pOffsetScale / FLevelPoints[Level];
     Inc(FSampleCount, FLevelPoints[Level]);
-    FLevelHeight[Level] := pLevelShapes[2 * Level];
-    FLevelWidth[Level] := pLevelShapes[2 * Level + 1];
+    if 2 * Level + 1 < Length(pLevelShapes) then
+    begin
+      FLevelHeight[Level] := pLevelShapes[2 * Level];
+      FLevelWidth[Level] := pLevelShapes[2 * Level + 1];
+    end
+    else
+    begin
+      FLevelHeight[Level] := 1;
+      FLevelWidth[Level] := 1;
+    end;
     if (FLevelHeight[Level] < 1) or (FLevelWidth[Level] < 1) or
        (FLevelHeight[Level] > $7FFF) or (FLevelWidth[Level] > $FFFF) then
       FErrorProc('TNNetMultiScaleDeformableAttention: bad level shape ' +
@@ -118507,6 +118535,88 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetTopKValues }
+
+procedure TNNetTopKValues.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ValueCount: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  ValueCount := FStruct[0];
+  if (ValueCount < 1) or (ValueCount > pPrevLayer.Output.Depth) then
+  begin
+    FErrorProc('TNNetTopKValues needs 1 <= K <= ' +
+      IntToStr(pPrevLayer.Output.Depth) + ', got ' + IntToStr(ValueCount) + '.');
+    ValueCount := Max(Min(ValueCount, pPrevLayer.Output.Depth), 1);
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, ValueCount);
+  SetOutputErrorSize(FOutput);
+  SetLength(FSelectedDepth, FOutput.Size);
+end;
+
+procedure TNNetTopKValues.Compute();
+var
+  StartTime: double;
+  Source: TNNetVolume;
+  CellPos, MaxCellPos, SourceBase, OutputBase, ValueCount, SourceDepth: integer;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  Source := FPrevLayer.Output;
+  SourceDepth := Source.Depth;
+  ValueCount := FOutput.Depth;
+  MaxCellPos := FOutput.SizeX * FOutput.SizeY - 1;
+  SourceBase := 0;
+  OutputBase := 0;
+  // NeuralMarkTopK only sets FKeptBuf entries, which nothing here reads.
+  for CellPos := 0 to MaxCellPos do
+  begin
+    NeuralMarkTopK(Source.DataPtr, nil, SourceBase, 1, SourceDepth, ValueCount,
+      FKeptBuf, FTopIdx, FTopVal);
+    Move(FTopVal[0], FOutput.FData[OutputBase], ValueCount * csNeuralFloatSize);
+    Move(FTopIdx[0], FSelectedDepth[OutputBase], ValueCount * csIntegerSize);
+    Inc(SourceBase, SourceDepth);
+    Inc(OutputBase, ValueCount);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTopKValues.Backpropagate();
+var
+  StartTime: double;
+  PrevError: TNNetVolume;
+  CellPos, MaxCellPos, ValuePos, MaxValuePos, SourceBase, OutputPos: integer;
+  SourceDepth, SourcePos: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  PrevError := FPrevLayer.OutputError;
+  if (PrevError.Size > 0) and (PrevError.Size = FPrevLayer.Output.Size) and
+     (FOutput.Size = FOutputError.Size) then
+  begin
+    SourceDepth := FPrevLayer.Output.Depth;
+    MaxCellPos := FOutput.SizeX * FOutput.SizeY - 1;
+    MaxValuePos := FOutput.Depth - 1;
+    SourceBase := 0;
+    OutputPos := 0;
+    for CellPos := 0 to MaxCellPos do
+    begin
+      for ValuePos := 0 to MaxValuePos do
+      begin
+        SourcePos := SourceBase + FSelectedDepth[OutputPos];
+        PrevError.FData[SourcePos] := PrevError.FData[SourcePos] +
+          FOutputError.FData[OutputPos];
+        Inc(OutputPos);
+      end;
+      Inc(SourceBase, SourceDepth);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetTopKGate }
 
 constructor TNNetTopKGate.Create(TopCnt: integer;
@@ -144377,6 +144487,7 @@ begin
       'TNNetPointwiseSoftMax' :     Result := TNNetPointwiseSoftMax.Create(St[0], St[1]);
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
       'TNNetTopK' :                 Result := TNNetTopK.Create(St[0]);
+      'TNNetTopKValues' :           Result := TNNetTopKValues.Create(St[0]);
       'TNNetTopKGate' :             Result := TNNetTopKGate.Create(St[0]);
       'TNNetBiasBalancedTopKGate' : Result := TNNetBiasBalancedTopKGate.Create(St[0], Ft[0]);
       'TNNetExpertChoiceGate' :     Result := TNNetExpertChoiceGate.Create(St[0]);
@@ -144839,6 +144950,7 @@ begin
       if S[0] = 'TNNetPointwiseSoftMax' then Result := TNNetPointwiseSoftMax.Create(St[0], St[1]) else
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
       if S[0] = 'TNNetTopK' then Result := TNNetTopK.Create(St[0]) else
+      if S[0] = 'TNNetTopKValues' then Result := TNNetTopKValues.Create(St[0]) else
       if S[0] = 'TNNetTopKGate' then Result := TNNetTopKGate.Create(St[0]) else
       if S[0] = 'TNNetBiasBalancedTopKGate' then Result := TNNetBiasBalancedTopKGate.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetExpertChoiceGate' then Result := TNNetExpertChoiceGate.Create(St[0]) else

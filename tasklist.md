@@ -1975,74 +1975,31 @@ rather than acted on.
               (model_type rt_detr_v2: per-level point counts, discrete
               sampling) is a separate importer.
 
-- [ ] D-FINE detector importer (BuildDFineFromSafeTensors[Ex], transformers
+- [X] D-FINE detector importer (BuildDFineFromSafeTensors[Ex], transformers
       model_type "d_fine", DFineForObjectDetection; Apache-2.0 checkpoints
       ustc-community/dfine-{nano,small,medium,large,xlarge}-coco and the obj365
-      variants). D-FINE (Peng et al., ICLR 2025) is the RT-DETR design with a
-      stronger box head: it is more accurate than RT-DETR at the same speed, and
-      the nano/small models run in real time on a CPU. Reuse from the RT-DETR
-      importer: the AIFI encoder layer, sine position table, top-K query
-      selection (TNNetTopKGatherTokens), TNNetInverseSigmoid,
-      TNNetMultiScaleDeformableAttention and the no-NMS post-process
-      (DecodeRtDetrDetections). Share the code; do not copy it. New code:
-        - [x] HGNetV2 backbone: DONE, BuildHGNetV2Backbone +
-          ReadHGNetV2Config[FromJSONFile] (LearnableAffineBlock = a
-          TNNetPolynomialActivation with a zero square term). Stem and stage
-          parity < 1e-6 on both pico fixtures, CPU and OpenCL. Pico fixtures
-          tiny_dfine / tiny_dfine_perlevel from tools/make_pico_dfine_fixture.py
-          also hold the encoder outputs, enc_topk, logits, boxes and
-          post-process. transformers 5.17 crashes when eval_idx is not the last
-          layer, so the perlevel oracle runs with the decoder cut after eval_idx.
-        - [x] Hybrid encoder + query selection: DONE, TDFineConfig /
-          ReadDFineConfigFromJSONFile (reads the decoder fields too: per-level
-          points, offset scale, bins, reg_scale, up, eval_idx made
-          non-negative, LQE sizes, layer_scale) and BuildDFineEncoder (returns
-          TDFineEncoderLayers: EncoderOutputs, SourceFlat, LevelShapes,
-          QuerySelection, Target, ReferenceLogits). The RT-DETR builder is now
-          the TRtDetrNetBuilder class (implementation section); D-FINE's
-          TDFineNetBuilder overrides its three neck steps: lateral conv without
-          activation, DFineSCDown, DFineRepNCSPELAN4 (its own convs are silu,
-          the CSP layers activation_function; blocks = round(3 * depth_mult)).
-          D-FINE differences: AIFI FFN is mlp.layers.0/1; decoder_input_proj
-          is identity (no layer) when d_model = decoder_in_channels[-1], extra
-          levels included; anchor_image_size must equal the input size.
-          Encoder outputs < 1e-6 and enc_topk exact on both pico fixtures, CPU
-          and OpenCL (TestDFineEncoderParity / TestDFineEncoderOpenCL).
-          Step 4 notes: build the full net as input -> BuildDFineEncoder ->
-          decoder in a BuildDFineFromSafeTensors that sets
-          ShareHostOutputsByLiveness and calls NN.SetTrainable() like
-          BuildRtDetrFromSafeTensors; use a TDFineNetBuilder for the decoder
-          (AddLinear/AddLayerNorm/AddMLPHead/AddSelfAttention/AddFeedForward,
-          PickModule takes a name list). ReferenceLogits are unsigmoided
-          (RT-DETR adds the TNNetSigmoid after AddQuerySelection). Use the
-          per-level TNNetMultiScaleDeformableAttention.Create with
-          DecoderPointsPerLevel and DecoderOffsetScale; Detector.DecoderPoints
-          is 0.
-        - [x] Deformable attention with one point count per level
-          (decoder_n_points as a list, num_points_scale = 1/n per point) and
-          decoder_offset_scale: DONE, the per-level Create overload of
-          TNNetMultiScaleDeformableAttention (FFloatSt [0] scale, [1+l]
-          counts; old saves load unchanged) and cai_ms_deformable_attn.
-          decoder_method "discrete" is not implemented (default is
-          "default"). TNNetInverseSigmoid also runs in OpenCL now (opcode 73).
-        - Decoder gate (DFineGate: sigmoid(Linear(concat)) mixes the residual
-          and the cross-attention output, then LayerNorm).
-        - Fine-grained Distribution Refinement: each layer predicts 4 x
-          (max_num_bins + 1) logits; the box is the softmax over the bins
-          times the fixed weighting_function(max_num_bins, up, reg_scale),
-          then distance2bbox. The weighting vector is a constant computed at
-          build time. Each layer adds its corners to the previous ones.
-        - LQE head: top-k (top_prob_values) of each softmaxed side + their
-          mean -> small MLP -> added to the class logits.
-      Honour eval_idx (the output layer can be before the last decoder layer;
-      do not build the layers after it). Add ObjectDetection --dfine
-      [--image], a pico fixture generator next to
-      tools/make_pico_rtdetr_fixture.py, and parity tests against transformers
-      (logits and boxes < 1e-4) on two pico configs: one with equal and one
-      with per-level point counts. Agent check on dfine-nano-coco at 640 x 640
-      under the 2 GB cap: same detections as transformers. Update
-      examples/ObjectDetection/README.md. Inference only; training (FDR/GO-LSD
-      distillation losses) is out of scope.
+      variants). DONE: HGNetV2 backbone (BuildHGNetV2Backbone), the hybrid
+      encoder + query selection on the shared TRtDetrNetBuilder
+      (BuildDFineEncoder), and the decoder in TDFineNetBuilder.AddDecoder:
+      DFineGate, per-level TNNetMultiScaleDeformableAttention on the decoder
+      memory (no value/output projection), pre_bbox_head initial box,
+      Fine-grained Distribution Refinement (bin softmax, DFineWeightingFunction
+      folded with distance2bbox into one fixed Linear, corners accumulated
+      across layers) and the LQE head (new TNNetTopKValues layer; the mean
+      folded into the first Linear). Layers after eval_idx are not built.
+      Post-process is DecodeRtDetrDetections. Parity on tiny_dfine and
+      tiny_dfine_perlevel, CPU and forced OpenCL: logits < 1.8e-6, boxes
+      < 1.5e-7, post-process scores and xyxy < 1.5e-7 (TestDFineParity,
+      TestDFineOpenCL). ObjectDetection --dfine [--image] [--size].
+        - [ ] Agent or user check on a real ustc-community/dfine-* checkpoint
+              (dfine-nano-coco at 640 x 640 under the 2 GB cap): same
+              detections as transformers. Not run on the dev box.
+        - [ ] decoder_method "discrete" (rejected at load now).
+        - [ ] TNNetTopKValues has no OpenCL path, so under OpenCL the LQE
+              downloads the eval layer's bin probabilities (4 x queries x
+              (max_num_bins + 1) floats) once per forward.
+        - Inference only; training (FDR/GO-LSD distillation losses) is out of
+          scope.
 
 - [ ] Fuyu decoder-only multimodal importer (BuildFuyuFromSafeTensors[Ex],
       model_type "fuyu", e.g. adept/fuyu-8b). Architecturally DISTINCT from every

@@ -1692,6 +1692,11 @@ type
     procedure TestDFineConfigFromJSONFile;
     procedure TestDFineEncoderParity;
     procedure TestDFineEncoderOpenCL;
+    // The whole D-FINE: logits, pred_boxes and post-process against
+    // transformers on both pico fixtures, CPU and forced OpenCL.
+    procedure TestDFineParity;
+    procedure TestDFineOpenCL;
+    procedure TestDFineSkipsLayersAfterEvalIdx;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -59137,58 +59142,26 @@ begin
 end;
 {$ENDIF}
 
-procedure RunRtDetrParity(ATest: TTestNeuralPretrained; const Name: string;
-  OnOpenCL: boolean);
+// The (queries, 1, labels + 4) Output of the pico detector Name against the
+// logits, pred_boxes and post-process of its transformers oracle IO.
+procedure AssertRtDetrOutputMatchesOracle(ATest: TTestNeuralPretrained;
+  IO: TNNetSafeTensorsReader; Output: TNNetVolume; NumLabels,
+  NumQueries: integer; const Name: string);
 var
-  Config: TRtDetrConfig;
-  NN: TNNet;
-  IO: TNNetSafeTensorsReader;
-  Image, Expected, ExpectedBoxes, ExpectedLabels, Settings, Output: TNNetVolume;
+  Expected, ExpectedBoxes, ExpectedLabels, Settings: TNNetVolume;
   Detections: TDetrDetectionArray;
-  Query, Channel, MaxQuery, NumLabels, DetectionPos, TargetW, TargetH: integer;
+  Query, Channel, MaxQuery, DetectionPos, TargetW, TargetH: integer;
   LogitDiff, BoxDiff, ScoreDiff, CornerDiff: double;
   Corners: array[0..3] of double;
-  {$IFDEF OpenCL}
-  PlatformId: cl_platform_id;
-  DeviceId: cl_device_id;
-  {$ENDIF}
 begin
-  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
-  Image := TNNetVolume.Create;
   Expected := TNNetVolume.Create;
   ExpectedBoxes := TNNetVolume.Create;
   ExpectedLabels := TNNetVolume.Create;
   Settings := TNNetVolume.Create;
-  NN := nil;
   try
-    IO.LoadTensorFlat('image', Expected);
-    Image.ReSize(IO.DimSize('image', 1), IO.DimSize('image', 0), 3);
-    Image.CopyNoChecks(Expected);
-    NN := BuildRtDetrFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
-      {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
-      Image.SizeY);
-    {$IFDEF OpenCL}
-    if OnOpenCL then
-    begin
-      if not ATest.AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
-      begin
-        ATest.AssertTrue('no OpenCL device: SKIP', true);
-        exit;
-      end;
-      NN.EnableOpenCL(PlatformId, DeviceId);
-      NN.ForceOpenCL(true);
-      NN.LayerProfiling := true;
-    end;
-    {$ENDIF}
-    NN.Compute(Image);
-    {$IFDEF OpenCL}
-    if OnOpenCL then ReportRtDetrResidency(ATest, NN, Name);
-    {$ENDIF}
-    Output := NN.GetLastLayer.Output;
-    NumLabels := Config.NumLabels;
-    ATest.AssertEquals(Name + ' queries', Config.NumQueries, Output.SizeX);
+    ATest.AssertEquals(Name + ' queries', NumQueries, Output.SizeX);
     ATest.AssertEquals(Name + ' depth', NumLabels + 4, Output.Depth);
-    MaxQuery := Config.NumQueries - 1;
+    MaxQuery := NumQueries - 1;
     IO.LoadTensorFlat('logits', Expected);
     LogitDiff := 0;
     for Query := 0 to MaxQuery do
@@ -59233,16 +59206,77 @@ begin
         CornerDiff := Max(CornerDiff, Abs(Corners[Channel] -
           ExpectedBoxes.FData[DetectionPos * 4 + Channel]) / Max(TargetW, TargetH));
     end;
+    WriteLn('  ', Name, ' post-process: ', Length(Detections), ' detections, score ',
+      'max |diff| ', FloatToStr(ScoreDiff), ', xyxy max |diff| / size ',
+      FloatToStr(CornerDiff));
     ATest.AssertTrue(Name + ' score max |diff| = ' + FloatToStr(ScoreDiff),
       ScoreDiff < 1e-4);
     ATest.AssertTrue(Name + ' xyxy box max |diff| / size = ' +
       FloatToStr(CornerDiff), CornerDiff < 1e-4);
   finally
-    NN.Free;
     Settings.Free;
     ExpectedLabels.Free;
     ExpectedBoxes.Free;
     Expected.Free;
+  end;
+end;
+
+// The image of the pico fixture Name as a (width, height, 3) volume.
+procedure LoadDetectorFixtureImage(IO: TNNetSafeTensorsReader; Image: TNNetVolume);
+var
+  Flat: TNNetVolume;
+begin
+  Flat := TNNetVolume.Create;
+  try
+    IO.LoadTensorFlat('image', Flat);
+    Image.ReSize(IO.DimSize('image', 1), IO.DimSize('image', 0), 3);
+    Image.CopyNoChecks(Flat);
+  finally
+    Flat.Free;
+  end;
+end;
+
+procedure RunRtDetrParity(ATest: TTestNeuralPretrained; const Name: string;
+  OnOpenCL: boolean);
+var
+  Config: TRtDetrConfig;
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image: TNNetVolume;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+begin
+  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  NN := nil;
+  try
+    LoadDetectorFixtureImage(IO, Image);
+    NN := BuildRtDetrFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
+      {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
+      Image.SizeY);
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      if not ATest.AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+      begin
+        ATest.AssertTrue('no OpenCL device: SKIP', true);
+        exit;
+      end;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(true);
+      NN.LayerProfiling := true;
+    end;
+    {$ENDIF}
+    NN.Compute(Image);
+    {$IFDEF OpenCL}
+    if OnOpenCL then ReportRtDetrResidency(ATest, NN, Name);
+    {$ENDIF}
+    AssertRtDetrOutputMatchesOracle(ATest, IO, NN.GetLastLayer.Output,
+      Config.NumLabels, Config.NumQueries, Name);
+  finally
+    NN.Free;
     Image.Free;
     IO.Free;
   end;
@@ -59540,6 +59574,96 @@ begin
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
+end;
+
+// The whole pico D-FINE of Name (eval_idx heads) against the transformers
+// logits, pred_boxes and post-process.
+procedure RunDFineParity(ATest: TTestNeuralPretrained; const Name: string;
+  OnOpenCL: boolean);
+var
+  Config: TDFineConfig;
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image: TNNetVolume;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+begin
+  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  NN := nil;
+  try
+    LoadDetectorFixtureImage(IO, Image);
+    NN := BuildDFineFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
+      {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
+      Image.SizeY);
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      if not ATest.AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+      begin
+        ATest.AssertTrue('no OpenCL device: SKIP', true);
+        exit;
+      end;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(true);
+      NN.LayerProfiling := true;
+    end;
+    {$ENDIF}
+    NN.Compute(Image);
+    {$IFDEF OpenCL}
+    if OnOpenCL then ReportRtDetrResidency(ATest, NN, Name);
+    {$ENDIF}
+    AssertRtDetrOutputMatchesOracle(ATest, IO, NN.GetLastLayer.Output,
+      Config.Detector.NumLabels, Config.Detector.NumQueries, Name);
+  finally
+    NN.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDFineParity;
+begin
+  RunDFineParity(Self, 'tiny_dfine', {OnOpenCL=}false);
+  RunDFineParity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}false);
+end;
+
+// The pico nets on OpenCL (forced) against the same transformers oracle.
+procedure TTestNeuralPretrained.TestDFineOpenCL;
+begin
+  {$IFDEF OpenCL}
+  RunDFineParity(Self, 'tiny_dfine', {OnOpenCL=}true);
+  RunDFineParity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// eval_idx 1 of 3: the layers after it are not built, so the net holds the
+// decoder layers 0 and 1 only.
+procedure TTestNeuralPretrained.TestDFineSkipsLayersAfterEvalIdx;
+var
+  Config: TDFineConfig;
+  NN: TNNet;
+  LayerPos, MaxLayerPos, AttentionCount: integer;
+begin
+  NN := BuildDFineFromSafeTensors(FixturePath('tiny_dfine_perlevel.safetensors'),
+    Config, {pTrainable=}false, FixturePath('tiny_dfine_perlevel_config.json'),
+    64, 64);
+  try
+    AttentionCount := 0;
+    MaxLayerPos := NN.CountLayers() - 1;
+    for LayerPos := 0 to MaxLayerPos do
+      if NN.Layers[LayerPos] is TNNetMultiScaleDeformableAttention then
+        Inc(AttentionCount);
+    AssertEquals('decoder layers built', Config.EvalIdx + 1, AttentionCount);
+    AssertEquals('output depth', Config.Detector.NumLabels + 4,
+      NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;
