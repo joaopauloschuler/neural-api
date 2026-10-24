@@ -19138,6 +19138,17 @@ type
   /// padding, stride, suppress-bias) and FStruct[5] the modulation flag, so the
   /// layer round-trips through SaveStructureToString / LoadFromString /
   /// CreateLayer with the modulation flag preserved.
+  ///
+  /// EXTERNAL-OFFSET MODE (torchvision.ops.deform_conv2d): Create(NumFeatures,
+  /// FeatureSize, Padding, Stride, SuppressBias, OffsetSource, MaskSource,
+  /// OffsetGroups) takes the offsets from OffsetSource (OutX x OutY x
+  /// 2*OffsetGroups*KK, channel g*2*KK + 2*tap = dy, +1 = dx, tap = fy*K + fx)
+  /// and the optional modulation mask from MaskSource (OutX x OutY x
+  /// OffsetGroups*KK, channel g*KK + tap), used as given (no sigmoid). Input
+  /// channels split into OffsetGroups contiguous groups, each sampled with its
+  /// own offsets and mask. There is no offset head (neurons 2/3 are 1-element
+  /// placeholders). FStruct[6] = OffsetGroups (0 = self-offset mode), FStruct[7]
+  /// = has-mask; the source layer indexes ride the third save-string slot.
   // Coded by Claude (AI).
   TNNetDeformableConv = class(TNNetConvolutionLinear)
   private
@@ -19149,6 +19160,12 @@ type
     FOffOut: integer;      // offset-head output channels: 2*KK, or 3*KK if modulated
     FModulated: integer;   // 0 = plain deformable conv (v1), 1 = DCNv2 modulated
     FOffMap: TNNetVolume;  // cached offset maps (FOutputSizeX,Y, FOffOut)
+    FOffsetLayer: TNNetLayer;  // external offsets (nil in self-offset mode)
+    FMaskLayer: TNNetLayer;    // external modulation mask (optional)
+    FHasOffsetSource: boolean;
+    FHasMaskSource: boolean;
+    FGroupCount: integer;      // offset groups; 1 in self-offset mode
+    FGroupDepth: integer;      // input channels per offset group
     // AVX scratch for the main-conv ci-reduction. FSampledCol holds the
     // bilinearly-sampled (and modulated) input column over ci for one (ox,oy,tap)
     // -- gathered SCALAR once, independent of co. FWeightCI is mW transposed to
@@ -19180,12 +19197,29 @@ type
     {$ENDIF}
     function SampleBilinear(PrevOut: TNNetVolume; px, py: TNeuralFloat;
       ci: integer): TNeuralFloat;
+    // Raw positions of output pixel (ox,oy) in the offset map (FOffMap or the
+    // offset source) and in the mask source.
+    procedure TapSourceBases(ox, oy: integer; out OffBase, MaskBase: integer);
+    // Dest[0..InDepth) := bilinear samples of tap (fx,fy) at output (ox,oy),
+    // scaled by the modulation (sigmoid logit, or the mask source).
+    procedure GatherTapColumn(PrevOut: TNNetVolume;
+      OffBase, MaskBase, ox, oy, fx, fy: integer; Dest: TNeuralFloatArrPtr);
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; override;
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias, pModulated: integer); reintroduce; overload;
+    // torchvision.ops.deform_conv2d form: offsets (and an optional mask) from
+    // extra sources; see the class comment for shapes and channel order.
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride,
+      pSuppressBias: integer; OffsetSource: TNNetLayer;
+      MaskSource: TNNetLayer = nil; pOffsetGroups: integer = 1); reintroduce; overload;
+    // Rebuilds the layer from its saved FStruct and source layers (CreateLayer).
+    class function CreateFromStruct(const pStruct: array of integer;
+      const pSources: array of TNNetLayer): TNNetDeformableConv;
     destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure AppendInputLayers(pList: TList); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure InitDefault(); override;
     procedure Compute(); override;
@@ -19197,6 +19231,9 @@ type
     property InDepth: integer read FInDepth;
     property OutDepth: integer read FOutDepth;
     property Modulated: integer read FModulated;
+    property OffsetSource: TNNetLayer read FOffsetLayer;
+    property MaskSource: TNNetLayer read FMaskLayer;
+    property OffsetGroups: integer read FGroupCount;
   end;
 
   /// p4 GROUP-EQUIVARIANT CONVOLUTION -- the LIFTING layer of a Group
@@ -25995,9 +26032,10 @@ type
 
   // OutPtr[0..D-1] := bilinear blend of Src's depth columns at source-pixel
   // (sx, sy); BorderPad clamps corners, else out-of-range corners add 0.
+  // SrcDepthOffset selects the first source channel of the D-long column.
   procedure NeuralBilinearGatherColumn(Src: TNNetVolume;
     OutPtr: TNeuralFloatArrPtr; sx, sy: TNeuralFloat;
-    W, H, D: integer; BorderPad: boolean);
+    W, H, D: integer; BorderPad: boolean; SrcDepthOffset: integer = 0);
 
   // Marks the pK largest of pValues^[pBase + i*pStride] (+ pBias^[i]) in the
   // zeroed pKept; pTopIdx/pTopVal (>= pK entries) end sorted, largest first.
@@ -46865,7 +46903,7 @@ end;
 // here removes the duplicated MulAdd blend.
 procedure NeuralBilinearGatherColumn(Src: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr; sx, sy: TNeuralFloat;
-  W, H, D: integer; BorderPad: boolean);
+  W, H, D: integer; BorderPad: boolean; SrcDepthOffset: integer);
 var
   x0, y0, x1, y1: integer;
   fx, fy, w00, w01, w10, w11: TNeuralFloat;
@@ -46887,10 +46925,10 @@ begin
     if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
     if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
     if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0), w00, D);
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0), w10, D);
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1), w01, D);
-    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1), w11, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0, SrcDepthOffset), w00, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, SrcDepthOffset), w10, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, SrcDepthOffset), w01, D);
+    TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, SrcDepthOffset), w11, D);
   end
   else
   begin
@@ -46899,10 +46937,10 @@ begin
     inX1 := (x1 >= 0) and (x1 < W);
     inY0 := (y0 >= 0) and (y0 < H);
     inY1 := (y1 >= 0) and (y1 < H);
-    if inX0 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0), w00, D);
-    if inX1 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0), w10, D);
-    if inX0 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1), w01, D);
-    if inX1 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1), w11, D);
+    if inX0 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y0, SrcDepthOffset), w00, D);
+    if inX1 and inY0 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y0, SrcDepthOffset), w10, D);
+    if inX0 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x0, y1, SrcDepthOffset), w01, D);
+    if inX1 and inY1 then TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(x1, y1, SrcDepthOffset), w11, D);
   end;
 end;
 
@@ -104266,6 +104304,62 @@ begin
   // Neurons are sized in SetPrevLayer once InDepth is known.
 end;
 
+constructor TNNetDeformableConv.Create(pNumFeatures, pFeatureSize,
+  pInputPadding, pStride, pSuppressBias: integer; OffsetSource: TNNetLayer;
+  MaskSource: TNNetLayer; pOffsetGroups: integer);
+begin
+  Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pSuppressBias, 0);
+  if OffsetSource = nil then
+    FErrorProc('TNNetDeformableConv requires a non-nil OffsetSource.');
+  if pOffsetGroups < 1 then
+    FErrorProc('TNNetDeformableConv requires OffsetGroups >= 1. Got ' +
+      IntToStr(pOffsetGroups));
+  FStruct[6] := pOffsetGroups;
+  FOffsetLayer := OffsetSource;
+  FMaskLayer := MaskSource;
+  if Assigned(FMaskLayer) then FStruct[7] := 1 else FStruct[7] := 0;
+  // Extra sources: register one more departing branch on each (the input
+  // branch is counted by AddLayer/AddLayerAfter).
+  if FOffsetLayer is TNNetInput then TNNetInput(FOffsetLayer).EnableErrorCollection;
+  FOffsetLayer.IncDepartingBranchesCnt();
+  if Assigned(FMaskLayer) then
+  begin
+    if FMaskLayer is TNNetInput then TNNetInput(FMaskLayer).EnableErrorCollection;
+    FMaskLayer.IncDepartingBranchesCnt();
+  end;
+end;
+
+class function TNNetDeformableConv.CreateFromStruct(
+  const pStruct: array of integer;
+  const pSources: array of TNNetLayer): TNNetDeformableConv;
+begin
+  if pStruct[6] = 0 then
+    Result := TNNetDeformableConv.Create(pStruct[0], pStruct[1], pStruct[2],
+      pStruct[3], pStruct[4], pStruct[5])
+  else if pStruct[7] = 0 then
+    Result := TNNetDeformableConv.Create(pStruct[0], pStruct[1], pStruct[2],
+      pStruct[3], pStruct[4], pSources[0], nil, pStruct[6])
+  else
+    Result := TNNetDeformableConv.Create(pStruct[0], pStruct[1], pStruct[2],
+      pStruct[3], pStruct[4], pSources[0], pSources[1], pStruct[6]);
+end;
+
+function TNNetDeformableConv.SaveStructureToString(): string;
+var
+  SourceIdxs: string;
+begin
+  if not Assigned(FOffsetLayer) then
+  begin
+    Result := inherited SaveStructureToString;
+    exit;
+  end;
+  SourceIdxs := IntToStr(FOffsetLayer.FLayerIdx);
+  if Assigned(FMaskLayer) then
+    SourceIdxs := SourceIdxs + ';' + IntToStr(FMaskLayer.FLayerIdx);
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + SourceIdxs + ':', [rfReplaceAll]);
+end;
+
 destructor TNNetDeformableConv.Destroy();
 begin
   FOffMap.Free;
@@ -104301,12 +104395,50 @@ begin
 
   FModulated := FStruct[5];                            // 0 (v1) or 1 (DCNv2)
   FNumTaps := FFeatureSizeX * FFeatureSizeY;          // KK
-  if FModulated <> 0 then
-    FOffOut := 3 * FNumTaps                            // 2*KK offsets + KK mod logits
+  FHasOffsetSource := Assigned(FOffsetLayer);
+  FHasMaskSource := Assigned(FMaskLayer);
+  if FHasOffsetSource then
+  begin
+    FGroupCount := FStruct[6];
+    if FModulated <> 0 then
+      FErrorProc('TNNetDeformableConv: Modulated=1 needs the self-offset mode;' +
+        ' pass a MaskSource instead.');
+    if (FGroupCount < 1) or (FInDepth mod FGroupCount <> 0) then
+      FErrorProc('TNNetDeformableConv requires InDepth=' + IntToStr(FInDepth) +
+        ' divisible by OffsetGroups=' + IntToStr(FGroupCount));
+    if (FOffsetLayer.Output.SizeX <> FOutputSizeX) or
+       (FOffsetLayer.Output.SizeY <> FOutputSizeY) or
+       (FOffsetLayer.Output.Depth <> 2 * FGroupCount * FNumTaps) then
+      FErrorProc('TNNetDeformableConv requires an offset source of ' +
+        IntToStr(FOutputSizeX) + 'x' + IntToStr(FOutputSizeY) + 'x' +
+        IntToStr(2 * FGroupCount * FNumTaps) + '. Got ' +
+        IntToStr(FOffsetLayer.Output.SizeX) + 'x' +
+        IntToStr(FOffsetLayer.Output.SizeY) + 'x' +
+        IntToStr(FOffsetLayer.Output.Depth));
+    if FHasMaskSource and
+      ((FMaskLayer.Output.SizeX <> FOutputSizeX) or
+       (FMaskLayer.Output.SizeY <> FOutputSizeY) or
+       (FMaskLayer.Output.Depth <> FGroupCount * FNumTaps)) then
+      FErrorProc('TNNetDeformableConv requires a mask source of ' +
+        IntToStr(FOutputSizeX) + 'x' + IntToStr(FOutputSizeY) + 'x' +
+        IntToStr(FGroupCount * FNumTaps) + '. Got ' +
+        IntToStr(FMaskLayer.Output.SizeX) + 'x' +
+        IntToStr(FMaskLayer.Output.SizeY) + 'x' +
+        IntToStr(FMaskLayer.Output.Depth));
+    FOffOut := 0;                                      // no offset head
+    FOffSize := 0;
+  end
   else
-    FOffOut := 2 * FNumTaps;                           // 2*KK offset channels
+  begin
+    FGroupCount := 1;
+    if FModulated <> 0 then
+      FOffOut := 3 * FNumTaps                          // 2*KK offsets + KK mod logits
+    else
+      FOffOut := 2 * FNumTaps;                         // 2*KK offset channels
+    FOffSize := FNumTaps * FInDepth * FOffOut;         // offset-head weights
+  end;
+  FGroupDepth := FInDepth div FGroupCount;
   FMainSize := FNumTaps * FInDepth * FOutDepth;        // main conv weights
-  FOffSize := FNumTaps * FInDepth * FOffOut;           // offset-head weights
 
   NeededNeurons := 4;  // main W, main bias, offset W, offset bias
   while FNeurons.Count > NeededNeurons do
@@ -104343,20 +104475,20 @@ begin
     end;
   end;
   FNeurons[1].FBiasWeight := 0;
-  // neuron 2: offset-head weights.
-  FNeurons[2].Weights.ReSize(FOffSize, 1, 1);
+  // neuron 2: offset-head weights (1-element placeholder without a head).
+  FNeurons[2].Weights.ReSize(Max(FOffSize, 1), 1, 1);
   if FIsTrainable then
   begin
-    FNeurons[2].BackInertia.ReSize(FOffSize, 1, 1);
-    FNeurons[2].Delta.ReSize(FOffSize, 1, 1);
+    FNeurons[2].BackInertia.ReSize(Max(FOffSize, 1), 1, 1);
+    FNeurons[2].Delta.ReSize(Max(FOffSize, 1), 1, 1);
   end;
   FNeurons[2].FBiasWeight := 0;
-  // neuron 3: offset-head biases (2*KK).
-  FNeurons[3].Weights.ReSize(FOffOut, 1, 1);
+  // neuron 3: offset-head biases (2*KK, or 3*KK if modulated).
+  FNeurons[3].Weights.ReSize(Max(FOffOut, 1), 1, 1);
   if FIsTrainable then
   begin
-    FNeurons[3].BackInertia.ReSize(FOffOut, 1, 1);
-    FNeurons[3].Delta.ReSize(FOffOut, 1, 1);
+    FNeurons[3].BackInertia.ReSize(Max(FOffOut, 1), 1, 1);
+    FNeurons[3].Delta.ReSize(Max(FOffOut, 1), 1, 1);
   end;
   FNeurons[3].FBiasWeight := 0;
 
@@ -104365,17 +104497,17 @@ begin
   FShouldInterleaveWeights := false;
   BuildArrNeurons();
 
-  FOffMap.ReSize(FOutputSizeX, FOutputSizeY, FOffOut);
+  FOffMap.ReSize(FOutputSizeX, FOutputSizeY, Max(FOffOut, 1));
   FSampledCol.ReSize(1, 1, FInDepth);
   FWeightCI.ReSize(1, 1, FMainSize);  // ci-contiguous transpose of mW
   // Backward scratch (see field comments).
   FMWDeltaCI.ReSize(1, 1, FMainSize);
-  FOWDeltaCI.ReSize(1, 1, FOffSize);
-  FOWeightCI.ReSize(1, 1, FOffSize);
+  FOWDeltaCI.ReSize(1, 1, Max(FOffSize, 1));
+  FOWeightCI.ReSize(1, 1, Max(FOffSize, 1));
   FBwScol.ReSize(1, 1, FInDepth);
   FBwDSpx.ReSize(1, 1, FInDepth);
   FBwDSpy.ReSize(1, 1, FInDepth);
-  FdOffMap.ReSize(FOutputSizeX, FOutputSizeY, FOffOut);
+  FdOffMap.ReSize(FOutputSizeX, FOutputSizeY, Max(FOffOut, 1));
 
   {$IFDEF OpenCL}
   FShouldOpenCL := (Int64(FOutDepth) * (FOutputSizeX * FOutputSizeY) * (FNumTaps * FInDepth) >= cNeuralOpenCLMinWork);
@@ -104439,6 +104571,69 @@ begin
   Result := v;
 end;
 
+procedure TNNetDeformableConv.TapSourceBases(ox, oy: integer;
+  out OffBase, MaskBase: integer);
+begin
+  MaskBase := 0;
+  if FHasOffsetSource then
+  begin
+    OffBase := FOffsetLayer.FOutput.GetRawPos(ox, oy);
+    if FHasMaskSource then MaskBase := FMaskLayer.FOutput.GetRawPos(ox, oy);
+  end
+  else
+    OffBase := FOffMap.GetRawPos(ox, oy);
+end;
+
+procedure TNNetDeformableConv.GatherTapColumn(PrevOut: TNNetVolume;
+  OffBase, MaskBase, ox, oy, fx, fy: integer; Dest: TNeuralFloatArrPtr);
+var
+  tap, tap2, Group, MaxGroupPos, GroupOfs, OffPos, MaskPos, TapCount2: integer;
+  dx, dy, px, py, modM: TNeuralFloat;
+  OffVol, MaskVol: TNNetVolume;
+begin
+  tap := fy * FFeatureSizeX + fx;
+  tap2 := 2 * tap;
+  if not FHasOffsetSource then
+  begin
+    dx := FOffMap.FData[OffBase + tap2];
+    dy := FOffMap.FData[OffBase + tap2 + 1];
+    px := ox * FStride + fx - FPadding + dx;
+    py := oy * FStride + fy - FPadding + dy;
+    // AVX bilinear gather of the whole ci column (zero-padding); the DCNv2
+    // per-tap modulation m = sigmoid(logit) scales it after the gather.
+    NeuralBilinearGatherColumn(PrevOut, Dest, px, py,
+      PrevOut.SizeX, PrevOut.SizeY, FInDepth, {BorderPad=}false);
+    if FModulated <> 0 then
+    begin
+      modM := 1.0 / (1.0 + NeuralExp(-FOffMap.FData[OffBase + 2 * FNumTaps + tap]));
+      TNNetVolume.Mul(Dest, modM, FInDepth);
+    end;
+    exit;
+  end;
+  // torchvision order: per group g, channel g*2*KK + 2*tap = dy, +1 = dx.
+  OffVol := FOffsetLayer.FOutput;
+  if FHasMaskSource then MaskVol := FMaskLayer.FOutput else MaskVol := nil;
+  TapCount2 := 2 * FNumTaps;
+  OffPos := OffBase + tap2;
+  MaskPos := MaskBase + tap;
+  GroupOfs := 0;
+  MaxGroupPos := FGroupCount - 1;
+  for Group := 0 to MaxGroupPos do
+  begin
+    dy := OffVol.FData[OffPos];
+    dx := OffVol.FData[OffPos + 1];
+    px := ox * FStride + fx - FPadding + dx;
+    py := oy * FStride + fy - FPadding + dy;
+    NeuralBilinearGatherColumn(PrevOut, @Dest^[GroupOfs], px, py,
+      PrevOut.SizeX, PrevOut.SizeY, FGroupDepth, {BorderPad=}false, GroupOfs);
+    if FHasMaskSource then
+      TNNetVolume.Mul(@Dest^[GroupOfs], MaskVol.FData[MaskPos], FGroupDepth);
+    Inc(OffPos, TapCount2);
+    Inc(MaskPos, FNumTaps);
+    Inc(GroupOfs, FGroupDepth);
+  end;
+end;
+
 procedure TNNetDeformableConv.Compute();
 var
   StartTime: double;
@@ -104446,6 +104641,8 @@ begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
+  if FHasOffsetSource then FOffsetLayer.ForceOutputOnRAM();
+  if FHasMaskSource then FMaskLayer.ForceOutputOnRAM();
   // Offload the dense main-conv im2col GEMM to the device when OpenCL is armed
   // and the contraction is large enough to amortise the upload/dispatch. The
   // offset head and the bilinear GATHER stay on the CPU (see ComputeOpenCL);
@@ -104467,17 +104664,15 @@ end;
 procedure TNNetDeformableConv.ComputeCPU();
 var
   ox, oy, co, fx, fy, ci, tap, oc, FNumTapsM1: integer;
-  prevX0, prevY0, sx, sy: integer;
+  prevX0, prevY0: integer;
   MaxOY, MaxOX, MaxOffOut, MaxFY, MaxFX, MaxCI, MaxCO: integer;
   PrevOut, mW, mB, oW, oB: TNNetVolume;
-  dx, dy, px, py, offv, modM: TNeuralFloat;
-  baseOut, offBase, tap2, dstBase, srcPos, wOfs, pos: integer;
+  offv: TNeuralFloat;
+  baseOut, offBase, maskBase, dstBase, srcPos, wOfs, pos: integer;
   rowPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
-  sx := PrevOut.SizeX;
-  sy := PrevOut.SizeY;
   mW := FArrNeurons[0].FWeights;
   mB := FArrNeurons[1].FWeights;
   oW := FArrNeurons[2].FWeights;
@@ -104492,6 +104687,7 @@ begin
   MaxCO := FOutDepth - 1;
 
   // 1. Offset head: ordinary conv (same kernel/pad/stride) -> 2*KK offset maps.
+  //    Absent when the offsets come from an external source (MaxOffOut = -1).
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
     for oc := 0 to MaxOffOut do
@@ -104536,41 +104732,22 @@ begin
       end;
     end;
 
-  // 2. Deformable main conv: sample each tap by bilinear interpolation at the
-  //    offset position, then the usual weighted sum. The bilinear GATHER stays
-  //    scalar; the sampled (+modulated) input column over ci is gathered ONCE
-  //    per (ox,oy,tap) into FSampledCol (independent of co), then reduced over
-  //    ci against each co's weight row with the AVX DotProduct primitive.
+  // 2. Deformable main conv: the sampled (+modulated) input column over ci is
+  //    gathered ONCE per (ox,oy,tap) into FSampledCol (independent of co), then
+  //    reduced over ci against each co's weight row with the AVX DotProduct.
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
   begin
     baseOut := FOutput.GetRawPos(ox, oy);
-    offBase := FOffMap.GetRawPos(ox, oy);  // invariant across tap (#11)
+    TapSourceBases(ox, oy, offBase, maskBase);  // invariant across tap (#11)
     for co := 0 to MaxCO do
       FOutput.FData[baseOut + co] := mB.FData[co];  // bias seed
     for fy := 0 to MaxFY do
     for fx := 0 to MaxFX do
     begin
       tap := fy * FFeatureSizeX + fx;
-      tap2 := 2 * tap;
-      dx := FOffMap.FData[offBase + tap2];
-      dy := FOffMap.FData[offBase + tap2 + 1];
-      px := ox * FStride + fx - FPadding + dx;
-      py := oy * FStride + fy - FPadding + dy;
-      // DCNv2: per-tap modulation m = sigmoid(logit) scales the sampled value.
-      if FModulated <> 0 then
-        modM := 1.0 / (1.0 + NeuralExp(-FOffMap.FData[offBase + 2 * FNumTaps + tap]))
-      else
-        modM := 1.0;
-      // AVX bilinear gather of the whole ci column for this tap via the shared
-      // depth-contiguous corner-blend helper (zero-padding). Offsets are per-tap
-      // (shared across ci), so the four corners blend as Depth-long MulAdds in the
-      // same in-bounds add order as the scalar SampleBilinear reference. The DCNv2
-      // per-tap modulation scales the gathered column AFTER the gather.
-      NeuralBilinearGatherColumn(PrevOut, @FSampledCol.FData[0], px, py,
-        sx, sy, FInDepth, {BorderPad=}false);
-      if FModulated <> 0 then
-        TNNetVolume.Mul(@FSampledCol.FData[0], modM, FInDepth);
+      GatherTapColumn(PrevOut, offBase, maskBase, ox, oy, fx, fy,
+        @FSampledCol.FData[0]);
       // AVX ci-reduction: acc[co] += <weightRow(tap,co), FSampledCol>.
       wOfs := (tap * FOutDepth) * FInDepth;   // co = 0 (#12: carry per co)
       for co := 0 to MaxCO do
@@ -104629,16 +104806,14 @@ procedure TNNetDeformableConv.ComputeOpenCL();
 var
   ox, oy, co, fx, fy, ci, tap, t: integer;
   MaxOY, MaxOX, MaxOffOut, MaxFY, MaxFX, MaxCI, MaxCO: integer;
-  NumPos, Sz, oc, sx, sy: integer;
+  NumPos, Sz, oc: integer;
   prevX0, prevY0: integer;
   PrevOut, mW, mB, oW, oB: TNNetVolume;
-  dx, dy, px, py, offv, modM: TNeuralFloat;
-  baseOut, offBase, tap2, tSz, patchOfs, resBase: integer;
+  offv: TNeuralFloat;
+  baseOut, offBase, maskBase, tSz, patchOfs, resBase: integer;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
-  sx := PrevOut.SizeX;
-  sy := PrevOut.SizeY;
   mW := FArrNeurons[0].FWeights;
   mB := FArrNeurons[1].FWeights;
   oW := FArrNeurons[2].FWeights;
@@ -104655,7 +104830,8 @@ begin
   Sz := FNumTaps * FInDepth;
 
   // 1. Offset head: ordinary conv (same kernel/pad/stride) -> 2*KK offset maps.
-  //    Identical to ComputeCPU step 1 (stays on the CPU).
+  //    Identical to ComputeCPU step 1 (stays on the CPU; absent with an
+  //    external offset source).
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
     for oc := 0 to MaxOffOut do
@@ -104699,29 +104875,16 @@ begin
   begin
     t := oy * FOutputSizeX + ox;
     tSz := t * Sz;                          // tap-invariant patch row base (#11)
-    offBase := FOffMap.GetRawPos(ox, oy);   // invariant across tap (#11)
+    TapSourceBases(ox, oy, offBase, maskBase);  // invariant across tap (#11)
     for fy := 0 to MaxFY do
     for fx := 0 to MaxFX do
     begin
-      tap := fy * FFeatureSizeX + fx;
-      tap2 := 2 * tap;
-      dx := FOffMap.FData[offBase + tap2];
-      dy := FOffMap.FData[offBase + tap2 + 1];
-      px := ox * FStride + fx - FPadding + dx;
-      py := oy * FStride + fy - FPadding + dy;
-      if FModulated <> 0 then
-        modM := 1.0 / (1.0 + NeuralExp(-FOffMap.FData[offBase + 2 * FNumTaps + tap]))
-      else
-        modM := 1.0;
       // The patch slot [t*Sz + tap*FInDepth .. +FInDepth) is contiguous over ci,
-      // so blend the four corner columns straight into it with the shared AVX
-      // helper (zero-padding), then scale by the DCNv2 modulation in place.
+      // so the sampled (+modulated) column is gathered straight into it.
+      tap := fy * FFeatureSizeX + fx;
       patchOfs := tSz + tap * FInDepth;     // formed once (#4)
-      NeuralBilinearGatherColumn(PrevOut,
-        @FGemmPatch.FData[patchOfs], px, py,
-        sx, sy, FInDepth, {BorderPad=}false);
-      if FModulated <> 0 then
-        TNNetVolume.Mul(@FGemmPatch.FData[patchOfs], modM, FInDepth);
+      GatherTapColumn(PrevOut, offBase, maskBase, ox, oy, fx, fy,
+        @FGemmPatch.FData[patchOfs]);
     end;
   end;
 
@@ -104760,6 +104923,13 @@ begin
     BackpropagateCPU();
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  // Propagate into the extra sources, then the input chain.
+  if FHasOffsetSource and
+     (FOffsetLayer.OutputError.Size = FOffsetLayer.Output.Size) then
+    FOffsetLayer.Backpropagate();
+  if FHasMaskSource and
+     (FMaskLayer.OutputError.Size = FMaskLayer.Output.Size) then
+    FMaskLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -104767,14 +104937,16 @@ procedure TNNetDeformableConv.BackpropagateCPU();
 var
   ox, oy, co, fx, fy, ci, tap, oc, FNumTapsM1: integer;
   prevX0, prevY0, x0, y0, x1, y1, sx, sy: integer;
-  MaxOY, MaxOX, MaxCO, MaxFY, MaxFX, MaxCI, MaxOffOut: integer;
-  PrevOut, PrevErr, mW, oW: TNNetVolume;
+  MaxOY, MaxOX, MaxCO, MaxFY, MaxFX, MaxCI, MaxOffOut, MaxGroupPos: integer;
+  PrevOut, PrevErr, mW, oW, OffVol, OffErr, MaskVol, MaskErr: TNNetVolume;
   mWDelta, mBDelta, oWDelta, oBDelta: TNNetVolume;
   dy_out, dx, dyo, px, py, fxr, fyr, dOff, lr: TNeuralFloat;
   w00, w01, w10, w11: TNeuralFloat;
-  modM, dModAcc, coef, wdpx, wdpy: TNeuralFloat;
-  HasPrevError, b00, b01, b10, b11: boolean;
-  wciBase, owBase, owDBase, scl, errBase, offBase, tap2: integer;
+  modM, dModAcc, dOffXAcc, dOffYAcc, coef, wdpx, wdpy: TNeuralFloat;
+  HasPrevError, HasOffErr, HasMaskErr, NeedModGrad: boolean;
+  b00, b01, b10, b11: boolean;
+  wciBase, owBase, owDBase, scl, errBase, offBase, maskBase, tap2: integer;
+  Group, GroupOfs, OffPos, MaskPos, TapCount2: integer;
   pScol, pDSpx, pDSpy, pWrow, pPrev00, pPrev01, pPrev10, pPrev11: TNeuralFloatArrPtr;
   pErr00, pErr01, pErr10, pErr11: TNeuralFloatArrPtr;
 
@@ -104792,6 +104964,23 @@ begin
   mBDelta := FArrNeurons[1].FDelta;
   oWDelta := FArrNeurons[2].FDelta;
   oBDelta := FArrNeurons[3].FDelta;
+  OffVol := nil; OffErr := nil; MaskVol := nil; MaskErr := nil;
+  HasOffErr := false;
+  HasMaskErr := false;
+  if FHasOffsetSource then
+  begin
+    OffVol := FOffsetLayer.FOutput;
+    OffErr := FOffsetLayer.FOutputError;
+    HasOffErr := (OffErr.Size = OffVol.Size);
+    if FHasMaskSource then
+    begin
+      MaskVol := FMaskLayer.FOutput;
+      MaskErr := FMaskLayer.FOutputError;
+      HasMaskErr := (MaskErr.Size = MaskVol.Size);
+    end;
+  end;
+  NeedModGrad := (FModulated <> 0) or HasMaskErr;
+  TapCount2 := 2 * FNumTaps;
 
   MaxOY := FOutputSizeY - 1;
   MaxOX := FOutputSizeX - 1;
@@ -104800,6 +104989,7 @@ begin
   MaxFX := FFeatureSizeX - 1;
   MaxCI := FInDepth - 1;
   MaxOffOut := FOffOut - 1;
+  MaxGroupPos := FGroupCount - 1;
 
   // Rebuild the ci-contiguous main-weight transpose (forward already maintains
   // FWeightCI, but rebuild defensively so backward is self-contained: weights
@@ -104818,123 +105008,157 @@ begin
   FdOffMap.Fill(0);
 
   // --- Main deformable conv backward ---
-  // For each output (ox,oy,co): accumulate main-weight grad, main-bias grad,
-  // input grad through the 4 bilinear corners, and offset-map grad through the
-  // interpolation coefficients' dependence on (px,py). The per-tap raw bilinear
-  // sample column (FBwScol) and its dpx/dpy derivative columns (FBwDSpx/DSpy) are
-  // CONTIGUOUS over ci and gathered ONCE per (ox,oy,tap) -- independent of co --
-  // then every co-reduction over ci becomes an AVX DotProduct / MulAdd. The
-  // bilinear GATHER itself is the same in-bounds-corner add order as the scalar
-  // reference (zero corners are skipped, not added), so the column build is
-  // bit-identical to the prior per-ci recompute.
+  // For each output (ox,oy,co) and offset group: accumulate main-weight grad,
+  // main-bias grad, input grad through the 4 bilinear corners, and offset grad
+  // through the interpolation coefficients' dependence on (px,py). The per-tap
+  // raw bilinear sample column (FBwScol) and its dpx/dpy derivative columns
+  // (FBwDSpx/DSpy) are CONTIGUOUS over the group's ci and gathered ONCE per
+  // (ox,oy,tap,group) -- independent of co -- then every co-reduction over ci is
+  // an AVX DotProduct / MulAdd. Zero corners are skipped, not added. The
+  // self-offset mode is the single group covering all of ci.
   pScol := FBwScol.GetRawPtr(0);
   pDSpx := FBwDSpx.GetRawPtr(0);
   pDSpy := FBwDSpy.GetRawPtr(0);
-  scl := FInDepth;
+  scl := FGroupDepth;
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
   begin
-    // FOutputError / FOffMap bases for this (ox,oy) are invariant across tap/co (#11).
+    // Error / offset / mask bases for this (ox,oy) are invariant across tap/co (#11).
     errBase := FOutputError.GetRawPos(ox, oy);
-    offBase := FOffMap.GetRawPos(ox, oy);
+    TapSourceBases(ox, oy, offBase, maskBase);
     for fy := 0 to MaxFY do
     for fx := 0 to MaxFX do
     begin
       tap := fy * FFeatureSizeX + fx;
       tap2 := 2 * tap;
-      dx := FOffMap.FData[offBase + tap2];
-      dyo := FOffMap.FData[offBase + tap2 + 1];
-      px := ox * FStride + fx - FPadding + dx;
-      py := oy * FStride + fy - FPadding + dyo;
-      // DCNv2: per-tap modulation m = sigmoid(logit). NeuralExp matches the
-      // forward's fast exp (rule #16).
-      if FModulated <> 0 then
-        modM := 1.0 / (1.0 + NeuralExp(-FOffMap.FData[offBase + 2 * FNumTaps + tap]))
-      else
-        modM := 1.0;
-      x0 := Floor(px); y0 := Floor(py);
-      x1 := x0 + 1;    y1 := y0 + 1;
-      fxr := px - x0;  fyr := py - y0;
-      w00 := (1 - fxr) * (1 - fyr);
-      w01 := fxr * (1 - fyr);
-      w10 := (1 - fxr) * fyr;
-      w11 := fxr * fyr;
-      b00 := (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy);
-      b01 := (x1 >= 0) and (x1 < sx) and (y0 >= 0) and (y0 < sy);
-      b10 := (x0 >= 0) and (x0 < sx) and (y1 >= 0) and (y1 < sy);
-      b11 := (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy);
-      // Contiguous corner-column base pointers (only dereferenced if in bounds).
-      pPrev00 := nil; pPrev01 := nil; pPrev10 := nil; pPrev11 := nil;
-      if b00 then pPrev00 := PrevOut.GetRawPtr(x0, y0);
-      if b01 then pPrev01 := PrevOut.GetRawPtr(x1, y0);
-      if b10 then pPrev10 := PrevOut.GetRawPtr(x0, y1);
-      if b11 then pPrev11 := PrevOut.GetRawPtr(x1, y1);
-      // PrevErr corner write pointers are invariant across the co loop (#11).
-      pErr00 := nil; pErr01 := nil; pErr10 := nil; pErr11 := nil;
-      if HasPrevError then
+      OffPos := offBase + tap2;
+      MaskPos := maskBase + tap;
+      GroupOfs := 0;
+      for Group := 0 to MaxGroupPos do
       begin
-        if b00 then pErr00 := PrevErr.GetRawPtr(x0, y0);
-        if b01 then pErr01 := PrevErr.GetRawPtr(x1, y0);
-        if b10 then pErr10 := PrevErr.GetRawPtr(x0, y1);
-        if b11 then pErr11 := PrevErr.GetRawPtr(x1, y1);
-      end;
-      // FBwScol[ci] = raw bilinear sample (in-bounds corners only, w-order).
-      FBwScol.Fill(0);
-      if b00 then TNNetVolume.MulAdd(pScol, pPrev00, w00, scl);
-      if b01 then TNNetVolume.MulAdd(pScol, pPrev01, w01, scl);
-      if b10 then TNNetVolume.MulAdd(pScol, pPrev10, w10, scl);
-      if b11 then TNNetVolume.MulAdd(pScol, pPrev11, w11, scl);
-      // dS/dpx and dS/dpy corner coefficients (same in-bounds add order).
-      //   dS/dpx: x0y0:-(1-fyr) x1y0:+(1-fyr) x0y1:-fyr  x1y1:+fyr
-      //   dS/dpy: x0y0:-(1-fxr) x1y0:-fxr     x0y1:+(1-fxr) x1y1:+fxr
-      FBwDSpx.Fill(0);
-      if b00 then TNNetVolume.MulAdd(pDSpx, pPrev00, -(1 - fyr), scl);
-      if b01 then TNNetVolume.MulAdd(pDSpx, pPrev01,  (1 - fyr), scl);
-      if b10 then TNNetVolume.MulAdd(pDSpx, pPrev10, -fyr,       scl);
-      if b11 then TNNetVolume.MulAdd(pDSpx, pPrev11,  fyr,       scl);
-      FBwDSpy.Fill(0);
-      if b00 then TNNetVolume.MulAdd(pDSpy, pPrev00, -(1 - fxr), scl);
-      if b01 then TNNetVolume.MulAdd(pDSpy, pPrev01, -fxr,       scl);
-      if b10 then TNNetVolume.MulAdd(pDSpy, pPrev10,  (1 - fxr), scl);
-      if b11 then TNNetVolume.MulAdd(pDSpy, pPrev11,  fxr,       scl);
-
-      dModAcc := 0;  // dL/dm for this tap, summed over output AND input channels
-      for co := 0 to MaxCO do
-      begin
-        dy_out := FOutputError.FData[errBase + co];
-        if dy_out = 0 then continue;
-        // main bias gradient (once per (ox,oy,co); guarded to first tap).
-        if (FStruct[4] = 0) and (tap = 0) then
-          mBDelta.FData[co] := mBDelta.FData[co] + lr * dy_out;
-        wciBase := (tap * FOutDepth + co) * FInDepth;  // FWeightCI / FMWDeltaCI row base
-        pWrow := FWeightCI.GetRawPtr(wciBase);
-        // main-weight gradient (ci-contiguous accumulator): dW += lr*dy_out*modM*S
-        TNNetVolume.MulAdd(FMWDeltaCI.GetRawPtr(wciBase), pScol,
-          lr * dy_out * modM, scl);
-        // DCNv2: dL/dm += dy_out * <wgt, raw_sample>.
-        if FModulated <> 0 then
-          dModAcc := dModAcc + dy_out *
-            TNNetVolume.DotProduct(pWrow, pScol, scl);
-        // input gradient via the 4 bilinear corners: dInput_corner += coef*wgt,
-        // with coef = dy_out*modM*cornerWeight. Corner columns are contiguous in
-        // ci, FWeightCI row is contiguous in ci -> MulAdd over ci.
+        if FHasOffsetSource then
+        begin
+          // torchvision order: dy first, then dx; the mask is used as given.
+          dyo := OffVol.FData[OffPos];
+          dx := OffVol.FData[OffPos + 1];
+          if FHasMaskSource then modM := MaskVol.FData[MaskPos] else modM := 1.0;
+        end
+        else
+        begin
+          dx := FOffMap.FData[OffPos];
+          dyo := FOffMap.FData[OffPos + 1];
+          // DCNv2: per-tap modulation m = sigmoid(logit). NeuralExp matches the
+          // forward's fast exp (rule #16).
+          if FModulated <> 0 then
+            modM := 1.0 / (1.0 + NeuralExp(-FOffMap.FData[offBase + TapCount2 + tap]))
+          else
+            modM := 1.0;
+        end;
+        px := ox * FStride + fx - FPadding + dx;
+        py := oy * FStride + fy - FPadding + dyo;
+        x0 := Floor(px); y0 := Floor(py);
+        x1 := x0 + 1;    y1 := y0 + 1;
+        fxr := px - x0;  fyr := py - y0;
+        w00 := (1 - fxr) * (1 - fyr);
+        w01 := fxr * (1 - fyr);
+        w10 := (1 - fxr) * fyr;
+        w11 := fxr * fyr;
+        b00 := (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy);
+        b01 := (x1 >= 0) and (x1 < sx) and (y0 >= 0) and (y0 < sy);
+        b10 := (x0 >= 0) and (x0 < sx) and (y1 >= 0) and (y1 < sy);
+        b11 := (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy);
+        // Contiguous corner-column base pointers (only dereferenced if in bounds).
+        pPrev00 := nil; pPrev01 := nil; pPrev10 := nil; pPrev11 := nil;
+        if b00 then pPrev00 := PrevOut.GetRawPtr(x0, y0, GroupOfs);
+        if b01 then pPrev01 := PrevOut.GetRawPtr(x1, y0, GroupOfs);
+        if b10 then pPrev10 := PrevOut.GetRawPtr(x0, y1, GroupOfs);
+        if b11 then pPrev11 := PrevOut.GetRawPtr(x1, y1, GroupOfs);
+        // PrevErr corner write pointers are invariant across the co loop (#11).
+        pErr00 := nil; pErr01 := nil; pErr10 := nil; pErr11 := nil;
         if HasPrevError then
         begin
-          coef := dy_out * modM;
-          if b00 then TNNetVolume.MulAdd(pErr00, pWrow, coef * w00, scl);
-          if b01 then TNNetVolume.MulAdd(pErr01, pWrow, coef * w01, scl);
-          if b10 then TNNetVolume.MulAdd(pErr10, pWrow, coef * w10, scl);
-          if b11 then TNNetVolume.MulAdd(pErr11, pWrow, coef * w11, scl);
+          if b00 then pErr00 := PrevErr.GetRawPtr(x0, y0, GroupOfs);
+          if b01 then pErr01 := PrevErr.GetRawPtr(x1, y0, GroupOfs);
+          if b10 then pErr10 := PrevErr.GetRawPtr(x0, y1, GroupOfs);
+          if b11 then pErr11 := PrevErr.GetRawPtr(x1, y1, GroupOfs);
         end;
-        // offset gradient: dOff += dy_out*modM*<wgt, dS/dp>.
-        wdpx := TNNetVolume.DotProduct(pWrow, pDSpx, scl);
-        wdpy := TNNetVolume.DotProduct(pWrow, pDSpy, scl);
-        FdOffMap.Add(ox, oy, tap2,     dy_out * modM * wdpx);
-        FdOffMap.Add(ox, oy, tap2 + 1, dy_out * modM * wdpy);
+        // FBwScol[ci] = raw bilinear sample (in-bounds corners only, w-order).
+        FillDWord(pScol^, scl, 0);
+        if b00 then TNNetVolume.MulAdd(pScol, pPrev00, w00, scl);
+        if b01 then TNNetVolume.MulAdd(pScol, pPrev01, w01, scl);
+        if b10 then TNNetVolume.MulAdd(pScol, pPrev10, w10, scl);
+        if b11 then TNNetVolume.MulAdd(pScol, pPrev11, w11, scl);
+        // dS/dpx and dS/dpy corner coefficients (same in-bounds add order).
+        //   dS/dpx: x0y0:-(1-fyr) x1y0:+(1-fyr) x0y1:-fyr  x1y1:+fyr
+        //   dS/dpy: x0y0:-(1-fxr) x1y0:-fxr     x0y1:+(1-fxr) x1y1:+fxr
+        FillDWord(pDSpx^, scl, 0);
+        if b00 then TNNetVolume.MulAdd(pDSpx, pPrev00, -(1 - fyr), scl);
+        if b01 then TNNetVolume.MulAdd(pDSpx, pPrev01,  (1 - fyr), scl);
+        if b10 then TNNetVolume.MulAdd(pDSpx, pPrev10, -fyr,       scl);
+        if b11 then TNNetVolume.MulAdd(pDSpx, pPrev11,  fyr,       scl);
+        FillDWord(pDSpy^, scl, 0);
+        if b00 then TNNetVolume.MulAdd(pDSpy, pPrev00, -(1 - fxr), scl);
+        if b01 then TNNetVolume.MulAdd(pDSpy, pPrev01, -fxr,       scl);
+        if b10 then TNNetVolume.MulAdd(pDSpy, pPrev10,  (1 - fxr), scl);
+        if b11 then TNNetVolume.MulAdd(pDSpy, pPrev11,  fxr,       scl);
+
+        dModAcc := 0;  // dL/dm for this tap and group, summed over co and ci
+        dOffXAcc := 0;
+        dOffYAcc := 0;
+        for co := 0 to MaxCO do
+        begin
+          dy_out := FOutputError.FData[errBase + co];
+          if dy_out = 0 then continue;
+          // main bias gradient (once per (ox,oy,co); guarded to the first tap/group).
+          if (FStruct[4] = 0) and (tap = 0) and (Group = 0) then
+            mBDelta.FData[co] := mBDelta.FData[co] + lr * dy_out;
+          wciBase := (tap * FOutDepth + co) * FInDepth + GroupOfs;  // FWeightCI / FMWDeltaCI row base
+          pWrow := FWeightCI.GetRawPtr(wciBase);
+          // main-weight gradient (ci-contiguous accumulator): dW += lr*dy_out*modM*S
+          TNNetVolume.MulAdd(FMWDeltaCI.GetRawPtr(wciBase), pScol,
+            lr * dy_out * modM, scl);
+          // dL/dm += dy_out * <wgt, raw_sample>.
+          if NeedModGrad then
+            dModAcc := dModAcc + dy_out *
+              TNNetVolume.DotProduct(pWrow, pScol, scl);
+          // input gradient via the 4 bilinear corners: dInput_corner += coef*wgt,
+          // with coef = dy_out*modM*cornerWeight.
+          if HasPrevError then
+          begin
+            coef := dy_out * modM;
+            if b00 then TNNetVolume.MulAdd(pErr00, pWrow, coef * w00, scl);
+            if b01 then TNNetVolume.MulAdd(pErr01, pWrow, coef * w01, scl);
+            if b10 then TNNetVolume.MulAdd(pErr10, pWrow, coef * w10, scl);
+            if b11 then TNNetVolume.MulAdd(pErr11, pWrow, coef * w11, scl);
+          end;
+          // offset gradient: dOff += dy_out*modM*<wgt, dS/dp>.
+          wdpx := TNNetVolume.DotProduct(pWrow, pDSpx, scl);
+          wdpy := TNNetVolume.DotProduct(pWrow, pDSpy, scl);
+          dOffXAcc := dOffXAcc + dy_out * modM * wdpx;
+          dOffYAcc := dOffYAcc + dy_out * modM * wdpy;
+        end;
+        if FHasOffsetSource then
+        begin
+          if HasOffErr then
+          begin
+            OffErr.FData[OffPos] := OffErr.FData[OffPos] + dOffYAcc;
+            OffErr.FData[OffPos + 1] := OffErr.FData[OffPos + 1] + dOffXAcc;
+          end;
+          if HasMaskErr then
+            MaskErr.FData[MaskPos] := MaskErr.FData[MaskPos] + dModAcc;
+        end
+        else
+        begin
+          FdOffMap.FData[OffPos] := dOffXAcc;
+          FdOffMap.FData[OffPos + 1] := dOffYAcc;
+          // DCNv2: modulation-logit gradient = dL/dm * dm/dlogit, dm/dlogit=m*(1-m).
+          if FModulated <> 0 then
+            FdOffMap.FData[offBase + TapCount2 + tap] := dModAcc * modM * (1 - modM);
+        end;
+        Inc(OffPos, TapCount2);
+        Inc(MaskPos, FNumTaps);
+        Inc(GroupOfs, FGroupDepth);
       end;
-      // DCNv2: modulation-logit gradient = dL/dm * dm/dlogit, dm/dlogit=m*(1-m).
-      if FModulated <> 0 then
-        FdOffMap.Add(ox, oy, 2 * FNumTaps + tap, dModAcc * modM * (1 - modM));
     end;
   end;
 
@@ -144649,7 +144873,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetGridSample') or (S[0] = 'TNNetMultiScaleDeformableAttention') or (S[0] = 'TNNetTopKGatherTokens') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetBackwardWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetGridSample') or (S[0] = 'TNNetMultiScaleDeformableAttention') or (S[0] = 'TNNetTopKGatherTokens') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetBackwardWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') or (S[0] = 'TNNetDeformableConv') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -144909,7 +145133,7 @@ begin
       'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], St[0] = 1);
       'TNNetALIFNeuron' :           Result := TNNetALIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
-      'TNNetDeformableConv' :       Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
+      'TNNetDeformableConv' :       Result := TNNetDeformableConv.CreateFromStruct(St, aL);
       'TNNetGroupConvP4' :          Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupPoolP4' :          Result := TNNetGroupPoolP4.Create(St[0]);
       'TNNetRoIAlign' :             Result := TNNetRoIAlign.Create(St[0], St[1], Ft[0], Ft[1], Ft[2], Ft[3], Ft[4], St[2]);
@@ -145372,7 +145596,7 @@ begin
       if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
       if S[0] = 'TNNetALIFNeuron' then Result := TNNetALIFNeuron.Create(-1.0/pcr_logf(Ft[0]), Ft[1], Ft[2], Ft[3], Ft[4], St[0] = 1) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetDeformableConv' then Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
+      if S[0] = 'TNNetDeformableConv' then Result := TNNetDeformableConv.CreateFromStruct(St, aL) else
       if S[0] = 'TNNetGroupConvP4' then Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupPoolP4' then Result := TNNetGroupPoolP4.Create(St[0]) else
       if S[0] = 'TNNetRoIAlign' then Result := TNNetRoIAlign.Create(St[0], St[1], Ft[0], Ft[1], Ft[2], Ft[3], Ft[4], St[2]) else
@@ -152869,6 +153093,13 @@ procedure TNNetAffineGridSample.AppendInputLayers(pList: TList);
 begin
   inherited AppendInputLayers(pList);
   if Assigned(FThetaLayer) then pList.Add(FThetaLayer);
+end;
+
+procedure TNNetDeformableConv.AppendInputLayers(pList: TList);
+begin
+  inherited AppendInputLayers(pList);
+  if Assigned(FOffsetLayer) then pList.Add(FOffsetLayer);
+  if Assigned(FMaskLayer) then pList.Add(FMaskLayer);
 end;
 
 procedure TNNetGridSample.AppendInputLayers(pList: TList);

@@ -2249,19 +2249,23 @@ rather than acted on.
       7x7 stride-3 convolution, and SoftComp (Linear, then nn.Fold) IS a 7x7
       stride-3 transposed convolution, so build both from the existing conv and
       deconvolution layers; do not add Unfold/Fold layers for them.
-      Prerequisite, a torch port with its own commit and tests:
-      `TNNetDeformableConv` predicts its offsets from its OWN input, but
-      ProPainter's (Second-Order) DeformableAlignment computes
-      offset = flow + residual from concatenated features and flows, with
-      deformable groups, as torchvision.ops.deform_conv2d(input, offset,
-      weight, mask) does. Add an option to the existing class (do not fork a
-      second deformable conv) that takes offsets and the modulation mask
-      from extra sources plus an offset-group count, with numerical-gradient
-      tests and a parity test against torchvision.ops.deform_conv2d. Parity
-      plan: a pico fixture from a tools/ script (fixture generation only, as
+      Prerequisite DONE: `TNNetDeformableConv` external-offset mode
+      (`Create(..., OffsetSource, MaskSource, OffsetGroups)`, torchvision
+      deform_conv2d channel order, gradient-checked); see the follow-ups item.
+      Parity plan: a pico fixture from a tools/ script (fixture generation only, as
       the other importers do) checked against the reference forward, stage by
       stage; then a real 432x240 clip on the user's box, frames processed in
       chunks under the 2 GB agent cap.
+- [ ] `TNNetDeformableConv` external-offset mode follow-ups:
+      - [ ] torchvision parity fixture: torchvision is not installed in the ~/x
+            venv, so the parity test compares against a Pascal transcription of
+            the torchvision CPU kernel; add a tools/ fixture script and a
+            .safetensors check once torchvision is available.
+      - [ ] OpenCL bilinear gather: only the patch x weight GEMM runs on the
+            device; the per-tap gather (both modes) runs on the CPU and the
+            sources are downloaded each forward.
+      - [ ] Not supported yet: OpenCL backward, dilation > 1, weight groups
+            (deform_conv2d with `groups` > 1).
 - [ ] Image-generator LoRA follow-ups (`--lora FILE[:SCALE]` in examples/QwenImage,
       `TNNetLoRAMergeReader.CreateFromFile` / `CreateLoRAMergeChain`, 6eb26a48):
       - [ ] Run a real community SD 1.5 LoRA (kohya and diffusers files) on
