@@ -22,7 +22,10 @@ into a mask cheaply. This example:
 5. upscales the low-res mask logits to `image_size`, crops off the padding,
    resizes to the photo's own size (bilinear, as `post_process_masks`) and
    thresholds at 0;
-6. writes `<out>_mask.png` (white = mask) and `<out>_overlay.png` (photo with the
+6. with `--refine N`, feeds the kept low-res mask logits back N times as a
+   **mask prompt** (SAM's `mask_input`, transformers `input_masks`) together with
+   the same clicks / box, one mask per pass, as the SAM notebooks do;
+7. writes `<out>_mask.png` (white = mask) and `<out>_overlay.png` (photo with the
    mask tinted red), both at the photo's resolution.
 
 With `--everything` it runs SAM's **automatic mask generator** instead (the
@@ -37,8 +40,14 @@ outlined, and prints each mask's IoU, stability score, box and area.
 
 - **`TSAMPredictor`** — holds the encoder net, the open checkpoint and the
   decoder weight cache. `SetImage` preprocesses and encodes once; each `Predict`
-  (points with labels, and/or a box, single or 3 masks + IoU scores) is
-  decoder-only.
+  (points with labels, and/or a box, and/or a low-res mask prompt, single or 3
+  masks + IoU scores) is decoder-only. `LowResLogits` holds the last decode's
+  `(4*Grid, 4*Grid, NumMasks)` logits; one channel (`CopyChannels`) is the
+  `MaskInput` of the next `Predict`.
+- **`BuildSAMMaskEmbedding`** — `prompt_encoder.mask_embed` (conv 2x2 s2 ->
+  LayerNorm2d -> GELU -> conv 2x2 s2 -> LayerNorm2d -> GELU -> conv 1x1) as a
+  small `TNNet`; the decoder adds its output to the image embedding in place of
+  `no_mask_embed`.
 - **`SAMPreprocessImage`**, **`SAMScaleCoordinates`**, **`SAMPostprocessMasks`**,
   **`SAMResizedImageSize`** — the processor steps on their own.
 - **`TSAMPredictor.GenerateMasks`** + **`TSAMGeneratedMasks`** — automatic mask
@@ -60,6 +69,8 @@ examples/SegmentAnything/SegmentAnything /path/to/sam-vit-base/model.safetensors
 examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
   --image photo.jpg --box 50,40,400,300 --multimask --out photo
 examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
+  --image photo.jpg --point 320,240 --multimask --refine 2 --out refined
+examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
   --image photo.jpg --everything --out photo
 ```
 
@@ -80,6 +91,8 @@ Options:
   (default), 0 = background. Without any prompt the click is the image centre.
 - `--box X0,Y0,X1,Y1` — top-left / bottom-right corner in photo pixels.
 - `--multimask` — ask for SAM's 3 masks and keep the highest predicted IoU.
+- `--refine N` — feed the kept low-res mask back N times as a mask prompt with
+  the same points / box (default 0). Each pass prints its predicted IoU.
 - `--config FILE` — config.json (default: beside the checkpoint).
 - `--out PREFIX` — output file prefix (default `sam`).
 - `--everything` — automatic mask generation (prompts are ignored), with:
@@ -107,6 +120,9 @@ lazbuild -B SegmentAnything.lpi
 - **Parity:** `TestSAMProcessorEndToEndParity` compares the preprocessed pixels,
   scaled prompts, IoU scores and full-resolution mask logits with
   `SamImageProcessorPil` + `SamModel` (float64) on the pico fixture.
+  `TestSAMMaskInputParity` compares the mask-prompt decodes (point refinement,
+  box + mask, mask only, and the `TSAMPredictor` refine round trip) with
+  `SamModel` given `input_masks`.
   `TestSAMAutomaticMaskGenerationParity` compares the generated masks (count,
   IoU, stability score, box, every pixel) with transformers' `mask-generation`
   pipeline and its processor functions, with and without a crop layer.

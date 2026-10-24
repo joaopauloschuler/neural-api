@@ -11437,10 +11437,10 @@ function BuildSAMFromSafeTensors(const FileName: string;
 // ---------------------------------------------------------------------------
 // SAM PROMPTABLE MASK DECODER (v1: a SINGLE point click -> a SINGLE binary
 // mask). Composes the SAM prompt encoder (point positional encoding + learned
-// point / not-a-point embeddings + the dense no-mask embedding), the lightweight
-// two-way transformer (token<->image cross-attention over the learned IoU +
-// mask-output tokens), and the output upscaling (2x transposed-conv x2) followed
-// by the per-mask hypernetwork-MLP dot with the upscaled embedding. The decoder
+// point / not-a-point embeddings + the dense mask or no-mask embedding), the
+// lightweight two-way transformer (token<->image cross-attention over the
+// learned IoU + mask-output tokens), and the output upscaling (2x
+// transposed-conv x2) followed by the per-mask hypernetwork-MLP dot with the upscaled embedding. The decoder
 // operates on the NECK output (OutputChannels-wide image embedding), so its
 // hidden_size == TSAMConfig.OutputChannels.
 //
@@ -11472,6 +11472,9 @@ type
     InputImageSize: integer;   // prompt_encoder image_size (1024 / pico 32)
     NumPosFeats: integer;      // vision num_pos_feats (HiddenSize div 2)
     LayerNormEps: TNeuralFloat;
+    MaskInputChannels: integer; // prompt_encoder mask_input_channels (16)
+    PromptHiddenAct: string;    // prompt_encoder hidden_act ('gelu')
+    PromptLayerNormEps: TNeuralFloat; // prompt_encoder layer_norm_eps (1e-6)
   end;
 
 type
@@ -11489,12 +11492,16 @@ type
     FNames: array of string;
     FVolumes: array of TNNetVolume;
     FCount: integer;
+    FMaskEmbedding: TNNet;
   public
     destructor Destroy; override;
     // Returns the named tensor, loading it through Reader on first request.
     // The cache OWNS the result: read it, never modify or free it.
     function Get(Reader: TNNetSafeTensorsReader;
       const pName: string): TNNetVolume;
+    // The BuildSAMMaskEmbedding net, built on first request; the cache owns it.
+    function MaskEmbedding(Reader: TNNetSafeTensorsReader;
+      const Config: TSAMMaskDecoderConfig; const Prefix: string): TNNet;
     property Count: integer read FCount;
   end;
 
@@ -11502,6 +11509,11 @@ type
 // a TSAMMaskDecoderConfig (VisionConfig supplies Grid + NumPosFeats).
 function ReadSAMMaskDecoderConfig(const FileName: string;
   const VisionConfig: TSAMConfig): TSAMMaskDecoderConfig;
+
+// SamMaskEmbedding (prompt_encoder.mask_embed): (4*Grid, 4*Grid, 1) low-res mask
+// logits -> (Grid, Grid, HiddenSize) dense prompt embedding; weights loaded here.
+function BuildSAMMaskEmbedding(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMMaskDecoderConfig; const Prefix: string = ''): TNNet;
 
 // Runs the SAM mask decoder for ONE positive/negative point click.
 //   ImageEmbedding: the (Grid, Grid, HiddenSize) neck output from the encoder
@@ -11536,17 +11548,20 @@ procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
 //   IoUScores:   OUT (NumMasks, 1, 1) iou_prediction_head scores, one scalar per
 //                emitted mask, aligned with MaskLogits' depth axis. Pass nil to
 //                skip. (No sigmoid: SAM's iou head has sigmoid_output=False.)
-// At least one prompt (a point or a box) must be supplied. The legacy
+// At least one prompt (a point, a box or MaskInput) must be supplied. The legacy
 // single-point RunSAMMaskDecoder above is a thin wrapper over this routine.
 //   Cache:       optional caller-owned weight cache (see TSAMWeightCache). Reuse
 //                one across clicks on the same image to skip re-reading the
 //                decoder weights; nil loads them fresh on every call.
+//   MaskInput:   optional (4*Grid, 4*Grid, 1) low-res mask logits (HF
+//                input_masks, e.g. one channel of an earlier MaskLogits) embedded
+//                by BuildSAMMaskEmbedding in place of no_mask_embed; nil = none.
 procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
   const PointsXY: array of TNeuralFloat; const PointLabels: array of integer;
   const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
   MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string = '';
-  Cache: TSAMWeightCache = nil);
+  Cache: TSAMWeightCache = nil; MaskInput: TNNetVolume = nil);
 
 // ---------------------------------------------------------------------------
 // SAM PROCESSOR (transformers SamProcessor / SamImageProcessorPil): photo
@@ -11660,12 +11675,13 @@ type
     destructor Destroy; override;
     // Image (W,H,3) RGB 0..255: preprocesses it and computes the image embedding.
     procedure SetImage(Image: TNNetVolume);
-    // Prompts in original-image pixels (see RunSAMMaskDecoderEx); Masks becomes
-    // (ImageWidth, ImageHeight, NumMasks), 1/0 when Binarize, else logits.
+    // Prompts in original-image pixels, MaskInput a LowResLogits channel (see
+    // RunSAMMaskDecoderEx); Masks: (ImageWidth, ImageHeight, NumMasks), 1/0 or logits.
     procedure Predict(const PointsXY: array of TNeuralFloat;
       const PointLabels: array of integer; const Box: array of TNeuralFloat;
       MultiMaskOutput: boolean; Masks: TNNetVolume;
-      IoUScores: TNNetVolume = nil; Binarize: boolean = true);
+      IoUScores: TNNetVolume = nil; Binarize: boolean = true;
+      MaskInput: TNNetVolume = nil);
     // Segments everything in Image (W,H,3 RGB 0..255) from a point grid per crop;
     // Output gets the masks by descending IoU; Image stays set for Predict.
     procedure GenerateMasks(Image: TNNetVolume;
@@ -89952,6 +89968,22 @@ begin
   PosEmb.FlushWeightCache();
 end;
 
+// The HF activation named Name (ACT2FN): relu, silu/swish, gelu (erf),
+// gelu_new / gelu_pytorch_tanh (tanh approximation); Ctx prefixes the error.
+function CreateHFActivationLayer(const Name, Ctx: string): TNNetLayer;
+begin
+  if Name = 'relu' then Result := TNNetReLU.Create()
+  else if (Name = 'silu') or (Name = 'swish') then Result := TNNetSiLU.Create()
+  else if Name = 'gelu' then Result := TNNetGELUErf.Create()
+  else if (Name = 'gelu_new') or (Name = 'gelu_pytorch_tanh') then
+    Result := TNNetGELU.Create()
+  else
+  begin
+    Result := nil;
+    ImportError(Ctx + ': unsupported activation "' + Name + '".');
+  end;
+end;
+
 // The GLU gate layer (firsthalf * act(secondhalf)) for a transformers hidden_act
 // name: silu/swish, exact-erf gelu or tanh gelu; Ctx prefixes the error.
 function CreateGLUGateForHiddenAct(const ActName, Ctx: string): TNNetLayer;
@@ -91486,9 +91518,55 @@ begin
     // num_pos_feats lives on the vision config; HF builds the shared positional
     // embedding with num_pos_feats = hidden_size div 2 by default.
     Result.NumPosFeats := Result.HiddenSize div 2;
+    Result.MaskInputChannels := PE.Get('mask_input_channels', 16);
+    Result.PromptHiddenAct := PE.Get('hidden_act', 'gelu');
+    Result.PromptLayerNormEps := PE.Get('layer_norm_eps', TJSONFloat(1e-6));
   finally
     Root.Free;
     JsonText.Free;
+  end;
+end;
+
+function BuildSAMMaskEmbedding(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMMaskDecoderConfig; const Prefix: string): TNNet;
+const
+  csCtx = 'SAM mask embedding';
+var
+  NN: TNNet;
+  Conv1, Norm1, Conv2, Norm2, Conv3: TNNetLayer;
+  QuarterChannels: integer;
+  Pfx: string;
+begin
+  QuarterChannels := Config.MaskInputChannels div 4;
+  if (QuarterChannels < 1) or (QuarterChannels * 4 <> Config.MaskInputChannels) then
+    ImportError(csCtx + ': mask_input_channels must be a positive multiple ' +
+      'of 4, got ' + IntToStr(Config.MaskInputChannels) + '.');
+  Pfx := Prefix + 'prompt_encoder.mask_embed.';
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4 * Config.Grid, 4 * Config.Grid, 1));
+    Conv1 := NN.AddLayer(TNNetConvolutionLinear.Create(QuarterChannels, 2, 0, 2, 0));
+    Norm1 := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.PromptLayerNormEps));
+    NN.AddLayer(CreateHFActivationLayer(Config.PromptHiddenAct, csCtx));
+    Conv2 := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.MaskInputChannels, 2, 0, 2, 0));
+    Norm2 := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.PromptLayerNormEps));
+    NN.AddLayer(CreateHFActivationLayer(Config.PromptHiddenAct, csCtx));
+    Conv3 := NN.AddLayer(TNNetConvolutionLinear.Create(Config.HiddenSize, 1, 0, 1, 0));
+    NN.SetTrainable();
+    LoadTorchConvFoldBN(Reader, Conv1, Pfx + 'conv1', '', QuarterChannels, 1, 2, nil);
+    LoadLayerNormWeights(Reader, Norm1, Pfx + 'layer_norm1.weight',
+      Pfx + 'layer_norm1.bias', QuarterChannels);
+    LoadTorchConvFoldBN(Reader, Conv2, Pfx + 'conv2', '', Config.MaskInputChannels,
+      QuarterChannels, 2, nil);
+    LoadLayerNormWeights(Reader, Norm2, Pfx + 'layer_norm2.weight',
+      Pfx + 'layer_norm2.bias', Config.MaskInputChannels);
+    LoadTorchConvFoldBN(Reader, Conv3, Pfx + 'conv3', '', Config.HiddenSize,
+      Config.MaskInputChannels, 1, nil);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
   end;
 end;
 
@@ -91503,7 +91581,16 @@ var
 begin
   CountM1 := FCount - 1;
   for i := 0 to CountM1 do FVolumes[i].Free;
+  FMaskEmbedding.Free;
   inherited Destroy;
+end;
+
+function TSAMWeightCache.MaskEmbedding(Reader: TNNetSafeTensorsReader;
+  const Config: TSAMMaskDecoderConfig; const Prefix: string): TNNet;
+begin
+  if FMaskEmbedding = nil then
+    FMaskEmbedding := BuildSAMMaskEmbedding(Reader, Config, Prefix);
+  Result := FMaskEmbedding;
 end;
 
 function TSAMWeightCache.Get(Reader: TNNetSafeTensorsReader;
@@ -91749,7 +91836,7 @@ procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   const PointsXY: array of TNeuralFloat; const PointLabels: array of integer;
   const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
   MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string;
-  Cache: TSAMWeightCache);
+  Cache: TSAMWeightCache; MaskInput: TNNetVolume);
 const
   INV_SQRT_2 = 0.70710678118654752;
   // Pixels processed per upscale_layer_norm tile. cSAMPixTile*Cmid floats is the
@@ -91769,7 +91856,8 @@ var
   Keys, Queries, Qinp, Kinp, AttnOut, Mlp1, Mlp2, Hbuf: TSAMMat;
   PE0, PE1, PE2, PE3: TNNetVolume;
   NotAPoint: TNNetVolume;
-  NoMask: TNNetVolume;
+  NoMask, DenseEmbedding: TNNetVolume;
+  MaskNet: TNNet;
   Pfx, BPfx: string;
   Eps, acc, x, cdf: TNeuralFloat;
   // prompt bookkeeping
@@ -91811,8 +91899,14 @@ begin
   if not ((Length(Box) = 0) or (Length(Box) = 4)) then
     ImportError('SAM mask decoder: Box must be empty or [x0,y0,x1,y1].');
   if Length(Box) = 4 then HasBox := 1 else HasBox := 0;
-  if (NumPoints = 0) and (HasBox = 0) then
-    ImportError('SAM mask decoder: at least one point or a box is required.');
+  if (NumPoints = 0) and (HasBox = 0) and (MaskInput = nil) then
+    ImportError('SAM mask decoder: at least one point, a box or a mask input ' +
+      'is required.');
+  if (MaskInput <> nil) and ((MaskInput.SizeX <> 4 * Config.Grid) or
+     (MaskInput.SizeY <> 4 * Config.Grid) or (MaskInput.Depth <> 1)) then
+    ImportError('SAM mask decoder: MaskInput must be ' + IntToStr(4 * Config.Grid) +
+      'x' + IntToStr(4 * Config.Grid) + 'x1, got ' + IntToStr(MaskInput.SizeX) +
+      'x' + IntToStr(MaskInput.SizeY) + 'x' + IntToStr(MaskInput.Depth) + '.');
   // HF pads the point list with a not-a-point token ONLY when no box is given.
   HasPad := (NumPoints > 0) and (HasBox = 0);
   // sparse prompt rows = points (+ optional pad) + 2 box corners.
@@ -91883,7 +91977,8 @@ begin
 
     SAMPosEnc(PEPos, Coords, NSparse, Config.NumPosFeats, SparseRaw);
     SetLength(Sparse, NSparse * H);
-    Move(SparseRaw[0], Sparse[0], (NSparseHM1 + 1) * csNeuralFloatSize);
+    if NSparse > 0 then
+      Move(SparseRaw[0], Sparse[0], (NSparseHM1 + 1) * csNeuralFloatSize);
 
     // Per-row label embedding addition, mirroring HF _embed_points/_embed_boxes:
     //   label 1 -> + point_embed[1], label 0 -> + point_embed[0],
@@ -91914,15 +92009,26 @@ begin
       Inc(srow);
     end;
 
-    // dense no-mask embedding broadcast over the grid, ADDED to the image emb.
-    NoMask := Cache.Get(Reader, Pfx + 'prompt_encoder.no_mask_embed.weight');
+    // Dense prompt ADDED to the image embedding: the mask_embed of MaskInput,
+    // else no_mask_embed broadcast over the grid.
     SetLength(Keys, NImg * H);
     Move(ImageEmbedding.FData[0], Keys[0], NImg * H * csNeuralFloatSize);
-    rwc := 0;
-    for i := 0 to NImgM1 do
+    if MaskInput <> nil then
     begin
-      TNNetVolume.Add(@Keys[rwc], NoMask.GetRawPtr(0), H);
-      Inc(rwc, H);
+      MaskNet := Cache.MaskEmbedding(Reader, Config, Pfx);
+      MaskNet.Compute(MaskInput);
+      DenseEmbedding := MaskNet.GetLastLayer().Output;
+      TNNetVolume.Add(@Keys[0], DenseEmbedding.GetRawPtr(0), NImg * H);
+    end
+    else
+    begin
+      NoMask := Cache.Get(Reader, Pfx + 'prompt_encoder.no_mask_embed.weight');
+      rwc := 0;
+      for i := 0 to NImgM1 do
+      begin
+        TNNetVolume.Add(@Keys[rwc], NoMask.GetRawPtr(0), H);
+        Inc(rwc, H);
+      end;
     end;
 
     // image-wide grid positional encoding: coords (x,y) = ((col+0.5)/Grid,
@@ -91942,8 +92048,9 @@ begin
     SetLength(PointEmb, NTok * H);
     Move(T1.FData[0], PointEmb[0], H * csNeuralFloatSize);
     Move(T2.FData[0], PointEmb[H], MaskTokenCount * H * csNeuralFloatSize);
-    Move(Sparse[0], PointEmb[(1 + MaskTokenCount) * H],
-      NSparseRows * H * csNeuralFloatSize);
+    if NSparseRows > 0 then
+      Move(Sparse[0], PointEmb[(1 + MaskTokenCount) * H],
+        NSparseRows * H * csNeuralFloatSize);
 
     SetLength(Queries, NTok * H);
     Move(PointEmb[0], Queries[0], NTok * H * csNeuralFloatSize);
@@ -92463,7 +92570,7 @@ end;
 procedure TSAMPredictor.Predict(const PointsXY: array of TNeuralFloat;
   const PointLabels: array of integer; const Box: array of TNeuralFloat;
   MultiMaskOutput: boolean; Masks: TNNetVolume; IoUScores: TNNetVolume;
-  Binarize: boolean);
+  Binarize: boolean; MaskInput: TNNetVolume);
 var
   ScaledPoints, ScaledBox: array of TNeuralFloat;
   CoordPos, MaxCoordPos: integer;
@@ -92480,7 +92587,7 @@ begin
   SAMScaleCoordinates(ScaledBox, FImageWidth, FImageHeight, FConfig.ImageSize);
   RunSAMMaskDecoderEx(FReader, FDecoderConfig, FImageEmbedding, ScaledPoints,
     PointLabels, ScaledBox, MultiMaskOutput, FLowResLogits, IoUScores, '',
-    FCache);
+    FCache, MaskInput);
   SAMPostprocessMasks(FLowResLogits, Masks, FConfig.ImageSize, FImageWidth,
     FImageHeight, Binarize);
 end;
@@ -96414,22 +96521,6 @@ begin
     ', input=' + IntToStr(Config.ImageWidth) + 'x' + IntToStr(Config.ImageHeight);
 end;
 
-// The HF activation named Name (ACT2FN): relu, silu/swish, gelu (erf),
-// gelu_new / gelu_pytorch_tanh (tanh approximation).
-function RtDetrActivationLayer(const Name: string): TNNetLayer;
-begin
-  if Name = 'relu' then Result := TNNetReLU.Create()
-  else if (Name = 'silu') or (Name = 'swish') then Result := TNNetSiLU.Create()
-  else if Name = 'gelu' then Result := TNNetGELUErf.Create()
-  else if (Name = 'gelu_new') or (Name = 'gelu_pytorch_tanh') then
-    Result := TNNetGELU.Create()
-  else
-  begin
-    Result := nil;
-    ImportError('RT-DETR import: unsupported activation "' + Name + '".');
-  end;
-end;
-
 // RTDetrSinePositionEmbedding of a GridW x GridH map into a
 // TNNetLearnedPositionalEmbedding table: channels [sin y | cos y | sin x | cos x].
 procedure FillRtDetrSinePosEmbed(Layer: TNNetLayer; GridW, GridH,
@@ -96568,7 +96659,7 @@ function TRtDetrNetBuilder.ActivationAfter(Source: TNNetLayer;
   const Name: string): TNNetLayer;
 begin
   Result := FNN.AddLayerAfter(
-    RtDetrActivationLayer(Name).SetTrainable(FTrainable), Source);
+    CreateHFActivationLayer(Name, 'RT-DETR import').SetTrainable(FTrainable), Source);
 end;
 
 function TRtDetrNetBuilder.AddConvNorm(Source: TNNetLayer; OutCh, KernelSize,
@@ -97396,7 +97487,7 @@ var
     end;
     if ActivationName <> '' then
     begin
-      Result := NN.AddLayerAfter(RtDetrActivationLayer(ActivationName)
+      Result := NN.AddLayerAfter(CreateHFActivationLayer(ActivationName, 'RT-DETR import')
         .SetTrainable(pTrainable), Result);
       if Config.UseLearnableAffineBlock then
         Result := AddLearnableAffine(Result, ConvPrefix + '.lab');

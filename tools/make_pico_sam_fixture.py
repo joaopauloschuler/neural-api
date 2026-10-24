@@ -23,10 +23,13 @@ Coded by Claude (AI).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/make_pico_sam_fixture.py
-writes tests/fixtures/tiny_sam{.safetensors,_config.json,_embed.json} and the
-automatic-mask-generation oracle tiny_sam_amg.json;
+writes tests/fixtures/tiny_sam{.safetensors,_config.json,_embed.json}, the
+automatic-mask-generation oracle tiny_sam_amg.json and the input_masks oracle
+tiny_sam_mask_input.json;
   /home/bpsa/x/bin/python tools/make_pico_sam_fixture.py --amg-oracle
-only rewrites tiny_sam_amg.json from the COMMITTED pico fixture.
+only rewrites tiny_sam_amg.json from the COMMITTED pico fixture, and
+  /home/bpsa/x/bin/python tools/make_pico_sam_fixture.py --mask-input-oracle
+only rewrites tiny_sam_mask_input.json from it.
 """
 import copy
 import json
@@ -39,6 +42,7 @@ from safetensors.torch import load_file, save_file
 from transformers import SamConfig, SamModel
 from transformers.models.sam.configuration_sam import (
     SamVisionConfig, SamPromptEncoderConfig, SamMaskDecoderConfig)
+from transformers.models.sam.modeling_sam import SamMaskEmbedding
 
 
 def _batched_nms(boxes, scores, idxs, iou_threshold):
@@ -216,6 +220,118 @@ def amg_oracle(model, path='tests/fixtures/tiny_sam_amg.json'):
         json.dump(result, f)
 
 
+def _mask_input_pattern(size):
+    """Deterministic dyadic low-res mask logits (exact in f32 and JSON)."""
+    m = torch.zeros(size, size, dtype=torch.float64)
+    for r in range(size):
+        for c in range(size):
+            m[r, c] = (((r * 5 + c * 3) % 11) - 5) / 4.0
+    return m
+
+
+def mask_input_oracle(model, path='tests/fixtures/tiny_sam_mask_input.json'):
+    """SamModel float64 with input_masks (the dense mask prompt): a point
+    refined with its own best low-res mask, a box + pattern mask with 3 masks,
+    a mask-only prompt, and the SamImageProcessorPil refine round trip."""
+    from PIL import Image
+    from transformers.models.sam.image_processing_pil_sam import (
+        SamImageProcessorPil)
+    import transformers.models.sam.image_processing_pil_sam as ips
+    emb_json = json.load(open('tests/fixtures/tiny_sam_embed.json'))
+    pixels = torch.tensor(emb_json['pixels'], dtype=torch.float64)[None]
+    result = {}
+    with torch.no_grad():
+        img_emb = model.get_image_embeddings(pixel_values=pixels)
+        size = 4 * img_emb.shape[-1]
+
+        def run(**kw):
+            out = model(image_embeddings=img_emb, **kw)
+            return out.pred_masks[0, 0], out.iou_scores[0, 0]
+
+        point = torch.tensor([[[[19.0, 11.0]]]], dtype=torch.float64)
+        label = torch.tensor([[[1]]], dtype=torch.long)
+        first, first_iou = run(input_points=point, input_labels=label,
+                               multimask_output=True)
+        best = int(first_iou.argmax())
+        prev = first[best].float().double()
+        refined, refined_iou = run(input_points=point, input_labels=label,
+                                   input_masks=prev[None, None],
+                                   multimask_output=False)
+        plain, _ = run(input_points=point, input_labels=label,
+                       multimask_output=False)
+        assert (refined[0] - plain[0]).abs().max() > 1e-3, 'mask prompt inert'
+        result['refine'] = {'point': [19.0, 11.0], 'label': 1,
+                            'first_best': best,
+                            'mask_input': prev.tolist(),
+                            'mask_logits': refined[0].tolist(),
+                            'iou_scores': refined_iou.tolist()}
+
+        pattern = _mask_input_pattern(size)
+        box = [6.0, 4.0, 26.0, 22.0]
+        bm, bm_iou = run(input_boxes=torch.tensor([[box]], dtype=torch.float64),
+                         input_masks=pattern[None, None], multimask_output=True)
+        result['box_mask'] = {'box': box, 'mask_input': pattern.tolist(),
+                              'mask_logits': bm.tolist(),
+                              'iou_scores': bm_iou.tolist()}
+
+        mo, mo_iou = run(input_masks=pattern[None, None], multimask_output=False)
+        result['mask_only'] = {'mask_input': pattern.tolist(),
+                               'mask_logits': mo[0].tolist(),
+                               'iou_scores': mo_iou.tolist()}
+
+        proc = SamImageProcessorPil(size={'longest_edge': IMAGE_SIZE},
+                                    pad_size={'height': IMAGE_SIZE,
+                                              'width': IMAGE_SIZE})
+        arr = _amg_pattern(45, 30)
+        inputs = proc(images=Image.fromarray(arr), return_tensors='pt')
+        pts = torch.tensor(ips._normalize_coordinates(
+            IMAGE_SIZE, np.array([[20.0, 12.0], [35.0, 25.0]]), (30, 45)),
+            dtype=torch.float64)[None, None]
+        lab = torch.tensor([[[1, 0]]], dtype=torch.long)
+        pemb = model.get_image_embeddings(inputs['pixel_values'].double())
+        first = model(image_embeddings=pemb, input_points=pts,
+                      input_labels=lab, multimask_output=False)
+        prev = first.pred_masks[0, 0, 0].float().double()
+        second = model(image_embeddings=pemb, input_points=pts,
+                       input_labels=lab, input_masks=prev[None, None],
+                       multimask_output=False)
+        logits = proc.post_process_masks(
+            second.pred_masks, inputs['original_sizes'],
+            inputs['reshaped_input_sizes'], binarize=False)[0][0, 0]
+        weights = (torch.arange(logits.numel()) % 7 + 1).double()
+        result['predictor_refine'] = {
+            'width': 45, 'height': 30, 'points': [[20.0, 12.0], [35.0, 25.0]],
+            'labels': [1, 0], 'iou': float(second.iou_scores[0, 0, 0]),
+            'logit_sum': float(logits.sum()),
+            'logit_weighted_sum': float((logits.reshape(-1) * weights).sum()),
+            'logit_samples': [[x, y, float(logits[y, x])] for x, y in
+                              ((0, 0), (20, 12), (35, 25), (44, 29), (40, 7))]}
+    with open(path, 'w') as f:
+        json.dump(result, f)
+    print(f'wrote {path}: refine iou {result["refine"]["iou_scores"]}, '
+          f'box+mask iou {[round(v, 4) for v in result["box_mask"]["iou_scores"]]}, '
+          f'mask-only iou {result["mask_only"]["iou_scores"]}, '
+          f'predictor refine iou {result["predictor_refine"]["iou"]:.6f}')
+
+
+def install_mask_embedding(model, cfg):
+    """SAM-base mask_input_channels ratio (conv1 -> 4, conv2 -> OUT_CH): with
+    the 1-channel conv1 of OUT_CH // 4, layer_norm1 erases the mask. O(1)
+    weights from a private seed, so no other tensor of the fixture moves."""
+    cfg.prompt_encoder_config.mask_input_channels = OUT_CH
+    with torch.random.fork_rng():
+        torch.manual_seed(20261024)
+        embed = SamMaskEmbedding(cfg.prompt_encoder_config)
+        with torch.no_grad():
+            for conv in (embed.conv1, embed.conv2, embed.conv3):
+                conv.weight.normal_(0.0, 0.5)
+                conv.bias.normal_(0.0, 0.2)
+            for norm in (embed.layer_norm1, embed.layer_norm2):
+                norm.weight.normal_(1.0, 0.25)
+                norm.bias.normal_(0.0, 0.2)
+    model.prompt_encoder.mask_embed = embed
+
+
 IMAGE_SIZE = 32
 if __name__ == '__main__' and '--amg-oracle' in sys.argv:
     fixture_cfg = SamConfig.from_dict(
@@ -223,6 +339,13 @@ if __name__ == '__main__' and '--amg-oracle' in sys.argv:
     fixture_model = SamModel(fixture_cfg)
     fixture_model.load_state_dict(load_file('tests/fixtures/tiny_sam.safetensors'))
     amg_oracle(fixture_model.double().eval())
+    sys.exit(0)
+if __name__ == '__main__' and '--mask-input-oracle' in sys.argv:
+    fixture_cfg = SamConfig.from_dict(
+        json.load(open('tests/fixtures/tiny_sam_config.json')))
+    fixture_model = SamModel(fixture_cfg)
+    fixture_model.load_state_dict(load_file('tests/fixtures/tiny_sam.safetensors'))
+    mask_input_oracle(fixture_model.double().eval())
     sys.exit(0)
 
 HIDDEN = 24
@@ -337,6 +460,8 @@ with torch.no_grad():
         mlp.proj_out.weight.normal_(0.0, 0.4); mlp.proj_out.bias.normal_(0.0, 0.2)
         for l in mlp.layers:
             l.weight.normal_(0.0, 0.4); l.bias.normal_(0.0, 0.2)
+
+install_mask_embedding(model, cfg)
 
 # Promote the WHOLE model to float64 so the oracle is exact.
 model = model.double().eval()
@@ -510,3 +635,4 @@ with torch.no_grad():
 print('all fixture self-checks passed')
 
 amg_oracle(model)
+mask_input_oracle(model)

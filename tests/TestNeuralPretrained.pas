@@ -1832,6 +1832,7 @@ type
     procedure TestSAMProcessorEndToEndParity;
     procedure TestSAMAutomaticMaskGenerationParity;
     procedure TestSAMMaskGeneratorHelpers;
+    procedure TestSAMMaskInputParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -66108,6 +66109,234 @@ begin
     Masks.Free;
     Image.Free;
     Predictor.Free;
+  end;
+end;
+
+// The input_masks (dense mask) prompt of RunSAMMaskDecoderEx and TSAMPredictor
+// vs tools/make_pico_sam_fixture.py --mask-input-oracle (SamModel float64).
+procedure TTestNeuralPretrained.TestSAMMaskInputParity;
+  // Arr [H][W] -> V (H, W, 1), row-major like the decoder's mask logits.
+  procedure LoadPlane(Arr: TJSONArray; V: TNNetVolume);
+  var
+    RowPos, ColPos: integer;
+    Row: TJSONArray;
+  begin
+    V.ReSize(Arr.Count, TJSONArray(Arr.Items[0]).Count, 1);
+    for RowPos := 0 to Arr.Count - 1 do
+    begin
+      Row := TJSONArray(Arr.Items[RowPos]);
+      for ColPos := 0 to Row.Count - 1 do
+        V.FData[RowPos * Row.Count + ColPos] := Row.Items[ColPos].AsFloat;
+    end;
+  end;
+  // Max |V[.., Channel] - Arr[H][W]|.
+  function PlaneDiff(Arr: TJSONArray; V: TNNetVolume; Channel: integer): double;
+  var
+    RowPos, ColPos: integer;
+    Row: TJSONArray;
+  begin
+    Result := 0;
+    for RowPos := 0 to Arr.Count - 1 do
+    begin
+      Row := TJSONArray(Arr.Items[RowPos]);
+      for ColPos := 0 to Row.Count - 1 do
+        Result := Max(Result, Abs(V.FData[(RowPos * Row.Count + ColPos) *
+          V.Depth + Channel] - Row.Items[ColPos].AsFloat));
+    end;
+  end;
+  function ListDiff(Arr: TJSONArray; V: TNNetVolume): double;
+  var
+    ItemPos: integer;
+  begin
+    AssertEquals('score count', Arr.Count, V.Size);
+    Result := 0;
+    for ItemPos := 0 to Arr.Count - 1 do
+      Result := Max(Result, Abs(V.FData[ItemPos] - Arr.Items[ItemPos].AsFloat));
+  end;
+  function WeightedSum(V: TNNetVolume): double;
+  var
+    ElementPos: integer;
+  begin
+    Result := 0;
+    for ElementPos := 0 to V.Size - 1 do
+      Result := Result + V.FData[ElementPos] * ((ElementPos mod 7) + 1);
+  end;
+var
+  VisCfg: TSAMConfig;
+  MDCfg: TSAMMaskDecoderConfig;
+  Reader: TNNetSafeTensorsReader;
+  Cache: TSAMWeightCache;
+  Predictor: TSAMPredictor;
+  EmbRoot, Root, MaskV1Root: TJSONData;
+  RefJson: TStringList;
+  EmbArr, Arr: TJSONArray;
+  Obj: TJSONObject;
+  ImgEmb, MaskLogits, IoUScores, MaskIn, Image: TNNetVolume;
+  Grid, OutCh, RowPos, ColPos, DPos, X, Y, MaskPos, BestMask: integer;
+  MaxDiff: double;
+  Pts, Box, NoBox, NoPts: array of TNeuralFloat;
+  Labels, NoLabels: array of integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  VisCfg := ReadSAMConfigFromJSONFile(FixturePath('tiny_sam_config.json'));
+  MDCfg := ReadSAMMaskDecoderConfig(FixturePath('tiny_sam_config.json'), VisCfg);
+  AssertEquals('mask_input_channels', 16, MDCfg.MaskInputChannels);
+  AssertEquals('prompt hidden_act', 'gelu', MDCfg.PromptHiddenAct);
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_sam.safetensors'));
+  Cache := TSAMWeightCache.Create;
+  RefJson := TStringList.Create;
+  ImgEmb := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  IoUScores := TNNetVolume.Create;
+  MaskIn := TNNetVolume.Create;
+  Image := TNNetVolume.Create(45, 30, 3);
+  Predictor := nil;
+  EmbRoot := nil; Root := nil; MaskV1Root := nil;
+  SetLength(NoBox, 0); SetLength(NoPts, 0); SetLength(NoLabels, 0);
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_sam_embed.json'));
+    EmbRoot := GetJSON(RefJson.Text);
+    EmbArr := TJSONArray(TJSONObject(EmbRoot).Find('embed'));
+    Grid := TJSONObject(EmbRoot).Get('grid', 0);
+    OutCh := TJSONObject(EmbRoot).Get('out_channels', 0);
+    ImgEmb.ReSize(Grid, Grid, OutCh);
+    for RowPos := 0 to Grid - 1 do
+      for ColPos := 0 to Grid - 1 do
+        for DPos := 0 to OutCh - 1 do
+          ImgEmb.FData[(RowPos * Grid + ColPos) * OutCh + DPos] :=
+            TJSONArray(TJSONArray(EmbArr.Items[RowPos]).Items[ColPos]).
+            Items[DPos].AsFloat;
+    RefJson.LoadFromFile(FixturePath('tiny_sam_mask_input.json'));
+    Root := GetJSON(RefJson.Text);
+
+    // (a) Refinement: the best of 3 masks for one click, fed back as the mask.
+    Obj := TJSONObject(TJSONObject(Root).Find('refine'));
+    SetLength(Pts, 2);
+    Pts[0] := TJSONArray(Obj.Find('point')).Items[0].AsFloat;
+    Pts[1] := TJSONArray(Obj.Find('point')).Items[1].AsFloat;
+    SetLength(Labels, 1); Labels[0] := Obj.Get('label', 1);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox, true,
+      MaskLogits, IoUScores, '', Cache);
+    BestMask := 0;
+    for MaskPos := 1 to IoUScores.Size - 1 do
+      if IoUScores.FData[MaskPos] > IoUScores.FData[BestMask] then
+        BestMask := MaskPos;
+    AssertEquals('refine best mask', Obj.Get('first_best', -1), BestMask);
+    MaskIn.CopyChannels(MaskLogits, [BestMask]);
+    MaxDiff := PlaneDiff(TJSONArray(Obj.Find('mask_input')), MaskIn, 0);
+    AssertTrue('refine mask input: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox, false,
+      MaskLogits, IoUScores, '', Cache, MaskIn);
+    MaxDiff := PlaneDiff(TJSONArray(Obj.Find('mask_logits')), MaskLogits, 0);
+    AssertTrue('refine mask logits: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    MaxDiff := ListDiff(TJSONArray(Obj.Find('iou_scores')), IoUScores);
+    AssertTrue('refine iou: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    // The oracle's own mask input, uncached: the mask embedding builds per call.
+    LoadPlane(TJSONArray(Obj.Find('mask_input')), MaskIn);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox, false,
+      MaskLogits, IoUScores, '', nil, MaskIn);
+    MaxDiff := PlaneDiff(TJSONArray(Obj.Find('mask_logits')), MaskLogits, 0);
+    AssertTrue('refine uncached logits: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+
+    // (b) Box + mask prompt, 3 masks.
+    Obj := TJSONObject(TJSONObject(Root).Find('box_mask'));
+    SetLength(Box, 4);
+    for DPos := 0 to 3 do
+      Box[DPos] := TJSONArray(Obj.Find('box')).Items[DPos].AsFloat;
+    LoadPlane(TJSONArray(Obj.Find('mask_input')), MaskIn);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, NoPts, NoLabels, Box, true,
+      MaskLogits, IoUScores, '', Cache, MaskIn);
+    AssertEquals('box+mask depth', 3, MaskLogits.Depth);
+    MaxDiff := 0;
+    for MaskPos := 0 to 2 do
+      MaxDiff := Max(MaxDiff, PlaneDiff(TJSONArray(TJSONArray(
+        Obj.Find('mask_logits')).Items[MaskPos]), MaskLogits, MaskPos));
+    AssertTrue('box+mask logits: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    MaxDiff := ListDiff(TJSONArray(Obj.Find('iou_scores')), IoUScores);
+    AssertTrue('box+mask iou: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+
+    // (c) Mask-only prompt: no sparse tokens at all.
+    Obj := TJSONObject(TJSONObject(Root).Find('mask_only'));
+    LoadPlane(TJSONArray(Obj.Find('mask_input')), MaskIn);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, NoPts, NoLabels, NoBox, false,
+      MaskLogits, IoUScores, '', Cache, MaskIn);
+    MaxDiff := PlaneDiff(TJSONArray(Obj.Find('mask_logits')), MaskLogits, 0);
+    AssertTrue('mask-only logits: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+    MaxDiff := ListDiff(TJSONArray(Obj.Find('iou_scores')), IoUScores);
+    AssertTrue('mask-only iou: max |diff| = ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+
+    // (d) No mask on the same cache still gives the no_mask_embed oracle.
+    RefJson.LoadFromFile(FixturePath('tiny_sam_mask.json'));
+    MaskV1Root := GetJSON(RefJson.Text);
+    Arr := TJSONArray(TJSONObject(MaskV1Root).Find('point'));
+    Pts[0] := Arr.Items[0].AsFloat; Pts[1] := Arr.Items[1].AsFloat;
+    Labels[0] := 1;
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox, false,
+      MaskLogits, nil, '', Cache);
+    MaxDiff := PlaneDiff(TJSONArray(TJSONObject(MaskV1Root).Find('mask_logits')),
+      MaskLogits, 0);
+    AssertTrue('no-mask after mask: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
+
+    // (e) A mask of the wrong size is rejected.
+    MaskIn.ReSize(4 * Grid, 4 * Grid, 2);
+    Raised := false;
+    try
+      RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox, false,
+        MaskLogits, nil, '', Cache, MaskIn);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('wrong mask shape raises', Raised);
+
+    // (f) TSAMPredictor round trip: LowResLogits fed back with the same clicks.
+    Obj := TJSONObject(TJSONObject(Root).Find('predictor_refine'));
+    for Y := 0 to 29 do
+      for X := 0 to 44 do
+      begin
+        Image[X, Y, 0] := (X * 7 + Y * 13) mod 256;
+        Image[X, Y, 1] := (X * X + 3 * Y) mod 256;
+        Image[X, Y, 2] := (X * Y * 5 + 17) mod 256;
+      end;
+    Predictor := TSAMPredictor.Create(FixturePath('tiny_sam.safetensors'),
+      FixturePath('tiny_sam_config.json'));
+    Predictor.SetImage(Image);
+    SetLength(Pts, 4);
+    Arr := TJSONArray(Obj.Find('points'));
+    for DPos := 0 to 1 do
+    begin
+      Pts[DPos * 2] := TJSONArray(Arr.Items[DPos]).Items[0].AsFloat;
+      Pts[DPos * 2 + 1] := TJSONArray(Arr.Items[DPos]).Items[1].AsFloat;
+    end;
+    SetLength(Labels, 2); Labels[0] := 1; Labels[1] := 0;
+    Predictor.Predict(Pts, Labels, NoBox, false, MaskLogits, IoUScores, false);
+    MaskIn.CopyChannels(Predictor.LowResLogits, [0]);
+    Predictor.Predict(Pts, Labels, NoBox, false, MaskLogits, IoUScores, false,
+      MaskIn);
+    AssertEquals('predictor refine width', 45, MaskLogits.SizeX);
+    AssertEquals('predictor refine iou', Obj.Get('iou', TJSONFloat(0)),
+      IoUScores.FData[0], 1e-4);
+    AssertEquals('predictor refine logit sum', Obj.Get('logit_sum', TJSONFloat(0)),
+      MaskLogits.GetSum(), 2e-2);
+    AssertEquals('predictor refine weighted sum',
+      Obj.Get('logit_weighted_sum', TJSONFloat(0)), WeightedSum(MaskLogits), 8e-2);
+    Arr := TJSONArray(Obj.Find('logit_samples'));
+    for DPos := 0 to Arr.Count - 1 do
+      AssertEquals('predictor refine sample ' + IntToStr(DPos),
+        TJSONArray(Arr.Items[DPos]).Items[2].AsFloat,
+        MaskLogits[TJSONArray(Arr.Items[DPos]).Items[0].AsInteger,
+          TJSONArray(Arr.Items[DPos]).Items[1].AsInteger, 0], 1e-4);
+  finally
+    Predictor.Free;
+    EmbRoot.Free; Root.Free; MaskV1Root.Free;
+    Image.Free; MaskIn.Free; IoUScores.Free; MaskLogits.Free; ImgEmb.Free;
+    RefJson.Free; Cache.Free; Reader.Free;
   end;
 end;
 

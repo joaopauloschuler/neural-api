@@ -15,12 +15,14 @@ program SegmentAnything;
 //   examples/SegmentAnything/SegmentAnything
 //   examples/SegmentAnything/SegmentAnything /path/to/sam-vit-base/model.safetensors \
 //     --image photo.jpg --point 320,240 --point 100,80,0 [--box x0,y0,x1,y1]
-//     [--multimask] [--out sam]
+//     [--multimask] [--refine 2] [--out sam]
 //   examples/SegmentAnything/SegmentAnything /path/to/model.safetensors \
 //     --image photo.jpg --everything [--points-per-side 32] [--crop-layers 1]
 //
 // Writes <out>_mask.png (white = mask, at the photo's resolution) and
-// <out>_overlay.png (the photo with the mask tinted red). --everything runs the
+// <out>_overlay.png (the photo with the mask tinted red). --refine N feeds the
+// kept low-res mask logits back N times as a mask prompt (SAM's mask_input,
+// HF input_masks) with the same clicks / box. --everything runs the
 // automatic mask generator (TSAMPredictor.GenerateMasks) instead and writes
 // <out>_everything.png: every mask in its own colour with its box outlined.
 //
@@ -105,13 +107,15 @@ procedure Usage();
 begin
   WriteLn('Usage: SegmentAnything [checkpoint.safetensors] [--config FILE]');
   WriteLn('  [--image FILE] [--point X,Y[,LABEL]]... [--box X0,Y0,X1,Y1]');
-  WriteLn('  [--multimask] [--out PREFIX]');
+  WriteLn('  [--multimask] [--refine N] [--out PREFIX]');
   WriteLn('  [--everything [--points-per-side N] [--crop-layers N]');
   WriteLn('   [--crop-points-downscale N] [--pred-iou-thresh T]');
   WriteLn('   [--stability-thresh T] [--stability-offset T] [--nms-thresh T]]');
   WriteLn('Coordinates are original-image pixels; LABEL 1 = foreground');
   WriteLn('(default), 0 = background. Without --image a synthetic 96x64 image');
   WriteLn('is segmented; without a prompt the click is the image centre.');
+  WriteLn('--refine N feeds the kept low-res mask back N times as a mask prompt');
+  WriteLn('together with the same points / box (one mask per refinement).');
   WriteLn('--everything segments the whole image from a point grid (defaults:');
   WriteLn('32 points per side, no crop layers, IoU > 0.88, stability > 0.95 at');
   WriteLn('offset 1, box NMS 0.7).');
@@ -168,13 +172,14 @@ end;
 var
   Ckpt, ConfigPath, ImagePath, OutPrefix, Arg: string;
   Predictor: TSAMPredictor;
-  Image, Masks, IoUScores, MaskImage, Overlay: TNNetVolume;
+  Image, Masks, IoUScores, MaskImage, Overlay, MaskInput: TNNetVolume;
   Points, Box, Fields: TNeuralFloatDynArr;
   Labels: array of integer;
   MultiMask, Everything: boolean;
   GeneratorOptions: TSAMMaskGeneratorOptions;
   OptionValue: TNeuralFloat;
   ArgPos, PointCount, BestMask, MaskPos, MaxMaskPos, X, Y, MaxX, MaxY: integer;
+  RefineCount, RefinePos: integer;
   ForegroundCount: integer;
   MaskValue: TNeuralFloat;
 begin
@@ -184,6 +189,7 @@ begin
   OutPrefix := 'sam';
   MultiMask := false;
   Everything := false;
+  RefineCount := 0;
   GeneratorOptions := SAMDefaultMaskGeneratorOptions();
   SetLength(Points, 0);
   SetLength(Labels, 0);
@@ -202,7 +208,7 @@ begin
     else if (Arg = '--points-per-side') or (Arg = '--crop-layers') or
       (Arg = '--crop-points-downscale') or (Arg = '--pred-iou-thresh') or
       (Arg = '--stability-thresh') or (Arg = '--stability-offset') or
-      (Arg = '--nms-thresh') then
+      (Arg = '--nms-thresh') or (Arg = '--refine') then
     begin
       Inc(ArgPos);
       if (ArgPos > ParamCount) or not ParseFloatList(ParamStr(ArgPos), Fields) or
@@ -224,6 +230,7 @@ begin
         GeneratorOptions.StabilityScoreThresh := OptionValue
       else if Arg = '--stability-offset' then
         GeneratorOptions.StabilityScoreOffset := OptionValue
+      else if Arg = '--refine' then RefineCount := Max(0, Round(OptionValue))
       else GeneratorOptions.CropsNMSThresh := OptionValue;
     end
     else if (Arg = '--image') or (Arg = '--point') or (Arg = '--box') or
@@ -291,6 +298,7 @@ begin
   IoUScores := TNNetVolume.Create;
   MaskImage := TNNetVolume.Create;
   Overlay := TNNetVolume.Create;
+  MaskInput := TNNetVolume.Create;
   Predictor := TSAMPredictor.Create(Ckpt, ConfigPath);
   try
     WriteLn('  ', SAMConfigToString(Predictor.Config));
@@ -342,6 +350,16 @@ begin
     end;
     if Masks.Depth > 1 then
       WriteLn('  keeping mask ', BestMask, ' (highest predicted IoU)');
+    // Iterative refinement as in the SAM notebooks: the kept low-res logits
+    // become the mask prompt of a single-mask decode with the same prompts.
+    for RefinePos := 1 to RefineCount do
+    begin
+      MaskInput.CopyChannels(Predictor.LowResLogits, [BestMask]);
+      Predictor.Predict(Points, Labels, Box, {MultiMaskOutput=}false, Masks,
+        IoUScores, {Binarize=}true, MaskInput);
+      BestMask := 0;
+      WriteLn('  refine ', RefinePos, ': predicted IoU ', IoUScores.FData[0]:0:4);
+    end;
 
     MaskImage.ReSize(Image.SizeX, Image.SizeY, 3);
     Overlay.Copy(Image);
@@ -365,6 +383,7 @@ begin
       Image.SizeX * Image.SizeY, ' pixels foreground');
   finally
     Predictor.Free;
+    MaskInput.Free;
     Overlay.Free;
     MaskImage.Free;
     IoUScores.Free;

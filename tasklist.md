@@ -1462,8 +1462,10 @@ rather than acted on.
         (tensor resize); the port matches the PIL backend (uint8 PIL bilinear).
         Measure the pixel_values gap on a real photo; add a torchvision-mode
         resize only if it changes masks.
-  - [ ] Not exposed (the decoder lacks it): the input_masks prompt (previous
-        low-res mask fed back).
+  - [ ] examples/SegmentAnything `--mask-input FILE`: read a mask PNG at the
+        photo's size, resize it into the padded low-res frame and convert it to
+        logits for `TSAMPredictor.Predict(..., MaskInput)` (`--refine N` with the
+        decoder's own low-res logits is done; TestSAMMaskInputParity).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
