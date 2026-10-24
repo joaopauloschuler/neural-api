@@ -1639,16 +1639,26 @@ rather than acted on.
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states. Further gaps (audit 2026-10-02), which together mean
       the repo has NO usable video generator today:
-  - [ ] VAE follow-up: activation RAM. Measured on random CogVideoX-2b-shape
-        weights: the first-batch net keeps ~48.6 MB of activations per latent
-        cell and the cached-pad net ~46.0 MB, so one 30x45 tile pair is ~128 GB
-        (the untiled 60x90 latent ~511 GB). Needs ShareHostOutputsByLiveness
-        (keep the causal pad layers alive for the cache copy) and freeing the
-        first-batch net before the cached-pad net runs.
+  - [X] VAE follow-up: activation RAM. Measured on random CogVideoX-2b-shape
+        weights (host bytes per latent cell): first-batch net 46.3 -> 6.6 MB,
+        cached-pad net 43.9 -> 5.9 MB; a whole tile decode (both nets) peaks
+        at 6.7 MB RSS per cell, was 92.7 MB (build included: the unshared
+        build used to touch every activation). The batch nets set
+        ShareHostOutputsByLiveness before the build (the build then holds no
+        activations), each frees its activations after its last batch of a
+        tile (TNNet.ReleaseHostOutputs), the cache taps are pinned 2-frame
+        gathers written straight into the next net's cache inputs
+        (TNNetLayer.HostOutputStorage), and RunsAfter edges order the taps and
+        zq branches so their storage is reused. Left: exact-size slots keep the
+        256-channel and 128-channel full-resolution phases in separate storage
+        (growable host slots would cut ~1/3 more); no in-place layers.
   - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (TCogVideoXVaeDecoder.Create
         on the downloaded vae folder, a 2-3 latent-frame low-res slice against
-        diffusers decode) once the chunked path makes it fit; check the encoder
-        tensors are ignored and no decoder tensor is left over.
+        diffusers decode); check the encoder tensors are ignored and no decoder
+        tensor is left over. RAM estimate: 0.47 GB FP32 weights + ~6.7 MB per
+        latent cell, so ~9 GB for one 30x45 tile with EnableTiling and ~36 GB
+        for the untiled 60x90 latent; a low-res slice (e.g. 8x8 latent) fits
+        in ~1 GB.
   - [ ] VAE follow-up: OpenCL / speed. TNNetConvolution3D's CPU forward is one
         C-wide dot product per output tap; time the decoder under OpenCL
         (cai_conv_implicit) and check the TNNetGatherChannels frame pads and the

@@ -1622,6 +1622,9 @@ type
     // 4/5/7-latent-frame clips vs diffusers' frame-batched _decode (conv cache).
     procedure TestCogVideoXVaeBatchedDecodeParity;
     procedure TestCogVideoXVaeTiledDecodeParity;
+    // ShareHostOutputs on vs off: byte-identical decodes (batched and tiled),
+    // fewer host activation bytes in a forward and none held after a tile.
+    procedure TestCogVideoXVaeSharedHostOutputs;
     // TCogVideoXSampler's First-Block Cache vs plain loops on a 3-block copy
     // of the pico checkpoint: threshold 0 bit-identical, skips as a reference.
     procedure TestCogVideoXFirstBlockCacheReference;
@@ -56978,6 +56981,72 @@ procedure TTestNeuralPretrained.TestCogVideoXVaeTiledDecodeParity;
 begin
   // 1 frame in 3x2 tiles of 4 shapes; 4 = 2 + 2 frames in 2x2 tiles.
   CheckCogVideoXVaeCases('vae_tiled', 2, 3, 10);
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXVaeSharedHostOutputs;
+const
+  LatentFrames = 5;
+  LatentH = 4;
+  LatentW = 6;
+var
+  Decoder: TCogVideoXVaeDecoder;
+  Latent, FramesOff, FramesOn, TiledOff, TiledOn, BatchInput: TNNetVolume;
+  BytesOff, BytesOn, BytesHeld: int64;
+  ValuePos, MaxValuePos: integer;
+begin
+  Decoder := TCogVideoXVaeDecoder.Create(ExtractFilePath(
+    FixturePath('tiny_cogvideox_vae' + DirectorySeparator + 'config.json')),
+    LatentFrames, LatentH, LatentW);
+  Latent := TNNetVolume.Create(LatentFrames * LatentH * LatentW *
+    Decoder.Config.LatentChannels, 1, 1);
+  FramesOff := TNNetVolume.Create;
+  FramesOn := TNNetVolume.Create;
+  TiledOff := TNNetVolume.Create;
+  TiledOn := TNNetVolume.Create;
+  BatchInput := TNNetVolume.Create;
+  try
+    MaxValuePos := Latent.Size - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Latent.FData[ValuePos] := Sin(ValuePos * 0.37) + 0.2 * Cos(ValuePos * 1.3);
+    AssertTrue('sharing is the default', Decoder.ShareHostOutputs);
+    Decoder.ShareHostOutputs := false;
+    Decoder.Decode(Latent, FramesOff);
+    AssertEquals('3 + 2 latent frames: two batch nets', 2, Decoder.BatchCount);
+    BytesOff := Decoder.FirstNet.NonWeightBytes();
+    Decoder.EnableTiling(16, 24, 0.5, 1 / 3);
+    Decoder.Decode(Latent, TiledOff);
+    AssertTrue('the latent is tiled', Decoder.LastTileCount > 1);
+    Decoder.DisableTiling();
+    Decoder.ShareHostOutputs := true;
+    Decoder.Decode(Latent, FramesOn);
+    AssertEquals('batched decode byte-identical', 0,
+      MaxAbsVolumeDiff(FramesOn, FramesOff), 0);
+    BytesHeld := Decoder.FirstNet.NonWeightBytes() +
+      Decoder.NextNet.NonWeightBytes();
+    // A forward of the first-batch net alone: its planned activations.
+    BatchInput.ReSize(Decoder.FirstNet.Layers[0].Output);
+    BatchInput.Fill(0.5);
+    Decoder.FirstNet.Compute(BatchInput);
+    BytesOn := Decoder.FirstNet.NonWeightBytes();
+    WriteLn('  CogVideoX VAE first-batch net host bytes: ', BytesOff,
+      ' unshared, ', BytesOn, ' shared; both nets after a tile: ', BytesHeld);
+    AssertTrue('sharing cuts the activation bytes at least 4x',
+      4 * BytesOn < BytesOff);
+    AssertTrue('the nets free their activations after a tile',
+      10 * BytesHeld < BytesOff);
+    Decoder.EnableTiling(16, 24, 0.5, 1 / 3);
+    Decoder.Decode(Latent, TiledOn);
+    AssertEquals('tiled decode byte-identical', 0,
+      MaxAbsVolumeDiff(TiledOn, TiledOff), 0);
+  finally
+    BatchInput.Free;
+    TiledOn.Free;
+    TiledOff.Free;
+    FramesOn.Free;
+    FramesOff.Free;
+    Latent.Free;
+    Decoder.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestCogVideoXFirstBlockCacheReference;

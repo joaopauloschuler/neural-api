@@ -14918,11 +14918,10 @@ const
 
 type
   // The causal convs (time kernel > 1) of one decoder net, in build order: the
-  // layer holding each padded input and, in a cached-pad net, its cache input.
+  // pinned layer holding the last 2 frames of each padded input (diffusers'
+  // conv_cache) and, in a cached-pad net, the input that receives it.
   TCogVideoXVaeCausalConvs = record
-    PadLayers, CacheInputs: array of TNNetLayer;
-    // Depth channels of the last 2 padded frames: diffusers' conv_cache.
-    CacheChannels: array of TNeuralIntegerArray;
+    CacheTaps, CacheInputs: array of TNNetLayer;
   end;
 
   // diffusers AutoencoderKLCogVideoX._decode / tiled_decode: 2 latent frames
@@ -14944,6 +14943,7 @@ type
     FTileSampleMinHeight, FTileSampleMinWidth: integer;
     FTileOverlapFactorHeight, FTileOverlapFactorWidth: double;
     FLastTileCount: integer;
+    FShareHostOutputs: boolean;
     procedure LoadWeights(Reader: TNNetSafeTensorsReader);
     procedure PrepareTileNets(TileW, TileH: integer);
     // Frame-batched decode of a frame-packed latent tile (W, H, T*C) into a
@@ -14956,6 +14956,7 @@ type
     function GetSpatialScale(): integer;
     function GetTileLatentMinHeight(): integer;
     function GetTileLatentMinWidth(): integer;
+    procedure SetShareHostOutputs(Value: boolean);
   public
     // VaePath is a diffusers vae folder (config.json + diffusion_pytorch_model)
     // or a .safetensors file with a sibling config.json.
@@ -14988,6 +14989,10 @@ type
     property WeightOwner: TNNet read FWeightOwner;
     property FirstNet: TNNet read FFirstNet;
     property NextNet: TNNet read FNextNet;
+    // TNNet.ShareHostOutputsByLiveness on the batch nets (default true); each
+    // net frees its activations after its last batch of a tile.
+    property ShareHostOutputs: boolean read FShareHostOutputs
+      write SetShareHostOutputs;
   end;
 
 // Returns the CogVideoX denoiser's timestep input (the (1,1,1) scalar, the
@@ -115817,7 +115822,7 @@ end;
 // WeightOwner's weights. CachedPad: causal pads take cache inputs, not frame 0.
 function BuildCogVideoXVaeBatchNet(Reader: TNNetSafeTensorsReader;
   WeightOwner: TNNet; const Config: TCogVideoXVaeConfig; BatchFrames, LatentH,
-  LatentW: integer; CachedPad: boolean;
+  LatentW: integer; CachedPad, ShareHostOutputs: boolean;
   out CausalConvs: TCogVideoXVaeCausalConvs): TNNet;
 var
   NN: TNNet;
@@ -115830,27 +115835,51 @@ var
   UpPrefix, TensorName: string;
   DecoderChannels: TNeuralIntegerArray;
 
-  // Records a causal conv's padded input (PadCount + FrameCount frames) and
-  // the channels of its last PadCount frames.
-  procedure AddCausalPad(PadLayer, CacheInput: TNNetLayer;
-    PadCount, Channels: integer);
+  // CogVideoXCausalConv3d's time pad: the cache input (CachedPad) or frame 0
+  // repeated, then the frames; its last PadCount frames go to a pinned tap.
+  function AddCausalPad(Source: TNNetLayer; PadCount, Channels: integer;
+    out CacheTap: TNNetLayer): TNNetLayer;
   var
-    CacheFrames: TNeuralIntegerArray;
+    PadFrames, CacheFrames: TNeuralIntegerArray;
+    CacheInput: TNNetLayer;
     FramePos, MaxFramePos, ConvPos: integer;
   begin
+    CacheInput := nil;
+    if CachedPad then
+    begin
+      CacheInput := NN.AddLayer(TNNetInput.Create(FrameW, FrameH,
+        PadCount * Channels).SetTrainable(false));
+      Result := NN.AddLayer(TNNetDeepConcat.Create([CacheInput, Source]).
+        SetTrainable(false));
+    end
+    else
+    begin
+      PadFrames := nil;
+      SetLength(PadFrames, PadCount + FrameCount);
+      MaxFramePos := PadCount + FrameCount - 1;
+      for FramePos := 0 to MaxFramePos do
+        PadFrames[FramePos] := Max(FramePos - PadCount, 0);
+      Result := NN.AddLayerAfter(TNNetGatherChannels.Create(
+        CogVideoXFrameGatherChannels(PadFrames, Channels)).SetTrainable(false),
+        Source);
+    end;
     CacheFrames := nil;
     SetLength(CacheFrames, PadCount);
     MaxFramePos := PadCount - 1;
     for FramePos := 0 to MaxFramePos do
       CacheFrames[FramePos] := FrameCount + FramePos;
-    ConvPos := Length(CausalConvs.PadLayers);
-    SetLength(CausalConvs.PadLayers, ConvPos + 1);
+    CacheTap := NN.AddLayerAfter(TNNetGatherChannels.Create(
+      CogVideoXFrameGatherChannels(CacheFrames, Channels)).SetTrainable(false),
+      Result);
+    // Read on the host after the forward.
+    CacheTap.OutputPinned := true;
+    // The pad has read the cache input when the tap overwrites it.
+    if CachedPad then CacheTap.HostOutputStorage := CacheInput.Output;
+    ConvPos := Length(CausalConvs.CacheTaps);
+    SetLength(CausalConvs.CacheTaps, ConvPos + 1);
     SetLength(CausalConvs.CacheInputs, ConvPos + 1);
-    SetLength(CausalConvs.CacheChannels, ConvPos + 1);
-    CausalConvs.PadLayers[ConvPos] := PadLayer;
+    CausalConvs.CacheTaps[ConvPos] := CacheTap;
     CausalConvs.CacheInputs[ConvPos] := CacheInput;
-    CausalConvs.CacheChannels[ConvPos] :=
-      CogVideoXFrameGatherChannels(CacheFrames, Channels);
   end;
 
   // A diffusers Conv3d (KT > 1: CogVideoXCausalConv3d, time padded by the
@@ -115858,36 +115887,14 @@ var
   function AddConv(Source: TNNetLayer; const Prefix: string;
     pOutCh, pInCh, KT, K: integer): TNNetLayer;
   var
-    PadFrames: TNeuralIntegerArray;
-    CacheInput: TNNetLayer;
-    FramePos, MaxFramePos, PadCount: integer;
+    CacheTap: TNNetLayer;
   begin
-    if KT > 1 then
-    begin
-      PadCount := KT - 1;
-      CacheInput := nil;
-      if CachedPad then
-      begin
-        CacheInput := NN.AddLayer(TNNetInput.Create(FrameW, FrameH,
-          PadCount * pInCh).SetTrainable(false));
-        Source := NN.AddLayer(TNNetDeepConcat.Create([CacheInput, Source]).
-          SetTrainable(false));
-      end
-      else
-      begin
-        PadFrames := nil;
-        SetLength(PadFrames, PadCount + FrameCount);
-        MaxFramePos := PadCount + FrameCount - 1;
-        for FramePos := 0 to MaxFramePos do
-          PadFrames[FramePos] := Max(FramePos - PadCount, 0);
-        Source := NN.AddLayerAfter(TNNetGatherChannels.Create(
-          CogVideoXFrameGatherChannels(PadFrames, pInCh)).SetTrainable(false),
-          Source);
-      end;
-      AddCausalPad(Source, CacheInput, PadCount, pInCh);
-    end;
+    CacheTap := nil;
+    if KT > 1 then Source := AddCausalPad(Source, KT - 1, pInCh, CacheTap);
     Result := NN.AddLayerAfter(TNNetConvolution3D.Create(pOutCh, KT, K,
       (K - 1) div 2, 1, pInCh).SetTrainable(false), Source);
+    // The tap then lets liveness sharing reuse the pad once the conv read it.
+    Result.RunsAfter := CacheTap;
     if Reader <> nil then
       LoadTorchConv3D(Reader, Result, Prefix + 'weight', Prefix + 'bias',
         pOutCh, pInCh, KT, K, csCogVideoXVaeImporter);
@@ -115897,13 +115904,16 @@ var
 
   // conv_y / conv_b (1x1x1) on zq, then the nearest resize of
   // CogVideoXSpatialNorm3D to the current frame shape (the two commute).
-  function AddZqBranch(const Prefix: string; Channels: integer): TNNetLayer;
+  // It runs after RunsAfter, so liveness sharing can reuse earlier storage.
+  function AddZqBranch(const Prefix: string; Channels: integer;
+    RunsAfter: TNNetLayer): TNNetLayer;
   var
     SourceFrame: TNeuralIntegerArray;
     FramePos, MaxFramePos: integer;
     IsIdentity: boolean;
   begin
     Result := AddConv(Zq, Prefix, Channels, Config.LatentChannels, 1, 1);
+    Result.RunsAfter := RunsAfter;
     SourceFrame := nil;
     SetLength(SourceFrame, FrameCount);
     MaxFramePos := FrameCount - 1;
@@ -115936,7 +115946,7 @@ var
   function AddSpatialNorm(Source: TNNetLayer; const Prefix: string;
     Channels: integer): TNNetLayer;
   var
-    Normed, ScaleBranch, ShiftBranch: TNNetLayer;
+    Normed, ScaleBranch, Scaled, ShiftBranch: TNNetLayer;
   begin
     NN.AddLayerAfter(TNNetReshape.Create(FrameW * FrameH * FrameCount, 1,
       Channels).SetTrainable(false), Source);
@@ -115949,10 +115959,11 @@ var
     LoadedNames.Add(Prefix + 'norm_layer.bias');
     Normed := NN.AddLayer(TNNetReshape.Create(FrameW, FrameH,
       FrameCount * Channels).SetTrainable(false));
-    ScaleBranch := AddZqBranch(Prefix + 'conv_y.conv.', Channels);
-    ShiftBranch := AddZqBranch(Prefix + 'conv_b.conv.', Channels);
-    NN.AddLayer(TNNetCellMulByCell.Create(Normed, ScaleBranch).SetTrainable(false));
-    Result := NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), ShiftBranch]).
+    ScaleBranch := AddZqBranch(Prefix + 'conv_y.conv.', Channels, Normed);
+    Scaled := NN.AddLayer(TNNetCellMulByCell.Create(Normed, ScaleBranch).
+      SetTrainable(false));
+    ShiftBranch := AddZqBranch(Prefix + 'conv_b.conv.', Channels, Scaled);
+    Result := NN.AddLayer(TNNetSum.Create([Scaled, ShiftBranch]).
       SetTrainable(false));
   end;
 
@@ -116028,6 +116039,8 @@ begin
   FrameW := LatentW;
   CausalConvs := Default(TCogVideoXVaeCausalConvs);
   NN := TNNet.Create();
+  // Set before the first layer: the build then holds no activations.
+  NN.ShareHostOutputsByLiveness := ShareHostOutputs;
   NN.BuildWeightOwner := WeightOwner;
   LoadedNames := TStringList.Create;
   LoadedNames.Sorted := true;
@@ -116098,16 +116111,18 @@ procedure CopyCogVideoXVaeConvCaches(const Source,
   Target: TCogVideoXVaeCausalConvs);
 var
   ConvPos, MaxConvPos: integer;
-  CacheInput: TNNetLayer;
+  CacheInput, CacheTap: TNNetLayer;
 begin
   MaxConvPos := High(Target.CacheInputs);
   for ConvPos := 0 to MaxConvPos do
   begin
     CacheInput := Target.CacheInputs[ConvPos];
-    Source.PadLayers[ConvPos].ForceOutputOnRAM();
+    CacheTap := Source.CacheTaps[ConvPos];
+    CacheTap.ForceOutputOnRAM();
     CacheInput.ForceOutputOnRAM();
-    CacheInput.Output.CopyChannels(Source.PadLayers[ConvPos].Output,
-      Source.CacheChannels[ConvPos]);
+    // A tap with the cache input as its HostOutputStorage wrote it already.
+    if Pointer(CacheInput.Output.FData) <> Pointer(CacheTap.Output.FData) then
+      CacheInput.Output.Copy(CacheTap.Output);
     CacheInput.MarkOutputWrittenOnRAM();
   end;
 end;
@@ -116204,8 +116219,10 @@ begin
     csCogVideoXVaeFrameBatch + FLatentFrames mod csCogVideoXVaeFrameBatch);
   FPackedLatent := TNNetVolume.Create();
   FBatchLatent := TNNetVolume.Create();
+  FShareHostOutputs := true;
   FWeightOwner := BuildCogVideoXVaeBatchNet(Reader, nil, FConfig,
-    FFirstBatchFrames, 1, 1, {CachedPad=}false, OwnerConvs);
+    FFirstBatchFrames, 1, 1, {CachedPad=}false, {ShareHostOutputs=}false,
+    OwnerConvs);
   FTileSampleMinHeight := csCogVideoXVaeTileSampleMinHeight;
   FTileSampleMinWidth := csCogVideoXVaeTileSampleMinWidth;
   FTileOverlapFactorHeight := csCogVideoXVaeTileOverlapFactorHeight;
@@ -116213,18 +116230,38 @@ begin
 end;
 
 procedure TCogVideoXVaeDecoder.PrepareTileNets(TileW, TileH: integer);
+var
+  ConvPos, MaxConvPos: integer;
 begin
   if Assigned(FFirstNet) and (TileW = FNetLatentW) and (TileH = FNetLatentH) then
     exit;
   FreeAndNil(FNextNet);
   FreeAndNil(FFirstNet);
   FFirstNet := BuildCogVideoXVaeBatchNet(nil, FWeightOwner, FConfig,
-    FFirstBatchFrames, TileH, TileW, {CachedPad=}false, FFirstConvs);
+    FFirstBatchFrames, TileH, TileW, {CachedPad=}false, FShareHostOutputs,
+    FFirstConvs);
   if GetBatchCount() > 1 then
+  begin
     FNextNet := BuildCogVideoXVaeBatchNet(nil, FWeightOwner, FConfig,
-      csCogVideoXVaeFrameBatch, TileH, TileW, {CachedPad=}true, FNextConvs);
+      csCogVideoXVaeFrameBatch, TileH, TileW, {CachedPad=}true,
+      FShareHostOutputs, FNextConvs);
+    // The first batch writes its cache straight into the next net's inputs.
+    MaxConvPos := High(FFirstConvs.CacheTaps);
+    for ConvPos := 0 to MaxConvPos do
+      FFirstConvs.CacheTaps[ConvPos].HostOutputStorage :=
+        FNextConvs.CacheInputs[ConvPos].Output;
+  end;
   FNetLatentW := TileW;
   FNetLatentH := TileH;
+end;
+
+procedure TCogVideoXVaeDecoder.SetShareHostOutputs(Value: boolean);
+begin
+  if Value = FShareHostOutputs then exit;
+  FShareHostOutputs := Value;
+  // PrepareTileNets rebuilds them with the new setting.
+  FreeAndNil(FNextNet);
+  FreeAndNil(FFirstNet);
 end;
 
 function TCogVideoXVaeDecoder.GetBatchCount(): integer;
@@ -116310,13 +116347,16 @@ begin
   DecodeBatch(FFirstNet, LatentTile, 0, TileFrames, OutFrame);
   FirstFrame := FFirstBatchFrames;
   MaxBatchPos := GetBatchCount() - 1;
+  if MaxBatchPos >= 1 then CopyCogVideoXVaeConvCaches(FFirstConvs, FNextConvs);
+  // One net holds activations at a time.
+  FFirstNet.ReleaseHostOutputs();
   for BatchPos := 1 to MaxBatchPos do
   begin
-    if BatchPos = 1 then CopyCogVideoXVaeConvCaches(FFirstConvs, FNextConvs)
-    else CopyCogVideoXVaeConvCaches(FNextConvs, FNextConvs);
+    if BatchPos > 1 then CopyCogVideoXVaeConvCaches(FNextConvs, FNextConvs);
     DecodeBatch(FNextNet, LatentTile, FirstFrame, TileFrames, OutFrame);
     Inc(FirstFrame, csCogVideoXVaeFrameBatch);
   end;
+  if MaxBatchPos >= 1 then FNextNet.ReleaseHostOutputs();
 end;
 
 procedure TCogVideoXVaeDecoder.Decode(Latent, Frames: TNNetVolume);

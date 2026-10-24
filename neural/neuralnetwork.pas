@@ -638,6 +638,10 @@ type
       FOutputPinned: boolean;
       // See ForwardSkipped.
       FForwardSkipped: boolean;
+      // See RunsAfter.
+      FRunsAfter: TNNetLayer;
+      // See HostOutputStorage.
+      FHostOutputStorage: TNNetVolume;
       {$IFDEF OpenCL}
       FHasOpenCL: boolean;
       FShouldOpenCL: boolean;
@@ -864,6 +868,8 @@ type
       // what it held, so TNNet may share its storage by liveness. False here.
       function CanShareHostOutput(): boolean; virtual;
       procedure SetOutputPinned(Value: boolean);
+      procedure SetRunsAfter(Value: TNNetLayer);
+      procedure SetHostOutputStorage(Value: TNNetVolume);
 
       // Arms the int8 quantized copy of this layer's forward input. Does
       // nothing here: only weight-carrying layers own one. Coded by Claude (AI).
@@ -1194,6 +1200,13 @@ type
       // Inference only: TNNet's forward does not run this layer and its output
       // goes stale; a TNNetSum counts it as zero. Nothing else may read it.
       property ForwardSkipped: boolean read FForwardSkipped write FForwardSkipped;
+      // An earlier layer of the net this layer runs after in every forward, a
+      // scheduling edge without a read (not saved); liveness sharing follows it.
+      property RunsAfter: TNNetLayer read FRunsAfter write SetRunsAfter;
+      // With TNNet.ShareHostOutputsByLiveness the forward writes this output into
+      // Value's storage (equal size; the caller keeps Value alive and unread meanwhile).
+      property HostOutputStorage: TNNetVolume read FHostOutputStorage
+        write SetHostOutputStorage;
   end;
 
   TNNetLayerClass = class of TNNetLayer;
@@ -10485,6 +10498,7 @@ type
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       function SupportsErrorOnlyBackprop(): boolean; override;
+      function CanShareHostOutput(): boolean; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -11773,6 +11787,7 @@ type
       procedure DisableOpenCL(); override;
       {$ENDIF}
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
       property FeatureSizeT: integer read FFeatureSizeT;
@@ -14334,6 +14349,7 @@ type
       function WillOpenCL(): boolean; override;
       {$ENDIF}
       procedure Compute(); override;
+      function CanShareHostOutput(): boolean; override;
       procedure Backpropagate(); override;
       procedure AppendInputLayers(pList: TList); override;
   end;
@@ -20882,8 +20898,14 @@ type
       // (Re)plans host FOutput sharing when ShareHostOutputsByLiveness and the
       // plan is stale; drops it when sharing is off or a layer is trainable.
       procedure PlanHostOutputSharing();
-      // Gives every sharing layer its own FOutput storage again; drops the plan.
-      procedure ReleaseHostOutputSharing();
+      // The volume whose host storage an inference-only Layer holds instead of
+      // its own: its HostOutputStorage, else its alias source's (equal sizes).
+      function PlannedHostStorage(Layer: TNNetLayer): TNNetVolume;
+      // Drops the plan. KeepStorage: every layer gets its own FOutput storage
+      // again; else the layers a plan manages lose theirs until the next plan.
+      procedure DropHostOutputPlan(KeepStorage: boolean);
+      // The layer's host FOutput storage is given by the plan: it may share it.
+      function IsHostOutputPlanned(Layer: TNNetLayer): boolean;
       procedure SetShareHostOutputsByLiveness(Value: boolean);
       // TNNetLayer.OutputPinned changed: the sharing plans are stale.
       procedure OutputPinChanged(pPinned: boolean);
@@ -22933,6 +22955,9 @@ type
       // forward, equal-size dead outputs share host storage; see PlanOutputSlotsByLiveness.
       property ShareHostOutputsByLiveness: boolean
         read FShareHostOutputsByLiveness write SetShareHostOutputsByLiveness;
+      // With ShareHostOutputsByLiveness: frees the host storage of every output
+      // the plan manages; the next forward plans and allocates it again.
+      procedure ReleaseHostOutputs();
 
       // debug procedures
       procedure DebugWeights();
@@ -25707,10 +25732,11 @@ const
   // previous error (TNNetConvolution.BackpropagateErrorOnlyCPU).
   csErrorOnlyConvRowSlots = 16;
 
-// nil-tolerant byte counts for NonWeightBytes.
+// nil-tolerant byte counts for NonWeightBytes: the storage held (none after
+// TNNetVolume.ReleaseData).
 function VolumeBytes(V: TNNetVolume): int64;
 begin
-  if Assigned(V) then Result := int64(V.Size) * csNeuralFloatSize
+  if Assigned(V) then Result := int64(Length(V.FData)) * csNeuralFloatSize
   else Result := 0;
 end;
 
@@ -62988,6 +63014,11 @@ begin
 end;
 {$ENDIF}
 
+function TNNetCellMulByCell.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
+end;
+
 procedure TNNetCellMulByCell.Compute();
 var
   StartTime: double;
@@ -72874,6 +72905,11 @@ begin
   if FHasOpenCL and Assigned(FDotCL) then
     ArmNeuronImplicitConv(FWeightsCL, FBiasCL, OutW * OutH * FOutputT);
   {$ENDIF}
+end;
+
+function TNNetConvolution3D.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
 end;
 
 procedure TNNetConvolution3D.Compute();
@@ -89730,6 +89766,11 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetGroupNorm.CanShareHostOutput(): boolean;
+begin
+  Result := not FIsTrainable;
 end;
 
 function TNNetGroupNorm.SupportsErrorOnlyBackprop(): boolean;
@@ -116094,7 +116135,9 @@ begin
   FOutputOnRAM := true;
   {$ENDIF}
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
-  FOutput.Copy(FPrevLayer.FOutput, Len);
+  // A liveness plan may give this layer its source's storage.
+  if Pointer(FOutput.FData) <> Pointer(FPrevLayer.FOutput.FData) then
+    FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -123546,13 +123589,17 @@ begin
   end;
 end;
 
+// An inference-only input sizes its error buffers at SetTrainable(true).
 function TNNetInput.EnableErrorCollection: TNNetInput;
 begin
   if FStruct[3] <> 1 then
   begin
     FStruct[3] := 1;
-    FOutputError.ReSize(FOutPut);
-    FOutputErrorDeriv.ReSize(FOutPut);
+    if FIsTrainable then
+    begin
+      FOutputError.ReSize(FOutPut);
+      FOutputErrorDeriv.ReSize(FOutPut);
+    end;
   end;
   Result := Self;
 end;
@@ -144036,6 +144083,10 @@ procedure TNNet.RegisterLayer(pLayer: TNNetLayer);
 begin
   FLayers.Add(pLayer);
   pLayer.FLayerIdx := GetLastLayerIdx();
+  // A planned forward gives the output storage back, so the build never holds
+  // every activation at once.
+  if FShareHostOutputsByLiveness and IsHostOutputPlanned(pLayer) then
+    pLayer.FOutput.ReleaseData();
   if Assigned(FBuildWeightOwner) then pLayer.LinkBuildWeightOwner();
   {$IFDEF OpenCL}
   // Reads the layer's sources, so they must be set before RegisterLayer.
@@ -145768,6 +145819,8 @@ begin
     begin
       RawDeps.Clear();
       FLayers[LayerCnt].AppendInputLayers(RawDeps);
+      if Assigned(FLayers[LayerCnt].FRunsAfter) then
+        RawDeps.Add(FLayers[LayerCnt].FRunsAfter);
       // Keep only edges to EARLIER layers of THIS net:
       // - A layer of another net (e.g. a seq2seq encoder feeding this
       //   decoder's input layer) is computed outside this pass - always ready.
@@ -147848,6 +147901,7 @@ procedure TNNet.PlanHostOutputSharing();
 var
   LayerCnt, LastLayerIdx, SlotPos, MaxSlotPos, HolderIdx: integer;
   IsOnOpenCL, IsWanted: boolean;
+  LayerOutput, Storage: TNNetVolume;
   Shareable: array of boolean;
   SlotLayerCount: TNeuralIntegerArray;
 begin
@@ -147863,11 +147917,12 @@ begin
   end;
   if IsWanted and (FHostOutputPlanLayerCount = LastLayerIdx + 1) and
     (FHostOutputPlanOnOpenCL = IsOnOpenCL) then exit;
-  ReleaseHostOutputSharing();
+  DropHostOutputPlan({KeepStorage=}not IsWanted);
   if not IsWanted then exit;
   SetLength(Shareable, LastLayerIdx + 1);
   for LayerCnt := 0 to LastLayerIdx do
-    Shareable[LayerCnt] := FLayers[LayerCnt].CanShareHostOutput();
+    Shareable[LayerCnt] := FLayers[LayerCnt].CanShareHostOutput() and
+      not Assigned(FLayers[LayerCnt].FHostOutputStorage);
   PlanOutputSlotsByLiveness(Shareable, {ExactSize=}true, FHostOutputPlan);
   MaxSlotPos := High(FHostOutputPlan.SlotBytes);
   SetLength(FHostOutputSlotHolders, MaxSlotPos + 1);
@@ -147877,14 +147932,26 @@ begin
     FHostOutputSlotHolders[SlotPos] := -1;
     SlotLayerCount[SlotPos] := 0;
   end;
+  // Layer order: an alias source and a slot holder have their storage first.
   for LayerCnt := 0 to LastLayerIdx do
   begin
+    LayerOutput := FLayers[LayerCnt].FOutput;
     SlotPos := FHostOutputPlan.SlotOfLayer[LayerCnt];
-    if SlotPos < 0 then continue;
+    if SlotPos < 0 then
+    begin
+      Storage := PlannedHostStorage(FLayers[LayerCnt]);
+      if Assigned(Storage) then LayerOutput.ShareDataWith(Storage)
+      else if not LayerOutput.HasData() then LayerOutput.UnshareData();
+      continue;
+    end;
     Inc(SlotLayerCount[SlotPos]);
     HolderIdx := FHostOutputSlotHolders[SlotPos];
-    if HolderIdx < 0 then FHostOutputSlotHolders[SlotPos] := LayerCnt
-    else FLayers[LayerCnt].FOutput.ShareDataWith(FLayers[HolderIdx].FOutput);
+    if HolderIdx < 0 then
+    begin
+      FHostOutputSlotHolders[SlotPos] := LayerCnt;
+      if not LayerOutput.HasData() then LayerOutput.UnshareData();
+    end
+    else LayerOutput.ShareDataWith(FLayers[HolderIdx].FOutput);
   end;
   {$IFDEF OpenCL}
   if IsOnOpenCL then
@@ -147902,15 +147969,48 @@ begin
   FHostOutputPlanOnOpenCL := IsOnOpenCL;
 end;
 
-procedure TNNet.ReleaseHostOutputSharing();
+function TNNet.PlannedHostStorage(Layer: TNNetLayer): TNNetVolume;
 var
-  LayerCnt, MaxPlannedLayerPos: integer;
+  AliasSource: TNNetLayer;
 begin
-  MaxPlannedLayerPos := Min(High(FHostOutputPlan.SlotOfLayer),
-    GetLastLayerIdx());
-  for LayerCnt := 0 to MaxPlannedLayerPos do
-    if FHostOutputPlan.SlotOfLayer[LayerCnt] >= 0 then
-      FLayers[LayerCnt].FOutput.UnshareData();
+  Result := nil;
+  if Layer.FIsTrainable then exit;
+  if Assigned(Layer.FHostOutputStorage) then
+  begin
+    if Layer.FHostOutputStorage.Size = Layer.FOutput.Size then
+      Result := Layer.FHostOutputStorage;
+    exit;
+  end;
+  AliasSource := Layer.OutputAliasSource();
+  if Assigned(AliasSource) and (AliasSource.LayerIdx >= 0) and
+    (AliasSource.LayerIdx < Layer.LayerIdx) and
+    (FLayers[AliasSource.LayerIdx] = AliasSource) and
+    (AliasSource.FOutput.Size = Layer.FOutput.Size) then
+    Result := AliasSource.FOutput;
+end;
+
+function TNNet.IsHostOutputPlanned(Layer: TNNetLayer): boolean;
+begin
+  Result := Layer.CanShareHostOutput() or Assigned(PlannedHostStorage(Layer));
+end;
+
+procedure TNNet.DropHostOutputPlan(KeepStorage: boolean);
+var
+  LayerCnt, LastLayerIdx, MaxPlannedLayerPos: integer;
+  LayerOutput: TNNetVolume;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  MaxPlannedLayerPos := Min(High(FHostOutputPlan.SlotOfLayer), LastLayerIdx);
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    LayerOutput := FLayers[LayerCnt].FOutput;
+    if not KeepStorage then
+    begin
+      if IsHostOutputPlanned(FLayers[LayerCnt]) then LayerOutput.ReleaseData();
+    end
+    else if (LayerCnt <= MaxPlannedLayerPos) or (not LayerOutput.HasData()) then
+      LayerOutput.UnshareData();
+  end;
   FHostOutputPlan := Default(TNNetOutputSlotPlan);
   SetLength(FHostOutputSlotHolders, 0);
   {$IFDEF OpenCL}
@@ -147919,18 +148019,24 @@ begin
   FHostOutputPlanLayerCount := -1;
 end;
 
+procedure TNNet.ReleaseHostOutputs();
+begin
+  if FShareHostOutputsByLiveness then DropHostOutputPlan({KeepStorage=}false);
+end;
+
 procedure TNNet.SetShareHostOutputsByLiveness(Value: boolean);
 begin
   FShareHostOutputsByLiveness := Value;
-  if not Value then ReleaseHostOutputSharing();
+  if not Value then DropHostOutputPlan({KeepStorage=}true);
 end;
 
-// A layer counts while its FOutput still holds its slot holder's storage (a
-// ReSize to another size gives it its own).
+// A layer counts while its FOutput still holds its slot holder's or planned
+// storage (a ReSize to another size gives it its own).
 procedure TNNet.CountHostSharedOutputs(out LayerCount: integer;
   out SharedBytes, PrivateBytes: int64);
 var
   LayerCnt, MaxPlannedLayerPos, SlotPos, MaxSlotPos, HolderIdx: integer;
+  Storage: TNNetVolume;
   HolderCounted: array of boolean;
 begin
   LayerCount := 0;
@@ -147944,7 +148050,17 @@ begin
   for LayerCnt := 0 to MaxPlannedLayerPos do
   begin
     SlotPos := FHostOutputPlan.SlotOfLayer[LayerCnt];
-    if SlotPos < 0 then continue;
+    if SlotPos < 0 then
+    begin
+      Storage := PlannedHostStorage(FLayers[LayerCnt]);
+      if Assigned(Storage) and
+        (Pointer(FLayers[LayerCnt].FOutput.FData) = Pointer(Storage.FData)) then
+      begin
+        Inc(LayerCount);
+        PrivateBytes := PrivateBytes + VolumeBytes(FLayers[LayerCnt].FOutput);
+      end;
+      continue;
+    end;
     HolderIdx := FHostOutputSlotHolders[SlotPos];
     if (HolderIdx = LayerCnt) or (Pointer(FLayers[LayerCnt].FOutput.FData) <>
       Pointer(FLayers[HolderIdx].FOutput.FData)) then continue;
@@ -148933,7 +149049,7 @@ procedure TNNet.Clear();
 begin
   FLayers.Free;
   FLayers := TNNetLayerList.Create();
-  ReleaseHostOutputSharing();
+  DropHostOutputPlan({KeepStorage=}true);
   // The old layer objects are gone: invalidate the inference plan so a
   // rebuild to the SAME layer count cannot reuse stale pointers in
   // FSchedDeps (count-only cache check in BuildInferencePlan).
@@ -151457,6 +151573,18 @@ end;
 function TNNetLayer.CanShareHostOutput(): boolean;
 begin
   Result := false;
+end;
+
+procedure TNNetLayer.SetHostOutputStorage(Value: TNNetVolume);
+begin
+  FHostOutputStorage := Value;
+  if Assigned(FNN) then FNN.InvalidateInferencePlan();
+end;
+
+procedure TNNetLayer.SetRunsAfter(Value: TNNetLayer);
+begin
+  FRunsAfter := Value;
+  if Assigned(FNN) then FNN.InvalidateInferencePlan();
 end;
 
 procedure TNNetLayer.SetOutputPinned(Value: boolean);

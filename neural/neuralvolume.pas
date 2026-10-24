@@ -466,8 +466,13 @@ type
       // Makes FData the same dynamic array as Original.FData, so a write through
       // either volume reaches both. Sizes must match unless pAdoptShape is set.
       procedure ShareDataWith(Original: TNNetVolume; pAdoptShape: boolean = false);
-      // Gives this volume its own copy of FData when another volume shares it.
+      // Gives this volume its own copy of FData when another volume shares it,
+      // or zeroed storage after ReleaseData.
       procedure UnshareData();
+      // Frees FData but keeps the shape: until ShareDataWith or UnshareData the
+      // volume holds no elements.
+      procedure ReleaseData();
+      function HasData(): boolean;
       // SqrElements is a caller-owned scratch volume shaped like Original; it
       // is resized here only when the shape changes, so nothing is allocated
       // per call (rule #17).
@@ -14160,6 +14165,17 @@ begin
   SetLength(FData, FSize);
   if FSize > 0 then FDataPtr := Addr(FData[0])
   else FDataPtr := nil;
+end;
+
+procedure TNNetVolume.ReleaseData();
+begin
+  FData := nil;
+  FDataPtr := nil;
+end;
+
+function TNNetVolume.HasData(): boolean;
+begin
+  Result := Length(FData) = FSize;
 end;
 
 function TNNetVolume.GetMemSize(): integer;
