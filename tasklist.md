@@ -2467,6 +2467,31 @@ rather than acted on.
             im2col column matrix of the 7x7 64->3 output conv and 3.4 GB the
             column matrices of the 36 FFC-unit 3x3 convs; releasing
             `FInputPrepared` is the user-decision item under "Layer follow-ups".
+- [ ] RAFT real-checkpoint support (`BuildRaftFromSafeTensors` /
+      `RaftPredictFlow`, examples/OpticalFlow). Today only the pico
+      `raft_small` fixture loads: ONE correlation-pyramid level, flow at the /4
+      encoder grid, no upsampling to full resolution, so neither torchvision
+      `raft_small` / `raft_large` nor the original `raft-things.pth` (which the
+      ProPainter task needs) loads. Missing pieces, all on existing layers:
+      (1) the 4-level correlation pyramid (avg-pool the target axes of the
+      `TNNetCorrelationVolume` output by 2 per level, one
+      `TNNetCorrelationLookup` per level with the flow scaled by 1/2^level,
+      concatenated in torch's level order); (2) the stride-8 `BasicEncoder`
+      (raft_large, raft-things) next to the landed small encoder, reusing
+      `RaftBuildEncoder` / `RaftLoadEncoder`; (3) full-resolution output:
+      bilinear x8 for raft_small, and for raft_large the convex upsampling
+      mask head (softmax over 9 neighbours per 8x8 sub-pixel, weighted sum of
+      the 3x3-unfolded 8*flow), built from conv + `TNNetPixelShuffle`-style
+      reshapes rather than a new hand-made loop if the existing layers allow;
+      (4) a torchvision key-rename table (`feature_encoder.*`,
+      `update_block.*`, `mask_predictor.*`) and the original princeton-vl key
+      names for `raft-things.pth` (read with neuraltorchbin.pas). Parity: a
+      pico fixture with 4 levels + mask head vs
+      `torchvision.models.optical_flow.raft_large` in the ~/x venv, < 1e-4 on
+      the final upsampled flow; then a real run of examples/OpticalFlow on two
+      real frames with `raft_small` (C_T_V2 weights) and the README updated
+      (input frames, flow colour image, warp check). OpenCL: both correlation
+      layers already have device paths; check the pyramid stays resident.
 - [ ] ProPainter video inpainting / object removal importer + examples/VideoInpaint
       (sczhou/ProPainter, ICCV 2023; release files `ProPainter.pth`,
       `recurrent_flow_completion.pth`, `raft-things.pth`, read with
