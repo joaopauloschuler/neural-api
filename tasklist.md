@@ -1974,6 +1974,49 @@ rather than acted on.
         removal via the BiRefNet path, grey composite, centred 512 px resize,
         --mc-resolution / --threshold / --no-remove-bg / --gpu, mesh out as
         PLY and OBJ.
+- [ ] LivePortrait portrait animation importer + examples/PortraitAnimation
+      (BuildLivePortraitFromCheckpoint[Ex], KwaiVGI/LivePortrait, MIT; the five
+      `liveportrait/base_models/*.pth` + `retargeting_models/
+      stitching_retargeting_module.pth` are torch pickles, so load them through
+      `TNNetTorchBinReader`). Input: one face photo + a driving video (or a folder
+      of frames). Output: the photo's face animated with the driving expressions
+      and head pose, written as a GIF / PNG frames through the existing writers.
+      Pipeline and reuse:
+      (1) face crop: RetinaFace 5 landmarks + the similarity crop helpers of
+      examples/FaceRestoration, scaled to LivePortrait's 256x256 crop (its own
+      203-point landmark model and InsightFace detector are NOT needed for a
+      first version; note the crop-scale difference in the README), paste-back
+      with PasteFaceIntoImage; (2) motion extractor =
+      ConvNeXt-V2-tiny trunk (reuse the HF convnextv2 importer blocks) + heads
+      for 21 canonical 3-D keypoints, pitch/yaw/roll as 66-bin softmax
+      expectations, translation, expression deltas and scale; (3) appearance
+      feature extractor: 2-D conv down blocks, then a reshape into a 3-D feature
+      volume (32 channels x 16 deep x 64 x 64, packed along Depth exactly like
+      TNNetConvolution3D) and 3-D ResBlocks (BatchNorm3d folded into channel
+      affine at load); (4) warping module: Gaussian keypoint heatmaps of
+      source vs driving keypoints, a 3-D hourglass (TNNetConvolution3D plus
+      per-frame AvgPool / nearest upsample) predicting a sparse-motion mask and
+      an occlusion map, then trilinear sampling of the feature volume; (5) SPADE
+      generator (SPADE ResBlocks + TNNetPixelShuffle up to 512x512);
+      (6) stitching + eye/lip retargeting MLPs (small TNNetFullConnect chains).
+      New code, kept general rather than LivePortrait-only: a temporal padding
+      parameter on TNNetConvolution3D (time is VALID today, LivePortrait uses
+      3x3x3 with padding 1 on all axes; extend FStruct with a back-compat
+      default of 0); a trilinear 3-D grid sample (torch F.grid_sample on 5-D
+      input, align_corners=False, zeros padding) built on the TNNetGridSample
+      gather helpers, with OpenCL forward, since 16 x 64 x 64 x 32 samples per
+      frame dominate the warp; a SPADE layer or builder (param-free
+      InstanceNorm/BatchNorm + conv-predicted gamma/beta from a resized segmap)
+      if TNNetInstanceNorm + TNNetCellMulByCell + TNNetSum cannot express it
+      without copies. Tests: trilinear grid sample against hand-derived cases
+      and a numerical-gradient check; Conv3D temporal padding against the
+      zero-padded-input equivalence; 66-bin head-pose expectation and the
+      Euler-to-rotation matrix by hand; pico-fixture parity of
+      motion extractor -> warp -> generator against the reference
+      `LivePortrait` repo needs a NEW Python oracle script in tools/, so ask the
+      user before writing it. examples/PortraitAnimation/README.md documents the
+      download, flags (--source, --driving, --relative-motion, --stitching,
+      --no-paste-back, --gpu) and RAM needs.
 - [ ] 3D Gaussian Splatting viewer follow-ups (arXiv:2308.04079). Landed:
       neural/neuralply.pas (`TNNetPLYReader` / `TNNetPLYWriter`),
       neural/neuralgaussiansplat.pas (`TGaussianSplatScene`,
