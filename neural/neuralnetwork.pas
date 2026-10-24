@@ -14725,6 +14725,8 @@ type
       procedure Backpropagate(); override;
 
       function SaveStructureToString(): string; override;
+      // The source token index of each output token (-1 = zero token).
+      property Tokens: TNeuralIntegerArray read FTokens;
   end;
 
   /// Data-dependent token gather: the K tokens with the largest score, where a

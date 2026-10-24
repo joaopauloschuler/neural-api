@@ -1686,6 +1686,12 @@ type
     procedure TestHGNetV2ConfigFromJSONFile;
     procedure TestHGNetV2Parity;
     procedure TestHGNetV2OpenCL;
+    // D-FINE (d_fine) up to the decoder: config reading, the hybrid encoder
+    // outputs per level and the encoder top-K against transformers on both
+    // pico fixtures, also forced OpenCL.
+    procedure TestDFineConfigFromJSONFile;
+    procedure TestDFineEncoderParity;
+    procedure TestDFineEncoderOpenCL;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -59400,6 +59406,137 @@ begin
   {$IFDEF OpenCL}
   RunHGNetV2Parity(Self, 'tiny_dfine', {OnOpenCL=}true);
   RunHGNetV2Parity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestDFineConfigFromJSONFile;
+var
+  Config: TDFineConfig;
+begin
+  Config := ReadDFineConfigFromJSONFile(FixturePath('tiny_dfine_config.json'),
+    64, 64);
+  AssertEquals('model_type', 'd_fine', Config.Detector.ModelType);
+  AssertEquals('encoder hidden', 16, Config.Detector.EncoderHiddenDim);
+  AssertEquals('expansion', 0.5, Config.Detector.HiddenExpansion, 1e-6);
+  AssertEquals('depth_mult', 0.34, Config.DepthMult, 1e-6);
+  AssertEquals('backbone stages', 4, Length(Config.Backbone.StageInChannels));
+  AssertEquals('input channels', 3, Config.Detector.NumChannels);
+  AssertEquals('points per level', 3, Length(Config.DecoderPointsPerLevel));
+  AssertEquals('equal points', 3, Config.DecoderPointsPerLevel[2]);
+  AssertEquals('offset scale', 0.5, Config.DecoderOffsetScale, 1e-6);
+  AssertEquals('bins', 8, Config.MaxNumBins);
+  AssertEquals('eval_idx -1 = last layer', 1, Config.EvalIdx);
+  AssertEquals('reg_scale', 4.0, Config.RegScale, 1e-6);
+  AssertEquals('no anchor size', 0, Config.AnchorImageWidth);
+  AssertEquals('labels', 5, Config.Detector.NumLabels);
+  AssertEquals('input width', 64, Config.Detector.ImageWidth);
+  Config := ReadDFineConfigFromJSONFile(
+    FixturePath('tiny_dfine_perlevel_config.json'), 64, 64);
+  AssertEquals('per-level points', 6, Config.DecoderPointsPerLevel[1]);
+  AssertEquals('eval_idx', 1, Config.EvalIdx);
+  AssertEquals('decoder layers', 3, Config.Detector.DecoderLayers);
+end;
+
+// The pico D-FINE of Name up to the decoder: every hybrid encoder output map
+// against encoder_output_<l> and the query selection against enc_topk.
+procedure RunDFineEncoderParity(ATest: TTestNeuralPretrained; const Name: string;
+  OnOpenCL: boolean);
+var
+  Config: TDFineConfig;
+  NN: TNNet;
+  Reader, IO: TNNetSafeTensorsReader;
+  Image, Expected, Actual: TNNetVolume;
+  Encoder: TDFineEncoderLayers;
+  LevelPos, MaxLevelPos, ElementPos, MaxElementPos, QueryPos, MaxQueryPos: integer;
+  MaxDiff: double;
+  TensorName: string;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+begin
+  IO := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '_io.safetensors'));
+  Reader := TNNetSafeTensorsReader.Create(ATest.FixturePath(Name + '.safetensors'));
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NN := TNNet.Create();
+  try
+    IO.LoadTensorFlat('image', Expected);
+    Image.ReSize(IO.DimSize('image', 1), IO.DimSize('image', 0), 3);
+    Image.CopyNoChecks(Expected);
+    Config := ReadDFineConfigFromJSONFile(ATest.FixturePath(Name + '_config.json'),
+      Image.SizeX, Image.SizeY);
+    NN.AddLayer(TNNetInput.Create(Image.SizeX, Image.SizeY, 3).SetTrainable(false));
+    Encoder := BuildDFineEncoder(NN, Reader, Config, NN.GetLastLayer());
+    {$IFDEF OpenCL}
+    if OnOpenCL then
+    begin
+      if not ATest.AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+      begin
+        ATest.AssertTrue('no OpenCL device: SKIP', true);
+        exit;
+      end;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(true);
+    end;
+    {$ENDIF}
+    NN.Compute(Image);
+    MaxLevelPos := High(Encoder.EncoderOutputs);
+    ATest.AssertEquals(Name + ' encoder levels', 3, MaxLevelPos + 1);
+    for LevelPos := 0 to MaxLevelPos do
+    begin
+      TensorName := 'encoder_output_' + IntToStr(LevelPos);
+      Encoder.EncoderOutputs[LevelPos].ForceOutputOnRAM();
+      Actual := Encoder.EncoderOutputs[LevelPos].Output;
+      IO.LoadTensorFlat(TensorName, Expected);
+      ATest.AssertEquals(Name + ' ' + TensorName + ' height',
+        IO.DimSize(TensorName, 0), Actual.SizeY);
+      ATest.AssertEquals(Name + ' ' + TensorName + ' width',
+        IO.DimSize(TensorName, 1), Actual.SizeX);
+      ATest.AssertEquals(Name + ' ' + TensorName + ' channels',
+        IO.DimSize(TensorName, 2), Actual.Depth);
+      MaxDiff := 0;
+      MaxElementPos := Actual.Size - 1;
+      for ElementPos := 0 to MaxElementPos do
+        MaxDiff := Max(MaxDiff, Abs(Expected.FData[ElementPos] -
+          Actual.FData[ElementPos]));
+      WriteLn('  ', Name, ' ', TensorName, ' max |diff| ', FloatToStr(MaxDiff));
+      ATest.AssertTrue(Name + ' ' + TensorName + ' max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-4);
+    end;
+    IO.LoadTensorFlat('enc_topk', Expected);
+    ATest.AssertEquals(Name + ' top-K count', Expected.Size,
+      Length(Encoder.QuerySelection.Tokens));
+    MaxQueryPos := Expected.Size - 1;
+    for QueryPos := 0 to MaxQueryPos do
+      ATest.AssertEquals(Name + ' enc_topk[' + IntToStr(QueryPos) + ']',
+        Round(Expected.FData[QueryPos]), Encoder.QuerySelection.Tokens[QueryPos]);
+    ATest.AssertEquals(Name + ' target depth', Config.Detector.DModel,
+      Encoder.Target.Output.Depth);
+    ATest.AssertEquals(Name + ' reference depth', 4,
+      Encoder.ReferenceLogits.Output.Depth);
+  finally
+    NN.Free;
+    Expected.Free;
+    Image.Free;
+    Reader.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDFineEncoderParity;
+begin
+  RunDFineEncoderParity(Self, 'tiny_dfine', {OnOpenCL=}false);
+  RunDFineEncoderParity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestDFineEncoderOpenCL;
+begin
+  {$IFDEF OpenCL}
+  RunDFineEncoderParity(Self, 'tiny_dfine', {OnOpenCL=}true);
+  RunDFineEncoderParity(Self, 'tiny_dfine_perlevel', {OnOpenCL=}true);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}

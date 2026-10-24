@@ -1993,8 +1993,31 @@ rather than acted on.
           also hold the encoder outputs, enc_topk, logits, boxes and
           post-process. transformers 5.17 crashes when eval_idx is not the last
           layer, so the perlevel oracle runs with the decoder cut after eval_idx.
-        - Neck blocks DFineRepNCSPELAN4 (RepVgg + CSP) and DFineSCDown
-          (pointwise + strided depthwise) in place of the RT-DETR CCFM convs.
+        - [x] Hybrid encoder + query selection: DONE, TDFineConfig /
+          ReadDFineConfigFromJSONFile (reads the decoder fields too: per-level
+          points, offset scale, bins, reg_scale, up, eval_idx made
+          non-negative, LQE sizes, layer_scale) and BuildDFineEncoder (returns
+          TDFineEncoderLayers: EncoderOutputs, SourceFlat, LevelShapes,
+          QuerySelection, Target, ReferenceLogits). The RT-DETR builder is now
+          the TRtDetrNetBuilder class (implementation section); D-FINE's
+          TDFineNetBuilder overrides its three neck steps: lateral conv without
+          activation, DFineSCDown, DFineRepNCSPELAN4 (its own convs are silu,
+          the CSP layers activation_function; blocks = round(3 * depth_mult)).
+          D-FINE differences: AIFI FFN is mlp.layers.0/1; decoder_input_proj
+          is identity (no layer) when d_model = decoder_in_channels[-1], extra
+          levels included; anchor_image_size must equal the input size.
+          Encoder outputs < 1e-6 and enc_topk exact on both pico fixtures, CPU
+          and OpenCL (TestDFineEncoderParity / TestDFineEncoderOpenCL).
+          Step 4 notes: build the full net as input -> BuildDFineEncoder ->
+          decoder in a BuildDFineFromSafeTensors that sets
+          ShareHostOutputsByLiveness and calls NN.SetTrainable() like
+          BuildRtDetrFromSafeTensors; use a TDFineNetBuilder for the decoder
+          (AddLinear/AddLayerNorm/AddMLPHead/AddSelfAttention/AddFeedForward,
+          PickModule takes a name list). ReferenceLogits are unsigmoided
+          (RT-DETR adds the TNNetSigmoid after AddQuerySelection). Use the
+          per-level TNNetMultiScaleDeformableAttention.Create with
+          DecoderPointsPerLevel and DecoderOffsetScale; Detector.DecoderPoints
+          is 0.
         - [x] Deformable attention with one point count per level
           (decoder_n_points as a list, num_points_scale = 1/n per point) and
           decoder_offset_scale: DONE, the per-level Create overload of
