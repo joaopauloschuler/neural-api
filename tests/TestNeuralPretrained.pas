@@ -1714,6 +1714,8 @@ type
     procedure TestDBNetDecodeSyntheticMap;
     // SortDBNetTextBoxesInReadingOrder: two lines of shuffled word boxes.
     procedure TestDBNetReadingOrder;
+    // MergeDBNetTextBoxesIntoLines on hand-made word boxes.
+    procedure TestDBNetMergeLines;
     // FaceAlignmentMatrix + AlignWarpFace + PasteFaceIntoImage against a numpy
     // port of facexlib (float warp, cv2 4.10 erode / GaussianBlur / Lanczos4).
     procedure TestFacePasteMatchesFacexlibOracle;
@@ -61079,6 +61081,72 @@ begin
   SetLength(Boxes, 0);
   SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
   AssertEquals('no boxes, no lines', 0, Length(LineIds));
+end;
+
+// Hand-made word boxes: same-line merge, a split at a big gap, two lines kept
+// apart, a single box, and the gap factor parameter.
+procedure TTestNeuralPretrained.TestDBNetMergeLines;
+
+  function MakeBox(X1, Y1, X2, Y2, Score: TNeuralFloat): TDBNetTextBox;
+  begin
+    Result.X1 := X1;
+    Result.Y1 := Y1;
+    Result.X2 := X2;
+    Result.Y2 := Y2;
+    Result.Score := Score;
+    Result.ClassId := 0;
+  end;
+
+var
+  Boxes, Lines: TDBNetTextBoxArray;
+  LineIds, MergedLineIds: TNeuralIntegerArray;
+begin
+  // Line 0: two words 5 px apart (height 10), then a column 40 px further on.
+  // Line 1: two words, the second one taller.
+  SetLength(Boxes, 5);
+  Boxes[0] := MakeBox(10, 10, 40, 20, 0.6);
+  Boxes[1] := MakeBox(45, 11, 70, 21, 0.8);
+  Boxes[2] := MakeBox(110, 10, 140, 20, 0.5);
+  Boxes[3] := MakeBox(12, 40, 30, 50, 0.9);
+  Boxes[4] := MakeBox(34, 38, 60, 52, 0.7);
+  SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
+  Lines := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds);
+  AssertEquals('line boxes', 3, Length(Lines));
+  AssertEquals('line id count', 3, Length(MergedLineIds));
+  AssertEquals('first run x1', 10, Lines[0].X1, 0);
+  AssertEquals('first run y1', 10, Lines[0].Y1, 0);
+  AssertEquals('first run x2', 70, Lines[0].X2, 0);
+  AssertEquals('first run y2', 21, Lines[0].Y2, 0);
+  AssertEquals('first run mean score', 0.7, Lines[0].Score, 1e-6);
+  AssertEquals('first run line', 0, MergedLineIds[0]);
+  AssertEquals('gap of 40 > 2 x 10 splits', 110, Lines[1].X1, 0);
+  AssertEquals('split run x2', 140, Lines[1].X2, 0);
+  AssertEquals('split run keeps its line', 0, MergedLineIds[1]);
+  AssertEquals('split run score', 0.5, Lines[1].Score, 1e-6);
+  AssertEquals('second line x1', 12, Lines[2].X1, 0);
+  AssertEquals('second line y1', 38, Lines[2].Y1, 0);
+  AssertEquals('second line x2', 60, Lines[2].X2, 0);
+  AssertEquals('second line y2', 52, Lines[2].Y2, 0);
+  AssertEquals('second line id', 1, MergedLineIds[2]);
+  // GapFactor 5: 40 <= 5 x 10, so line 0 becomes one box.
+  Lines := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds, 5);
+  AssertEquals('wide gap factor', 2, Length(Lines));
+  AssertEquals('whole line x2', 140, Lines[0].X2, 0);
+  AssertEquals('whole line score', (0.6 + 0.8 + 0.5) / 3, Lines[0].Score, 1e-6);
+  // GapFactor 0.3: the 5 and 4 px gaps exceed 0.3 x 10, nothing merges.
+  Lines := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds, 0.3);
+  AssertEquals('tiny gap factor keeps words', 5, Length(Lines));
+  SetLength(Boxes, 1);
+  Boxes[0] := MakeBox(3, 4, 9, 8, 0.4);
+  SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
+  Lines := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds);
+  AssertEquals('single box', 1, Length(Lines));
+  AssertEquals('single box x2', 9, Lines[0].X2, 0);
+  AssertEquals('single box score', 0.4, Lines[0].Score, 1e-6);
+  SetLength(Boxes, 0);
+  SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
+  Lines := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds);
+  AssertEquals('no boxes', 0, Length(Lines));
 end;
 
 // A FastSAM-x config with only widths/depths derives the ultralytics head widths.

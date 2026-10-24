@@ -23,6 +23,7 @@ against a released docTR checkpoint (see `tasklist.md`).
 page or photo (RGB)
   -> DetectDBNetTextBoxes          docTR resize + pad + normalize, DBNet, DB post-processing
   -> SortDBNetTextBoxesInReadingOrder   lines top to bottom, words left to right
+  -> MergeDBNetTextBoxesIntoLines      (--merge-lines) one box per run of words in a line
   -> for each box: TranscribeTrOCRImageRegion
        crop, TrOCR resize + normalize, DeiT encoder once,
        greedy decode with the self-attention KV cache
@@ -34,6 +35,11 @@ page or photo (RGB)
 - `SortDBNetTextBoxesInReadingOrder` sorts the boxes by their vertical centre
   and starts a new line when a box's centre passes the mean bottom edge of the
   boxes already in the current line. Inside a line, boxes go left to right.
+- With `--merge-lines`, `MergeDBNetTextBoxesIntoLines` unions the word boxes
+  of each line into one line box, so TrOCR reads a whole line crop, which is
+  what it was trained on. A horizontal gap wider than `--line-gap` times the
+  mean box height of the run so far (default 2) starts a new box in the same
+  line, so two columns stay apart. The line box score is the mean word score.
 - The TrOCR decoder is built with `DecSeqLen=1`, so `DecodeTrOCRGreedy` feeds
   one token per step through `TNNetStreamingDecoder` (KV cache) instead of
   re-running the whole prefix every step.
@@ -42,6 +48,7 @@ page or photo (RGB)
 
 ```
 ./DocumentOCR --smoke --boxes smoke_boxes.png       # pico fixture smoke run
+./DocumentOCR --smoke --merge-lines                  # same, one crop per text line
 ./DocumentOCR --detector db_mobilenet_v3_large.safetensors \
   --recognizer trocr-small-printed/model.safetensors \
   --input page.png --boxes page_boxes.png
@@ -60,6 +67,8 @@ page or photo (RGB)
 | `--boxes IMG` | also write the image with the boxes drawn, one colour per text line, numbered in reading order | off |
 | `--max-tokens N` | token cap per box | 32 |
 | `--bin-threshold X`, `--box-threshold X` | DBNet pixel and box thresholds | the detector config |
+| `--merge-lines` | read one crop per text line (word boxes merged) instead of one per word | off |
+| `--line-gap FACTOR` | with `--merge-lines`: a gap wider than FACTOR x the box height splits the line | 2 |
 | `--int8` | store the weights of all three nets in int8 (`TNNet.QuantizeWeightsInt8`) | FP32 |
 | `--gpu`, `--gpu-platform N`, `--gpu-device N` | run the nets on OpenCL (a build with `-dOpenCL`, the `.lpi` default) | CPU |
 
@@ -77,7 +86,8 @@ Not checked yet:
   gives the right text has not been checked; a `tokenizer.json` is the
   intended input.
 - docTR detects words, and TrOCR was trained on text lines. Reading single
-  words works in principle, but the accuracy on real pages has not been
+  words works in principle; `--merge-lines` gives TrOCR line crops instead.
+  The character accuracy of the two modes on a real page has not been
   measured.
 
 Coded by Claude (AI).

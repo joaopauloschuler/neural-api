@@ -17701,6 +17701,12 @@ function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
 procedure SortDBNetTextBoxesInReadingOrder(var Boxes: TDBNetTextBoxArray;
   out LineIds: TNeuralIntegerArray);
 
+// Unions each left-to-right run of one line of sorted Boxes into a line box (mean score); a gap
+// above GapFactor x the run's mean box height starts a new run. MergedLineIds = line per result.
+function MergeDBNetTextBoxesIntoLines(const Boxes: TDBNetTextBoxArray;
+  const LineIds: TNeuralIntegerArray; out MergedLineIds: TNeuralIntegerArray;
+  GapFactor: TNeuralFloat = 2): TDBNetTextBoxArray;
+
 // TrOCR's ViTImageProcessor for a missing preprocessor_config.json: an ImageSize
 // square bilinear resize, rescale 1/255, mean = std = 0.5, no crop.
 function DefaultTrOCRImageProcessorConfig(
@@ -120473,6 +120479,55 @@ begin
     end;
     Boxes[InsertPos] := Moving;
   end;
+end;
+
+function MergeDBNetTextBoxesIntoLines(const Boxes: TDBNetTextBoxArray;
+  const LineIds: TNeuralIntegerArray; out MergedLineIds: TNeuralIntegerArray;
+  GapFactor: TNeuralFloat): TDBNetTextBoxArray;
+var
+  BoxPos, MaxBoxPos, MergedCount, RunBoxCount: integer;
+  RunHeightSum, RunScoreSum: TNeuralFloat;
+  StartsRun: boolean;
+begin
+  MaxBoxPos := High(Boxes);
+  if Length(LineIds) <> MaxBoxPos + 1 then
+    raise Exception.Create('MergeDBNetTextBoxesIntoLines: ' +
+      IntToStr(Length(LineIds)) + ' line ids for ' + IntToStr(MaxBoxPos + 1) +
+      ' boxes');
+  SetLength(Result, MaxBoxPos + 1);
+  SetLength(MergedLineIds, MaxBoxPos + 1);
+  MergedCount := 0;
+  RunBoxCount := 0;
+  RunHeightSum := 0;
+  RunScoreSum := 0;
+  for BoxPos := 0 to MaxBoxPos do
+  begin
+    StartsRun := (BoxPos = 0) or (LineIds[BoxPos] <> LineIds[BoxPos - 1]) or
+      (Boxes[BoxPos].X1 - Result[MergedCount - 1].X2 >
+       GapFactor * RunHeightSum / RunBoxCount);
+    if StartsRun then
+    begin
+      Result[MergedCount] := Boxes[BoxPos];
+      MergedLineIds[MergedCount] := LineIds[BoxPos];
+      Inc(MergedCount);
+      RunBoxCount := 0;
+      RunHeightSum := 0;
+      RunScoreSum := 0;
+    end
+    else
+    begin
+      Result[MergedCount - 1].X1 := Min(Result[MergedCount - 1].X1, Boxes[BoxPos].X1);
+      Result[MergedCount - 1].Y1 := Min(Result[MergedCount - 1].Y1, Boxes[BoxPos].Y1);
+      Result[MergedCount - 1].X2 := Max(Result[MergedCount - 1].X2, Boxes[BoxPos].X2);
+      Result[MergedCount - 1].Y2 := Max(Result[MergedCount - 1].Y2, Boxes[BoxPos].Y2);
+    end;
+    Inc(RunBoxCount);
+    RunHeightSum := RunHeightSum + Boxes[BoxPos].Y2 - Boxes[BoxPos].Y1;
+    RunScoreSum := RunScoreSum + Boxes[BoxPos].Score;
+    Result[MergedCount - 1].Score := RunScoreSum / RunBoxCount;
+  end;
+  SetLength(Result, MergedCount);
+  SetLength(MergedLineIds, MergedCount);
 end;
 
 function DefaultTrOCRImageProcessorConfig(

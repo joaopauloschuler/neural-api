@@ -44,7 +44,8 @@ type
     InputFile, BoxesFile: string;
     MaxNewTokens: integer;
     BinThreshold, BoxThreshold: TNeuralFloat; // 0 = the detector config's
-    IsSmoke, UseOpenCL, UseInt8: boolean;
+    LineGapFactor: TNeuralFloat;              // --merge-lines split gap / height
+    IsSmoke, UseOpenCL, UseInt8, MergesLines: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
 
@@ -67,6 +68,9 @@ begin
   WriteLn('  --max-tokens N            token cap per box (default 32)');
   WriteLn('  --bin-threshold X         text pixel probability (default: config.json)');
   WriteLn('  --box-threshold X         minimum mean box probability (default: config.json)');
+  WriteLn('  --merge-lines             read whole text lines: merge the word boxes of a line');
+  WriteLn('                            (split at a gap above --line-gap x the box height)');
+  WriteLn('  --line-gap FACTOR         --merge-lines split gap in box heights (default 2)');
   WriteLn('  --int8                    store the weights in int8 (less RAM, small ',
     'accuracy loss)');
   WriteLn('  --gpu                     run the nets on OpenCL (needs a build with ',
@@ -100,6 +104,8 @@ begin
   Opt.MaxNewTokens := 32;
   Opt.BinThreshold := 0;
   Opt.BoxThreshold := 0;
+  Opt.LineGapFactor := 2;
+  Opt.MergesLines := false;
   Opt.IsSmoke := false;
   Opt.UseOpenCL := false;
   Opt.UseInt8 := false;
@@ -123,6 +129,8 @@ begin
     else if Arg = '--max-tokens' then Opt.MaxNewTokens := StrToInt(NextArg())
     else if Arg = '--bin-threshold' then Opt.BinThreshold := StrToFloat(NextArg())
     else if Arg = '--box-threshold' then Opt.BoxThreshold := StrToFloat(NextArg())
+    else if Arg = '--merge-lines' then Opt.MergesLines := true
+    else if Arg = '--line-gap' then Opt.LineGapFactor := StrToFloat(NextArg())
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
@@ -144,6 +152,8 @@ begin
     raise Exception.Create('--detector, --recognizer and --input go together');
   if Opt.MaxNewTokens < 1 then
     raise Exception.Create('--max-tokens must be at least 1');
+  if Opt.LineGapFactor <= 0 then
+    raise Exception.Create('--line-gap must be positive');
 end;
 
 // FileName in the first fixture folder that has it (repo root or example dir).
@@ -252,7 +262,7 @@ var
   Processor: TClipImageProcessorConfig;
   Tokenizer: TNeuralHFTokenizer;
   Boxes: TDBNetTextBoxArray;
-  LineIds, Ids: TNeuralIntegerArray;
+  LineIds, MergedLineIds, Ids: TNeuralIntegerArray;
   BoxesImage: TNNetVolume;
   BoxPos, MaxBoxPos, Left, Top: integer;
   ComputeText, ProcessorFile, TokenizerFile, WordText,
@@ -310,6 +320,13 @@ begin
     SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
     WriteLn(Format('  %d text boxes in %.2f s', [Length(Boxes),
       (Now() - StartTime) * 86400.0]));
+    if Opt.MergesLines then
+    begin
+      Boxes := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds,
+        Opt.LineGapFactor);
+      LineIds := MergedLineIds;
+      WriteLn(Format('  merged into %d line boxes', [Length(Boxes)]));
+    end;
     StartTime := Now();
     LineText := '';
     MaxBoxPos := High(Boxes);

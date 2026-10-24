@@ -1579,11 +1579,12 @@ rather than acted on.
   - [ ] Tokenizer: check that the trocr-small `sentencepiece.bpe.model` (fairseq id
         layout, possibly offset by one) decodes correctly through `--tokenizer`, or
         that a tokenizer.json is available; fix the offset in the loader if not.
-  - [ ] Word boxes -> line crops: docTR detects WORDS, TrOCR is trained on whole
-        LINES. Add a `--merge-lines` mode that unions the boxes of one
-        `SortDBNetTextBoxesInReadingOrder` line (split at a horizontal gap larger
-        than ~2x the line height) into one crop, and compare character accuracy of
-        word-by-word vs line crops on the real page.
+  - [X] Word boxes -> line crops: `MergeDBNetTextBoxesIntoLines` unions the boxes
+        of one `SortDBNetTextBoxesInReadingOrder` line, split at a gap above
+        GapFactor (default 2) x the run's mean box height; DocumentOCR
+        `--merge-lines` / `--line-gap` (TestDBNetMergeLines).
+    - [ ] Compare the character accuracy of word-by-word vs `--merge-lines` crops
+          on a real page (needs the real-run item above).
   - [ ] Rotated boxes (docTR assume_straight_pages=False): min-area rectangle of each
         component's contour + polygon unclip; `DecodeDBNetTextBoxes` is
         axis-aligned only. Also not ported: cv2.findContours RETR_EXTERNAL drops a
