@@ -1715,6 +1715,11 @@ type
     procedure TestEoMTConfigFromJSONFile;
     procedure TestEoMTParity;
     procedure TestEoMTRejectsNonzeroAttnMaskProbs;
+    procedure TestEoMTProcessorConfigFromJSONFile;
+    procedure TestEoMTPreprocessPadParity;
+    procedure TestEoMTPreprocessSplitParity;
+    procedure TestEoMTPostprocessPadParity;
+    procedure TestEoMTPostprocessSplitParity;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -59954,6 +59959,376 @@ begin
   end;
   AssertTrue('nonzero attn_mask_probs rejected: "' + ErrorText + '"',
     Pos('attn_mask_probs[1]', ErrorText) > 0);
+end;
+
+procedure TTestNeuralPretrained.TestEoMTProcessorConfigFromJSONFile;
+var
+  Processor: TEoMTProcessorConfig;
+begin
+  Processor := ReadEoMTProcessorConfigFromJSONFile(
+    FixturePath('tiny_eomt_preprocessor_config.json'));
+  AssertTrue('pad', Processor.DoPad);
+  AssertFalse('pad: no split', Processor.DoSplitImage);
+  AssertEquals('pad shortest', 32, Processor.ShortestEdge);
+  AssertEquals('pad longest', 32, Processor.LongestEdge);
+  AssertTrue('bilinear', Processor.Resample = irfBilinear);
+  AssertEquals('rescale', 1 / 255, Processor.RescaleFactor, 1e-12);
+  AssertEquals('mean[2]', 0.406, Processor.Mean[2], 1e-6);
+  AssertEquals('std[0]', 0.229, Processor.Std[0], 1e-6);
+  Processor := ReadEoMTProcessorConfigFromJSONFile(
+    FixturePath('tiny_eomt_swiglu_preprocessor_config.json'));
+  AssertTrue('split', Processor.DoSplitImage);
+  AssertFalse('split: no pad', Processor.DoPad);
+  AssertEquals('split shortest', 24, Processor.ShortestEdge);
+  AssertEquals('split longest = None', 0, Processor.LongestEdge);
+end;
+
+// Loads the (H, W, 3) float tensor Name of IO as a (W, H, 3) volume.
+procedure LoadEoMTImageTensor(IO: TNNetSafeTensorsReader; const Name: string;
+  Image: TNNetVolume);
+var
+  Flat: TNNetVolume;
+begin
+  Flat := TNNetVolume.Create;
+  try
+    IO.LoadTensorFlat(Name, Flat);
+    Image.ReSize(IO.DimSize(Name, 1), IO.DimSize(Name, 0), 3);
+    Image.CopyNoChecks(Flat);
+  finally
+    Flat.Free;
+  end;
+end;
+
+// Max |Expected - Actual| over Count floats starting at ExpectedStart.
+function EoMTMaxAbsDiff(Expected, Actual: TNNetVolume; ExpectedStart,
+  Count: integer): double;
+var
+  ElementPos, MaxElementPos: integer;
+begin
+  Result := 0;
+  MaxElementPos := Count - 1;
+  for ElementPos := 0 to MaxElementPos do
+    Result := Max(Result, Abs(Expected.FData[ExpectedStart + ElementPos] -
+      Actual.FData[ElementPos]));
+end;
+
+// Pixels where the label map differs from the float tensor Name of IO.
+function EoMTMapMismatches(IO: TNNetSafeTensorsReader; const Name: string;
+  const Map: TMask2FormerLabelMap; Scratch: TNNetVolume): integer;
+var
+  PixelPos, MaxPixelPos: integer;
+begin
+  IO.LoadTensorFlat(Name, Scratch);
+  if Scratch.Size <> Length(Map) then Exit(MaxInt);
+  Result := 0;
+  MaxPixelPos := High(Map);
+  for PixelPos := 0 to MaxPixelPos do
+    if Round(Scratch.FData[PixelPos]) <> Map[PixelPos] then Inc(Result);
+end;
+
+function EoMTScalar(IO: TNNetSafeTensorsReader; const Name: string;
+  Scratch: TNNetVolume): TNeuralFloat;
+begin
+  IO.LoadTensorFlat(Name, Scratch);
+  Result := Scratch.FData[0];
+end;
+
+// Window WindowPos of the (N, Q, L+1) / (N, Q, G, G) logits of Prefix as the
+// SplitEoMTOutput pair (Q, 1, L+1) / (Q, 1, G*G).
+procedure LoadEoMTWindowLogits(IO: TNNetSafeTensorsReader;
+  const Prefix: string; WindowPos: integer; Scratch, ClassLogits,
+  MaskLogits: TNNetVolume);
+var
+  NumQueries, ClassCount, PixelCount: integer;
+begin
+  NumQueries := IO.DimSize(Prefix + 'class_queries_logits', 1);
+  ClassCount := IO.DimSize(Prefix + 'class_queries_logits', 2);
+  PixelCount := IO.DimSize(Prefix + 'masks_queries_logits', 2) *
+    IO.DimSize(Prefix + 'masks_queries_logits', 3);
+  IO.LoadTensorFlat(Prefix + 'class_queries_logits', Scratch);
+  ClassLogits.ReSize(NumQueries, 1, ClassCount);
+  Move(Scratch.FData[WindowPos * NumQueries * ClassCount], ClassLogits.FData[0],
+    NumQueries * ClassCount * csNeuralFloatSize);
+  IO.LoadTensorFlat(Prefix + 'masks_queries_logits', Scratch);
+  MaskLogits.ReSize(NumQueries, 1, PixelCount);
+  Move(Scratch.FData[WindowPos * NumQueries * PixelCount], MaskLogits.FData[0],
+    NumQueries * PixelCount * csNeuralFloatSize);
+end;
+
+procedure TTestNeuralPretrained.TestEoMTPreprocessPadParity;
+var
+  Processor: TEoMTProcessorConfig;
+  Layout: TEoMTImageLayout;
+  IO: TNNetSafeTensorsReader;
+  Image, Expected: TNNetVolume;
+  Windows: TNNetVolumeList;
+  PixelDiff: double;
+begin
+  Processor := ReadEoMTProcessorConfigFromJSONFile(
+    FixturePath('tiny_eomt_preprocessor_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_eomt_processor_io.safetensors'));
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Windows := TNNetVolumeList.Create();
+  try
+    LoadEoMTImageTensor(IO, 'raw_image', Image);
+    EoMTPreprocessImage(Image, Processor, Windows, Layout);
+    AssertEquals('one padded input', 1, Windows.Count);
+    AssertEquals('resized width', 32, Layout.ResizedWidth);
+    AssertEquals('resized height', 22, Layout.ResizedHeight);
+    AssertEquals('padded width', 32, Windows[0].SizeX);
+    AssertEquals('padded height', 32, Windows[0].SizeY);
+    IO.LoadTensorFlat('pixel_values', Expected);
+    AssertEquals('pixel count', Expected.Size, Windows[0].Size);
+    PixelDiff := EoMTMaxAbsDiff(Expected, Windows[0], 0, Expected.Size);
+    WriteLn('  EoMT padded pixel_values max |diff| ', FloatToStr(PixelDiff));
+    AssertTrue('pixel_values max |diff| = ' + FloatToStr(PixelDiff),
+      PixelDiff < 1e-5);
+  finally
+    Windows.Free;
+    Expected.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestEoMTPreprocessSplitParity;
+const
+  csOrientations: array[0..1] of string = ('landscape_', 'portrait_');
+var
+  Processor: TEoMTProcessorConfig;
+  Layout: TEoMTImageLayout;
+  IO: TNNetSafeTensorsReader;
+  Image, Expected, Offsets: TNNetVolume;
+  Windows: TNNetVolumeList;
+  PixelDiff, MaxPixelDiff: double;
+  OrientationPos, WindowPos, MaxWindowPos, WindowSize: integer;
+  Prefix: string;
+begin
+  Processor := ReadEoMTProcessorConfigFromJSONFile(
+    FixturePath('tiny_eomt_swiglu_preprocessor_config.json'));
+  IO := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_eomt_swiglu_processor_io.safetensors'));
+  Image := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Offsets := TNNetVolume.Create;
+  Windows := TNNetVolumeList.Create();
+  MaxPixelDiff := 0;
+  try
+    for OrientationPos := 0 to 1 do
+    begin
+      Prefix := csOrientations[OrientationPos];
+      LoadEoMTImageTensor(IO, Prefix + 'raw_image', Image);
+      EoMTPreprocessImage(Image, Processor, Windows, Layout);
+      AssertTrue(Prefix + 'split', Layout.IsSplit);
+      AssertEquals(Prefix + 'along y', OrientationPos = 1, Layout.SplitAlongY);
+      AssertEquals(Prefix + 'window count', IO.DimSize(Prefix + 'pixel_values', 0),
+        Windows.Count);
+      IO.LoadTensorFlat(Prefix + 'patch_offsets', Offsets);
+      IO.LoadTensorFlat(Prefix + 'pixel_values', Expected);
+      WindowSize := Expected.Size div Windows.Count;
+      MaxWindowPos := Windows.Count - 1;
+      for WindowPos := 0 to MaxWindowPos do
+      begin
+        AssertEquals(Prefix + 'window start', Round(Offsets.FData[WindowPos * 3 + 1]),
+          Layout.WindowStarts[WindowPos]);
+        AssertEquals(Prefix + 'window size', WindowSize, Windows[WindowPos].Size);
+        AssertEquals(Prefix + 'window width', 24, Windows[WindowPos].SizeX);
+        PixelDiff := EoMTMaxAbsDiff(Expected, Windows[WindowPos],
+          WindowPos * WindowSize, WindowSize);
+        MaxPixelDiff := Max(MaxPixelDiff, PixelDiff);
+      end;
+    end;
+    WriteLn('  EoMT split pixel_values max |diff| ', FloatToStr(MaxPixelDiff));
+    AssertTrue('split pixel_values max |diff| = ' + FloatToStr(MaxPixelDiff),
+      MaxPixelDiff < 1e-5);
+  finally
+    Windows.Free;
+    Offsets.Free;
+    Expected.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+// Segments against the (N, 3) id / label / score rows of Name in IO.
+procedure CheckEoMTSegments(ATest: TTestNeuralPretrained;
+  IO: TNNetSafeTensorsReader; const Name: string;
+  const Segmentation: TMask2FormerSegmentation; Scratch: TNNetVolume);
+var
+  SegmentPos, MaxSegmentPos, ExpectedCount: integer;
+begin
+  ExpectedCount := IO.DimSize(Name, 0);
+  ATest.AssertEquals(Name + ' count', ExpectedCount, Length(Segmentation.Segments));
+  if ExpectedCount = 0 then Exit;
+  IO.LoadTensorFlat(Name, Scratch);
+  MaxSegmentPos := ExpectedCount - 1;
+  for SegmentPos := 0 to MaxSegmentPos do
+  begin
+    ATest.AssertEquals(Name + ' id', Round(Scratch.FData[SegmentPos * 3]),
+      Segmentation.Segments[SegmentPos].Id);
+    ATest.AssertEquals(Name + ' label', Round(Scratch.FData[SegmentPos * 3 + 1]),
+      Segmentation.Segments[SegmentPos].LabelId);
+    ATest.AssertEquals(Name + ' score', Scratch.FData[SegmentPos * 3 + 2],
+      Segmentation.Segments[SegmentPos].Score, 1e-5);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestEoMTPostprocessPadParity;
+var
+  Processor: TEoMTProcessorConfig;
+  Config: TEoMTConfig;
+  Layout: TEoMTImageLayout;
+  IO: TNNetSafeTensorsReader;
+  Image, Scratch, ClassLogits, MaskLogits, Scores: TNNetVolume;
+  Windows: TNNetVolumeList;
+  Segmentation: TMask2FormerSegmentation;
+  StuffClasses: array of integer;
+  Mismatches, StuffPos, MaxStuffPos: integer;
+  ScoreDiff: double;
+begin
+  Config := ReadEoMTConfigFromJSONFile(FixturePath('tiny_eomt_config.json'));
+  Processor := ReadEoMTProcessorConfigFromJSONFile(
+    FixturePath('tiny_eomt_preprocessor_config.json'));
+  IO := TNNetSafeTensorsReader.Create(FixturePath('tiny_eomt_processor_io.safetensors'));
+  Image := TNNetVolume.Create;
+  Scratch := TNNetVolume.Create;
+  ClassLogits := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  Scores := TNNetVolume.Create;
+  Windows := TNNetVolumeList.Create();
+  try
+    LoadEoMTImageTensor(IO, 'raw_image', Image);
+    EoMTPreprocessImage(Image, Processor, Windows, Layout);
+    IO.LoadTensorFlat('class_queries_logits', Scratch);
+    ClassLogits.ReSize(Config.NumQueries, 1, Config.NumLabels + 1);
+    ClassLogits.CopyNoChecks(Scratch);
+    IO.LoadTensorFlat('masks_queries_logits', Scratch);
+    MaskLogits.ReSize(Config.NumQueries, 1, Scratch.Size div Config.NumQueries);
+    MaskLogits.CopyNoChecks(Scratch);
+    EoMTSemanticScores([ClassLogits], [MaskLogits], Config.NumLabels,
+      EoMTMaskGridSize(Config), Layout, Scores);
+    IO.LoadTensorFlat('semantic_scores', Scratch);
+    AssertEquals('semantic scores size', Scratch.Size, Scores.Size);
+    ScoreDiff := EoMTMaxAbsDiff(Scratch, Scores, 0, Scratch.Size);
+    Mismatches := EoMTMapMismatches(IO, 'semantic', DecodeEoMTSemantic(
+      [ClassLogits], [MaskLogits], Config.NumLabels, EoMTMaskGridSize(Config),
+      Layout), Scratch);
+    WriteLn('  EoMT padded semantic scores max |diff| ', FloatToStr(ScoreDiff),
+      ', mismatched pixels ', Mismatches);
+    AssertTrue('semantic scores max |diff| = ' + FloatToStr(ScoreDiff),
+      ScoreDiff < 1e-5);
+    AssertEquals('semantic mismatched pixels', 0, Mismatches);
+    Segmentation := DecodeEoMTInstance(ClassLogits, MaskLogits, Config.NumLabels,
+      EoMTMaskGridSize(Config), Layout, EoMTScalar(IO, 'instance_threshold',
+      Scratch));
+    AssertEquals('instance width', 40, Segmentation.Width);
+    Mismatches := EoMTMapMismatches(IO, 'instance', Segmentation.SegmentMap,
+      Scratch);
+    WriteLn('  EoMT instance mismatched pixels ', Mismatches);
+    AssertEquals('instance mismatched pixels', 0, Mismatches);
+    CheckEoMTSegments(Self, IO, 'instance_segments', Segmentation, Scratch);
+    IO.LoadTensorFlat('panoptic_stuff_classes', Scratch);
+    SetLength(StuffClasses, Scratch.Size);
+    MaxStuffPos := Scratch.Size - 1;
+    for StuffPos := 0 to MaxStuffPos do
+      StuffClasses[StuffPos] := Round(Scratch.FData[StuffPos]);
+    Segmentation := DecodeEoMTPanoptic(ClassLogits, MaskLogits,
+      Config.NumLabels, EoMTMaskGridSize(Config), Layout, StuffClasses,
+      EoMTScalar(IO, 'panoptic_threshold', Scratch),
+      EoMTScalar(IO, 'panoptic_mask_threshold', Scratch),
+      EoMTScalar(IO, 'panoptic_overlap_threshold', Scratch));
+    Mismatches := EoMTMapMismatches(IO, 'panoptic', Segmentation.SegmentMap,
+      Scratch);
+    WriteLn('  EoMT panoptic mismatched pixels ', Mismatches, ', segments ',
+      Length(Segmentation.Segments));
+    AssertEquals('panoptic mismatched pixels', 0, Mismatches);
+    CheckEoMTSegments(Self, IO, 'panoptic_segments', Segmentation, Scratch);
+  finally
+    Windows.Free;
+    Scores.Free;
+    MaskLogits.Free;
+    ClassLogits.Free;
+    Scratch.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestEoMTPostprocessSplitParity;
+const
+  csOrientations: array[0..1] of string = ('landscape_', 'portrait_');
+var
+  Processor: TEoMTProcessorConfig;
+  Config: TEoMTConfig;
+  Layout: TEoMTImageLayout;
+  IO: TNNetSafeTensorsReader;
+  Image, Scratch, Scores: TNNetVolume;
+  ClassLogits, MaskLogits: array of TNNetVolume;
+  Windows: TNNetVolumeList;
+  Mismatches, OrientationPos, WindowPos, MaxWindowPos: integer;
+  ScoreDiff: double;
+  Prefix: string;
+begin
+  Config := ReadEoMTConfigFromJSONFile(FixturePath('tiny_eomt_swiglu_config.json'));
+  Processor := ReadEoMTProcessorConfigFromJSONFile(
+    FixturePath('tiny_eomt_swiglu_preprocessor_config.json'));
+  IO := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_eomt_swiglu_processor_io.safetensors'));
+  Image := TNNetVolume.Create;
+  Scratch := TNNetVolume.Create;
+  Scores := TNNetVolume.Create;
+  Windows := TNNetVolumeList.Create();
+  ClassLogits := nil;
+  MaskLogits := nil;
+  ScoreDiff := 0;
+  try
+    for OrientationPos := 0 to 1 do
+    begin
+      Prefix := csOrientations[OrientationPos];
+      LoadEoMTImageTensor(IO, Prefix + 'raw_image', Image);
+      EoMTPreprocessImage(Image, Processor, Windows, Layout);
+      SetLength(ClassLogits, Windows.Count);
+      SetLength(MaskLogits, Windows.Count);
+      MaxWindowPos := Windows.Count - 1;
+      for WindowPos := 0 to MaxWindowPos do
+      begin
+        if ClassLogits[WindowPos] = nil then
+        begin
+          ClassLogits[WindowPos] := TNNetVolume.Create;
+          MaskLogits[WindowPos] := TNNetVolume.Create;
+        end;
+        LoadEoMTWindowLogits(IO, Prefix, WindowPos, Scratch,
+          ClassLogits[WindowPos], MaskLogits[WindowPos]);
+      end;
+      EoMTSemanticScores(ClassLogits, MaskLogits, Config.NumLabels,
+        EoMTMaskGridSize(Config), Layout, Scores);
+      IO.LoadTensorFlat(Prefix + 'semantic_scores', Scratch);
+      AssertEquals(Prefix + 'semantic scores size', Scratch.Size, Scores.Size);
+      ScoreDiff := Max(ScoreDiff, EoMTMaxAbsDiff(Scratch, Scores, 0,
+        Scratch.Size));
+      Mismatches := EoMTMapMismatches(IO, Prefix + 'semantic',
+        DecodeEoMTSemantic(ClassLogits, MaskLogits, Config.NumLabels,
+        EoMTMaskGridSize(Config), Layout), Scratch);
+      WriteLn('  EoMT ', Prefix, 'split semantic mismatched pixels ', Mismatches);
+      AssertEquals(Prefix + 'split semantic mismatched pixels', 0, Mismatches);
+    end;
+    WriteLn('  EoMT split semantic scores max |diff| ', FloatToStr(ScoreDiff));
+    AssertTrue('split semantic scores max |diff| = ' + FloatToStr(ScoreDiff),
+      ScoreDiff < 1e-5);
+  finally
+    MaxWindowPos := High(ClassLogits);
+    for WindowPos := 0 to MaxWindowPos do
+    begin
+      ClassLogits[WindowPos].Free;
+      MaskLogits[WindowPos].Free;
+    end;
+    Windows.Free;
+    Scores.Free;
+    Scratch.Free;
+    Image.Free;
+    IO.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;

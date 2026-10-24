@@ -957,38 +957,57 @@ rather than acted on.
         _io.safetensors} (float64 transformers oracle; MLP and SwiGLU FFN).
         TestEoMTParity < 1e-4 on class and mask logits (about 2e-6 measured),
         TestEoMTConfigFromJSONFile, TestEoMTRejectsNonzeroAttnMaskProbs.
-  - [ ] Preprocessing helper (not written): EomtImageProcessor resizes so the
-        long side is size.longest_edge (640 / 512; bilinear, antialias),
-        rescales 1/255, normalizes with the ImageNet mean/std, then either pads
-        bottom/right with 0 to the square image_size (do_pad, panoptic and
-        instance checkpoints) or, for the ADE20K semantic checkpoints
-        (do_split_image), slices the long side into ceil(long / size) square
-        windows with an even overlap (`_split_image`: start = int(i * (size -
-        overlap_per_patch))). Read each checkpoint's preprocessor_config.json
-        for do_pad / do_split_image.
-  - [ ] Post-processing differs from Mask2Former's, so the example needs EoMT
-        variants or extra parameters on the DecodeMask2Former* routines:
-        every mode first resizes the mask logits bilinearly (align_corners
-        false) to the padded image_size; panoptic and instance then crop to the
-        unpadded resized region (`unpad_image`) and resize to the original
-        size. Semantic: segmentation = sum_q softmax(class)[q, :-1] *
-        sigmoid(mask)[q], resized to the target size, argmax; with
-        do_split_image the per-window class maps are summed and divided by the
-        per-pixel window count (`merge_image_patches`) before the resize.
-        Instance: no top-k - every query whose (softmax-without-null max) x
-        (mean sigmoid over mask > 0 pixels) >= threshold (0.8) is kept in query
-        order. Panoptic: threshold 0.8 default, compute_segments with
-        stuff_classes. Port and pin these against the HF processor on the pico
-        fixture before wiring the example.
-  - [ ] examples/UniversalSegmentation: a second `--model eomt` route that
-        reads config.json + preprocessor_config.json, calls
-        BuildEoMTFromSafeTensors(FileName, Config, false), runs NN.Compute on
-        the preprocessed (ImageSize, ImageSize, 3) volume (once per window for
-        the semantic split), then SplitEoMTOutput and the EoMT post-process
-        above.
-  - [ ] Real-checkpoint smoke (no EoMT checkpoint was run; the importer
-        assumes the transformers key names without a prefix, as
-        EomtForUniversalSegmentation.save_pretrained writes them).
+  - [X] Preprocessing: `TEoMTProcessorConfig`,
+        `ReadEoMTProcessorConfigFromJSONFile`, `EoMTPreprocessImage` (port of
+        EomtImageProcessorPil, the PIL backend as SAM/DPT): PIL bilinear uint8
+        resize by `HFSizeWithAspectRatio` (neuralimageresize, transformers
+        get_size_with_aspect_ratio; longest_edge null = None), then the
+        do_split_image windows (`_split_image` starts) and/or do_pad, then
+        rescale + normalize by `CropAndNormalizeImage` (neuralimageresize, now
+        also behind neuraldatasets' CenterCropAndNormalizeImage; EoMT pads
+        before normalizing, so padded pixels are -mean/std). `TEoMTImageLayout`
+        carries the sizes and window starts to the post-processors.
+  - [X] Post-processing: `EoMTSemanticScores` / `DecodeEoMTSemantic` (no
+        unpad, as transformers; merge_image_patches for split windows),
+        `DecodeEoMTInstance` (no top-k, query order, threshold 0.8),
+        `DecodeEoMTPanoptic` (unpad + resize, sigmoid after the resize,
+        compute_segments with stuff_classes, -1 background, ids from 0). Shared
+        with the DecodeMask2Former* routines through the factored
+        Mask2FormerSemanticScores / Mask2FormerArgmaxLabels /
+        Mask2FormerPositiveMaskStats / Mask2FormerPaintSegments /
+        Mask2FormerKeepConfidentQueries / Mask2FormerAssignKeptPixels.
+  - [X] Processor parity: tools/make_pico_eomt_fixture.py also writes
+        tests/fixtures/tiny_eomt{,_swiglu}_{processor_io.safetensors,
+        preprocessor_config.json} (40x28 uint8 test image; tiny_eomt do_pad,
+        tiny_eomt_swiglu do_split_image on a landscape and a portrait image).
+        TestEoMTProcessorConfigFromJSONFile, TestEoMTPreprocessPadParity and
+        TestEoMTPreprocessSplitParity (pixel_values max |diff| 4.8e-7),
+        TestEoMTPostprocessPadParity and TestEoMTPostprocessSplitParity
+        (semantic scores 7.2e-7; semantic / instance / panoptic maps 0
+        mismatched pixels; segment ids, labels and scores).
+  - [X] examples/UniversalSegmentation `--model eomt --model-dir DIR --image
+        FILE`: preprocess, one forward per window, the post-processor for the
+        checkpoint's task (do_split_image or "semantic" in the folder name ->
+        semantic, "instance" -> instance, else panoptic; --task overrides),
+        same printout and segmentation.ppm. Smoke-run on pico folders built
+        from the fixtures (panoptic, instance, split semantic).
+  - [ ] Real-checkpoint smoke on the user's box (no EoMT checkpoint was run;
+        the importer assumes the transformers key names without a prefix, as
+        EomtForUniversalSegmentation.save_pretrained writes them), e.g.
+        `UniversalSegmentation --model eomt --model-dir
+        coco_panoptic_eomt_large_640 --image photo.jpg` and an
+        ade20k_semantic_eomt_large_512 split run; then flip the README status
+        from "planned (coded)" to supported.
+  - [ ] model_type "eomt_dinov3" (transformers models/eomt_dinov3): the same
+        head over a DINOv3 trunk (RoPE 2-D, LayerScale); reuse the DINOv3
+        builder pieces (AddMultiHeadVisionRoPE2DAttention) and the EoMT head
+        code; needs a pico fixture like tiny_eomt.
+  - [ ] Small reuse follow-up: `SAMPreprocessImage` keeps its own normalize
+        loop; route it through `CropAndNormalizeImage` (neuralimageresize) and
+        re-run TestSAMProcessorEndToEndParity.
+  - [ ] Fast-processor backend: the port matches EomtImageProcessorPil (PIL
+        uint8 bilinear); transformers' default fast processor resizes with
+        torchvision antialias. Measure the gap on a real photo first.
 - [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
       + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
       Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;

@@ -3806,55 +3806,9 @@ end;
 // (zero padded where the window leaves Work), then (x/255 - Mean)/Std.
 procedure CenterCropAndNormalizeImage(Work, Dst: TNNetVolume;
   CropWidth, CropHeight: integer; const Mean, Std: array of TNeuralFloat);
-var
-  OffX, OffY, X, Y, C, SrcX, SrcY: integer;
-  MaxCropX, MaxCropY, WorkBase, DstBase: integer;
-  DstStride, WorkStride: integer;
-  WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
-  RowOutY: boolean;
-  ScaleC, BiasC: array[0..2] of TNeuralFloat;
 begin
-  OffX := (Work.SizeX - CropWidth) div 2;
-  OffY := (Work.SizeY - CropHeight) div 2;
-  Dst.ReSize(CropWidth, CropHeight, 3);
-  MaxCropX := CropWidth - 1;
-  MaxCropY := CropHeight - 1;
-  DstStride := Dst.GetRawPos(1, 0, 0);
-  WorkStride := Work.GetRawPos(1, 0, 0);
-  WorkSizeXM1 := Work.SizeX - 1;
-  WorkSizeYM1 := Work.SizeY - 1;
-  // (v/255 - Mean[C]) / Std[C] folded into one multiply-add per pixel: the
-  // per-channel scale and bias are invariant over the whole crop (#5).
-  for C := 0 to 2 do
-  begin
-    ScaleC[C] := (1.0 / 255.0) / Std[C];
-    BiasC[C] := -Mean[C] / Std[C];
-  end;
-  for Y := 0 to MaxCropY do
-  begin
-    SrcY := OffY + Y;
-    RowOutY := (SrcY < 0) or (SrcY > WorkSizeYM1);
-    if not RowOutY then WorkRowBase := Work.GetRawPos(0, SrcY, 0)
-    else WorkRowBase := 0;
-    DstBase := Dst.GetRawPos(0, Y, 0);
-    for X := 0 to MaxCropX do
-    begin
-      SrcX := OffX + X;
-      // pad with zeros if the crop window exceeds the resized image
-      if RowOutY or (SrcX < 0) or (SrcX > WorkSizeXM1) then
-      begin
-        for C := 0 to 2 do Dst.FData[DstBase + C] := 0;
-      end
-      else
-      begin
-        WorkBase := WorkRowBase + SrcX * WorkStride;
-        for C := 0 to 2 do
-          Dst.FData[DstBase + C] :=
-            Work.FData[WorkBase + C] * ScaleC[C] + BiasC[C];
-      end;
-      Inc(DstBase, DstStride);
-    end;
-  end;
+  CropAndNormalizeImage(Work, Dst, (Work.SizeX - CropWidth) div 2,
+    (Work.SizeY - CropHeight) div 2, CropWidth, CropHeight, Mean, Std);
 end;
 
 procedure CheckVisionModelPreprocessArgs(Src, Dst: TNNetVolume;

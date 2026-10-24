@@ -41,6 +41,18 @@ procedure ConvertAndResizeImagePIL(Source, Dest: TNNetVolume; Width, Height,
 procedure ResizeByteImageShortestEdge(Source, Dest: TNNetVolume;
   ShortestEdge: integer; Filter: TImageResampleFilter);
 
+// transformers get_size_with_aspect_ratio: short side -> Size unless the long
+// side would pass MaxSize (<= 0 = None); sides truncated as Python's int().
+procedure HFSizeWithAspectRatio(Width, Height, Size, MaxSize: integer;
+  out NewWidth, NewHeight: integer);
+
+// Work (W,H,3) window at (OffX,OffY) -> Dst (CropWidth,CropHeight,3) as (x *
+// RescaleFactor - Mean)/Std; outside Work 0, or -Mean/Std if PadBeforeNormalize.
+procedure CropAndNormalizeImage(Work, Dst: TNNetVolume;
+  OffX, OffY, CropWidth, CropHeight: integer;
+  const Mean, Std: array of TNeuralFloat; PadBeforeNormalize: boolean = false;
+  RescaleFactor: double = 1 / 255);
+
 // controlnet_aux util.resize_image output size: scale so the short side is
 // Resolution, then np.round (half to even) each side to a multiple of 64.
 procedure ControlNetAuxResizeImageSize(Width, Height, Resolution: integer;
@@ -427,6 +439,98 @@ begin
   if NewSizeY < 1 then NewSizeY := 1;
   ResizeImagePIL(Source, Dest, NewSizeX, NewSizeY, Filter,
     {RoundToBytes=}true);
+end;
+
+procedure HFSizeWithAspectRatio(Width, Height, Size, MaxSize: integer;
+  out NewWidth, NewHeight: integer);
+var
+  ShortSide, LongSide, RawSize: double;
+  HasRawSize: boolean;
+begin
+  // Double and Trunc, as Python's float and int().
+  HasRawSize := false;
+  RawSize := 0;
+  if MaxSize > 0 then
+  begin
+    ShortSide := Min(Width, Height);
+    LongSide := Max(Width, Height);
+    if LongSide / ShortSide * Size > MaxSize then
+    begin
+      RawSize := MaxSize * ShortSide / LongSide;
+      Size := Round(RawSize);
+      HasRawSize := true;
+    end;
+  end;
+  if ((Height <= Width) and (Height = Size)) or
+    ((Width <= Height) and (Width = Size)) then
+  begin
+    NewWidth := Width;
+    NewHeight := Height;
+  end
+  else if Width < Height then
+  begin
+    NewWidth := Size;
+    if HasRawSize then NewHeight := Trunc(RawSize * Height / Width)
+    else NewHeight := Trunc(Size * Height / Width);
+  end
+  else
+  begin
+    NewHeight := Size;
+    if HasRawSize then NewWidth := Trunc(RawSize * Width / Height)
+    else NewWidth := Trunc(Size * Width / Height);
+  end;
+end;
+
+procedure CropAndNormalizeImage(Work, Dst: TNNetVolume;
+  OffX, OffY, CropWidth, CropHeight: integer;
+  const Mean, Std: array of TNeuralFloat; PadBeforeNormalize: boolean;
+  RescaleFactor: double);
+var
+  X, Y, C, SrcX, SrcY: integer;
+  MaxCropX, MaxCropY, WorkBase, DstBase: integer;
+  DstStride, WorkStride: integer;
+  WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
+  RowOutY: boolean;
+  ScaleC, BiasC, PadC: array[0..2] of TNeuralFloat;
+begin
+  Dst.ReSize(CropWidth, CropHeight, 3);
+  MaxCropX := CropWidth - 1;
+  MaxCropY := CropHeight - 1;
+  DstStride := Dst.GetRawPos(1, 0, 0);
+  WorkStride := Work.GetRawPos(1, 0, 0);
+  WorkSizeXM1 := Work.SizeX - 1;
+  WorkSizeYM1 := Work.SizeY - 1;
+  // (v * RescaleFactor - Mean[C]) / Std[C] folded into one multiply-add.
+  for C := 0 to 2 do
+  begin
+    ScaleC[C] := RescaleFactor / Std[C];
+    BiasC[C] := -Mean[C] / Std[C];
+    if PadBeforeNormalize then PadC[C] := BiasC[C] else PadC[C] := 0;
+  end;
+  for Y := 0 to MaxCropY do
+  begin
+    SrcY := OffY + Y;
+    RowOutY := (SrcY < 0) or (SrcY > WorkSizeYM1);
+    if not RowOutY then WorkRowBase := Work.GetRawPos(0, SrcY, 0)
+    else WorkRowBase := 0;
+    DstBase := Dst.GetRawPos(0, Y, 0);
+    for X := 0 to MaxCropX do
+    begin
+      SrcX := OffX + X;
+      if RowOutY or (SrcX < 0) or (SrcX > WorkSizeXM1) then
+      begin
+        for C := 0 to 2 do Dst.FData[DstBase + C] := PadC[C];
+      end
+      else
+      begin
+        WorkBase := WorkRowBase + SrcX * WorkStride;
+        for C := 0 to 2 do
+          Dst.FData[DstBase + C] :=
+            Work.FData[WorkBase + C] * ScaleC[C] + BiasC[C];
+      end;
+      Inc(DstBase, DstStride);
+    end;
+  end;
 end;
 
 procedure ControlNetAuxResizeImageSize(Width, Height, Resolution: integer;
