@@ -64,6 +64,11 @@ procedure CannyEdges(Source, Dest: TNNetVolume; LowThreshold,
   HighThreshold: TNeuralFloat; L2Gradient: boolean = false;
   DestDepth: integer = 1);
 
+// Labels[Y * SizeX + X] := 1..Result for the 8-connected regions of Map channel
+// Channel above Threshold, numbered in raster order of their first pixel; 0 elsewhere.
+function LabelEightConnectedComponents(Map: TNNetVolume; Channel: integer;
+  Threshold: TNeuralFloat; var Labels: TNeuralIntegerArray): integer;
+
 // Canvas := Image with Left/Top/Right/Bottom pixels added on each side, each
 // new pixel copying the nearest edge pixel (torch F.pad mode="replicate").
 procedure PadImageClampToEdge(Image: TNNetVolume; Left, Top, Right,
@@ -1984,6 +1989,57 @@ begin
         Dest.FData[PixelPos + Channel] := EdgeValue;
       Inc(PixelPos, DestDepth);
       Inc(PaddedPos);
+    end;
+  end;
+end;
+
+function LabelEightConnectedComponents(Map: TNNetVolume; Channel: integer;
+  Threshold: TNeuralFloat; var Labels: TNeuralIntegerArray): integer;
+var
+  Stack: TNeuralIntegerArray;
+  StackCount, PixelCount, SeedPos, PixelPos, NeighbourPos, Depth: integer;
+  MaxSeedPos, X, Y, NeighbourX, NeighbourY, MaxX, MaxY: integer;
+begin
+  if (Channel < 0) or (Channel >= Map.Depth) then
+    raise Exception.Create('LabelEightConnectedComponents: channel ' +
+      IntToStr(Channel) + ' is outside depth ' + IntToStr(Map.Depth) + '.');
+  PixelCount := Map.SizeX * Map.SizeY;
+  SetLength(Labels, PixelCount);
+  if PixelCount = 0 then Exit(0);
+  FillChar(Labels[0], PixelCount * SizeOf(integer), 0);
+  SetLength(Stack, PixelCount);
+  Depth := Map.Depth;
+  MaxX := Map.SizeX - 1;
+  MaxY := Map.SizeY - 1;
+  MaxSeedPos := PixelCount - 1;
+  Result := 0;
+  for SeedPos := 0 to MaxSeedPos do
+  begin
+    if (Labels[SeedPos] <> 0) or
+      not (Map.FData[SeedPos * Depth + Channel] > Threshold) then continue;
+    Inc(Result);
+    Labels[SeedPos] := Result;
+    Stack[0] := SeedPos;
+    StackCount := 1;
+    // A pixel is labelled when pushed, so the stack never exceeds PixelCount.
+    while StackCount > 0 do
+    begin
+      Dec(StackCount);
+      PixelPos := Stack[StackCount];
+      Y := PixelPos div Map.SizeX;
+      X := PixelPos - Y * Map.SizeX;
+      for NeighbourY := Max(Y - 1, 0) to Min(Y + 1, MaxY) do
+        for NeighbourX := Max(X - 1, 0) to Min(X + 1, MaxX) do
+        begin
+          NeighbourPos := NeighbourY * Map.SizeX + NeighbourX;
+          if (Labels[NeighbourPos] = 0) and
+            (Map.FData[NeighbourPos * Depth + Channel] > Threshold) then
+          begin
+            Labels[NeighbourPos] := Result;
+            Stack[StackCount] := NeighbourPos;
+            Inc(StackCount);
+          end;
+        end;
     end;
   end;
 end;

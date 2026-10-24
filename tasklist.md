@@ -1558,36 +1558,53 @@ rather than acted on.
   - [ ] tensor-name mapping targets the transformers 5.11 layout
         (encoder.layers.N.attention.q_proj, decoder.model.decoder.*); add the published
         checkpoints' older DeiT naming if it differs (the fixture is the parity contract).
-- [ ] Text detection for whole pages and photos: DBNet importer (Liao et al., AAAI 2020,
+- [ ] Text detection for whole pages and photos: DBNet (Liao et al., AAAI 2020,
       arXiv:1911.08947, "Real-time Scene Text Detection with Differentiable
       Binarization"; the detector in docTR, PaddleOCR and mmocr) + examples/DocumentOCR.
       Today examples/OCRTranscribe reads ONE cropped text line; nothing in neural/ finds
       the lines on a page or in a photo, so TrOCR cannot be used on a real document.
-      - Model: docTR `db_mobilenet_v3_large` (and `db_resnet50`), the released torch
-        weights converted to .safetensors in the ~/x venv. Backbone: reuse
-        `BuildMobileNetV3` / `BuildResNet` with their stage outputs exposed (no copy of
-        either). Neck: the DBNet FPN (1x1 lateral convs, top-down add, 3x3 out convs,
-        upsample to 1/4 and concat). Head: conv3x3-BN-ReLU, two stride-2
-        `TNNetDeconvolution` 2x2 (BN-ReLU between), sigmoid -> probability map. Read
-        mean/std and the thresholds from the docTR config, do not hard-code them.
-      - `BuildDBNetFromSafeTensors[Ex]` + `TDBNetConfig` in neuralpretrained.pas, a pico
-        fixture under tests/fixtures and a probability-map parity test (< 1e-4) against
-        docTR in the ~/x venv (put the HF/docTR oracle first, per the test-ordering
-        rule).
-      - Post-processing as reusable routines in neural/ (not in the example): binarize
-        at bin_thresh, 8-connected component labelling, per-component mean probability
-        (box_thresh), axis-aligned box expansion by the DB unclip rule
-        (offset = area * unclip_ratio / perimeter), returned in input-image pixels.
-        Rotated boxes (min-area rectangle) as a second step; check first whether a
-        connected-component or box routine already exists (FastSAM / SAM / Canny code).
-      - examples/DocumentOCR (.lpr + .lpi + README.md, cthreads first): image in ->
-        DBNet boxes -> sort into reading order (top-to-bottom, then left-to-right) ->
-        crop + resize each line -> existing TrOCR (`microsoft/trocr-small-printed`)
-        -> text out, plus `--boxes out.png` drawing the boxes with the existing
-        drawing helpers. Pico fixtures make it run offline; `--gpu` and `--int8` follow
-        the other vision examples.
-      - Real-checkpoint run on a scanned page and a street photo before README.md lists
-        it as supported.
+  - [X] Importer + post-processing + pico parity. `TDBNetConfig`,
+        `DefaultDBNetConfig` / `ReadDBNetConfigFromJSONFile` (docTR config.json:
+        arch, mean, std, input_shape + optional bin_thresh, box_thresh, unclip_ratio,
+        preserve_aspect_ratio, symmetric_pad; docTR defaults when absent),
+        `InferDBNetConfigFromTensors`, `BuildDBNet` / `BuildDBNetFromSafeTensors[Ex]`
+        for docTR `db_mobilenet_v3_large` and `db_resnet50` over the shared
+        `AddMobileNetV3Trunk` / `AddResNetTrunk` (FPN with bilinear align_corners
+        upsampling, prob_head with two `TNNetDeconvolution` 2x2, sigmoid; the
+        training-only thresh_head is not built). `DBNetPrepareInput` (docTR
+        PreProcessor: aspect-preserving PIL-bilinear resize, symmetric zero pad,
+        normalize), `DecodeDBNetTextBoxes` (docTR DBPostProcessor, straight pages:
+        binarize, `LabelEightConnectedComponents` in neuralimageresize.pas, docTR
+        box_score over the bounding rectangle, size filter, unclip
+        offset = area * unclip_ratio / perimeter, boxes in input-image pixels) and
+        `DetectDBNetTextBoxes` (image -> boxes, optional probability map out).
+        Tests: TestDBNetMobileNetV3LargeParity / TestDBNetResNet50Parity
+        (probability map, net input and end to end < 1e-4 vs
+        tools/dbnet_tiny_fixture.py, measured 6e-8) and TestDBNetDecodeSyntheticMap.
+        The fixture script re-creates docTR's DBNet module tree over the real
+        torchvision backbones because docTR is not installed: its tensor names come
+        from docTR's source AS RECALLED and are NOT yet verified against a released
+        docTR checkpoint (feat_extractor.* IntermediateLayerGetter keys,
+        fpn.in_branches / out_branches, prob_head.0/.1/.3/.4/.6).
+  - [ ] Real docTR checkpoint: convert db_mobilenet_v3_large (and db_resnet50) to
+        .safetensors in the ~/x venv, confirm the tensor names above (fix the importer
+        if docTR's names differ), run `tools/dbnet_tiny_fixture.py --real CKPT` for a
+        probability-map parity < 1e-4 at 1024x1024, then a scanned page and a street
+        photo before README.md lists it as supported. Also check docTR's PreProcessor
+        resize against `DBNetPrepareInput` on a large downscale (the pico case only
+        downscales 120x90 -> 85x64), and docTR's padding removal against
+        `DecodeDBNetTextBoxes`'s pixel mapping.
+  - [ ] examples/DocumentOCR (.lpr + .lpi + README.md, cthreads first): image in ->
+        `BuildDBNetFromSafeTensors` + `DetectDBNetTextBoxes` -> sort into reading order
+        (top-to-bottom, then left-to-right) -> crop + resize each line -> existing
+        TrOCR (`microsoft/trocr-small-printed`) -> text out, plus `--boxes out.png`
+        drawing the boxes with the existing drawing helpers. Pico fixtures
+        (tests/fixtures/tiny_dbnet_*) make it run offline; `--gpu` and `--int8`
+        follow the other vision examples.
+  - [ ] Rotated boxes (docTR assume_straight_pages=False): min-area rectangle of each
+        component's contour + polygon unclip; `DecodeDBNetTextBoxes` is
+        axis-aligned only. Also not ported: cv2.findContours RETR_EXTERNAL drops a
+        region that sits inside another region's hole; the labelling keeps it.
 - [ ] EfficientNet (timm / torchvision efficientnet_b0..b7) importer follow-up
       (BuildEfficientNetFromSafeTensors LANDED, commit d35970c; AddEfficientNetMBConv
       reusing MobileNetV3 MBConv + conv-BN fold, b0..b7 share one JSON-driven builder,

@@ -241,6 +241,8 @@ type
     procedure CheckRetinaFaceParity(const Base, Tag: string;
       out Config: TRetinaFaceConfig; out FaceCount: integer);
     procedure RunRetinaFaceOpenCLParity(const Base, Tag: string);
+    // tiny_dbnet_<Variant>.*: probability map, DBNetPrepareInput, end to end.
+    procedure CheckDBNetParity(const Variant: string; out Config: TDBNetConfig);
     // Max |diff| between NN's output for NetInput and the IO tensor Key.
     function CodeFormerOutputMaxDiff(NN: TNNet; IO: TNNetSafeTensorsReader;
       NetInput: TNNetVolume; const Key: string): double;
@@ -1701,6 +1703,9 @@ type
     procedure TestRetinaFaceResNet50Parity;
     procedure TestRetinaFaceResizedInput;
     procedure TestRetinaFaceOpenCLParity;
+    procedure TestDBNetMobileNetV3LargeParity;
+    procedure TestDBNetResNet50Parity;
+    procedure TestDBNetDecodeSyntheticMap;
     // FaceAlignmentMatrix + AlignWarpFace + PasteFaceIntoImage against a numpy
     // port of facexlib (float warp, cv2 4.10 erode / GaussianBlur / Lanczos4).
     procedure TestFacePasteMatchesFacexlibOracle;
@@ -60718,6 +60723,183 @@ procedure TTestNeuralPretrained.TestRetinaFaceOpenCLParity;
 begin
   RunRetinaFaceOpenCLParity('tiny_retinaface_mobilenet', 'odd');
   RunRetinaFaceOpenCLParity('tiny_retinaface_resnet50', 'odd');
+end;
+
+// tiny_dbnet_<Variant>.* (tools/dbnet_tiny_fixture.py, docTR's DBNet module tree
+// over torchvision backbones, float64): the probability map from the oracle net
+// input, DBNetPrepareInput vs docTR's PreProcessor, then end to end.
+procedure TTestNeuralPretrained.CheckDBNetParity(const Variant: string;
+  out Config: TDBNetConfig);
+var
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Image, OracleInput, OracleProb, Output, NetInput, Expected: TNNetVolume;
+  Placement: TYoloLetterbox;
+  Base: string;
+  ProbDiff, InputDiff, EndToEndDiff: double;
+begin
+  Base := 'tiny_dbnet_' + Variant;
+  IO := TNNetSafeTensorsReader.Create(FixturePath(Base + '_io.safetensors'));
+  Image := TNNetVolume.Create;
+  OracleInput := TNNetVolume.Create;
+  OracleProb := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  NetInput := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  NN := nil;
+  try
+    LoadDDColorTorchImage(IO, 'image', Image);
+    LoadDDColorTorchImage(IO, 'input', OracleInput);
+    LoadDDColorTorchImage(IO, 'prob', OracleProb);
+    NN := BuildDBNetFromSafeTensors(FixturePath(Base + '.safetensors'), Config,
+      {pTrainable=}false, FixturePath(Base + '_config.json'));
+    NN.Compute(OracleInput);
+    NN.GetOutput(Output);
+    AssertEquals('prob width', OracleProb.SizeX, Output.SizeX);
+    AssertEquals('prob height', OracleProb.SizeY, Output.SizeY);
+    AssertEquals('prob classes', OracleProb.Depth, Output.Depth);
+    ProbDiff := MaxAbsVolumeDiff(Output, OracleProb);
+    AssertTrue(Variant + ' probability map max |diff| = ' + FloatToStr(ProbDiff) +
+      ' must be < 1e-4', ProbDiff < 1e-4);
+    DBNetPrepareInput(Image, Config, NetInput, Placement);
+    IO.LoadTensorFlat('letterbox', Expected);
+    AssertEquals('pad left', Round(Expected.FData[0]), Placement.Left);
+    AssertEquals('pad top', Round(Expected.FData[1]), Placement.Top);
+    AssertEquals('content width', Round(Expected.FData[2]), Placement.ContentX);
+    AssertEquals('content height', Round(Expected.FData[3]), Placement.ContentY);
+    InputDiff := MaxAbsVolumeDiff(NetInput, OracleInput);
+    AssertTrue(Variant + ' net input max |diff| = ' + FloatToStr(InputDiff) +
+      ' must be < 1e-4', InputDiff < 1e-4);
+    DetectDBNetTextBoxes(NN, Config, Image, Output);
+    EndToEndDiff := MaxAbsVolumeDiff(Output, OracleProb);
+    AssertTrue(Variant + ' end-to-end probability max |diff| = ' +
+      FloatToStr(EndToEndDiff) + ' must be < 1e-4', EndToEndDiff < 1e-4);
+    WriteLn('  DBNet ', Variant, ': probability max|diff| = ', ProbDiff:0:9,
+      ', net input = ', InputDiff:0:9, ', end to end = ', EndToEndDiff:0:9);
+    AssertEquals('arch', 'db_' + Variant, Config.Arch);
+    AssertEquals('backbone', Variant, Config.Backbone);
+    AssertEquals('fpn width', 16, Config.HeadChannels);
+    AssertEquals('level width', 4, Config.LevelChannels);
+    AssertEquals('prob head width', 4, Config.ProbHeadChannels);
+    AssertEquals('classes', 1, Config.NumClasses);
+    AssertEquals('input width', 96, Config.InputWidth);
+    AssertEquals('input height', 64, Config.InputHeight);
+    AssertEquals('mean from config', 0.45, Config.Mean[1], 1e-6);
+    AssertEquals('std from config', 0.2, Config.Std[2], 1e-6);
+    AssertEquals('bin_thresh from config', 0.35, Config.BinThreshold, 1e-6);
+    AssertEquals('box_thresh from config', 0.2, Config.BoxThreshold, 1e-6);
+    AssertEquals('docTR unclip_ratio default', 1.5, Config.UnclipRatio, 1e-6);
+  finally
+    NN.Free;
+    Expected.Free;
+    NetInput.Free;
+    Output.Free;
+    OracleProb.Free;
+    OracleInput.Free;
+    Image.Free;
+    IO.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDBNetMobileNetV3LargeParity;
+var
+  Config: TDBNetConfig;
+begin
+  CheckDBNetParity(csDBNetMobileNetV3Large, Config);
+  AssertEquals('features 3 width', 8, Config.StageChannels[0]);
+  AssertEquals('features 12 width', 16, Config.StageChannels[2]);
+  AssertEquals('features 16 width (6 x 16)', 96, Config.StageChannels[3]);
+  AssertEquals('block 0 has no expand conv', Config.MobileNet.StemWidth,
+    Config.MobileNet.Blocks[0].ExpChannels);
+end;
+
+procedure TTestNeuralPretrained.TestDBNetResNet50Parity;
+var
+  Config: TDBNetConfig;
+begin
+  CheckDBNetParity(csDBNetResNet50, Config);
+  AssertEquals('layer1 width', 8, Config.StageChannels[0]);
+  AssertEquals('layer4 width', 24, Config.StageChannels[3]);
+  AssertEquals('layer1 blocks', 2, Config.ResNet.BlocksPerStage[0]);
+end;
+
+// A 40x30 synthetic map (background 0.05): 8-connected labels, the size and
+// docTR box_score filters, the unclip offset, clipping, and the pixel mapping.
+procedure TTestNeuralPretrained.TestDBNetDecodeSyntheticMap;
+var
+  ProbMap: TNNetVolume;
+  Config: TDBNetConfig;
+  Placement: TYoloLetterbox;
+  Boxes: TDBNetTextBoxArray;
+  Labels: TNeuralIntegerArray;
+  X, Y, DiagonalPos: integer;
+  OffsetA, OffsetD, OffsetF: TNeuralFloat;
+begin
+  ProbMap := TNNetVolume.Create(40, 30, 1);
+  try
+    ProbMap.Fill(0.05);
+    for Y := 4 to 7 do                      // A: 10x4 text line
+      for X := 5 to 14 do ProbMap[X, Y, 0] := 0.9;
+    for Y := 2 to 3 do                      // B: 2x2, below the size filter
+      for X := 30 to 31 do ProbMap[X, Y, 0] := 0.9;
+    for DiagonalPos := 0 to 3 do            // D: joined only diagonally
+      ProbMap[20 + DiagonalPos, 10 + DiagonalPos, 0] := 0.9;
+    for Y := 20 to 25 do                    // E: weak 8x6 region
+      for X := 2 to 9 do ProbMap[X, Y, 0] := 0.32;
+    for Y := 27 to 29 do                    // F: 4x3 in the bottom-left corner
+      for X := 0 to 3 do ProbMap[X, Y, 0] := 0.9;
+    AssertEquals('8-connected components', 5,
+      LabelEightConnectedComponents(ProbMap, 0, 0.3, Labels));
+    AssertEquals('B is first in raster order', 1, Labels[2 * 40 + 30]);
+    AssertEquals('A label', 2, Labels[4 * 40 + 5]);
+    AssertEquals('D diagonal joined', 3, Labels[13 * 40 + 23]);
+    AssertEquals('background', 0, Labels[0]);
+    Config := DefaultDBNetConfig();
+    Config.BoxThreshold := 0.12;
+    Placement.Left := 0;
+    Placement.Top := 0;
+    Placement.ContentX := 40;
+    Placement.ContentY := 30;
+    Placement.Scale := 1;
+    Boxes := DecodeDBNetTextBoxes(ProbMap, Config, Placement, 40, 30);
+    AssertEquals('A, D, E, F kept', 4, Length(Boxes));
+    // offset = w * h * 1.5 / (2 * (w + h)); score over x..x+w, y..y+h.
+    OffsetA := 10 * 4 * 1.5 / 28;
+    AssertEquals('A x1', 5 - OffsetA, Boxes[0].X1, 1e-5);
+    AssertEquals('A y1', 4 - OffsetA, Boxes[0].Y1, 1e-5);
+    AssertEquals('A x2', 15 + OffsetA, Boxes[0].X2, 1e-5);
+    AssertEquals('A y2', 8 + OffsetA, Boxes[0].Y2, 1e-5);
+    AssertEquals('A score', (40 * 0.9 + 15 * 0.05) / 55, Boxes[0].Score, 1e-5);
+    OffsetD := 4 * 4 * 1.5 / 16;
+    AssertEquals('D x1', 20 - OffsetD, Boxes[1].X1, 1e-5);
+    AssertEquals('D y2', 14 + OffsetD, Boxes[1].Y2, 1e-5);
+    AssertEquals('D score', (4 * 0.9 + 21 * 0.05) / 25, Boxes[1].Score, 1e-5);
+    AssertEquals('E score', (48 * 0.32 + 15 * 0.05) / 63, Boxes[2].Score, 1e-5);
+    OffsetF := 4 * 3 * 1.5 / 14;
+    AssertEquals('F x1 clipped', 0, Boxes[3].X1, 1e-6);
+    AssertEquals('F y1', 27 - OffsetF, Boxes[3].Y1, 1e-5);
+    AssertEquals('F x2', 4 + OffsetF, Boxes[3].X2, 1e-5);
+    AssertEquals('F y2 clipped', 30, Boxes[3].Y2, 1e-6);
+    AssertEquals('F score (bottom row clipped)', (12 * 0.9 + 3 * 0.05) / 15,
+      Boxes[3].Score, 1e-5);
+    AssertEquals('class', 0, Boxes[3].ClassId);
+    Config.BoxThreshold := 0.3;
+    Boxes := DecodeDBNetTextBoxes(ProbMap, Config, Placement, 40, 30);
+    AssertEquals('box_thresh 0.3 keeps A and F', 2, Length(Boxes));
+    AssertEquals('second box is F', 0, Boxes[1].X1, 1e-6);
+    // Content at (4, 2), 32x26 net pixels for a 64x52 image: x2 image px.
+    Placement.Left := 4;
+    Placement.Top := 2;
+    Placement.ContentX := 32;
+    Placement.ContentY := 26;
+    Boxes := DecodeDBNetTextBoxes(ProbMap, Config, Placement, 64, 52);
+    AssertEquals('A x1 clipped to the image', 0, Boxes[0].X1, 1e-6);
+    AssertEquals('A x2 in image pixels', (15 + OffsetA - 4) * 2, Boxes[0].X2, 1e-4);
+    AssertEquals('A y2 in image pixels', (8 + OffsetA - 2) * 2, Boxes[0].Y2, 1e-4);
+    AssertEquals('F y2 in image pixels', 52, Boxes[1].Y2, 1e-4);
+  finally
+    ProbMap.Free;
+  end;
 end;
 
 // A FastSAM-x config with only widths/depths derives the ultralytics head widths.

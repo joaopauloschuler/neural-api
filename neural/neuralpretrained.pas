@@ -17536,6 +17536,94 @@ type
 procedure LetterboxYoloImage(Image, NetInput: TNNetVolume; Size: integer;
   out Box: TYoloLetterbox);
 
+// ---------------------------------------------------------------------------
+// DBNET TEXT DETECTION IMPORT (Liao et al. AAAI 2020, "Real-time Scene Text
+// Detection with Differentiable Binarization", as packaged by docTR:
+// db_mobilenet_v3_large / db_resnet50). One TNNet per input size: normalized
+// RGB (InputWidth, InputHeight, 3) -> torchvision mobilenet_v3_large features
+// (outputs of features 3, 6, 12, 16) or ResNet-50 (layer1..layer4) -> FPN
+// (1x1 conv-BN-ReLU laterals, top-down bilinear align_corners add, 3x3
+// conv-BN-ReLU per level, bilinear upsample to 1/4, concat) -> prob_head
+// (3x3 conv-BN-ReLU, 2x2 stride-2 deconv-BN-ReLU, 2x2 stride-2 deconv) ->
+// sigmoid. Output (InputWidth, InputHeight, NumClasses) text probability.
+// The thresh_head (training only) is not built. Coded by Claude (AI).
+const
+  csDBNetMobileNetV3Large = 'mobilenet_v3_large';
+  csDBNetResNet50 = 'resnet50';
+
+type
+  TDBNetConfig = record
+    Arch: string;                           // config.json "arch" ('' = any)
+    Backbone: string;                       // csDBNetMobileNetV3Large / csDBNetResNet50
+    MobileNet: TMobileNetV3Config;          // mobilenet trunk (from shapes)
+    ResNet: TResNetConfig;                  // resnet50 trunk (from shapes)
+    StageChannels: array[0..3] of integer;  // the four FPN input widths
+    HeadChannels: integer;                  // FPN width (docTR head_chans, 256)
+    LevelChannels: integer;                 // per-level 3x3 width (HeadChannels/4)
+    ProbHeadChannels: integer;              // prob_head inner width (HeadChannels/4)
+    NumClasses: integer;                    // probability-map channels
+    InputWidth, InputHeight: integer;       // net input, multiples of 32
+    Mean, Std: array[0..2] of TNeuralFloat; // on RGB in [0, 1]
+    PreserveAspectRatio, SymmetricPad: boolean;
+    BinThreshold: TNeuralFloat;             // pixel is text if prob > this
+    BoxThreshold: TNeuralFloat;             // keep boxes with mean prob >= this
+    UnclipRatio: TNeuralFloat;              // DB box expansion ratio
+    MinBoxSize: integer;                    // drop boxes narrower than this (map px)
+    BnEps: TNeuralFloat;                    // FPN / head BatchNorm eps
+  end;
+
+  // One detected text box in input-image pixels; ClassId = probability channel.
+  TDBNetTextBox = record
+    X1, Y1, X2, Y2, Score: TNeuralFloat;
+    ClassId: integer;
+  end;
+  TDBNetTextBoxArray = array of TDBNetTextBox;
+
+// docTR defaults: 1024x1024, mean (0.798, 0.785, 0.772), std (0.264, 0.2749,
+// 0.287), aspect-preserving symmetric pad, bin 0.3, box 0.1, unclip 1.5.
+function DefaultDBNetConfig(): TDBNetConfig;
+
+// DefaultDBNetConfig overridden by docTR config.json "arch", "mean", "std", "input_shape"
+// ([3, H, W]), "bin_thresh", "box_thresh", "unclip_ratio", "preserve_aspect_ratio", "symmetric_pad".
+function ReadDBNetConfigFromJSONFile(const FileName: string): TDBNetConfig;
+
+// Fills Config's architecture fields (backbone, widths, class count) from the
+// checkpoint shapes; a config "arch" naming another backbone raises.
+procedure InferDBNetConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TDBNetConfig);
+
+function DBNetConfigToString(const Config: TDBNetConfig): string;
+
+// Builds the DBNet for Config and loads every weight, folding each BatchNorm
+// (caller owns Reader). Config must already hold the inferred architecture.
+function BuildDBNet(Reader: TNNetSafeTensorsReader; const Config: TDBNetConfig;
+  pTrainable: boolean = true): TNNet;
+
+function BuildDBNetFromSafeTensorsEx(const FileName: string;
+  const Config: TDBNetConfig; pTrainable: boolean = true): TNNet;
+
+// Reads ConfigFileName ('' = "config.json" beside FileName, docTR defaults when
+// that file is absent), infers the architecture and builds the net.
+function BuildDBNetFromSafeTensors(const FileName: string;
+  out Config: TDBNetConfig; pTrainable: boolean = true;
+  const ConfigFileName: string = ''): TNNet;
+
+// docTR PreProcessor: Image (W, H, 3) RGB 0..255 -> NetInput (InputWidth,
+// InputHeight, 3) resized (PIL bilinear), zero padded, then (v - mean) / std.
+procedure DBNetPrepareInput(Image: TNNetVolume; const Config: TDBNetConfig;
+  NetInput: TNNetVolume; out Placement: TYoloLetterbox);
+
+// docTR DBPostProcessor (straight pages) on ProbMap: binarize, label 8-connected
+// regions, score, unclip, then map from net pixels to ImageWidth x ImageHeight.
+function DecodeDBNetTextBoxes(ProbMap: TNNetVolume; const Config: TDBNetConfig;
+  const Placement: TYoloLetterbox; ImageWidth,
+  ImageHeight: integer): TDBNetTextBoxArray;
+
+// DBNetPrepareInput -> NN.Compute -> DecodeDBNetTextBoxes, in pixels of Image;
+// ProbMap (nil = not kept) receives the net output.
+function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
+  Image: TNNetVolume; ProbMap: TNNetVolume = nil): TDBNetTextBoxArray;
+
 type
   // One person: the xyxy detector box in photo pixels, its score and the joints.
   TPoseKeypoints = record
@@ -69470,8 +69558,8 @@ begin
   end;
 end;
 
-// Loads a torch ConvTranspose2d (weight [I,O,K,K] + bias [O]) into a TNNetDeconvolution
-// (weights (kx,ky,c) per out channel), folding BatchNorm BnPrefix into it when <> ''.
+// Loads a torch ConvTranspose2d (weight [I,O,K,K] + bias [O], BName '' = no bias) into
+// a TNNetDeconvolution (weights (kx,ky,c) per out channel), folding BnPrefix when <> ''.
 procedure LoadConvTranspose2DFoldBN(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string;
   InCh, OutCh, K: integer; const BnPrefix: string = '';
@@ -69504,10 +69592,18 @@ begin
   Var_ := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, W);
-    Reader.LoadTensorFlat(BName, B);
-    if B.Size <> OutCh then
-      ImportError('ConvTranspose2d import: "' + BName + '" must have ' +
-        IntToStr(OutCh) + ' elements.');
+    if BName <> '' then
+    begin
+      Reader.LoadTensorFlat(BName, B);
+      if B.Size <> OutCh then
+        ImportError('ConvTranspose2d import: "' + BName + '" must have ' +
+          IntToStr(OutCh) + ' elements.');
+    end
+    else
+    begin
+      B.ReSize(OutCh, 1, 1);
+      B.Fill(0);
+    end;
     if BnPrefix <> '' then
     begin
       if not Reader.HasTensor(BnPrefix + '.weight') then
@@ -71788,9 +71884,9 @@ begin
 end;
 
 // Loads the AddMobileNetV3Trunk weights from the torchvision keys
-// Prefix + 'features.{i}...', folding every BatchNorm.
+// FeaturesPrefix + '{i}...' (e.g. 'features.'), folding every BatchNorm.
 procedure LoadMobileNetV3Trunk(Reader: TNNetSafeTensorsReader;
-  const Config: TMobileNetV3Config; const Prefix: string;
+  const Config: TMobileNetV3Config; const FeaturesPrefix: string;
   const Trunk: TMobileNetV3Trunk);
 var
   i, InChannels, LastFeatIdx, BlocksHi: integer;
@@ -71799,15 +71895,15 @@ var
 begin
   BlocksHi := High(Config.Blocks);
   // features.0.0 = stem conv, features.0.1 = stem BN.
-  LoadResNetConvFoldBN(Reader, Trunk.StemConv, Prefix + 'features.0.0.weight',
-    Prefix + 'features.0.1', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
+  LoadResNetConvFoldBN(Reader, Trunk.StemConv, FeaturesPrefix + '0.0.weight',
+    FeaturesPrefix + '0.1', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
   InChannels := Config.StemWidth;
   for i := 0 to BlocksHi do
   begin
     // MBConv body keys: features.{i+1}.block.{j}...; j advances over the
     // optional expand sub-block (ConvNormActivation = .0 conv .1 bn), the
     // depthwise sub-block, the optional SE module, and the project sub-block.
-    BlockPrefix := Prefix + 'features.' + IntToStr(i + 1) + '.block.';
+    BlockPrefix := FeaturesPrefix + IntToStr(i + 1) + '.block.';
     if Trunk.Blocks[i].HasExpand then
     begin
       LoadResNetConvFoldBN(Reader, Trunk.Blocks[i].Expand,
@@ -71852,8 +71948,8 @@ begin
   // head conv+BN: features.{last}.0 / .1
   LastFeatIdx := Length(Config.Blocks) + 1;
   LoadResNetConvFoldBN(Reader, Trunk.HeadConv,
-    Prefix + 'features.' + IntToStr(LastFeatIdx) + '.0.weight',
-    Prefix + 'features.' + IntToStr(LastFeatIdx) + '.1',
+    FeaturesPrefix + IntToStr(LastFeatIdx) + '.0.weight',
+    FeaturesPrefix + IntToStr(LastFeatIdx) + '.1',
     Config.HeadConvWidth, InChannels, 1, Config.BnEps);
 end;
 
@@ -71882,7 +71978,7 @@ begin
     if not pTrainable then NN.SetTrainable();
 
     // ---------------- Weights ----------------
-    LoadMobileNetV3Trunk(Reader, Config, '', Trunk);
+    LoadMobileNetV3Trunk(Reader, Config, 'features.', Trunk);
     // classifier.0 (Linear, with bias) -> hard-swish -> classifier.3 (Linear).
     LoadLlamaLinearWeights(Reader, FC0, 'classifier.0.weight',
       Config.HeadConvWidth, Config.ClassifierHidden, 0, -1, 0,
@@ -117010,15 +117106,15 @@ end;
 
 const
   csRVMImporter = 'RVM import';
-  csRVMBlockCount = 15;
-  // MobileNetV3LargeEncoder per-block stride, hard-swish flag and dilation.
-  csRVMBlockStride: array[0..csRVMBlockCount - 1] of integer =
+  // torchvision mobilenet_v3_large: MBConv block count, per-block stride and
+  // hard-swish flag; the last csMobileNetV3LargeLastStageBlocks blocks form C4.
+  csMobileNetV3LargeBlockCount = 15;
+  csMobileNetV3LargeLastStageBlocks = 3;
+  csMobileNetV3LargeBlockStride: array[0..csMobileNetV3LargeBlockCount - 1] of integer =
     (1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 1, 1, 2, 1, 1);
-  csRVMBlockHardSwish: array[0..csRVMBlockCount - 1] of boolean =
+  csMobileNetV3LargeBlockHardSwish: array[0..csMobileNetV3LargeBlockCount - 1] of boolean =
     (false, false, false, false, false, false, true, true, true, true, true,
      true, true, true, true);
-  csRVMBlockDilation: array[0..csRVMBlockCount - 1] of integer =
-    (1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2);
   // Blocks whose outputs are f1 (1/2), f2 (1/4), f3 (1/8): features[1]/[3]/[6].
   csRVMFeatureBlocks: array[0..2] of integer = (0, 2, 5);
   csRVMImageMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
@@ -117035,6 +117131,15 @@ begin
   Result := Reader.DimSize(Name, Axis);
 end;
 
+// Size of axis Axis of tensor Name; a missing tensor raises an ImporterName error.
+function ImportTensorDim(Reader: TNNetSafeTensorsReader;
+  const ImporterName, Name: string; Axis: integer): integer;
+begin
+  if not Reader.HasTensor(Name) then
+    ImportError(ImporterName + ': missing tensor "' + Name + '".');
+  Result := Reader.DimSize(Name, Axis);
+end;
+
 // torchvision Bottleneck ResNet trunk under Prefix (e.g. 'backbone.'): stem width
 // and per-stage widths and block counts from the shapes; no stage dilated.
 function InferResNetTrunkConfig(Reader: TNNetSafeTensorsReader;
@@ -117045,9 +117150,7 @@ var
 
   function TrunkDim(const Name: string; Axis: integer): integer;
   begin
-    if not Reader.HasTensor(Name) then
-      ImportError(ImporterName + ': missing tensor "' + Name + '".');
-    Result := Reader.DimSize(Name, Axis);
+    Result := ImportTensorDim(Reader, ImporterName, Name, Axis);
   end;
 
 begin
@@ -117080,12 +117183,20 @@ begin
   Result.PyTorchMaxPool := true;
 end;
 
-// MobileNetV3LargeEncoder: the 15 MBConv widths/kernels/SE from the
-// "backbone.features.*" shapes; strides and dilations are fixed by RVM.
-function InferRVMMobileNetConfig(Reader: TNNetSafeTensorsReader): TMobileNetV3Config;
+// torchvision mobilenet_v3_large features: the 15 MBConv widths/kernels/SE
+// from the FeaturesPrefix + '{i}.*' shapes; DilateLastStage = dilated=True.
+function InferMobileNetV3LargeConfig(Reader: TNNetSafeTensorsReader;
+  const FeaturesPrefix, ImporterName: string;
+  DilateLastStage: boolean): TMobileNetV3Config;
 var
   BlockPos, InChannels, DwIdx, ProjIdx: integer;
   BlockPrefix: string;
+
+  function FeatureDim(const Name: string; Axis: integer): integer;
+  begin
+    Result := ImportTensorDim(Reader, ImporterName, Name, Axis);
+  end;
+
 begin
   Result.Variant := 'large';
   Result.ModelType := 'mobilenet_v3';
@@ -117094,15 +117205,15 @@ begin
   Result.NumLabels := 0;
   Result.ClassifierHidden := 0;
   Result.BnEps := 0.001;
-  Result.StemWidth := RVMDim(Reader, 'backbone.features.0.0.weight', 0);
-  SetLength(Result.Blocks, csRVMBlockCount);
+  Result.StemWidth := FeatureDim(FeaturesPrefix + '0.0.weight', 0);
+  SetLength(Result.Blocks, csMobileNetV3LargeBlockCount);
   InChannels := Result.StemWidth;
-  for BlockPos := 0 to csRVMBlockCount - 1 do
+  for BlockPos := 0 to csMobileNetV3LargeBlockCount - 1 do
     with Result.Blocks[BlockPos] do
     begin
-      BlockPrefix := 'backbone.features.' + IntToStr(BlockPos + 1) + '.block.';
+      BlockPrefix := FeaturesPrefix + IntToStr(BlockPos + 1) + '.block.';
       // The expand 1x1 is absent when exp == in; block.0 is then the depthwise.
-      if RVMDim(Reader, BlockPrefix + '0.0.weight', 1) <> 1 then
+      if FeatureDim(BlockPrefix + '0.0.weight', 1) <> 1 then
       begin
         ExpChannels := Reader.DimSize(BlockPrefix + '0.0.weight', 0);
         DwIdx := 1;
@@ -117112,7 +117223,7 @@ begin
         ExpChannels := InChannels;
         DwIdx := 0;
       end;
-      Kernel := RVMDim(Reader, BlockPrefix + IntToStr(DwIdx) + '.0.weight', 2);
+      Kernel := FeatureDim(BlockPrefix + IntToStr(DwIdx) + '.0.weight', 2);
       UseSE := Reader.HasTensor(BlockPrefix + IntToStr(DwIdx + 1) + '.fc1.weight');
       if UseSE then
       begin
@@ -117125,18 +117236,22 @@ begin
         SEChannels := 0;
         ProjIdx := DwIdx + 1;
       end;
-      OutChannels := RVMDim(Reader, BlockPrefix + IntToStr(ProjIdx) + '.0.weight', 0);
-      Stride := csRVMBlockStride[BlockPos];
-      UseHardSwish := csRVMBlockHardSwish[BlockPos];
-      Dilation := csRVMBlockDilation[BlockPos];
+      OutChannels := FeatureDim(BlockPrefix + IntToStr(ProjIdx) + '.0.weight', 0);
+      Stride := csMobileNetV3LargeBlockStride[BlockPos];
+      UseHardSwish := csMobileNetV3LargeBlockHardSwish[BlockPos];
+      if DilateLastStage and (BlockPos >=
+        csMobileNetV3LargeBlockCount - csMobileNetV3LargeLastStageBlocks) then
+        Dilation := 2
+      else
+        Dilation := 1;
       InChannels := OutChannels;
     end;
-  if Reader.HasTensor('backbone.features.' + IntToStr(csRVMBlockCount + 1) +
+  if Reader.HasTensor(FeaturesPrefix + IntToStr(csMobileNetV3LargeBlockCount + 1) +
     '.block.0.0.weight') then
-    ImportError(csRVMImporter + ': the backbone has more than ' +
-      IntToStr(csRVMBlockCount) + ' MBConv blocks.');
-  Result.HeadConvWidth := RVMDim(Reader, 'backbone.features.' +
-    IntToStr(csRVMBlockCount + 1) + '.0.weight', 0);
+    ImportError(ImporterName + ': the backbone has more than ' +
+      IntToStr(csMobileNetV3LargeBlockCount) + ' MBConv blocks.');
+  Result.HeadConvWidth := FeatureDim(FeaturesPrefix +
+    IntToStr(csMobileNetV3LargeBlockCount + 1) + '.0.weight', 0);
 end;
 
 function InferRVMConfigFromTensors(Reader: TNNetSafeTensorsReader;
@@ -117174,7 +117289,9 @@ begin
   end
   else
   begin
-    Result.Backbone := InferRVMMobileNetConfig(Reader);
+    // MobileNetV3LargeEncoder is mobilenet_v3_large(dilated=True).features.
+    Result.Backbone := InferMobileNetV3LargeConfig(Reader, 'backbone.features.',
+      csRVMImporter, {DilateLastStage=}true);
     Result.ResNet.Depth := 0;
     for BlockPos := 0 to 2 do
       Result.FeatureChannels[BlockPos] :=
@@ -117402,9 +117519,9 @@ begin
   IsResNet := Config.Variant = 'resnet50';
   if not IsResNet and (Config.Variant <> 'mobilenetv3') then
     ImportError(csRVMImporter + ': unsupported variant "' + Config.Variant + '".');
-  if not IsResNet and (Length(Config.Backbone.Blocks) <> csRVMBlockCount) then
+  if not IsResNet and (Length(Config.Backbone.Blocks) <> csMobileNetV3LargeBlockCount) then
     ImportError(csRVMImporter + ': the backbone config needs ' +
-      IntToStr(csRVMBlockCount) + ' blocks.');
+      IntToStr(csMobileNetV3LargeBlockCount) + ' blocks.');
   TrunkWidth := RVMTrunkWidth(Config);
   IsFastRefiner := Config.Refiner = csRVMFastGuidedFilter;
   if not IsFastRefiner and (Config.Refiner <> csRVMDeepGuidedFilter) then
@@ -117565,7 +117682,7 @@ begin
     if IsResNet then
       LoadResNetTrunk(Reader, Config.ResNet, 'backbone.', ResNetTrunk)
     else
-      LoadMobileNetV3Trunk(Reader, Config.Backbone, 'backbone.', Trunk);
+      LoadMobileNetV3Trunk(Reader, Config.Backbone, 'backbone.features.', Trunk);
     LoadResNetConvFoldBN(Reader, Aspp1, 'aspp.aspp1.0.weight', 'aspp.aspp1.1',
       Config.FeatureChannels[3], TrunkWidth, 1, Config.BnEps);
     LoadResNetConvFoldBN(Reader, Aspp2, 'aspp.aspp2.1.weight', '',
@@ -119355,6 +119472,462 @@ begin
   Result := RestoreFacesInImage(Detector, DetectorConfig, Restorer,
     RestorerConfig.ImageSize, Image, Background, Output, UpscaleFactor,
     ConfThreshold, MinEyeDistance, MaxFaces, Crops, RestoredFaces, Parser);
+end;
+
+// ===========================================================================
+// DBNET TEXT DETECTION IMPORT
+// ===========================================================================
+
+const
+  csDBNetImporter = 'DBNet import';
+  // mobilenet_v3_large MBConv blocks whose outputs are features 3, 6 and 12;
+  // feature 16 is the trunk head conv.
+  csDBNetMobileNetTapBlocks: array[0..2] of integer = (2, 5, 11);
+  csDBNetLevelCount = 4;
+
+function DefaultDBNetConfig(): TDBNetConfig;
+const
+  DocTRMean: array[0..2] of TNeuralFloat = (0.798, 0.785, 0.772);
+  DocTRStd: array[0..2] of TNeuralFloat = (0.264, 0.2749, 0.287);
+begin
+  Result := Default(TDBNetConfig);
+  Result.InputWidth := 1024;
+  Result.InputHeight := 1024;
+  Move(DocTRMean[0], Result.Mean[0], SizeOf(DocTRMean));
+  Move(DocTRStd[0], Result.Std[0], SizeOf(DocTRStd));
+  Result.PreserveAspectRatio := true;
+  Result.SymmetricPad := true;
+  Result.BinThreshold := 0.3;
+  Result.BoxThreshold := 0.1;
+  Result.UnclipRatio := 1.5;
+  Result.MinBoxSize := 2;
+  Result.BnEps := 0.00001;
+end;
+
+function ReadDBNetConfigFromJSONFile(const FileName: string): TDBNetConfig;
+var
+  Obj: TJSONObject;
+  ShapeArr: TJSONArray;
+
+  procedure ReadTriple(const Key: string; var Values: array of TNeuralFloat);
+  var
+    Arr: TJSONArray;
+    Channel: integer;
+  begin
+    if Obj.Find(Key) = nil then Exit;
+    if not (Obj.Find(Key) is TJSONArray) or
+      (TJSONArray(Obj.Find(Key)).Count <> 3) then
+      ImportError(csDBNetImporter + ': "' + Key + '" must be a 3-number array.');
+    Arr := TJSONArray(Obj.Find(Key));
+    for Channel := 0 to 2 do Values[Channel] := Arr.Floats[Channel];
+  end;
+
+begin
+  Result := DefaultDBNetConfig();
+  Obj := LoadImportJSONObject(FileName, 'DBNet');
+  try
+    Result.Arch := Obj.Get('arch', '');
+    ReadTriple('mean', Result.Mean);
+    ReadTriple('std', Result.Std);
+    if Obj.Find('input_shape') <> nil then
+    begin
+      if not (Obj.Find('input_shape') is TJSONArray) or
+        (TJSONArray(Obj.Find('input_shape')).Count <> 3) then
+        ImportError(csDBNetImporter + ': "input_shape" must be [3, H, W].');
+      ShapeArr := TJSONArray(Obj.Find('input_shape'));
+      Result.InputHeight := ShapeArr.Integers[1];
+      Result.InputWidth := ShapeArr.Integers[2];
+    end;
+    Result.BinThreshold := Obj.Get('bin_thresh', Double(Result.BinThreshold));
+    Result.BoxThreshold := Obj.Get('box_thresh', Double(Result.BoxThreshold));
+    Result.UnclipRatio := Obj.Get('unclip_ratio', Double(Result.UnclipRatio));
+    Result.PreserveAspectRatio := Obj.Get('preserve_aspect_ratio',
+      Result.PreserveAspectRatio);
+    Result.SymmetricPad := Obj.Get('symmetric_pad', Result.SymmetricPad);
+  finally
+    Obj.Free;
+  end;
+end;
+
+procedure InferDBNetConfigFromTensors(Reader: TNNetSafeTensorsReader;
+  var Config: TDBNetConfig);
+var
+  Level: integer;
+  LevelPrefix: string;
+begin
+  if Reader.HasTensor('feat_extractor.conv1.weight') then
+  begin
+    Config.Backbone := csDBNetResNet50;
+    Config.ResNet := InferResNetTrunkConfig(Reader, 'feat_extractor.',
+      csDBNetImporter);
+    for Level := 0 to csDBNetLevelCount - 1 do
+      Config.StageChannels[Level] := Config.ResNet.StageWidths[Level] *
+        Config.ResNet.Expansion;
+  end
+  else if Reader.HasTensor('feat_extractor.0.0.weight') then
+  begin
+    Config.Backbone := csDBNetMobileNetV3Large;
+    Config.MobileNet := InferMobileNetV3LargeConfig(Reader, 'feat_extractor.',
+      csDBNetImporter, {DilateLastStage=}false);
+    for Level := 0 to 2 do
+      Config.StageChannels[Level] :=
+        Config.MobileNet.Blocks[csDBNetMobileNetTapBlocks[Level]].OutChannels;
+    Config.StageChannels[3] := Config.MobileNet.HeadConvWidth;
+  end
+  else
+    ImportError(csDBNetImporter + ': neither "feat_extractor.0.0.weight" ' +
+      '(mobilenet_v3_large) nor "feat_extractor.conv1.weight" (resnet50) ' +
+      'found; not a docTR DBNet checkpoint.');
+  if (Config.Arch <> '') and (Config.Arch <> 'db_' + Config.Backbone) then
+    ImportError(csDBNetImporter + ': config arch "' + Config.Arch +
+      '" does not match the checkpoint backbone "' + Config.Backbone + '".');
+  Config.HeadChannels := ImportTensorDim(Reader, csDBNetImporter,
+    'fpn.in_branches.0.0.weight', 0);
+  for Level := 0 to csDBNetLevelCount - 1 do
+  begin
+    LevelPrefix := 'fpn.in_branches.' + IntToStr(Level) + '.0.weight';
+    if (ImportTensorDim(Reader, csDBNetImporter, LevelPrefix, 0) <>
+      Config.HeadChannels) or
+      (Reader.DimSize(LevelPrefix, 1) <> Config.StageChannels[Level]) then
+      ImportError(csDBNetImporter + ': "' + LevelPrefix + '" must have shape [' +
+        IntToStr(Config.HeadChannels) + ', ' +
+        IntToStr(Config.StageChannels[Level]) + ', 1, 1], got ' +
+        Reader.ShapeAsString(LevelPrefix));
+  end;
+  Config.LevelChannels := ImportTensorDim(Reader, csDBNetImporter,
+    'fpn.out_branches.0.0.weight', 0);
+  Config.ProbHeadChannels := ImportTensorDim(Reader, csDBNetImporter,
+    'prob_head.0.weight', 0);
+  Config.NumClasses := ImportTensorDim(Reader, csDBNetImporter,
+    'prob_head.6.weight', 1);
+end;
+
+function DBNetConfigToString(const Config: TDBNetConfig): string;
+begin
+  Result := 'DBNet(' + Config.Backbone + ', stages ' +
+    IntToStr(Config.StageChannels[0]) + '/' + IntToStr(Config.StageChannels[1]) +
+    '/' + IntToStr(Config.StageChannels[2]) + '/' +
+    IntToStr(Config.StageChannels[3]) + ', fpn ' + IntToStr(Config.HeadChannels) +
+    ', classes ' + IntToStr(Config.NumClasses) + ', input ' +
+    IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight) +
+    ', bin ' + FloatToStr(Config.BinThreshold) + ', box ' +
+    FloatToStr(Config.BoxThreshold) + ', unclip ' +
+    FloatToStr(Config.UnclipRatio) + ')';
+end;
+
+function BuildDBNet(Reader: TNNetSafeTensorsReader; const Config: TDBNetConfig;
+  pTrainable: boolean): TNNet;
+var
+  NN: TNNet;
+  MobileTrunk: TMobileNetV3Trunk;
+  ResNetTrunk: TResNetTrunk;
+  Taps, Laterals, Merged, LevelConvs, LevelOutputs:
+    array[0..csDBNetLevelCount - 1] of TNNetLayer;
+  HeadConv, HeadDeconv, ProbDeconv: TNNetLayer;
+  Level, Factor: integer;
+  LevelPrefix: string;
+begin
+  if (Config.Backbone <> csDBNetMobileNetV3Large) and
+    (Config.Backbone <> csDBNetResNet50) then
+    ImportError(csDBNetImporter + ': unknown backbone "' + Config.Backbone +
+      '"; call InferDBNetConfigFromTensors first.');
+  if (Config.InputWidth < 32) or (Config.InputHeight < 32) or
+    (Config.InputWidth mod 32 <> 0) or (Config.InputHeight mod 32 <> 0) then
+    ImportError(csDBNetImporter + ': input ' + IntToStr(Config.InputWidth) + 'x' +
+      IntToStr(Config.InputHeight) + ' must be a positive multiple of 32.');
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.InputWidth, Config.InputHeight, 3) );
+    if Config.Backbone = csDBNetResNet50 then
+    begin
+      AddResNetTrunk(NN, Config.ResNet, pTrainable, ResNetTrunk);
+      for Level := 0 to csDBNetLevelCount - 1 do
+        Taps[Level] := ResNetTrunk.StageOutputs[Level];
+    end
+    else
+    begin
+      AddMobileNetV3Trunk(NN, Config.MobileNet, pTrainable, MobileTrunk);
+      for Level := 0 to 2 do
+        Taps[Level] := MobileTrunk.BlockOutputs[csDBNetMobileNetTapBlocks[Level]];
+      Taps[3] := MobileTrunk.HeadOutput;
+    end;
+    for Level := 0 to csDBNetLevelCount - 1 do
+      Laterals[Level] := NN.AddLayerAfter( TNNetConvolutionReLU.Create(
+        Config.HeadChannels, 1, 0, 1, 0).SetTrainable(pTrainable), Taps[Level] );
+    // Top-down: bilinear (align_corners=True) 2x of the coarser sum + lateral.
+    Merged[3] := Laterals[3];
+    for Level := 2 downto 0 do
+    begin
+      NN.AddLayerAfter( TNNetBilinearResize.Create(Laterals[Level].Output.SizeX,
+        Laterals[Level].Output.SizeY, {AlignCorners=}1), Merged[Level + 1] );
+      Merged[Level] := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(),
+        Laterals[Level]]) );
+    end;
+    for Level := 0 to csDBNetLevelCount - 1 do
+    begin
+      LevelConvs[Level] := NN.AddLayerAfter( TNNetConvolutionReLU.Create(
+        Config.LevelChannels, 3, 1, 1, 0).SetTrainable(pTrainable), Merged[Level] );
+      LevelOutputs[Level] := LevelConvs[Level];
+      if Level > 0 then
+      begin
+        Factor := 1 shl Level;
+        LevelOutputs[Level] := NN.AddLayer( TNNetBilinearResize.Create(
+          LevelConvs[Level].Output.SizeX * Factor,
+          LevelConvs[Level].Output.SizeY * Factor, {AlignCorners=}1) );
+      end;
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create([LevelOutputs[0], LevelOutputs[1],
+      LevelOutputs[2], LevelOutputs[3]]) );
+    HeadConv := NN.AddLayer( TNNetConvolutionReLU.Create(Config.ProbHeadChannels,
+      3, 1, 1, 0).SetTrainable(pTrainable) );
+    HeadDeconv := NN.AddLayer( TNNetDeconvolutionReLU.Create(
+      Config.ProbHeadChannels, 2, 2, 0, 0).SetTrainable(pTrainable) );
+    ProbDeconv := NN.AddLayer( TNNetDeconvolutionLinear.Create(Config.NumClasses,
+      2, 2, 0, 0).SetTrainable(pTrainable) );
+    NN.AddLayer( TNNetSigmoid.Create() );
+
+    // ---------------- Weights ----------------
+    if Config.Backbone = csDBNetResNet50 then
+      LoadResNetTrunk(Reader, Config.ResNet, 'feat_extractor.', ResNetTrunk)
+    else
+      LoadMobileNetV3Trunk(Reader, Config.MobileNet, 'feat_extractor.',
+        MobileTrunk);
+    for Level := 0 to csDBNetLevelCount - 1 do
+    begin
+      LevelPrefix := 'fpn.in_branches.' + IntToStr(Level);
+      LoadResNetConvFoldBN(Reader, Laterals[Level], LevelPrefix + '.0.weight',
+        LevelPrefix + '.1', Config.HeadChannels, Config.StageChannels[Level], 1,
+        Config.BnEps);
+      LevelPrefix := 'fpn.out_branches.' + IntToStr(Level);
+      LoadResNetConvFoldBN(Reader, LevelConvs[Level], LevelPrefix + '.0.weight',
+        LevelPrefix + '.1', Config.LevelChannels, Config.HeadChannels, 3,
+        Config.BnEps);
+    end;
+    LoadResNetConvFoldBN(Reader, HeadConv, 'prob_head.0.weight', 'prob_head.1',
+      Config.ProbHeadChannels, Config.LevelChannels * csDBNetLevelCount, 3,
+      Config.BnEps);
+    LoadConvTranspose2DFoldBN(Reader, HeadDeconv, 'prob_head.3.weight', '',
+      Config.ProbHeadChannels, Config.ProbHeadChannels, 2, 'prob_head.4',
+      Config.BnEps);
+    LoadConvTranspose2DFoldBN(Reader, ProbDeconv, 'prob_head.6.weight',
+      'prob_head.6.bias', Config.ProbHeadChannels, Config.NumClasses, 2);
+    if not pTrainable then NN.SetTrainable();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildDBNetFromSafeTensorsEx(const FileName: string;
+  const Config: TDBNetConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDBNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDBNetFromSafeTensors(const FileName: string;
+  out Config: TDBNetConfig; pTrainable: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  if (ConfigFileName = '') and not FileExists(ConfigPath) then
+    Config := DefaultDBNetConfig()
+  else
+    Config := ReadDBNetConfigFromJSONFile(ConfigPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    InferDBNetConfigFromTensors(Reader, Config);
+    Result := BuildDBNet(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure DBNetPrepareInput(Image: TNNetVolume; const Config: TDBNetConfig;
+  NetInput: TNNetVolume; out Placement: TYoloLetterbox);
+var
+  Resized, ChannelScale, ChannelShift: TNNetVolume;
+  TargetRatio, ImageRatio: double;
+  Y, MaxY, RowLength, Channel: integer;
+begin
+  if Image.Depth <> 3 then
+    ImportError(csDBNetImporter + ': DBNetPrepareInput needs an RGB image, ' +
+      'got depth ' + IntToStr(Image.Depth) + '.');
+  // docTR Resize: int() of the scaled side, ceil half of the pad on the left/top.
+  TargetRatio := Config.InputHeight / Config.InputWidth;
+  ImageRatio := Image.SizeY / Image.SizeX;
+  Placement.ContentX := Config.InputWidth;
+  Placement.ContentY := Config.InputHeight;
+  if Config.PreserveAspectRatio and (ImageRatio <> TargetRatio) then
+  begin
+    if ImageRatio > TargetRatio then
+      Placement.ContentX := Max(Trunc(Config.InputHeight / ImageRatio), 1)
+    else
+      Placement.ContentY := Max(Trunc(Config.InputWidth * ImageRatio), 1);
+  end;
+  Placement.Left := 0;
+  Placement.Top := 0;
+  if Config.SymmetricPad then
+  begin
+    Placement.Left := (Config.InputWidth - Placement.ContentX + 1) div 2;
+    Placement.Top := (Config.InputHeight - Placement.ContentY + 1) div 2;
+  end;
+  Placement.Scale := Placement.ContentX / Image.SizeX;
+  Resized := TNNetVolume.Create;
+  ChannelScale := TNNetVolume.Create(1, 1, 3);
+  ChannelShift := TNNetVolume.Create(1, 1, 3);
+  try
+    ResizeImagePIL(Image, Resized, Placement.ContentX, Placement.ContentY,
+      irfBilinear);
+    NetInput.ReSize(Config.InputWidth, Config.InputHeight, 3);
+    NetInput.Fill(0);
+    MaxY := Placement.ContentY - 1;
+    RowLength := Placement.ContentX * 3;
+    for Y := 0 to MaxY do
+      Move(Resized.FData[Resized.GetRawPos(0, Y)],
+        NetInput.FData[NetInput.GetRawPos(Placement.Left, Placement.Top + Y)],
+        RowLength * csNeuralFloatSize);
+    // (v / 255 - mean) / std = v * Scale + Shift per channel; the pad maps to -mean/std.
+    for Channel := 0 to 2 do
+    begin
+      ChannelScale.FData[Channel] := 1 / (255 * Config.Std[Channel]);
+      ChannelShift.FData[Channel] := -Config.Mean[Channel] / Config.Std[Channel];
+    end;
+    NetInput.MulChannels(ChannelScale);
+    NetInput.AddToChannels(ChannelShift);
+  finally
+    ChannelShift.Free;
+    ChannelScale.Free;
+    Resized.Free;
+  end;
+end;
+
+function DecodeDBNetTextBoxes(ProbMap: TNNetVolume; const Config: TDBNetConfig;
+  const Placement: TYoloLetterbox; ImageWidth,
+  ImageHeight: integer): TDBNetTextBoxArray;
+var
+  Labels, MinX, MaxX, MinY, MaxY: TNeuralIntegerArray;
+  ClassId, ComponentCount, Component, PixelPos, X, Y, Depth, BoxCount: integer;
+  MapMaxX, MapMaxY, ScoreMaxX, ScoreMaxY, PixelCount, MaxClassId: integer;
+  BoxWidth, BoxHeight: integer;
+  ScoreSum, Score, Offset, X1, Y1, X2, Y2, ToImageX, ToImageY: TNeuralFloat;
+begin
+  Result := nil;
+  if (ProbMap.SizeX = 0) or (ProbMap.SizeY = 0) or
+    (Placement.ContentX < 1) or (Placement.ContentY < 1) then Exit;
+  Depth := ProbMap.Depth;
+  MapMaxX := ProbMap.SizeX - 1;
+  MapMaxY := ProbMap.SizeY - 1;
+  ToImageX := ImageWidth / Placement.ContentX;
+  ToImageY := ImageHeight / Placement.ContentY;
+  BoxCount := 0;
+  MaxClassId := Depth - 1;
+  for ClassId := 0 to MaxClassId do
+  begin
+    ComponentCount := LabelEightConnectedComponents(ProbMap, ClassId,
+      Config.BinThreshold, Labels);
+    SetLength(MinX, ComponentCount + 1);
+    SetLength(MaxX, ComponentCount + 1);
+    SetLength(MinY, ComponentCount + 1);
+    SetLength(MaxY, ComponentCount + 1);
+    for Component := 1 to ComponentCount do
+    begin
+      MinX[Component] := MapMaxX;
+      MaxX[Component] := 0;
+      MinY[Component] := MapMaxY;
+      MaxY[Component] := 0;
+    end;
+    PixelPos := 0;
+    for Y := 0 to MapMaxY do
+      for X := 0 to MapMaxX do
+      begin
+        Component := Labels[PixelPos];
+        if Component > 0 then
+        begin
+          if X < MinX[Component] then MinX[Component] := X;
+          if X > MaxX[Component] then MaxX[Component] := X;
+          if Y < MinY[Component] then MinY[Component] := Y;
+          if Y > MaxY[Component] then MaxY[Component] := Y;
+        end;
+        Inc(PixelPos);
+      end;
+    SetLength(Result, BoxCount + ComponentCount);
+    for Component := 1 to ComponentCount do
+    begin
+      if (MaxX[Component] - MinX[Component] < Config.MinBoxSize) or
+        (MaxY[Component] - MinY[Component] < Config.MinBoxSize) then continue;
+      // docTR box_score: the mean over the bounding rectangle grown by one
+      // pixel right and down (its x + w end point), clipped to the map.
+      ScoreMaxX := Min(MaxX[Component] + 1, MapMaxX);
+      ScoreMaxY := Min(MaxY[Component] + 1, MapMaxY);
+      ScoreSum := 0;
+      for Y := MinY[Component] to ScoreMaxY do
+      begin
+        PixelPos := (Y * ProbMap.SizeX + MinX[Component]) * Depth + ClassId;
+        for X := MinX[Component] to ScoreMaxX do
+        begin
+          ScoreSum := ScoreSum + ProbMap.FData[PixelPos];
+          Inc(PixelPos, Depth);
+        end;
+      end;
+      PixelCount := (ScoreMaxX - MinX[Component] + 1) *
+        (ScoreMaxY - MinY[Component] + 1);
+      Score := ScoreSum / PixelCount;
+      if Score < Config.BoxThreshold then continue;
+      // DB unclip of the w x h rectangle: offset = area * ratio / perimeter.
+      BoxWidth := MaxX[Component] - MinX[Component] + 1;
+      BoxHeight := MaxY[Component] - MinY[Component] + 1;
+      Offset := BoxWidth * BoxHeight * Config.UnclipRatio /
+        (2 * (BoxWidth + BoxHeight));
+      X1 := Max(MinX[Component] - Offset, 0);
+      Y1 := Max(MinY[Component] - Offset, 0);
+      X2 := Min(MaxX[Component] + 1 + Offset, ProbMap.SizeX);
+      Y2 := Min(MaxY[Component] + 1 + Offset, ProbMap.SizeY);
+      if (X2 - X1 < Config.MinBoxSize) or (Y2 - Y1 < Config.MinBoxSize) then
+        continue;
+      Result[BoxCount].X1 := EnsureRange((X1 - Placement.Left) * ToImageX, 0, ImageWidth);
+      Result[BoxCount].Y1 := EnsureRange((Y1 - Placement.Top) * ToImageY, 0, ImageHeight);
+      Result[BoxCount].X2 := EnsureRange((X2 - Placement.Left) * ToImageX, 0, ImageWidth);
+      Result[BoxCount].Y2 := EnsureRange((Y2 - Placement.Top) * ToImageY, 0, ImageHeight);
+      Result[BoxCount].Score := Score;
+      Result[BoxCount].ClassId := ClassId;
+      Inc(BoxCount);
+    end;
+  end;
+  SetLength(Result, BoxCount);
+end;
+
+function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
+  Image: TNNetVolume; ProbMap: TNNetVolume): TDBNetTextBoxArray;
+var
+  NetInput, Output: TNNetVolume;
+  Placement: TYoloLetterbox;
+begin
+  NetInput := TNNetVolume.Create;
+  if ProbMap <> nil then Output := ProbMap
+  else Output := TNNetVolume.Create;
+  try
+    DBNetPrepareInput(Image, Config, NetInput, Placement);
+    NN.Compute(NetInput);
+    NN.GetOutput(Output);
+    Result := DecodeDBNetTextBoxes(Output, Config, Placement, Image.SizeX,
+      Image.SizeY);
+  finally
+    if Output <> ProbMap then Output.Free;
+    NetInput.Free;
+  end;
 end;
 
 {$IFDEF OpenCL}
