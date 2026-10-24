@@ -2423,6 +2423,30 @@ rather than acted on.
             processor (uint8 grayscale before an antialiased resize) is not
             matched, only the PIL backend.
 
+- [ ] EfficientLoFTR detector-free dense matching importer
+      (`BuildEfficientLoFTRFromSafeTensors[Ex]` + `TEfficientLoFTRMatcher`,
+      checkpoint zju-community/efficientloftr, transformers model_type
+      `efficientloftr`; Wang et al. 2024, *Efficient LoFTR: Semi-Dense Local
+      Feature Matching with Sparse-Like Speed*, arXiv:2403.04765). SuperPoint +
+      LightGlue only match points the detector fired on, so they fail on
+      low-texture walls, floors and repeated patterns; EfficientLoFTR matches on
+      a dense 1/8 grid and keeps working there. Graph: a RepVGG grayscale
+      backbone (stage blocks [1,2,4,14], 1/2..1/8 features; fold the branches
+      with the existing `ReparamRepVGGBlock`) -> 4 self/cross
+      `AggregatedAttention` layers (a 4x4 stride-4 depthwise conv on Q and a 4x4
+      max pool on K/V, attention on the reduced grid with 2-D RoPE (check
+      whether `TNNetVisionRoPE2D` matches its pairing), bilinear upsample back,
+      LeakyReLU MLP) -> dual-softmax coarse matching (temperature 0.1,
+      threshold 0.2, border removal 2, mutual-nearest) -> fine fusion pyramid
+      on the 1/2 and 1/4 features, 8x8 window around each coarse match and the
+      sub-pixel expectation step (`fine_matching_regress_temperature`). Add a
+      `--matcher loftr` switch to examples/KeypointMatching that draws the
+      same match picture through the existing renderer, and a README row.
+      Pico-fixture parity < 1e-4 against transformers 5.17
+      `EfficientLoFTRForKeypointMatching` (in the ~/x venv) on the coarse
+      confidence matrix and the final keypoints; ask the user before adding the
+      Python fixture script to tools/.
+
 - [ ] CoTracker3 point tracking importer + examples/PointTracking (Karaev et al.
       2024, *CoTracker3: Simpler and Better Point Tracking by Pseudo-Labelling
       Real Videos*, arXiv:2410.11831; checkpoint facebook/cotracker3,
