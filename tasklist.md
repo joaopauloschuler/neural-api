@@ -1940,8 +1940,7 @@ rather than acted on.
       OpenCL inference forward `cai_triplane_sample` (binds resident sources,
       output stays resident). Tests: hand-derived bilinear cases, save/load,
       gradient check, OpenCL parity (max |diff| 8.3e-7, not bit-identical).
-      Still open: the importer, vertex colouring and the example; chunk the
-      256^3 grid (N * 3 * Cp must stay below 2^31 per forward).
+      Still open: the importer and the example.
   - [ ] T3. Checkpoint reader: load model.ckpt through `TNNetTorchBinReader`,
         list the tensor names (image_tokenizer.*, tokenizer.*, backbone.*,
         post_processor.*, decoder.*) and read config.yaml sizes into a
@@ -1957,67 +1956,6 @@ rather than acted on.
         ff.net.0.proj.weight is [8192, 1024] (GEGLU), and the DINO token count
         is 1025 at 512 px (CLS kept); the image tokens are DINO's
         last_hidden_state, (1025, 1, 768), fed as backbone input 0.
-  - [X] T4. Backbone: factor the BasicTransformerBlock (self-attn + cross-attn
-        + GEGLU FFN) out of AddSDTransformer2D into a shared builder routine,
-        then build Transformer1D over the 3 x 32 x 32 learned tokens
-        (GroupNorm, proj_in, 16 blocks, proj_out) and the 2x2 stride-2
-        post-processor; verify the triplane layout against
-        TNNetDeconvolution's output (planes must not mix).
-        Landed: `AddSDBasicTransformerBlock` / `LoadSDBasicTransformerBlock`
-        (public, with the TSDBasicBlockLayers records) now build and load
-        every SD UNet block; tiny SD UNet structure and weights are
-        byte-identical before and after (SaveStructureToString /
-        SaveDataToString CRC32 on 4 fixtures). `TTripoSRConfig`,
-        `TripoSRDefaultConfig`, `ValidateTripoSRConfig`, `AddTripoSRBackbone`
-        (learned tokens = TNNetLearnedPositionalEmbedding over a zero input,
-        GroupNorm eps 1e-6, proj_in, N shared blocks cross-attending the
-        image tokens, proj_out, + tokens, reshape to (Wp, 3*Hp, C),
-        TNNetDeconvolutionLinear kernel 2 stride 2), `BuildTripoSRBackbone`
-        and `LoadTripoSRBackbone` (tokenizer.embeddings [3, C, Hp, Wp]
-        transposed to "(Np Hp Wp)" token rows, backbone.*,
-        post_processor.upsample.*). Tests: TestTripoSRBackbonePicoShapes
-        (also (32, 96, 1024) -> (64, 192, 40) on TNNetDeconvolution),
-        TestTripoSRPostProcessorPlaneIndependence (perturbing plane k
-        changes exactly output rows [2k*Hp, 2(k+1)*Hp)),
-        TestTripoSRBackboneLoadHandParity (synthetic checkpoint, zeroed
-        to_out / ff.net.2 so the blocks are identity, hand-computed output).
-        No real-checkpoint parity yet (T3 + oracle). RAM, estimated not
-        measured: the full backbone is ~330M FP32 parameters (~1.3 GB), and
-        every per-head attention layer keeps its score matrix (3072 x 3072
-        self, 3072 x 1025 cross: ~9.6 GB + ~3.2 GB over 16 blocks), so T6
-        needs a fused/shared attention path or int8 before a full-size run.
-  - [X] T5. NeRF decoder + density sweep: the per-point MLP after
-        TNNetTriplaneSample (pointwise convs, SiLU, density bias/activation,
-        RGB sigmoid), queried over the marching grid in chunks so
-        N * 3 * Cp < 2^31 and RAM stays under the 2 GB cap; MarchingCubes on
-        the density, then a second query at the vertices for colours.
-        Landed: `TTripoSRConfig` gained DecoderNeurons (64),
-        DecoderHiddenLayers (9), DensityBias (-1.0) and Radius (0.87);
-        `AddTripoSRDecoder` / `BuildTripoSRDecoder(Config, PointsPerChunk)`
-        (input 0 = triplane, input 1 = (N, 1, 3) points; TNNetTriplaneSample
-        zero padding, align_corners false; DecoderHiddenLayers x
-        (TNNetPointwiseConvLinear + TNNetSiLU), a 4-wide head, then
-        exp(density + DensityBias) and sigmoid(rgb) concatenated to (N, 1, 4));
-        `LoadTripoSRDecoder` (decoder.layers.{0, 2, ..., 18}.weight / .bias,
-        ASSUMED from NeRFMLP's nn.Sequential with activations at odd indices,
-        not checked against model.ckpt); `TripoSRDensityGrid` (R^3 grid over
-        [-Radius, Radius]^3, grid point (X, Y, D) = world (x, y, z), one
-        chunk per forward on the same net, no per-chunk allocation),
-        `TripoSRColorVertices` and `TripoSRExtractMesh` (MarchingCubes at the
-        density_act threshold, 25.0 by default, with world Origin/Spacing).
-        csTripoSRDefaultChunkPoints = 16384 measured at ~0.25 GB peak RSS
-        for the full-size decoder (plain -O2 build, ~61 us/point on one core,
-        so a 256^3 sweep is ~17 min on CPU: the OpenCL forward or threading
-        is the next lever). Tests: TestTripoSRDecoderPicoShapes,
-        TestTripoSRDecoderLoadHandParity (synthetic checkpoint, MLP + exp
-        bias + sigmoid recomputed by hand), TestTripoSRDensitySweepSphere
-        (triplane planes encode (x-cx)^2, (z-cz)^2, (y-cy)^2 of an off-centre
-        sphere; chunked (1000, partial last chunk) and single-chunk sweeps
-        give bit-identical density and colours; closed oriented mesh, Euler
-        2, positive volume, vertices within 0.01 of r0, bounding box pins the
-        axis order, colours match the analytic sigmoid). Open: torchmcubes
-        face winding not compared (ours is CCW seen from the low-density
-        side); no real-checkpoint parity (T3 + oracle).
   - [ ] T6a. Backbone attention RAM (blocker for T6, see the RAM note in T6):
         move attn1 onto one TNNetFusedSDPA (check that its full forward drops
         the score matrix) and give attn2 a fused cross path or liveness-shared
@@ -2047,6 +1985,8 @@ rather than acted on.
         1025) needs either a fused cross path or host-output liveness sharing
         (TNNet.ShareHostOutputsByLiveness) to reuse the per-block score
         buffers. Without one of these the full-size forward exceeds the cap.
+        Also compare the mesh face winding against torchmcubes (ours is CCW
+        seen from the low-density side).
 - [ ] LivePortrait portrait animation importer + examples/PortraitAnimation
       (BuildLivePortraitFromCheckpoint[Ex], KwaiVGI/LivePortrait, MIT; the five
       `liveportrait/base_models/*.pth` + `retargeting_models/
@@ -2072,22 +2012,13 @@ rather than acted on.
       an occlusion map, then trilinear sampling of the feature volume; (5) SPADE
       generator (SPADE ResBlocks + TNNetPixelShuffle up to 512x512);
       (6) stitching + eye/lip retargeting MLPs (small TNNetFullConnect chains).
-      New code, kept general rather than LivePortrait-only: LANDED, the
-      trailing `pPaddingT` parameter of TNNetConvolution3D (temporal zero
-      padding, packed in the high half of FStruct[7], old nets load with 0;
-      PaddingT > 0 runs on the host because cai_conv_implicit has no depth
-      bounds check, so an OpenCL padded-time path is still open); LANDED,
-      TNNetGridSample3D (torch F.grid_sample on 5-D input: trilinear and
-      nearest, zeros and border padding, both align_corners; features and grid
-      packed along Depth like TNNetConvolution3D; CPU forward + backward to
-      features and grid, OpenCL inference forward cai_grid_sample_3d; tests
-      TestGridSample3DHandCases/SaveLoad/GradientCheck/OpenCLParity). Still
-      open: a SPADE layer or builder (param-free
-      InstanceNorm/BatchNorm + conv-predicted gamma/beta from a resized segmap)
-      if TNNetInstanceNorm + TNNetCellMulByCell + TNNetSum cannot express it
-      without copies. Tests: trilinear grid sample against hand-derived cases
-      and a numerical-gradient check; Conv3D temporal padding against the
-      zero-padded-input equivalence; 66-bin head-pose expectation and the
+      New code, kept general rather than LivePortrait-only (TNNetConvolution3D
+      `pPaddingT` and TNNetGridSample3D are in): an OpenCL padded-time path
+      for TNNetConvolution3D (PaddingT > 0 runs on the host because
+      cai_conv_implicit has no depth bounds check); a SPADE layer or builder
+      (param-free InstanceNorm/BatchNorm + conv-predicted gamma/beta from a
+      resized segmap) if TNNetInstanceNorm + TNNetCellMulByCell + TNNetSum cannot express it
+      without copies. Tests: 66-bin head-pose expectation and the
       Euler-to-rotation matrix by hand; pico-fixture parity of
       motion extractor -> warp -> generator against the reference
       `LivePortrait` repo needs a NEW Python oracle script in tools/, so ask the
