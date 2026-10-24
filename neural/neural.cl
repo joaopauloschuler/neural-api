@@ -2717,6 +2717,8 @@ __kernel void cai_rfft2_rows_r2c
 //   Dst[ky, kw] = s[kw] * sum_{y < FInRows} Src[y, kw] * exp(i*FSign*2*pi*ky*y/H),
 // FSign = -1 (forward) or +1 (unnormalised inverse); s = FBinScale when
 // FApplyBinScale != 0, else 1. FInRows < FH skips source rows known to be zero.
+// Output rows >= FOutGapRow and source rows >= FInGapRow sit FOutGap and FInGap
+// rows further along H, so ky and y above are those shifted positions.
 __kernel void cai_rfft2_cols_c2c
 (
   const int FNumOut,
@@ -2729,14 +2731,20 @@ __kernel void cai_rfft2_cols_c2c
   __global const float* FTwid,
   __global const float* FBinScale,
   __global const float* FSrc,
-  __global float* FDst
+  __global float* FDst,
+  const int FOutGapRow,
+  const int FOutGap,
+  const int FInGapRow,
+  const int FInGap
 )
 {
   const int g_id = get_global_id(0);
   if (g_id >= FNumOut) return;
   const int RowLen = FHalfW * FC;
-  const int ky = g_id / RowLen;
-  const int Col = g_id - ky * RowLen;
+  const int OutRow = g_id / RowLen;
+  const int Col = g_id - OutRow * RowLen;
+  const int ky = (OutRow >= FOutGapRow) ? OutRow + FOutGap : OutRow;
+  const int GapStep = (int)(((long)FInGap * ky) % FH);
   int SrcPos = 2 * Col;
   const int SrcStride = 2 * RowLen;
   int Idx = 0;
@@ -2744,6 +2752,11 @@ __kernel void cai_rfft2_cols_c2c
   float Im = 0.0f;
   for (int y = 0; y < FInRows; y++)
   {
+    if (y == FInGapRow)
+    {
+      Idx += GapStep;
+      if (Idx >= FH) Idx -= FH;
+    }
     const float a = FSrc[SrcPos];
     const float b = FSrc[SrcPos + 1];
     const float co = FTwid[2 * Idx];

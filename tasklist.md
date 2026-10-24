@@ -2799,13 +2799,13 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         reads. Time a CAI self-attention model on the GPU box; if the
         contraction shows up at long sequences, tile A and B rows through
         local memory.
-- [ ] Check (not verified): `TNNetSpectralConv2D` (CPU and OpenCL) keeps only
-      the low corner [0..ModesX-1][0..ModesY-1] of the spectrum and takes the
-      real part of the inverse 2-D FFT. The reference FNO `SpectralConv2d`
-      keeps TWO corners along the full-FFT axis (weights1 for the low modes,
-      weights2 for the negative-frequency modes) and uses irfft2. Decide
-      whether to add the second corner (needed to import a torch FNO
-      checkpoint) or document the layer as a one-corner variant.
+- [X] `TNNetSpectralConv2D` FNO mode: `Create(OutDepth, ModesX, ModesY, True)`
+      (`FStruct[3]`) is torch's `SpectralConv2d` (two Y corners, irfft2), CPU +
+      OpenCL, with `ImportTorchFNOWeights`; the default stays the one-corner,
+      real-part-of-IFFT variant. Checked against a naive Double rfft2/irfft2.
+      Still open: `TNNetSpectralConv1D` is the one-sided real-part variant, not
+      torch's `SpectralConv1d` (irfft doubles the non-DC bins), and no
+      safetensors FNO checkpoint loader exists yet.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and

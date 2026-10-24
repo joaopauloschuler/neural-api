@@ -360,6 +360,12 @@ type
     procedure TestSpectralConv2DShapeAndTruncation;
     procedure TestSpectralConv2DSerializationRoundTrip;
     procedure TestSpectralConvInferenceOnlyWeightPlanes;
+    // FNO mode (torch SpectralConv2d): two Y corners + irfft2 vs a naive Double
+    // DFT reference in torch layout; gradients, guards and round-trip.
+    procedure TestSpectralConv2DFNOMatchesNaiveIrfft2;
+    procedure TestSpectralConv2DFNOGradientCheck;
+    procedure TestSpectralConv2DFNOGuards;
+    procedure TestSpectralConv2DFNOSerializationRoundTrip;
     // TNNetRealFFT2D / TNNetInverseRealFFT2D (torch.fft.rfft2 / irfft2 port)
     procedure TestRealFFT2DMatchesNaiveDFT;
     procedure TestInverseRealFFT2DMatchesNaiveDFT;
@@ -852,6 +858,7 @@ type
     // an even width's Nyquist bin must be dropped), odd and even widths.
     procedure TestInverseRealFFT2DOpenCLParity;
     procedure TestSpectralConv2DOpenCLParity;
+    procedure TestSpectralConv2DFNOOpenCLParity;
     procedure TestLearnedPositionalEmbeddingOpenCLParity;
     procedure TestSoftPromptOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
@@ -66782,7 +66789,7 @@ begin
 end;
 
 procedure SpectralConv2DGradCheck(ATestCase: TTestCase; SizeX, SizeY: integer;
-  ModesX: integer = 2; ModesY: integer = 3);
+  ModesX: integer = 2; ModesY: integer = 3; FNOMode: boolean = False);
 var
   NN: TNNet;
   Input, InputPlus, Desired: TNNetVolume;
@@ -66821,7 +66828,7 @@ begin
   maxErr := 0;
   try
     NN.AddLayer(TNNetInput.Create(SizeX, SizeY, InDepth, 1)); // 1 = collect input error
-    SC := TNNetSpectralConv2D.Create(OutDepth, ModesX, ModesY);
+    SC := TNNetSpectralConv2D.Create(OutDepth, ModesX, ModesY, FNOMode);
     NN.AddLayer(SC);
     NN.SetLearningRate(1.0, 0.0);
     NN.SetBatchUpdate(true);
@@ -67130,6 +67137,277 @@ begin
         AssertEquals('SpectralConv2D Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// torch FNO SpectralConv2d forward in Double on an NCHW tensor read from the
+// (SizeX=W, SizeY=H, C) volume: rfft2, the two modes1 corners, then irfft2 with
+// pocketfft's c2r semantics (Hermitian extension along W, Im of DC/Nyquist dropped).
+procedure NaiveTorchFNOForward(Input: TNNetVolume; const W1, W2: array of TNeuralFloat;
+  OutDepth, Modes1, Modes2: integer; Output: TNNetVolume);
+var
+  SizeH, SizeW, HalfW, InDepth, RowH, x, kh, kw, k, ci, co, m1, Corner, b: integer;
+  Ang, Xr, Xi, Wr, Wi, Zr, Zi, Fr, Fi, Acc: Double;
+  XftRe, XftIm: array of array of array of Double;   // [ci][kh][kw]
+  OutRe, OutIm: array of array of Double;            // [kh][kw]
+  ZRe, ZIm: array of Double;                         // [kw] of one row
+begin
+  SizeW := Input.SizeX; SizeH := Input.SizeY; InDepth := Input.Depth;
+  HalfW := SizeW div 2 + 1;
+  SetLength(XftRe, InDepth, SizeH, HalfW);
+  SetLength(XftIm, InDepth, SizeH, HalfW);
+  for ci := 0 to InDepth - 1 do
+    for kh := 0 to SizeH - 1 do
+      for kw := 0 to HalfW - 1 do
+      begin
+        Xr := 0; Xi := 0;
+        for RowH := 0 to SizeH - 1 do
+          for x := 0 to SizeW - 1 do
+          begin
+            Ang := 2 * Pi * (kh * RowH / SizeH + kw * x / SizeW);
+            Xr := Xr + Input[x, RowH, ci] * Cos(Ang);
+            Xi := Xi - Input[x, RowH, ci] * Sin(Ang);
+          end;
+        XftRe[ci][kh][kw] := Xr;
+        XftIm[ci][kh][kw] := Xi;
+      end;
+  Output.ReSize(SizeW, SizeH, OutDepth);
+  SetLength(OutRe, SizeH, HalfW);
+  SetLength(OutIm, SizeH, HalfW);
+  SetLength(ZRe, HalfW);
+  SetLength(ZIm, HalfW);
+  for co := 0 to OutDepth - 1 do
+  begin
+    for kh := 0 to SizeH - 1 do
+      for kw := 0 to HalfW - 1 do
+      begin
+        OutRe[kh][kw] := 0;
+        OutIm[kh][kw] := 0;
+      end;
+    // out_ft[:, :, :modes1, :modes2] then out_ft[:, :, -modes1:, :modes2].
+    for Corner := 0 to 1 do
+      for m1 := 0 to Modes1 - 1 do
+      begin
+        if Corner = 0 then kh := m1 else kh := SizeH - Modes1 + m1;
+        for kw := 0 to Modes2 - 1 do
+        begin
+          Zr := 0; Zi := 0;
+          for ci := 0 to InDepth - 1 do
+          begin
+            b := (((ci * OutDepth + co) * Modes1 + m1) * Modes2 + kw) * 2;
+            if Corner = 0 then
+            begin
+              Wr := W1[b]; Wi := W1[b + 1];
+            end
+            else
+            begin
+              Wr := W2[b]; Wi := W2[b + 1];
+            end;
+            Xr := XftRe[ci][kh][kw];
+            Xi := XftIm[ci][kh][kw];
+            Zr := Zr + Xr * Wr - Xi * Wi;
+            Zi := Zi + Xr * Wi + Xi * Wr;
+          end;
+          OutRe[kh][kw] := Zr;
+          OutIm[kh][kw] := Zi;
+        end;
+      end;
+    for RowH := 0 to SizeH - 1 do
+    begin
+      // Inverse complex DFT along H (with 1/H).
+      for kw := 0 to HalfW - 1 do
+      begin
+        Zr := 0; Zi := 0;
+        for kh := 0 to SizeH - 1 do
+        begin
+          Ang := 2 * Pi * kh * RowH / SizeH;
+          Zr := Zr + OutRe[kh][kw] * Cos(Ang) - OutIm[kh][kw] * Sin(Ang);
+          Zi := Zi + OutRe[kh][kw] * Sin(Ang) + OutIm[kh][kw] * Cos(Ang);
+        end;
+        ZRe[kw] := Zr / SizeH;
+        ZIm[kw] := Zi / SizeH;
+      end;
+      ZIm[0] := 0;
+      if SizeW mod 2 = 0 then ZIm[SizeW div 2] := 0;
+      // c2r along W: full inverse DFT of the Hermitian extension F[W-k] = conj F[k].
+      for x := 0 to SizeW - 1 do
+      begin
+        Acc := 0;
+        for k := 0 to SizeW - 1 do
+        begin
+          if k < HalfW then
+          begin
+            Fr := ZRe[k]; Fi := ZIm[k];
+          end
+          else
+          begin
+            Fr := ZRe[SizeW - k]; Fi := -ZIm[SizeW - k];
+          end;
+          Ang := 2 * Pi * k * x / SizeW;
+          Acc := Acc + Fr * Cos(Ang) - Fi * Sin(Ang);
+        end;
+        Output[x, RowH, co] := Acc / SizeW;
+      end;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DFNOMatchesNaiveIrfft2;
+const
+  // W, H, InDepth, OutDepth, modes1 (Y), modes2 (X): even W without and with
+  // the Nyquist bin, odd W, odd H, and touching corners (2*modes1 = H).
+  csShapes: array[0..4, 0..5] of integer = (
+    (8, 8, 2, 3, 3, 4), (8, 6, 3, 2, 2, 5), (7, 6, 2, 2, 2, 4),
+    (6, 5, 3, 2, 2, 4), (5, 4, 2, 3, 2, 3));
+var
+  NN: TNNet;
+  Input, Want: TNNetVolume;
+  SC: TNNetSpectralConv2D;
+  W1, W2: array of TNeuralFloat;
+  ShapePos, i, CornerCount: integer;
+  MaxDiff: Double;
+  ShapeName: string;
+begin
+  RandSeed := 424242;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    ShapeName := 'FNO ' + IntToStr(csShapes[ShapePos, 0]) + 'x' +
+      IntToStr(csShapes[ShapePos, 1]) + ' modes ' +
+      IntToStr(csShapes[ShapePos, 4]) + ',' + IntToStr(csShapes[ShapePos, 5]);
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2]);
+    Want := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      SC := TNNetSpectralConv2D.Create(csShapes[ShapePos, 3],
+        csShapes[ShapePos, 5], csShapes[ShapePos, 4], True);
+      NN.AddLayer(SC);
+      NN.SetTrainable(False, False);
+      AssertEquals(ShapeName + ' kept Y rows', 2 * csShapes[ShapePos, 4],
+        SC.KeptRowsY);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Random * 2 - 1;
+      CornerCount := 2 * csShapes[ShapePos, 2] * csShapes[ShapePos, 3] *
+        csShapes[ShapePos, 4] * csShapes[ShapePos, 5];
+      SetLength(W1, CornerCount);
+      SetLength(W2, CornerCount);
+      for i := 0 to CornerCount - 1 do
+      begin
+        W1[i] := Random * 2 - 1;
+        W2[i] := Random * 2 - 1;
+      end;
+      SC.ImportTorchFNOWeights(W1, W2);
+      NN.Compute(Input);
+      NaiveTorchFNOForward(Input, W1, W2, csShapes[ShapePos, 3],
+        csShapes[ShapePos, 4], csShapes[ShapePos, 5], Want);
+      AssertEquals(ShapeName + ' output size', Want.Size, SC.Output.Size);
+      AssertTrue(ShapeName + ' reference is not degenerate', Want.GetMaxAbs() > 0.1);
+      MaxDiff := 0;
+      for i := 0 to Want.Size - 1 do
+        MaxDiff := Max(MaxDiff, Abs(Want.Raw[i] - SC.Output.Raw[i]));
+      MaxDiff := MaxDiff / Want.GetMaxAbs();
+      WriteLn('  SpectralConv2D ', ShapeName, ' vs naive irfft2 rel max-diff: ',
+        MaxDiff:0:9);
+      AssertTrue(ShapeName + ' rel max-diff ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      NN.Free;
+      Input.Free;
+      Want.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DFNOGradientCheck;
+begin
+  // SizeX, SizeY, ModesX (half axis), ModesY (per corner): even SizeX with the
+  // Nyquist bin kept, odd SizeX, odd SizeY, and touching corners.
+  SpectralConv2DGradCheck(Self, 4, 5, 3, 2, True);
+  SpectralConv2DGradCheck(Self, 5, 6, 3, 2, True);
+  SpectralConv2DGradCheck(Self, 6, 4, 2, 2, True);
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DFNOGuards;
+var
+  NN: TNNet;
+  SC: TNNetSpectralConv2D;
+  Capture: TErrorCapture;
+begin
+  // 2*ModesY > SizeY would make the two Y corners overlap: reported and clamped.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 5, 2));
+    SC := TNNetSpectralConv2D.Create(2, 2, 3, True);
+    SC.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(SC);
+    AssertTrue('FNO overlapping corners must fire FErrorProc', Capture.Triggered);
+    AssertTrue('FNO overlap message names the corners',
+      Pos('overlap', Capture.Message) > 0);
+    AssertEquals('FNO overlap clamps to SizeY div 2 per corner', 4, SC.KeptRowsY);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
+  // ModesX above the half spectrum of a real FFT along X.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 2));
+    SC := TNNetSpectralConv2D.Create(2, 5, 2, True);
+    SC.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(SC);
+    AssertTrue('FNO ModesX > SizeX div 2 + 1 must fire FErrorProc',
+      Capture.Triggered);
+    AssertEquals('FNO ModesX clamps to SizeX div 2 + 1', 4, SC.ModesX);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConv2DFNOSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  SC: TNNetSpectralConv2D;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 6, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 6, 2));
+    SC := TNNetSpectralConv2D.Create(3, 3, 2, True);
+    NN.AddLayer(SC);
+    NN.AddLayer(TNNetSpectralConv2D.Create(2, 2, 2));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.3 - 0.2;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('FNO SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('FNO mode round-trips',
+        (NN2.Layers[1] as TNNetSpectralConv2D).FNOMode);
+      AssertFalse('one-corner layer stays one-corner',
+        (NN2.Layers[2] as TNNetSpectralConv2D).FNOMode);
+      AssertEquals('FNO kept rows round-trip', 4,
+        (NN2.Layers[1] as TNNetSpectralConv2D).KeptRowsY);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FNO Compute matches after round-trip pos ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
       NN2.Free;
     end;
@@ -78259,6 +78537,86 @@ begin
         FloatToStr(ChangedDiff) + ' must be < 1e-4', ChangedDiff < 1e-4);
     finally
       OpenCLTransferCounting := WasCounting;
+      Input.Free;
+      NNCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// FNO-mode SpectralConv2D (two Y corners, irfft2 bin weights) on OpenCL vs a host
+// twin: odd/even sizes, the Nyquist bin, and touching corners.
+procedure TTestNeuralNumerical.TestSpectralConv2DFNOOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // SizeX, SizeY, InDepth, OutDepth, ModesX, ModesY.
+  csShapes: array[0..3, 0..5] of integer = (
+    (8, 8, 3, 4, 5, 3), (7, 6, 2, 3, 4, 2), (6, 5, 4, 2, 3, 2),
+    (16, 10, 3, 3, 4, 5));
+var
+  NN, NNCPU: TNNet;
+  Input: TNNetVolume;
+  FirstLayer, FirstCPU: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ShapePos, Pos, MaxPos: integer;
+  FirstDiff, LastDiff: TNeuralFloat;
+  ShapeName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for ShapePos := 0 to High(csShapes) do
+  begin
+    ShapeName := 'FNO ' + IntToStr(csShapes[ShapePos, 0]) + 'x' +
+      IntToStr(csShapes[ShapePos, 1]) + ' modes ' +
+      IntToStr(csShapes[ShapePos, 4]) + 'x' + IntToStr(csShapes[ShapePos, 5]);
+    NN := TNNet.Create();
+    NNCPU := TNNet.Create();
+    Input := TNNetVolume.Create(csShapes[ShapePos, 0], csShapes[ShapePos, 1],
+      csShapes[ShapePos, 2]);
+    try
+      NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      FirstLayer := NN.AddLayer(TNNetSpectralConv2D.Create(csShapes[ShapePos, 3],
+        csShapes[ShapePos, 4], csShapes[ShapePos, 5], True));
+      NN.AddLayer(TNNetSpectralConv2D.Create(2, 2, 2, True));
+      NN.SetTrainable(False, False);
+      NNCPU.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+      FirstCPU := NNCPU.AddLayer(TNNetSpectralConv2D.Create(csShapes[ShapePos, 3],
+        csShapes[ShapePos, 4], csShapes[ShapePos, 5], True));
+      NNCPU.AddLayer(TNNetSpectralConv2D.Create(2, 2, 2, True));
+      NNCPU.SetTrainable(False, False);
+      NNCPU.CopyWeights(NN);
+      MaxPos := Input.Size - 1;
+      for Pos := 0 to MaxPos do
+        Input.Raw[Pos] := 2 * Sin(Pos * 0.37) + 0.3 * Cos(Pos * 1.7) + 0.5;
+      NNCPU.Compute(Input);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      LastDiff := RelMaxDiffToOutput(NNCPU.GetLastLayer.Output,
+        NN.GetLastLayer.Output);
+      FirstLayer.ForceOutputOnRAM();
+      FirstDiff := RelMaxDiffToOutput(FirstCPU.Output, FirstLayer.Output);
+      WriteLn('  SpectralConv2D OpenCL ', ShapeName, ': first rel=',
+        FirstDiff:0:9, ' last rel=', LastDiff:0:9);
+      AssertEquals(ShapeName + ': first layer ran on OpenCL', 1,
+        FirstLayer.ForwardGPUCnt);
+      AssertEquals(ShapeName + ': last layer ran on OpenCL', 1,
+        NN.GetLastLayer.ForwardGPUCnt);
+      AssertTrue(ShapeName + ': the reference is not degenerate',
+        FirstCPU.Output.GetMaxAbs() > 0);
+      AssertTrue(ShapeName + ': first layer OpenCL vs CPU rel diff = ' +
+        FloatToStr(FirstDiff) + ' must be < 1e-4', FirstDiff < 1e-4);
+      AssertTrue(ShapeName + ': last layer OpenCL vs CPU rel diff = ' +
+        FloatToStr(LastDiff) + ' must be < 1e-4', LastDiff < 1e-4);
+    finally
       Input.Free;
       NNCPU.Free;
       NN.Free;

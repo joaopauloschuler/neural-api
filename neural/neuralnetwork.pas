@@ -5992,8 +5992,11 @@ type
     // The three DFT launches; BinCount bins of each line are computed, and the
     // column pass sums only the first InRows (<= H) source rows.
     procedure RunRowsR2C(NumOut, W, BinCount, C: longint; Src, Dst: cl_mem);
+    // Output rows >= OutGapRow and source rows >= InGapRow sit OutGap and InGap
+    // rows further along H (TNNetSpectralConv2D's FNO corner pair).
     procedure RunColsC2C(NumOut, H, InRows, BinCount, C: longint; Sign: single;
-      ApplyBinScale: longint; Src, Dst: cl_mem);
+      ApplyBinScale: longint; Src, Dst: cl_mem; OutGapRow: longint = 0;
+      OutGap: longint = 0; InGapRow: longint = 0; InGap: longint = 0);
     procedure RunRowsC2R(NumOut, W, BinCount, C: longint; Src, Dst: cl_mem);
   public
     constructor Create(NN: TNNet);
@@ -6011,7 +6014,8 @@ type
 
   /// OpenCL forward of TNNetSpectralConv2D on the rfft2 kernels: the kept-mode
   // spectrum (cai_rfft2_rows_r2c, cai_rfft2_cols_c2c), cai_spectral_mode_mix,
-  // then Re of the inverse 2-D DFT (cai_rfft2_cols_c2c, cai_irfft2_rows_c2r).
+  // then Re of the inverse 2-D DFT (irfft2 in FNO mode) through cai_rfft2_cols_c2c
+  // and cai_irfft2_rows_c2r.
   // Coded by Claude (AI).
   TNNetSpectralConv2DCL = class(TNNetRealFFT2DCL)
   private
@@ -6024,7 +6028,8 @@ type
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // Uploads the twiddles and the 1/(SizeX*SizeY) bin scales on a shape change.
+    // Uploads the twiddles and the FBinWeightX/(SizeX*SizeY) bin scales on a
+    // shape change.
     procedure EnsureSpectralTables(Consumer: TNNetLayer);
     procedure UploadWeights(Weights: TNNetVolume);
     function BufferBytes(): int64; override;
@@ -18334,14 +18339,22 @@ type
   ///      domain; the real part is the output, taken as the real inverse FFT
   ///      along X of the spectrum's Hermitian part.
   ///
+  /// FNO mode (Create(..., True)) is torch's SpectralConv2d on an NCHW tensor
+  /// stored as (SizeX=W, SizeY=H, Depth=C): torch modes1 = ModesY (full-FFT axis
+  /// H), modes2 = ModesX (half axis W, ModesX <= SizeX div 2 + 1). Y bins
+  /// [0..ModesY-1] use weights1 and [SizeY-ModesY..SizeY-1] use weights2
+  /// (2*ModesY <= SizeY is required; torch would let weights2 overwrite the
+  /// overlap), and the inverse is irfft2: X bins other than DC and an even
+  /// SizeX's Nyquist count twice, and the Im of those two is dropped.
+  ///
   /// Weight layout: a single weight neuron holding
-  ///   2 * FModesX * FModesY * InDepth * OutDepth reals (real then imag for each
-  ///   (mx,my,in,out)), indexed
-  ///   base = (((mx*FModesY + my)*InDepth + ci)*OutDepth + co)*2;
+  ///   2 * FModesX * FKeptRowsY * InDepth * OutDepth reals (real then imag for
+  ///   each (mx,my,in,out)), FKeptRowsY = ModesY (2*ModesY in FNO mode), indexed
+  ///   base = (((mx*FKeptRowsY + my)*InDepth + ci)*OutDepth + co)*2;
   ///   [base]=Re R, [base+1]=Im R.
-  /// Constructor: Create(OutDepth, ModesX, ModesY). OutDepth round-trips via
-  /// FStruct[0], ModesX via FStruct[1], ModesY via FStruct[2]; dispatch is wired
-  /// through Create(St[0], St[1], St[2]).
+  /// Constructor: Create(OutDepth, ModesX, ModesY, FNOMode); the four round-trip
+  /// via FStruct[0..3] (FStruct[3] = 1 in FNO mode; older saved structures load
+  /// as 0) through Create(St[0], St[1], St[2], St[3] <> 0).
   /// Backward is the exact real adjoint of the linear 2-D FFT -> complex-matmul
   /// -> 2-D IFFT pipeline; both the input AND complex-weight gradients are
   /// numerically tested.
@@ -18351,6 +18364,10 @@ type
     FOutDepth: integer;     // requested output Depth
     FModesX: integer;       // number of kept low-frequency modes along X
     FModesY: integer;       // number of kept low-frequency modes along Y
+    FFNOMode: boolean;      // two Y corners and irfft2 inverse (torch FNO)
+    FKeptRowsY: integer;    // kept Y bins: FModesY, or 2*FModesY in FNO mode
+    FKeptBinY: array of integer;  // Y frequency bin of each kept row
+    FBinWeightX: array of Double; // X-bin count in the inverse: 1, or 2 (FNO irfft2)
     FSizeX: integer;        // input SizeX, any size >= 1
     FSizeY: integer;        // input SizeY, any size >= 1
     FRealPlanX: TRealFFTPlan; // X-axis real FFT plan, built in SetPrevLayer
@@ -18394,10 +18411,14 @@ type
     procedure FreeBackpropScratch();
     procedure SizeBackpropScratch();
   public
-    constructor Create(pOutDepth, pModesX, pModesY: integer); reintroduce; overload;
+    constructor Create(pOutDepth, pModesX, pModesY: integer;
+      pFNOMode: boolean = False); reintroduce; overload;
     destructor Destroy(); override;
     function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // FNO mode: loads torch weights1/weights2 (in, out, ModesY, ModesX) complex,
+    // each view_as_real (trailing Re, Im) row-major; call after SetPrevLayer.
+    procedure ImportTorchFNOWeights(const Weights1, Weights2: array of TNeuralFloat);
     procedure InitDefault(); override;
     procedure AfterWeightUpdate(); override;
     procedure Compute(); override;
@@ -18414,6 +18435,8 @@ type
     {$ENDIF}
     property ModesX: integer read FModesX;
     property ModesY: integer read FModesY;
+    property FNOMode: boolean read FFNOMode;
+    property KeptRowsY: integer read FKeptRowsY;
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property InDepth: integer read FInDepth;
@@ -22274,8 +22297,10 @@ type
       // 2-D Fourier Neural Operator Fourier layer over a (SizeX,SizeY,Depth)
       // grid: y = Activation( SpectralConv2D(x) + W_1x1(x) ). 2-D sibling of
       // AddFourierNeuralOperator1D; the pointwise residual works per-pixel.
+      // pFNOMode builds the spectral branch as torch's SpectralConv2d.
       function AddFourierNeuralOperator2D(pOutDepth, pModesX, pModesY: integer;
-        pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+        pActFn: TNNetActivationFunctionClass = nil;
+        pFNOMode: boolean = False): TNNetLayer;
       // MLP-Mixer block (Tolstikhin et al. 2021,
       // https://arxiv.org/abs/2105.01601) over a (Tokens,1,Channels) sequence.
       // Replaces self-attention with two pre-LayerNorm residual MLP sub-blocks:
@@ -42921,7 +42946,8 @@ begin
 end;
 
 procedure TNNetRealFFT2DCL.RunColsC2C(NumOut, H, InRows, BinCount, C: longint;
-  Sign: single; ApplyBinScale: longint; Src, Dst: cl_mem);
+  Sign: single; ApplyBinScale: longint; Src, Dst: cl_mem; OutGapRow: longint;
+  OutGap: longint; InGapRow: longint; InGap: longint);
 var
   k: cl_kernel;
 begin
@@ -42937,6 +42963,10 @@ begin
   clSetKernelArg(k, 8, csCLMemSize, @FBufBinScale);
   clSetKernelArg(k, 9, csCLMemSize, @Src);
   clSetKernelArg(k, 10, csCLMemSize, @Dst);
+  clSetKernelArg(k, 11, csLongintSize, @OutGapRow);
+  clSetKernelArg(k, 12, csLongintSize, @OutGap);
+  clSetKernelArg(k, 13, csLongintSize, @InGapRow);
+  clSetKernelArg(k, 14, csLongintSize, @InGap);
   FKernel.RunKernel(k, NumOut);
 end;
 
@@ -43013,12 +43043,16 @@ end;
 procedure TNNetSpectralConv2DCL.EnsureSpectralTables(Consumer: TNNetLayer);
 var
   Layer: TNNetSpectralConv2D;
+  BinX, MaxBinXPos: integer;
 begin
   Layer := TNNetSpectralConv2D(Consumer);
   if (FTableShape[0] = Layer.FSizeX) and (FTableShape[1] = Layer.FSizeY) and
     (FTableShape[2] = Layer.FModesX) then exit;
   FBinScaleHost.ReSize(Layer.FModesX, 1, 1);
-  FBinScaleHost.Fill(1 / (Layer.FSizeX * Layer.FSizeY));
+  MaxBinXPos := Layer.FModesX - 1;
+  for BinX := 0 to MaxBinXPos do
+    FBinScaleHost.FData[BinX] := Layer.FBinWeightX[BinX] /
+      (Layer.FSizeX * Layer.FSizeY);
   UploadTables(Layer.FSizeX, Layer.FSizeY);
   FTableShape[0] := Layer.FSizeX;
   FTableShape[1] := Layer.FSizeY;
@@ -43040,7 +43074,7 @@ procedure TNNetSpectralConv2DCL.ConvolveFromPrevLayer(Consumer: TNNetLayer);
 var
   Layer: TNNetSpectralConv2D;
   bufSrc, bufMid, bufSpec, bufDst: cl_mem;
-  SpecCount, MixCount, MaxDepth: longint;
+  SpecCount, MixCount, MaxDepth, GapRows: longint;
   SpecBytes: csize_t;
   k: cl_kernel;
 begin
@@ -43053,28 +43087,31 @@ begin
   bufMid := FKernel.EnsureBuffer(FBufMid, FCapMid, CL_MEM_READ_WRITE, SpecBytes);
   bufSpec := FKernel.EnsureBuffer(FBufSpec, FCapSpec, CL_MEM_READ_WRITE, SpecBytes);
   bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Layer.FOutput);
-  // Forward DFT of the kept ModesY x ModesX corner, (ModesY, ModesX, InDepth).
+  // Forward DFT of the kept rows, (KeptRowsY, ModesX, InDepth): rows from
+  // ModesY on are the FNO negative-frequency corner, GapRows further along Y.
+  GapRows := Layer.FSizeY - Layer.FKeptRowsY;
   RunRowsR2C(Layer.FSizeY * Layer.FModesX * Layer.FInDepth, Layer.FSizeX,
     Layer.FModesX, Layer.FInDepth, bufSrc, bufMid);
-  SpecCount := Layer.FModesY * Layer.FModesX * Layer.FInDepth;
+  SpecCount := Layer.FKeptRowsY * Layer.FModesX * Layer.FInDepth;
   RunColsC2C(SpecCount, Layer.FSizeY, Layer.FSizeY, Layer.FModesX,
-    Layer.FInDepth, -1, 0, bufMid, bufSpec);
-  // Channel mixing into a (ModesY, ModesX, OutDepth) spectrum.
-  MixCount := Layer.FModesY * Layer.FModesX * Layer.FOutDepth;
+    Layer.FInDepth, -1, 0, bufMid, bufSpec, Layer.FModesY, GapRows);
+  // Channel mixing into a (KeptRowsY, ModesX, OutDepth) spectrum.
+  MixCount := Layer.FKeptRowsY * Layer.FModesX * Layer.FOutDepth;
   k := FMixKernel;
   clSetKernelArg(k, 0, csLongintSize, @MixCount);
   clSetKernelArg(k, 1, csLongintSize, @Layer.FModesX);
-  clSetKernelArg(k, 2, csLongintSize, @Layer.FModesY);
+  clSetKernelArg(k, 2, csLongintSize, @Layer.FKeptRowsY);
   clSetKernelArg(k, 3, csLongintSize, @Layer.FInDepth);
   clSetKernelArg(k, 4, csLongintSize, @Layer.FOutDepth);
   clSetKernelArg(k, 5, csCLMemSize, @FBufWeights);
   clSetKernelArg(k, 6, csCLMemSize, @bufSpec);
   clSetKernelArg(k, 7, csCLMemSize, @bufMid);
   FKernel.RunKernel(k, MixCount);
-  // Inverse DFT along SizeY over the ModesY nonzero rows, then Re of the
-  // inverse along SizeX with 1/(SizeX*SizeY).
+  // Inverse DFT along SizeY over the KeptRowsY nonzero rows, then Re of the
+  // inverse along SizeX with BinWeightX/(SizeX*SizeY) (irfft2 in FNO mode).
   RunColsC2C(Layer.FSizeY * Layer.FModesX * Layer.FOutDepth, Layer.FSizeY,
-    Layer.FModesY, Layer.FModesX, Layer.FOutDepth, 1, 0, bufMid, bufSpec);
+    Layer.FKeptRowsY, Layer.FModesX, Layer.FOutDepth, 1, 0, bufMid, bufSpec,
+    0, 0, Layer.FModesY, GapRows);
   RunRowsC2R(Layer.FOutput.Size, Layer.FSizeX, Layer.FModesX, Layer.FOutDepth,
     bufSpec, bufDst);
   FinishResult(Layer, true);
@@ -96151,7 +96188,7 @@ begin
 end;
 
 function TNNet.AddFourierNeuralOperator2D(pOutDepth, pModesX, pModesY: integer;
-  pActFn: TNNetActivationFunctionClass): TNNetLayer;
+  pActFn: TNNetActivationFunctionClass; pFNOMode: boolean): TNNetLayer;
 var
   Origin, SpectralBranch, PointwiseBranch: TNNetLayer;
 begin
@@ -96164,7 +96201,8 @@ begin
   Origin := GetLastLayer();
   // Spectral branch: separable 2-D low-pass mode mix (Depth -> pOutDepth).
   SpectralBranch :=
-    AddLayerAfter( TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY), Origin );
+    AddLayerAfter( TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY,
+      pFNOMode), Origin );
   // Local per-pixel 1x1 residual branch from the SAME origin (Depth->pOutDepth).
   PointwiseBranch :=
     AddLayerAfter( TNNetPointwiseConvLinear.Create(pOutDepth), Origin );
@@ -101224,7 +101262,8 @@ end;
 // the reals, so backward is the EXACT transpose of each stage. The FFT is the
 // shared TFFTPlan applied per axis -- we do NOT hand-roll a second FFT.
 
-constructor TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY: integer);
+constructor TNNetSpectralConv2D.Create(pOutDepth, pModesX, pModesY: integer;
+  pFNOMode: boolean);
 begin
   inherited Create();
   if pOutDepth <= 0 then
@@ -101236,9 +101275,11 @@ begin
   FOutDepth := pOutDepth;
   FModesX := pModesX;
   FModesY := pModesY;
+  FFNOMode := pFNOMode;
   FStruct[0] := pOutDepth;
   FStruct[1] := pModesX;
   FStruct[2] := pModesY;
+  FStruct[3] := Ord(pFNOMode);
   // One weight neuron (complex spectral weights); sized in SetPrevLayer.
   while FNeurons.Count > 1 do
     FNeurons.Delete(FNeurons.Count - 1);
@@ -101259,8 +101300,8 @@ procedure TNNetSpectralConv2D.SizeBackpropScratch();
 begin
   SetLength(FGreBuf, FModesX, FSizeY);
   SetLength(FGimBuf, FModesX, FSizeY);
-  SetLength(FdXrePlane, FModesX * FModesY * FInDepth);
-  SetLength(FdXimPlane, FModesX * FModesY * FInDepth);
+  SetLength(FdXrePlane, FModesX * FKeptRowsY * FInDepth);
+  SetLength(FdXimPlane, FModesX * FKeptRowsY * FInDepth);
 end;
 
 function TNNetSpectralConv2D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -101281,13 +101322,52 @@ begin
   SetLength(FWiPlane, 0);
   SetLength(FxrPlane, 0);
   SetLength(FximPlane, 0);
+  SetLength(FKeptBinY, 0);
+  SetLength(FBinWeightX, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
 
 function TNNetSpectralConv2D.WBase(mx, my, ci, co: integer): integer;
 begin
-  Result := (((mx * FModesY + my) * FInDepth + ci) * FOutDepth + co) * 2;
+  Result := (((mx * FKeptRowsY + my) * FInDepth + ci) * FOutDepth + co) * 2;
+end;
+
+procedure TNNetSpectralConv2D.ImportTorchFNOWeights(const Weights1,
+  Weights2: array of TNeuralFloat);
+var
+  ci, co, m1, m2, SrcPos, Dst, CornerCount: integer;
+  MaxInPos, MaxOutPos, MaxModeYPos, MaxModeXPos: integer;
+  W: TNNetVolume;
+begin
+  CornerCount := 2 * FInDepth * FOutDepth * FModesY * FModesX;
+  if (not FFNOMode) or (FInDepth <= 0) or (Length(Weights1) <> CornerCount) or
+    (Length(Weights2) <> CornerCount) then
+  begin
+    FErrorProc('TNNetSpectralConv2D.ImportTorchFNOWeights needs FNO mode, a ' +
+      'previous layer and ' + IntToStr(CornerCount) + ' reals per corner.');
+    exit;
+  end;
+  W := FArrNeurons[0].FWeights;
+  MaxInPos := FInDepth - 1;
+  MaxOutPos := FOutDepth - 1;
+  MaxModeYPos := FModesY - 1;
+  MaxModeXPos := FModesX - 1;
+  SrcPos := 0;                     // torch row-major [ci][co][m1][m2][Re,Im]
+  for ci := 0 to MaxInPos do
+    for co := 0 to MaxOutPos do
+      for m1 := 0 to MaxModeYPos do
+        for m2 := 0 to MaxModeXPos do
+        begin
+          Dst := WBase(m2, m1, ci, co);
+          W.FData[Dst] := Weights1[SrcPos];
+          W.FData[Dst + 1] := Weights1[SrcPos + 1];
+          Dst := WBase(m2, FModesY + m1, ci, co);
+          W.FData[Dst] := Weights2[SrcPos];
+          W.FData[Dst + 1] := Weights2[SrcPos + 1];
+          Inc(SrcPos, 2);
+        end;
+  AfterWeightUpdate();
 end;
 
 // Real FFT along X per grid row, keeping the FModesX bins that the mode block
@@ -101359,7 +101439,7 @@ end;
 
 procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  WeightCount: integer;
+  WeightCount, KeptRow, BinX, MaxKeptRowPos, MaxBinXPos: integer;
 begin
   FPrevLayer := pPrevLayer;
   FSizeX := pPrevLayer.Output.SizeX;
@@ -101371,11 +101451,44 @@ begin
   if FModesY > FSizeY then
     FErrorProc('TNNetSpectralConv2D: ModesY (' + IntToStr(FModesY) +
       ') must be <= SizeY (' + IntToStr(FSizeY) + ').');
+  if FFNOMode then
+  begin
+    // torch's x_ft[..., :modes2] slice of the half spectrum would not match weights.
+    if FModesX > FSizeX div 2 + 1 then
+    begin
+      FErrorProc('TNNetSpectralConv2D FNO mode: ModesX (' + IntToStr(FModesX) +
+        ') must be <= SizeX div 2 + 1 (' + IntToStr(FSizeX div 2 + 1) + ').');
+      FModesX := FSizeX div 2 + 1;
+    end;
+    // Overlapping corners: torch's second assignment would overwrite weights1's rows.
+    if 2 * FModesY > FSizeY then
+    begin
+      FErrorProc('TNNetSpectralConv2D FNO mode: 2*ModesY (' +
+        IntToStr(2 * FModesY) + ') must be <= SizeY (' + IntToStr(FSizeY) +
+        '); the two Y corners would overlap.');
+      FModesY := FSizeY div 2;
+    end;
+    FKeptRowsY := 2 * FModesY;
+  end
+  else
+    FKeptRowsY := FModesY;
+  SetLength(FKeptBinY, FKeptRowsY);
+  MaxKeptRowPos := FKeptRowsY - 1;
+  for KeptRow := 0 to MaxKeptRowPos do
+    if KeptRow < FModesY then FKeptBinY[KeptRow] := KeptRow
+    else FKeptBinY[KeptRow] := KeptRow + FSizeY - FKeptRowsY;
+  SetLength(FBinWeightX, FModesX);
+  MaxBinXPos := FModesX - 1;
+  for BinX := 0 to MaxBinXPos do
+    if FFNOMode and (BinX > 0) and (2 * BinX <> FSizeX) then
+      FBinWeightX[BinX] := 2
+    else
+      FBinWeightX[BinX] := 1;
 
   FOutput.ReSize(FSizeX, FSizeY, FOutDepth);
   SetOutputErrorSize(FSizeX, FSizeY, FOutDepth);
 
-  WeightCount := 2 * FModesX * FModesY * FInDepth * FOutDepth;
+  WeightCount := 2 * FModesX * FKeptRowsY * FInDepth * FOutDepth;
   FNeurons[0].Weights.ReSize(WeightCount, 1, 1);
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
@@ -101392,10 +101505,10 @@ begin
   SetLength(FSreBuf, FModesX, FSizeY);
   SetLength(FSimBuf, FModesX, FSizeY);
   // AVX-contiguous weight + input-spectrum planes (forward path).
-  SetLength(FWrPlane, FOutDepth * FModesX * FModesY * FInDepth);
-  SetLength(FWiPlane, FOutDepth * FModesX * FModesY * FInDepth);
-  SetLength(FxrPlane, FModesX * FModesY * FInDepth);
-  SetLength(FximPlane, FModesX * FModesY * FInDepth);
+  SetLength(FWrPlane, FOutDepth * FModesX * FKeptRowsY * FInDepth);
+  SetLength(FWiPlane, FOutDepth * FModesX * FKeptRowsY * FInDepth);
+  SetLength(FxrPlane, FModesX * FKeptRowsY * FInDepth);
+  SetLength(FximPlane, FModesX * FKeptRowsY * FInDepth);
   SetLength(FRealRow, FSizeX);
   SetLength(FBinRe, Max(FModesX, FSizeX div 2 + 1));
   SetLength(FBinIm, Max(FModesX, FSizeX div 2 + 1));
@@ -101431,7 +101544,7 @@ end;
 procedure TNNetSpectralConv2D.RebuildWeightPlanes();
 var
   ci, co, mx, my, b, dst, OutStride: integer;
-  InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
+  InDepthM1, OutDepthM1, ModesXM1, MaxKeptRowPos: integer;
   W: TNNetVolume;
 begin
   if (FInDepth <= 0) or (Length(FWrPlane) = 0) then exit;
@@ -101439,16 +101552,16 @@ begin
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
   ModesXM1 := FModesX - 1;
-  ModesYM1 := FModesY - 1;
+  MaxKeptRowPos := FKeptRowsY - 1;
   // #12: ci is the minor axis of both layouts, so both bases are carried --
   // the mirror steps by 1 and the interleaved source by one (out, Re/Im) pair.
   OutStride := FOutDepth * 2;
   dst := 0;
   for co := 0 to OutDepthM1 do
     for mx := 0 to ModesXM1 do
-      for my := 0 to ModesYM1 do
+      for my := 0 to MaxKeptRowPos do
       begin
-        b := (((mx * FModesY + my) * FInDepth) * FOutDepth + co) * 2;
+        b := (((mx * FKeptRowsY + my) * FInDepth) * FOutDepth + co) * 2;
         for ci := 0 to InDepthM1 do
         begin
           FWrPlane[dst + ci] := W.FData[b];
@@ -101547,9 +101660,10 @@ end;
 
 procedure TNNetSpectralConv2D.ComputeCPU();
 var
-  ci, co, mx, my, ix: integer;
-  InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
-  wBaseIdx, xBaseIdx, TailBytes: integer;
+  ci, co, mx, my, ix, BinY: integer;
+  InDepthM1, OutDepthM1, ModesXM1, MaxKeptRowPos: integer;
+  wBaseIdx, xBaseIdx, GapBytes: integer;
+  BinWeight: Double;
   PrevOut: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -101557,7 +101671,7 @@ begin
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
   ModesXM1 := FModesX - 1;
-  ModesYM1 := FModesY - 1;
+  MaxKeptRowPos := FKeptRowsY - 1;
   // Every sanctioned weight writer (SetPrevLayer, UpdateWeights, CopyWeights,
   // LoadDataFromString, the Init*/normalize helpers) goes through
   // AfterWeightUpdate, which rebuilds the mirror, so an inference-only layer's
@@ -101572,43 +101686,50 @@ begin
   // Pack the kept-mode input spectra into contiguous (mx,my,ci) Single planes so
   // the InDepth contraction below is a vectorizable DotProduct.
   for mx := 0 to ModesXM1 do
-    for my := 0 to ModesYM1 do
+    for my := 0 to MaxKeptRowPos do
     begin
-      xBaseIdx := (mx * FModesY + my) * FInDepth;
+      xBaseIdx := (mx * FKeptRowsY + my) * FInDepth;
+      BinY := FKeptBinY[my];
       for ci := 0 to InDepthM1 do
       begin
-        FxrPlane[xBaseIdx + ci] := FXre[ci][mx][my];
-        FximPlane[xBaseIdx + ci] := FXim[ci][mx][my];
+        FxrPlane[xBaseIdx + ci] := FXre[ci][mx][BinY];
+        FximPlane[xBaseIdx + ci] := FXim[ci][mx][BinY];
       end;
     end;
   // 2./3./4. Per output channel: spectral matmul over kept 2-D modes, then IFFT.
   // The InDepth complex contraction is the 4-multiply complex GEMM, each real
   // reduction an AVX DotProduct over the contiguous ci axis:
   //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
-  TailBytes := (FSizeY - FModesY) * csDoubleSize;
+  // The unkept Y bins are the contiguous gap [FModesY..FSizeY-FKeptRowsY+FModesY-1].
+  GapBytes := (FSizeY - FKeptRowsY) * csDoubleSize;
   for co := 0 to OutDepthM1 do
   begin
-    // Only the truncated Y tail of each kept X bin stays zero: the kept mode
-    // block [0..ModesX-1][0..ModesY-1] is overwritten below (#13: FillChar per row).
-    if TailBytes > 0 then                 // #20: loop-invariant, tested once
+    // Only the unkept Y gap of each kept X bin stays zero: the kept rows are
+    // overwritten below (#13: FillChar per row).
+    if GapBytes > 0 then                  // #20: loop-invariant, tested once
       for ix := 0 to ModesXM1 do
       begin
-        FillChar(FSreBuf[ix][FModesY], TailBytes, 0);
-        FillChar(FSimBuf[ix][FModesY], TailBytes, 0);
+        FillChar(FSreBuf[ix][FModesY], GapBytes, 0);
+        FillChar(FSimBuf[ix][FModesY], GapBytes, 0);
       end;
     for mx := 0 to ModesXM1 do
-      for my := 0 to ModesYM1 do
+    begin
+      BinWeight := FBinWeightX[mx];
+      for my := 0 to MaxKeptRowPos do
       begin
-        wBaseIdx := ((co * FModesX + mx) * FModesY + my) * FInDepth;
-        xBaseIdx := (mx * FModesY + my) * FInDepth;
-        FSreBuf[mx][my] :=
+        wBaseIdx := ((co * FModesX + mx) * FKeptRowsY + my) * FInDepth;
+        xBaseIdx := (mx * FKeptRowsY + my) * FInDepth;
+        BinY := FKeptBinY[my];
+        FSreBuf[mx][BinY] := BinWeight * (
           TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth) -
-          TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth);
-        FSimBuf[mx][my] :=
+          TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth));
+        FSimBuf[mx][BinY] := BinWeight * (
           TNNetVolume.DotProduct(@FWrPlane[wBaseIdx], @FximPlane[xBaseIdx], FInDepth) +
-          TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth);
+          TNNetVolume.DotProduct(@FWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], FInDepth));
       end;
-    // Real part of the inverse 2-D FFT (includes 1/(FSizeX*FSizeY)).
+    end;
+    // Real part of the inverse 2-D FFT (includes 1/(FSizeX*FSizeY)); with the
+    // FNO bin weights this is irfft2.
     KeptSpectrumToReal(FSreBuf, FSimBuf, FOutput, co, FOutDepth, 1.0, false);
   end;
 end;
@@ -101632,13 +101753,13 @@ end;
 // Exact real adjoint of 2-D FFT -> complex matmul -> real 2-D IFFT.
 procedure TNNetSpectralConv2D.BackpropagateCPU();
 var
-  ci, co, mx, my, ix: integer;
-  InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
+  ci, co, mx, my, ix, BinY: integer;
+  InDepthM1, OutDepthM1, ModesXM1, MaxKeptRowPos: integer;
   WDelta, LocalPrevError: TNNetVolume;
-  invL, gyr, gyi, lrGyr, lrGyi: Double;
+  invL, BinGradScale, gyr, gyi, lrGyr, lrGyi: Double;
   xr, xi, wr, wi: TNeuralFloat;
   b, L, wBaseIdx, xBaseIdx, wPos, xPos, planeSize, OutStride: integer;
-  TailBytes: integer;
+  GapBytes: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
   L := FSizeX * FSizeY;
@@ -101646,26 +101767,29 @@ begin
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
   ModesXM1 := FModesX - 1;
-  ModesYM1 := FModesY - 1;
+  MaxKeptRowPos := FKeptRowsY - 1;
 
   // Contiguous (mx,my,ci) input-spectrum gradient planes -- vectorizable AXPY
   // target, mirroring the 1-D class.
-  planeSize := FModesX * FModesY * FInDepth;
+  planeSize := FModesX * FKeptRowsY * FInDepth;
   FillChar(FdXrePlane[0], planeSize * csNeuralFloatSize, 0);   // #13
   FillChar(FdXimPlane[0], planeSize * csNeuralFloatSize, 0);
-  TailBytes := (FSizeY - FModesY) * csDoubleSize;
+  GapBytes := (FSizeY - FKeptRowsY) * csDoubleSize;
   OutStride := FOutDepth * 2;             // #12: ci step in the interleaved layout
   for co := 0 to OutDepthM1 do
   begin
-    // dL/dYhat[co][mx,my] = (1/L) * FFT2D(g[co])[mx,my].
+    // dL/dYhat[co][mx,my] = (BinWeight/L) * FFT2D(g[co])[mx,my].
     RealToKeptSpectrum(FOutputError, co, FOutDepth, FGreBuf, FGimBuf);
     for mx := 0 to ModesXM1 do
-      for my := 0 to ModesYM1 do
+    begin
+      BinGradScale := invL * FBinWeightX[mx];
+      for my := 0 to MaxKeptRowPos do
       begin
-        gyr := invL * FGreBuf[mx][my];
-        gyi := invL * FGimBuf[mx][my];
-        wBaseIdx := ((co * FModesX + mx) * FModesY + my) * FInDepth;
-        xBaseIdx := (mx * FModesY + my) * FInDepth;
+        BinY := FKeptBinY[my];
+        gyr := BinGradScale * FGreBuf[mx][BinY];
+        gyi := BinGradScale * FGimBuf[mx][BinY];
+        wBaseIdx := ((co * FModesX + mx) * FKeptRowsY + my) * FInDepth;
+        xBaseIdx := (mx * FKeptRowsY + my) * FInDepth;
         // Transpose of the forward complex GEMM, with -FLearningRate folded into
         // the weight-gradient scalars:
         //   dWr[ci]  += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
@@ -101679,7 +101803,7 @@ begin
         // FillChars, eight AXPY passes and a separate scatter loop.
         lrGyr := -FLearningRate * gyr;
         lrGyi := -FLearningRate * gyi;
-        b := (((mx * FModesY + my) * FInDepth) * FOutDepth + co) * 2;
+        b := (((mx * FKeptRowsY + my) * FInDepth) * FOutDepth + co) * 2;
         wPos := wBaseIdx;
         xPos := xBaseIdx;
         for ci := 0 to InDepthM1 do
@@ -101697,6 +101821,7 @@ begin
           Inc(xPos);
         end;
       end;
+    end;
   end;
 
   // Propagate the input-spectrum gradient back through the input 2-D FFT:
@@ -101706,21 +101831,22 @@ begin
     LocalPrevError := FPrevLayer.OutputError;
     for ci := 0 to InDepthM1 do
     begin
-      // Only the truncated part stays zero: the kept mode block is overwritten
-      // right below (#13: FillChar per row).
-      if TailBytes > 0 then               // #20: loop-invariant, tested once
+      // Only the unkept Y gap stays zero: the kept rows are overwritten right
+      // below (#13: FillChar per row).
+      if GapBytes > 0 then                // #20: loop-invariant, tested once
         for ix := 0 to ModesXM1 do
         begin
-          FillChar(FGreBuf[ix][FModesY], TailBytes, 0);
-          FillChar(FGimBuf[ix][FModesY], TailBytes, 0);
+          FillChar(FGreBuf[ix][FModesY], GapBytes, 0);
+          FillChar(FGimBuf[ix][FModesY], GapBytes, 0);
         end;
       // Gather channel ci of the contiguous (mx,my,ci) gradient planes.
-      xBaseIdx := ci;         // #12: carries (mx*FModesY+my)*FInDepth + ci
+      xBaseIdx := ci;         // #12: carries (mx*FKeptRowsY+my)*FInDepth + ci
       for mx := 0 to ModesXM1 do
-        for my := 0 to ModesYM1 do
+        for my := 0 to MaxKeptRowPos do
         begin
-          FGreBuf[mx][my] := FdXrePlane[xBaseIdx];
-          FGimBuf[mx][my] := FdXimPlane[xBaseIdx];
+          BinY := FKeptBinY[my];
+          FGreBuf[mx][BinY] := FdXrePlane[xBaseIdx];
+          FGimBuf[mx][BinY] := FdXimPlane[xBaseIdx];
           Inc(xBaseIdx, FInDepth);
         end;
       // L * Re(IFFT2D) undoes the inverse's 1/L: the real adjoint.
@@ -145942,7 +146068,7 @@ begin
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
       'TNNetDWT1D' :                Result := TNNetDWT1D.Create(St[0], St[1] <> 0);
-      'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]);
+      'TNNetSpectralConv2D' :       Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2], St[3] <> 0);
       'TNNetRealFFT2D' :            Result := TNNetRealFFT2D.Create(St[0]);
       'TNNetInverseRealFFT2D' :     Result := TNNetInverseRealFFT2D.Create(St[1], St[0]);
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
@@ -146406,7 +146532,7 @@ begin
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
       if S[0] = 'TNNetDWT1D' then Result := TNNetDWT1D.Create(St[0], St[1] <> 0) else
-      if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2]) else
+      if S[0] = 'TNNetSpectralConv2D' then Result := TNNetSpectralConv2D.Create(St[0], St[1], St[2], St[3] <> 0) else
       if S[0] = 'TNNetRealFFT2D' then Result := TNNetRealFFT2D.Create(St[0]) else
       if S[0] = 'TNNetInverseRealFFT2D' then Result := TNNetInverseRealFFT2D.Create(St[1], St[0]) else
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
