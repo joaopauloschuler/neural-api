@@ -1579,34 +1579,21 @@ rather than acted on.
   - [ ] Tokenizer: check that the trocr-small `sentencepiece.bpe.model` (fairseq id
         layout, possibly offset by one) decodes correctly through `--tokenizer`, or
         that a tokenizer.json is available; fix the offset in the loader if not.
-  - [X] Word boxes -> line crops: `MergeDBNetTextBoxesIntoLines` unions the boxes
-        of one `SortDBNetTextBoxesInReadingOrder` line, split at a gap above
-        GapFactor (default 2) x the run's mean box height; DocumentOCR
-        `--merge-lines` / `--line-gap` (TestDBNetMergeLines).
+  - Word boxes -> line crops (`MergeDBNetTextBoxesIntoLines`, DocumentOCR
+    `--merge-lines`) follow-up:
     - [ ] Compare the character accuracy of word-by-word vs `--merge-lines` crops
           on a real page (needs the real-run item above).
-  - [X] Rotated boxes (docTR assume_straight_pages=False): `DecodeDBNetRotatedTextBoxes`
-        / `DetectDBNetRotatedTextBoxes` (convex hull `ConvexHullOfPoints`, rotating-
-        calipers `MinAreaRectOfConvexHull`, the rectangle offset by D = hull area x
-        unclip_ratio / hull perimeter via `OffsetRotatedRect`),
-        `SortDBNetRotatedTextBoxesInReadingOrder`, upright crops by `CropRotatedRect`
-        (WarpImageAffine bilinear), `TranscribeTrOCRImage`; DocumentOCR `--rotated`
-        (TestDBNetDecodeRotatedMap, TestConvexHullOfKnownPoints,
-        TestMinAreaRectAndUnclip, TestCropRotatedRect). Differences from docTR, none
-        checked against a docTR oracle yet:
+  - Rotated boxes (docTR assume_straight_pages=False): `DecodeDBNetRotatedTextBoxes`
+    / `DetectDBNetRotatedTextBoxes` (convex hull `ConvexHullOfPoints`, rotating-
+    calipers `MinAreaRectOfConvexHull`, the rectangle offset by D = hull area x
+    unclip_ratio / hull perimeter via `OffsetRotatedRect`), upright crops by
+    `CropRotatedRect`; DocumentOCR `--rotated`. Differences from docTR, none
+    checked against a docTR oracle yet:
     - [ ] docTR offsets the CONTOUR polygon with pyclipper (round joins, area and
           perimeter of the possibly concave contour), then cv2.minAreaRect; here the
           hull's min-area rectangle is offset directly. Same for convex regions up
           to the orientation choice and the arc approximation; a concave region
           (curved text) gets a different D. Port a polygon offset if a real page shows it.
-    - [X] Corners are clipped to the image as docTR does (np.clip to [0, 1] in
-          bitmap_to_boxes and again in _remove_padding; checked in docTR main on
-          GitHub). A clipped box can be non-rectangular: CropRotatedRect warps
-          corners 0, 1, 2 and sizes the height from |c2 - c1| (docTR extract_rcrops).
-          TestDBNetDecodeRotatedBorderAndHoles, TestCropRotatedRect.
-    - [X] Score = mean non-zero probability over the filled outer contour (region +
-          holes: the bounding box grown by 1 minus its 4-connected outside), as
-          docTR's fillPoly + count_nonzero. TestDBNetDecodeRotatedBorderAndHoles.
     - [ ] CropRotatedRect rounds the crop size and maps corner 1 to W - 1; docTR
           truncates (int(d1), int(d2)) and maps it to d1 - 1 (sub-pixel difference).
     - [ ] Not ported: cv2.findContours RETR_EXTERNAL drops a region that sits inside
@@ -1663,35 +1650,8 @@ rather than acted on.
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states. Further gaps (audit 2026-10-02), which together mean
       the repo has NO usable video generator today:
-  - [X] VAE follow-up: activation RAM. Measured on random CogVideoX-2b-shape
-        weights (host bytes per latent cell): first-batch net 46.3 -> 6.6 MB,
-        cached-pad net 43.9 -> 5.9 MB; a whole tile decode (both nets) peaks
-        at 6.7 MB RSS per cell, was 92.7 MB (build included: the unshared
-        build used to touch every activation). The batch nets set
-        ShareHostOutputsByLiveness before the build (the build then holds no
-        activations), each frees its activations after its last batch of a
-        tile (TNNet.ReleaseHostOutputs), the cache taps are pinned 2-frame
-        gathers written straight into the next net's cache inputs
-        (TNNetLayer.HostOutputStorage), and RunsAfter edges order the taps and
-        zq branches so their storage is reused. Left: exact-size slots keep the
-        256-channel and 128-channel full-resolution phases in separate storage
-        (growable host slots would cut ~1/3 more); no in-place layers.
-  - [X] VAE follow-up: let a smaller host output reuse a larger free slot in
-        the ShareHostOutputsByLiveness plan. The host plan now uses the
-        best-fit/grow planner the OpenCL plan already had: a slot's first user
-        allocates the slot's largest size (TNNetVolume.AllocateData) and later
-        users view its prefix (TNNetVolume.ShareDataPrefixWith); every TVolume
-        method now bounds its loops by Size, not Length(FData). Measured on
-        random CogVideoX-2b-shape weights (2x2-latent batch nets, NonWeightBytes
-        after one forward, MiB per latent cell): first-batch net 27.47 MB ->
-        15.42 MB (6.55 -> 3.68 MiB per cell, -44%), cached-pad net 24.65 MB ->
-        14.22 MB (5.88 -> 3.39 MiB per cell, -42%); output unchanged. Other
-        sharing users on their pico fixtures: RT-DETR 1.68 -> 1.61 MB (-4.5%),
-        RT-DETR R50 1.54 -> 1.44 MB (-6.2%), EfficientLoFTR 34.03 -> 33.18 MB
-        (-2.5%), parity unchanged. Tests: TestVolumeSharePrefixView,
-        TestShareHostOutputsGrowingSlots.
   - [ ] VAE follow-up: re-measure the whole-tile peak RSS per latent cell with
-        the grown slots (the 6.7 MB figure predates them; scaling by the net
+        the growable host slots (the 6.7 MB figure predates them; scaling by the net
         bytes gives ~3.8 MB, i.e. ~5.5 GB for a 30x45 tile) - part of the real
         THUDM run below.
   - [ ] Host output sharing follow-up: in-place layers (an elementwise layer
@@ -1953,7 +1913,9 @@ rather than acted on.
       dev-box runs must use a small scene under the 2 GB cap; real scenes are a
       user GPU-box check. Out of scope for v1: training (the differentiable
       backward), which would be a follow-up that fits a scene from posed photos.
-      - Steps (1)-(3) DONE: neural/neuralply.pas (`TNNetPLYReader` /
+      - Steps (1)-(4) and examples/GaussianSplatView (`--demo` on CPU and
+        PoCL) DONE; the OpenCL path is `TGaussianSplatRasterizerCL` with
+        BinTiles still on the host. neural/neuralply.pas (`TNNetPLYReader` /
         `TNNetPLYWriter`, ascii + both binary byte orders, streamed rows, list
         properties skipped on read), neural/neuralgaussiansplat.pas
         (`TGaussianSplatScene` Load/SaveToPLY, `TGaussianSplatCamera` +
@@ -1961,30 +1923,11 @@ rather than acted on.
         `TGaussianSplatRasterizer` Preprocess / BinTiles / BlendTile / Render
         with the per-Gaussian and per-tile results in flat public arrays for
         the OpenCL upload); tests in tests/TestNeuralGaussianSplat.pas. Open:
-        - [X] (4) `TGaussianSplatRasterizerCL`: cai_gaussian_splat_preprocess
-              (one work-item per Gaussian) + cai_gaussian_splat_blend (one
-              16x16 work-group per tile, 256-Gaussian batches in local memory);
-              BinTiles on the host between them (Radii/Depths/TileRects down,
-              tile lists up). TestOpenCLMatchesCPU: 400-Gaussian SH-3 scene,
-              two cameras, max |diff| < 1e-4 on PoCL. Not done: device-side
-              sort/binning (a radix sort on (tile, depth) keys).
-        - [X] examples/GaussianSplatView (.lpr + .lpi + README.md); `--demo`
-              smoke runs on CPU and PoCL.
         - [ ] Real INRIA scene check (small scene on the dev box, big ones on
               the user's GPU box), including a `--cameras cameras.json` run.
         - [ ] Device-side sort + binning (radix sort on (tile, depth) keys,
               then per-tile ranges) so a frame needs no host round-trip; time
               it against the host BinTiles on a real 1-6 M Gaussian scene first.
-        - [X] GaussianSplatView orbit target: the centroid of all means is
-              pulled off the object by far background Gaussians on real scenes;
-              use an opacity-weighted median (or the cameras.json look-at
-              centre) as the default target. Done: TGaussianSplatScene.
-              ComputeRobustCentre (per-axis opacity-weighted median of the
-              means with opacity >= 0.1, plus the weighted median distance,
-              which replaces the RMS spread in the default radius) and
-              GaussianSplatNearestPointToRays (least-squares point nearest to
-              every cameras.json view axis; the median is the fallback).
-              Not yet checked on a real scene (see the item above).
 
 - [X] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
@@ -2015,16 +1958,6 @@ rather than acted on.
               ShareHostOutputsByLiveness on (80 MB of weights); profile which
               layers hold it (stem convs at 320 x 320, the valid-mask
               TNNetCellMul table of 8400 x 256) and trim.
-        - [X] OpenCL paths for TNNetMultiScaleDeformableAttention and
-              TNNetTopKGatherTokens (CPU only; the gather forces its sources to
-              RAM), with PoCL parity tests in the opencl suite. Inference
-              forward only (training stays on the host): cai_ms_deformable_attn
-              binds all three sources and keeps its output resident; the top-K
-              reads only the scores to RAM, picks K on the host and gathers from
-              a resident source by cai_gather_copy (plan re-uploaded per
-              forward). Tests: TestMultiScaleDeformableAttentionOpenCLParity,
-              TestTopKGatherTokensOpenCLParity, TestRtDetrOpenCL (both pico
-              fixtures, forced OpenCL, residency counts printed).
         - [ ] TNNetInverseSigmoid OpenCL forward: the box-refinement chain
               (inverse_sigmoid -> TNNetSum -> TNNetSigmoid) runs on the host, so
               from decoder layer 1 on the deformable attention uploads its
@@ -2534,40 +2467,10 @@ rather than acted on.
             processor (uint8 grayscale before an antialiased resize) is not
             matched, only the PIL backend.
 
-- [X] EfficientLoFTR detector-free dense matching importer
-      (`BuildEfficientLoFTRFromSafeTensors[Ex]` + `TEfficientLoFTRMatcher`,
-      checkpoint zju-community/efficientloftr, transformers model_type
-      `efficientloftr`; Wang et al. 2024, *Efficient LoFTR: Semi-Dense Local
-      Feature Matching with Sparse-Like Speed*, arXiv:2403.04765). SuperPoint +
-      LightGlue only match points the detector fired on, so they fail on
-      low-texture walls, floors and repeated patterns; EfficientLoFTR matches on
-      a dense 1/8 grid and keeps working there. Graph: a RepVGG grayscale
-      backbone (stage blocks [1,2,4,14], 1/2..1/8 features; fold the branches
-      with the existing `ReparamRepVGGBlock`) -> 4 self/cross
-      `AggregatedAttention` layers (a 4x4 stride-4 depthwise conv on Q and a 4x4
-      max pool on K/V, attention on the reduced grid with 2-D RoPE (check
-      whether `TNNetVisionRoPE2D` matches its pairing), bilinear upsample back,
-      LeakyReLU MLP) -> dual-softmax coarse matching (temperature 0.1,
-      threshold 0.2, border removal 2, mutual-nearest) -> fine fusion pyramid
-      on the 1/2 and 1/4 features, 8x8 window around each coarse match and the
-      sub-pixel expectation step (`fine_matching_regress_temperature`). Add a
-      `--matcher loftr` switch to examples/KeypointMatching that draws the
-      same match picture through the existing renderer, and a README row.
-      Pico-fixture parity < 1e-4 against transformers 5.17
-      `EfficientLoFTRForKeypointMatching` (in the ~/x venv) on the coarse
-      confidence matrix and the final keypoints; ask the user before adding the
-      Python fixture script to tools/.
-      - [X] One two-input TNNet (RepVGG folded by `ReparamRepVGGBlock`, now
-            with branch-name parameters; RoPE by `TNNetAxialRotaryEmbedding`
-            plus a `TNNetSplitChannels` reorder; `TNNetFusedSDPA`), the host
-            matcher, `--matcher loftr` in examples/KeypointMatching, README
-            rows, `tools/make_pico_efficientloftr_fixture.py` and
-            `TestEfficientLoFTR*` (confidence 9.0e-6, scores 4.2e-6, fine
-            windows 1.2e-5; keypoints equal to float32 rounding). The fine
-            refinement follows the original zju3dv code, because transformers
-            5.17 differs there (see examples/KeypointMatching/README.md).
-            Real checkpoint against transformers at 256 x 192: 463/463
-            matches, confidence 9.2e-6, keypoints 1.5e-5 px.
+- [ ] EfficientLoFTR follow-ups (`BuildEfficientLoFTRFromSafeTensors[Ex]` +
+      `TEfficientLoFTRMatcher`, `--matcher loftr` in examples/KeypointMatching
+      and `TestEfficientLoFTR*` are done, 238641b4; real checkpoint checked
+      against transformers at 256 x 192):
       - [ ] Memory: about 22 KB of RAM per input pixel (1.35 GB at 256 x 192,
             about 6.9 GB at 640 x 480). Every CPU 3x3 convolution keeps its
             im2col (`FInputPrepared`), its padded input copy (`FInputCopy`),
