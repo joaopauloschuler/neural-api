@@ -1915,6 +1915,38 @@ rather than acted on.
       the reference `vggt` package — needs a NEW Python oracle script in tools/,
       so ask the user before writing it; the PLY writer and pose-encoding
       conversion can be tested by hand-derived cases without it.
+- [ ] 3D Gaussian Splatting viewer: load a trained 3DGS scene and render novel
+      views (Kerbl et al., SIGGRAPH 2023, arXiv:2308.04079). Input: the INRIA
+      `point_cloud.ply` (binary_little_endian vertex list with x,y,z, nx,ny,nz,
+      f_dc_0..2, f_rest_0..44 stored channel-major (15 coefficients per colour),
+      opacity, scale_0..2, rot_0..3 as w,x,y,z). This file layout is shared by
+      most 3DGS trainers (INRIA, gsplat, nerfstudio splatfacto exports). Today
+      the tree has no 3D scene renderer (examples/TinyNeRF ray-marches a toy
+      field it trains itself). Work: (1) a small PLY reader/writer unit
+      (neural/neuralply.pas, header parse + typed binary properties), which the
+      VGGT task above should reuse for its point-cloud writer instead of a second
+      writer; (2) `TGaussianSplatScene` (load, activate: sigmoid opacity, exp
+      scale, normalized quaternion; degree 0-3 SH colour + 0.5, clamp at 0);
+      (3) a CPU tile rasterizer: per Gaussian, the 3D covariance R S S^T R^T,
+      the 2D covariance J W Sigma W^T J^T + 0.3 I, a 3-sigma radius, then 16x16
+      tile binning, depth sort per tile (key = tile id + depth), and
+      front-to-back blending with alpha = min(0.99, opacity * exp(-0.5 d^T
+      Sigma2D^-1 d)), skipping alpha < 1/255 and stopping at T < 1e-4. Output is
+      an RGB TNNetVolume; (4) an OpenCL path: one preprocess kernel per Gaussian
+      plus one blend kernel per tile (one work-group per tile, Gaussians staged
+      through local memory in batches as in the reference CUDA code). The sort
+      can stay on the host in v1. examples/GaussianSplatView (.lpr + .lpi +
+      README.md, cthreads first): `--ply FILE --orbit N --size WxH [--gpu]`
+      writes PNG frames and an animated GIF through TNNetAnimatedGIFWriter;
+      camera intrinsics come from `--fov` or the INRIA `cameras.json`. Tests,
+      all hand-derived (no Python oracle): one isotropic Gaussian at a known
+      depth (peak pixel value and footprint radius), the degree-0 SH colour, two
+      overlapping Gaussians (front-to-back order), a quaternion rotation of an
+      anisotropic Gaussian, a PLY round-trip, and CPU vs OpenCL agreement.
+      Memory: a real scene has 1-6 M Gaussians x 62 floats (~1.5 GB at 6 M), so
+      dev-box runs must use a small scene under the 2 GB cap; real scenes are a
+      user GPU-box check. Out of scope for v1: training (the differentiable
+      backward), which would be a follow-up that fits a scene from posed photos.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
