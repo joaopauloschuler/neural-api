@@ -1,0 +1,125 @@
+{
+  "_name_or_path": "",
+  "activation_function": "relu",
+  "architectures": null,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "batch_norm_eps": 1e-05,
+  "chunk_size_feed_forward": 0,
+  "coarse_matching_border_removal": 2,
+  "coarse_matching_skip_softmax": false,
+  "coarse_matching_temperature": 0.1,
+  "coarse_matching_threshold": 0.2,
+  "dtype": null,
+  "fine_fusion_dims": [
+    32,
+    24,
+    16
+  ],
+  "fine_kernel_size": 8,
+  "fine_matching_regress_temperature": 10.0,
+  "fine_matching_slice_dim": 8,
+  "hidden_size": 32,
+  "id2label": {
+    "0": "LABEL_0",
+    "1": "LABEL_1"
+  },
+  "initializer_range": 0.02,
+  "intermediate_size": 64,
+  "is_encoder_decoder": false,
+  "kv_aggregation_kernel_size": 4,
+  "kv_aggregation_stride": 4,
+  "label2id": {
+    "LABEL_0": 0,
+    "LABEL_1": 1
+  },
+  "mlp_activation_function": "leaky_relu",
+  "model_type": "efficientloftr",
+  "num_attention_heads": 8,
+  "num_attention_layers": 2,
+  "num_key_value_heads": 8,
+  "out_features": [
+    16,
+    16,
+    24,
+    32
+  ],
+  "output_attentions": false,
+  "output_hidden_states": false,
+  "partial_rotary_factor": 4.0,
+  "problem_type": null,
+  "q_aggregation_kernel_size": 4,
+  "q_aggregation_stride": 4,
+  "return_dict": true,
+  "rope_parameters": {
+    "partial_rotary_factor": 4.0,
+    "rope_theta": 10000.0,
+    "rope_type": "default"
+  },
+  "stage_block_in_channels": [
+    [
+      1
+    ],
+    [
+      16
+    ],
+    [
+      16,
+      24
+    ],
+    [
+      24,
+      32
+    ]
+  ],
+  "stage_block_out_channels": [
+    [
+      16
+    ],
+    [
+      16
+    ],
+    [
+      24,
+      24
+    ],
+    [
+      32,
+      32
+    ]
+  ],
+  "stage_block_stride": [
+    [
+      2
+    ],
+    [
+      1
+    ],
+    [
+      2,
+      1
+    ],
+    [
+      2,
+      1
+    ]
+  ],
+  "stage_in_channels": [
+    1,
+    16,
+    16,
+    24
+  ],
+  "stage_num_blocks": [
+    1,
+    1,
+    2,
+    2
+  ],
+  "stage_stride": [
+    2,
+    1,
+    2,
+    2
+  ]
+}

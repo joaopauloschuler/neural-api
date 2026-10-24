@@ -16657,6 +16657,128 @@ function BuildLightGlueFromSafeTensors(const FileName: string;
 function BuildLightGlueKeypointDetectorFromSafeTensors(const FileName: string;
   const Config: TLightGlueConfig; pTrainable: boolean = true): TNNet;
 
+// ---------------------------------------------------------------------------
+// EfficientLoFTR detector-free semi-dense matching (Wang et al. 2024,
+// arXiv:2403.04765; transformers model_type "efficientloftr",
+// zju-community/efficientloftr). BuildEfficientLoFTR returns ONE TNNet with two
+// (W, H, 1) gray inputs: a RepVGG backbone per image (the same weights loaded
+// twice, branches folded), NumAttentionLayers x (self 0, self 1, cross 0<-1,
+// cross 1<-0) aggregated-attention blocks on the 1/8 maps, and a fine-fusion
+// pyramid per image back to full resolution. TEfficientLoFTRMatcher runs the
+// coarse dual-softmax matching and the two-stage fine refinement of the
+// original EfficientLoFTR code on the host.
+// ---------------------------------------------------------------------------
+type
+  TEfficientLoFTRConfig = record
+    StageNumBlocks: TNeuralIntegerArray;   // [1, 2, 4, 14]
+    StageStride: TNeuralIntegerArray;      // [2, 1, 2, 2]
+    OutFeatures: TNeuralIntegerArray;      // [64, 64, 128, 256]
+    HiddenSize: integer;                   // 256 = OutFeatures[3]
+    NumAttentionHeads: integer;            // 8
+    NumAttentionLayers: integer;           // 4
+    AggregationSize: integer;              // q/kv aggregation kernel = stride (4)
+    ActivationFunction: string;            // 'relu' (backbone)
+    MlpActivationFunction: string;         // 'leaky_relu' (slope 0.01)
+    RopeTheta, PartialRotaryFactor: TNeuralFloat; // 10000, 4
+    CoarseMatchingThreshold: TNeuralFloat; // 0.2
+    CoarseMatchingTemperature: TNeuralFloat; // 0.1
+    CoarseMatchingBorderRemoval: integer;  // 2
+    CoarseMatchingSkipSoftmax: boolean;    // false
+    FineKernelSize: integer;               // 8
+    FineMatchingSliceDim: integer;         // 8
+    FineMatchingRegressTemperature: TNeuralFloat; // 10
+    BatchNormEps: TNeuralFloat;            // 1e-5
+    InputWidth, InputHeight: integer;      // multiples of 32 (640 x 480)
+    ModelType: string;                     // 'efficientloftr'
+  end;
+
+// Reads a transformers EfficientLoFTR config.json; the net input is
+// pInputWidth x pInputHeight (EfficientLoFTRImageProcessor's 640 x 480).
+function ReadEfficientLoFTRConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer = 640; pInputHeight: integer = 480): TEfficientLoFTRConfig;
+
+function EfficientLoFTRConfigToString(const Config: TEfficientLoFTRConfig): string;
+
+// Builds the two-input net and loads its weights from Reader (caller owns
+// Reader). Inputs: two (W, H, 1) gray images in [0, 1], same size.
+function BuildEfficientLoFTR(Reader: TNNetSafeTensorsReader;
+  const Config: TEfficientLoFTRConfig; pTrainable: boolean = true): TNNet;
+
+function BuildEfficientLoFTRFromSafeTensorsEx(const FileName: string;
+  const Config: TEfficientLoFTRConfig; pTrainable: boolean = true): TNNet;
+
+// Reads config.json beside FileName ('' = "config.json" next to it), builds
+// the net for a pInputWidth x pInputHeight input and returns the Config.
+function BuildEfficientLoFTRFromSafeTensors(const FileName: string;
+  pInputWidth, pInputHeight: integer; out Config: TEfficientLoFTRConfig;
+  pTrainable: boolean = true; const ConfigFileName: string = ''): TNNet;
+
+// The (W/8, H/8, HiddenSize) coarse maps after the attention layers and the
+// (W, H, OutFeatures[0]) fine maps of a BuildEfficientLoFTR net.
+procedure GetEfficientLoFTROutputs(NN: TNNet;
+  out Coarse0, Coarse1, Fine0, Fine1: TNNetLayer);
+
+type
+  // Matches of one image pair in net-input pixels: KeypointX0[i], KeypointY0[i]
+  // in image 0 pair with KeypointX1[i], KeypointY1[i] in image 1.
+  TEfficientLoFTRMatcher = class(TObject)
+  private
+    FConfig: TEfficientLoFTRConfig;
+    FCount, FCoarseWidth, FCoarseHeight: integer;
+    FCoarseIndex0, FCoarseIndex1: TNeuralIntegerArray;
+    FScores, FX0, FY0, FX1, FY1: TNeuralFloatDynArr;
+    // (N0 x N1) coarse confidence, row i = image-0 cell i (y * width + x).
+    FConfidence: TNNetVolume;
+    // Scratch reused across calls.
+    FPacked, FRowScratch, FColumnMax, FColumnLogSumExp: TNNetVolume;
+    FRowLogSumExp: TNeuralFloatDynArr;
+    FWindow0, FWindow1, FRegress0, FRegress1, FFineScores, FFinePacked: TNNetVolume;
+    FFineColumnMax, FFineColumnLogSumExp, FFineRowScratch: TNNetVolume;
+    // FConfidence := dual softmax (or the scaled similarity) of the maps.
+    procedure ComputeConfidence(Coarse0, Coarse1: TNNetVolume);
+    // Mutual nearest neighbours above the threshold, away from the border.
+    procedure SelectCoarseMatches();
+    // Fills the 8x8 window of image-0 cell Cell0 and the zero-padded 10x10
+    // window of image-1 cell Cell1, each split at FineMatchingSliceDim.
+    procedure ExtractWindows(Fine0, Fine1: TNNetVolume; Cell0, Cell1: integer);
+    // The two-stage sub-pixel refinement of match MatchPos.
+    procedure RefineMatch(MatchPos: integer);
+    function GetX0(Index: integer): TNeuralFloat;
+    function GetY0(Index: integer): TNeuralFloat;
+    function GetX1(Index: integer): TNeuralFloat;
+    function GetY1(Index: integer): TNeuralFloat;
+    function GetScore(Index: integer): TNeuralFloat;
+    function GetCoarseIndex0(Index: integer): integer;
+    function GetCoarseIndex1(Index: integer): integer;
+  public
+    constructor Create(const pConfig: TEfficientLoFTRConfig);
+    destructor Destroy(); override;
+    // Runs NN (a BuildEfficientLoFTR net) on the two (W, H, 1) images, then
+    // the coarse matching and the fine refinement.
+    procedure Match(NN: TNNet; Image0, Image1: TNNetVolume);
+    // The same steps on the outputs of a net that already ran.
+    procedure MatchFromOutputs(NN: TNNet);
+    // Trunc((X / InputWidth) * ImageWidth) as post_process_keypoint_matching.
+    function ImageX(X: TNeuralFloat; ImageWidth: integer): integer;
+    function ImageY(Y: TNeuralFloat; ImageHeight: integer): integer;
+    property Config: TEfficientLoFTRConfig read FConfig;
+    // Read by the next Match.
+    property CoarseMatchingThreshold: TNeuralFloat
+      read FConfig.CoarseMatchingThreshold write FConfig.CoarseMatchingThreshold;
+    property Count: integer read FCount;
+    property KeypointX0[Index: integer]: TNeuralFloat read GetX0;
+    property KeypointY0[Index: integer]: TNeuralFloat read GetY0;
+    property KeypointX1[Index: integer]: TNeuralFloat read GetX1;
+    property KeypointY1[Index: integer]: TNeuralFloat read GetY1;
+    // Coarse confidence of the match, its image-0 and image-1 cells.
+    property Scores[Index: integer]: TNeuralFloat read GetScore;
+    property CoarseIndex0[Index: integer]: integer read GetCoarseIndex0;
+    property CoarseIndex1[Index: integer]: integer read GetCoarseIndex1;
+    property Confidence: TNNetVolume read FConfidence;
+    property CoarseWidth: integer read FCoarseWidth;
+    property CoarseHeight: integer read FCoarseHeight;
+  end;
+
 type
   // ViTPose human-pose KEYPOINT-estimation config (model_type "vitpose"; the
   // nested backbone_config is model_type "vitpose_backbone"). The repo's FIRST
@@ -69177,9 +69299,14 @@ end;
 // whether the identity branch exists. The 1x1 branch is always present in
 // RepVGG; Has1x1 lets the helper be reused where it is absent.
 // Coded by Claude (AI).
+// Branch tensors: Prefix.<DenseBranch|OneByOneBranch>.conv.weight + .<BranchNorm>.
 procedure ReparamRepVGGBlock(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const Prefix: string;
-  OutCh, InCh: integer; Has1x1, HasIdentity: boolean; BnEps: TNeuralFloat);
+  OutCh, InCh: integer; Has1x1, HasIdentity: boolean; BnEps: TNeuralFloat;
+  const DenseBranch: string = 'rbr_dense';
+  const OneByOneBranch: string = 'rbr_1x1';
+  const IdentityBranch: string = 'rbr_identity';
+  const BranchNorm: string = 'bn');
 var
   Wd, W1, Gd, Bd, Md, Vd, G1, B1, M1, V1, Gi, Bi, Mi, Vi, WVol: TNNetVolume;
   o, c, ky, kx, kBase, srcIdx, CentreBase, OutChM1, InChM1: integer;
@@ -69202,8 +69329,8 @@ var
 
 begin
   EnsureWritableImportWeights(Layer);
-  DenseWName := Prefix + '.rbr_dense.conv.weight';
-  OneWName := Prefix + '.rbr_1x1.conv.weight';
+  DenseWName := Prefix + '.' + DenseBranch + '.conv.weight';
+  OneWName := Prefix + '.' + OneByOneBranch + '.conv.weight';
   if Layer.Neurons.Count <> OutCh then
     ImportError('RepVGG import: internal error - block "' + Prefix +
       '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
@@ -69214,14 +69341,13 @@ begin
       ' weights, expected ' + IntToStr(3 * 3 * InCh) + '.');
   // dense 3x3 conv must exist with shape [OutCh, InCh, 3, 3].
   if not Reader.HasTensor(DenseWName) then
-    ImportError('RepVGG import: missing tensor "' + Prefix +
-      '.rbr_dense.conv.weight".');
+    ImportError('RepVGG import: missing tensor "' + DenseWName + '".');
   if (Reader.DimCount(DenseWName) <> 4) or
      (Reader.DimSize(DenseWName, 0) <> OutCh) or
      (Reader.DimSize(DenseWName, 1) <> InCh) or
      (Reader.DimSize(DenseWName, 2) <> 3) or
      (Reader.DimSize(DenseWName, 3) <> 3) then
-    ImportError('RepVGG import: "' + Prefix + '.rbr_dense.conv.weight" must ' +
+    ImportError('RepVGG import: "' + DenseWName + '" must ' +
       'have shape [' + IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', 3, 3], got ' +
       Reader.ShapeAsString(DenseWName));
   Wd := TNNetVolume.Create; W1 := TNNetVolume.Create;
@@ -69233,29 +69359,28 @@ begin
   Mi := TNNetVolume.Create; Vi := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(DenseWName, Wd);
-    NeedBN(Prefix + '.rbr_dense.bn', Gd, Bd, Md, Vd);
+    NeedBN(Prefix + '.' + DenseBranch + '.' + BranchNorm, Gd, Bd, Md, Vd);
     if Has1x1 then
     begin
       if not Reader.HasTensor(OneWName) then
-        ImportError('RepVGG import: missing tensor "' + Prefix +
-          '.rbr_1x1.conv.weight".');
+        ImportError('RepVGG import: missing tensor "' + OneWName + '".');
       if (Reader.DimCount(OneWName) <> 4) or
          (Reader.DimSize(OneWName, 0) <> OutCh) or
          (Reader.DimSize(OneWName, 1) <> InCh) or
          (Reader.DimSize(OneWName, 2) <> 1) or
          (Reader.DimSize(OneWName, 3) <> 1) then
-        ImportError('RepVGG import: "' + Prefix + '.rbr_1x1.conv.weight" must ' +
+        ImportError('RepVGG import: "' + OneWName + '" must ' +
           'have shape [' + IntToStr(OutCh) + ', ' + IntToStr(InCh) +
           ', 1, 1], got ' + Reader.ShapeAsString(OneWName));
       Reader.LoadTensorFlat(OneWName, W1);
-      NeedBN(Prefix + '.rbr_1x1.bn', G1, B1, M1, V1);
+      NeedBN(Prefix + '.' + OneByOneBranch + '.' + BranchNorm, G1, B1, M1, V1);
     end;
     if HasIdentity then
     begin
       if InCh <> OutCh then
         ImportError('RepVGG import: identity branch in "' + Prefix +
           '" requires InCh = OutCh.');
-      NeedBN(Prefix + '.rbr_identity', Gi, Bi, Mi, Vi);
+      NeedBN(Prefix + '.' + IdentityBranch, Gi, Bi, Mi, Vi);
     end;
     OutChM1 := OutCh - 1;
     InChM1 := InCh - 1;
@@ -101191,6 +101316,982 @@ begin
   finally
     Reader.Free;
   end;
+end;
+
+// ----------------------------- EfficientLoFTR ------------------------------
+function ReadEfficientLoFTRConfigFromJSONFile(const FileName: string;
+  pInputWidth: integer; pInputHeight: integer): TEfficientLoFTRConfig;
+var
+  Obj, RopeObj: TJSONObject;
+  RopeField: TJSONData;
+  QKernel, QStride, KVKernel, KVStride: integer;
+begin
+  Obj := LoadImportJSONObject(FileName, 'EfficientLoFTR');
+  try
+    Result.ModelType := Obj.Get('model_type', 'efficientloftr');
+    if LowerCase(Result.ModelType) <> 'efficientloftr' then
+      ImportError('EfficientLoFTR import: model_type in "' + FileName +
+        '" is "' + Result.ModelType + '", expected "efficientloftr".');
+    Result.StageNumBlocks := ReadJSONIntArray(Obj, 'stage_num_blocks',
+      [1, 2, 4, 14]);
+    Result.StageStride := ReadJSONIntArray(Obj, 'stage_stride', [2, 1, 2, 2]);
+    Result.OutFeatures := ReadJSONIntArray(Obj, 'out_features',
+      [64, 64, 128, 256]);
+    Result.HiddenSize := Obj.Get('hidden_size', 256);
+    Result.NumAttentionHeads := Obj.Get('num_attention_heads', 8);
+    Result.NumAttentionLayers := Obj.Get('num_attention_layers', 4);
+    QKernel := Obj.Get('q_aggregation_kernel_size', 4);
+    QStride := Obj.Get('q_aggregation_stride', 4);
+    KVKernel := Obj.Get('kv_aggregation_kernel_size', 4);
+    KVStride := Obj.Get('kv_aggregation_stride', 4);
+    if (QStride <> QKernel) or (KVKernel <> QKernel) or (KVStride <> QKernel) then
+      ImportError('EfficientLoFTR import: "' + FileName + '" needs equal q/kv ' +
+        'aggregation kernel sizes and strides.');
+    Result.AggregationSize := QKernel;
+    if Obj.Get('attention_bias', false) then
+      ImportError('EfficientLoFTR import: attention_bias = true is not supported.');
+    Result.ActivationFunction := Obj.Get('activation_function', 'relu');
+    Result.MlpActivationFunction := Obj.Get('mlp_activation_function',
+      'leaky_relu');
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Result.PartialRotaryFactor := Obj.Get('partial_rotary_factor', 4.0);
+    RopeField := Obj.Find('rope_parameters');
+    if RopeField is TJSONObject then
+    begin
+      RopeObj := TJSONObject(RopeField);
+      if RopeObj.Get('rope_type', 'default') <> 'default' then
+        ImportError('EfficientLoFTR import: only the default rope_type is ' +
+          'supported.');
+      Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+      Result.PartialRotaryFactor := RopeObj.Get('partial_rotary_factor',
+        Result.PartialRotaryFactor);
+    end;
+    Result.CoarseMatchingThreshold := Obj.Get('coarse_matching_threshold', 0.2);
+    Result.CoarseMatchingTemperature :=
+      Obj.Get('coarse_matching_temperature', 0.1);
+    Result.CoarseMatchingBorderRemoval :=
+      Obj.Get('coarse_matching_border_removal', 2);
+    Result.CoarseMatchingSkipSoftmax :=
+      Obj.Get('coarse_matching_skip_softmax', false);
+    Result.FineKernelSize := Obj.Get('fine_kernel_size', 8);
+    Result.FineMatchingSliceDim := Obj.Get('fine_matching_slice_dim', 8);
+    Result.FineMatchingRegressTemperature :=
+      Obj.Get('fine_matching_regress_temperature', 10.0);
+    Result.BatchNormEps := Obj.Get('batch_norm_eps', 1e-5);
+    Result.InputWidth := pInputWidth;
+    Result.InputHeight := pInputHeight;
+  finally
+    Obj.Free;
+  end;
+end;
+
+function EfficientLoFTRConfigToString(const Config: TEfficientLoFTRConfig): string;
+
+  function IntList(const Values: TNeuralIntegerArray): string;
+  var
+    ValuePos, MaxValuePos: integer;
+  begin
+    Result := '[';
+    MaxValuePos := High(Values);
+    for ValuePos := 0 to MaxValuePos do
+    begin
+      if ValuePos > 0 then Result := Result + ',';
+      Result := Result + IntToStr(Values[ValuePos]);
+    end;
+    Result := Result + ']';
+  end;
+
+begin
+  Result := Config.ModelType + ' config: stage_num_blocks=' +
+    IntList(Config.StageNumBlocks) + ', out_features=' +
+    IntList(Config.OutFeatures) + ', hidden_size=' +
+    IntToStr(Config.HiddenSize) + ', heads=' +
+    IntToStr(Config.NumAttentionHeads) + ', attention_layers=' +
+    IntToStr(Config.NumAttentionLayers) + ', aggregation=' +
+    IntToStr(Config.AggregationSize) + ', rope_theta=' +
+    FloatToStr(Config.RopeTheta) + ', coarse threshold=' +
+    FloatToStr(Config.CoarseMatchingThreshold) + ' temperature=' +
+    FloatToStr(Config.CoarseMatchingTemperature) + ' border=' +
+    IntToStr(Config.CoarseMatchingBorderRemoval) + ', fine kernel=' +
+    IntToStr(Config.FineKernelSize) + ' slice=' +
+    IntToStr(Config.FineMatchingSliceDim) + ' regress temperature=' +
+    FloatToStr(Config.FineMatchingRegressTemperature) + ', input=' +
+    IntToStr(Config.InputWidth) + 'x' + IntToStr(Config.InputHeight);
+end;
+
+// Raises unless BuildEfficientLoFTR can build Config.
+procedure CheckEfficientLoFTRConfig(const Config: TEfficientLoFTRConfig);
+var
+  HeadDim, GridSize: integer;
+begin
+  if (Length(Config.StageNumBlocks) <> 4) or (Length(Config.StageStride) <> 4) or
+     (Length(Config.OutFeatures) <> 4) then
+    ImportError('EfficientLoFTR import: 4 backbone stages are supported.');
+  if (Config.StageStride[0] <> 2) or (Config.StageStride[1] <> 1) or
+     (Config.StageStride[2] <> 2) or (Config.StageStride[3] <> 2) then
+    ImportError('EfficientLoFTR import: stage_stride must be [2, 1, 2, 2].');
+  if Config.HiddenSize <> Config.OutFeatures[3] then
+    ImportError('EfficientLoFTR import: hidden_size must equal out_features[3].');
+  if (Config.NumAttentionHeads <= 0) or
+     (Config.HiddenSize mod Config.NumAttentionHeads <> 0) or
+     (Config.HiddenSize mod 4 <> 0) then
+    ImportError('EfficientLoFTR import: hidden_size must split into the heads ' +
+      'and be a multiple of 4.');
+  HeadDim := Config.HiddenSize div Config.NumAttentionHeads;
+  // transformers builds the 2-D RoPE table only when the rotary width
+  // head_dim * partial_rotary_factor equals hidden_size / 2.
+  if Trunc(HeadDim * Config.PartialRotaryFactor + 1e-6) <> Config.HiddenSize div 2 then
+    ImportError('EfficientLoFTR import: head_dim * partial_rotary_factor must ' +
+      'equal hidden_size / 2.');
+  if Config.ActivationFunction <> 'relu' then
+    ImportError('EfficientLoFTR import: activation_function "' +
+      Config.ActivationFunction + '" is not supported (relu).');
+  if Config.MlpActivationFunction <> 'leaky_relu' then
+    ImportError('EfficientLoFTR import: mlp_activation_function "' +
+      Config.MlpActivationFunction + '" is not supported (leaky_relu).');
+  GridSize := 8 * Config.AggregationSize;
+  if (Config.InputWidth <= 0) or (Config.InputHeight <= 0) or
+     (Config.InputWidth mod GridSize <> 0) or
+     (Config.InputHeight mod GridSize <> 0) then
+    ImportError('EfficientLoFTR import: the input ' + IntToStr(Config.InputWidth) +
+      'x' + IntToStr(Config.InputHeight) + ' must be a multiple of ' +
+      IntToStr(GridSize) + ' on both sides.');
+  if (Config.FineKernelSize < 1) or (Config.FineKernelSize > 8) then
+    ImportError('EfficientLoFTR import: fine_kernel_size must be 1..8.');
+  if (Config.FineMatchingSliceDim < 1) or
+     (Config.FineMatchingSliceDim >= Config.OutFeatures[0]) then
+    ImportError('EfficientLoFTR import: fine_matching_slice_dim must be below ' +
+      'out_features[0].');
+end;
+
+type
+  TEfficientLoFTRAttentionLayers = record
+    QAggregation, QNorm, KVNorm, QProj, KProj, VProj, OProj: TNNetLayer;
+    FC1, FC2, MLPNorm: TNNetLayer;
+  end;
+
+  TEfficientLoFTRPyramidLayers = record
+    OutConv: TNNetLayer;
+    OutConv1, OutConv2, OutConv3: array[0..1] of TNNetLayer;
+  end;
+
+// LoFTR rotary channel n sits at Result[n] of the axial layout (row pairs
+// first); LoFTR pair p rotates by (row, column)[p mod 2] at frequency p div 2.
+function EfficientLoFTRRopeOrder(Hidden: integer): TNeuralIntegerArray;
+var
+  PairPos, MaxPairPos, AxialPair, QuarterPairs: integer;
+begin
+  Result := nil;
+  SetLength(Result, Hidden);
+  QuarterPairs := Hidden shr 2;
+  MaxPairPos := (Hidden shr 1) - 1;
+  for PairPos := 0 to MaxPairPos do
+  begin
+    AxialPair := (PairPos shr 1) + (PairPos and 1) * QuarterPairs;
+    Result[2 * PairPos] := 2 * AxialPair;
+    Result[2 * PairPos + 1] := 2 * AxialPair + 1;
+  end;
+end;
+
+// Rotates a (GridW * GridH, 1, Hidden) projection with LoFTR's 1-based 2-D
+// RoPE; the projection rows must be loaded in the axial order.
+function EfficientLoFTRAddRope(NN: TNNet; Projection: TNNetLayer;
+  GridW, GridH: integer; const Config: TEfficientLoFTRConfig;
+  pTrainable: boolean): TNNetLayer;
+var
+  Rope: TNNetAxialRotaryEmbedding;
+  QuarterPairs, TokenPos, RowPos, ColumnPos, MaxRowPos, MaxColumnPos: integer;
+  PosT, PosH, PosW: TNeuralIntegerArray;
+begin
+  QuarterPairs := Config.HiddenSize shr 2;
+  Rope := TNNetAxialRotaryEmbedding.Create(Config.RopeTheta, 0, QuarterPairs,
+    QuarterPairs, 0);
+  Rope.SetTrainable(pTrainable);
+  NN.AddLayerAfter(Rope, Projection);
+  SetLength(PosT, GridW * GridH);
+  SetLength(PosH, GridW * GridH);
+  SetLength(PosW, GridW * GridH);
+  TokenPos := 0;
+  MaxRowPos := GridH - 1;
+  MaxColumnPos := GridW - 1;
+  for RowPos := 0 to MaxRowPos do
+    for ColumnPos := 0 to MaxColumnPos do
+    begin
+      PosT[TokenPos] := 0;
+      PosH[TokenPos] := RowPos + 1;
+      PosW[TokenPos] := ColumnPos + 1;
+      Inc(TokenPos);
+    end;
+  Rope.SetPositions(PosT, PosH, PosW);
+  Result := NN.AddLayer(TNNetSplitChannels.Create(
+    EfficientLoFTRRopeOrder(Config.HiddenSize)).SetTrainable(pTrainable));
+end;
+
+// One aggregated-attention block: X attends to the 4x4-reduced Source, the
+// result is upsampled back, then X + LayerNorm(MLP([X, attention])).
+function EfficientLoFTRAddAttention(NN: TNNet; X, Source: TNNetLayer;
+  const Config: TEfficientLoFTRConfig; HasRope, pTrainable: boolean;
+  out Layers: TEfficientLoFTRAttentionLayers): TNNetLayer;
+var
+  Hidden, HeadDim, GridW, GridH, TokenCount: integer;
+  QueryTokens, KeyValueTokens, Queries, Keys, Upsampled: TNNetLayer;
+  Attention: TNNetFusedSDPA;
+begin
+  Hidden := Config.HiddenSize;
+  HeadDim := Hidden div Config.NumAttentionHeads;
+  GridW := X.Output.SizeX div Config.AggregationSize;
+  GridH := X.Output.SizeY div Config.AggregationSize;
+  TokenCount := GridW * GridH;
+  Layers.QAggregation := NN.AddLayerAfter(TNNetDepthwiseConvLinear.Create(1,
+    Config.AggregationSize, 0, Config.AggregationSize).SetTrainable(pTrainable), X);
+  Layers.QNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable));
+  NN.AddLayerAfter(TNNetMaxPool.Create(Config.AggregationSize,
+    Config.AggregationSize).SetTrainable(pTrainable), Source);
+  Layers.KVNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable));
+  QueryTokens := NN.AddLayerAfter(TNNetReshape.Create(TokenCount, 1,
+    Hidden).SetTrainable(pTrainable), Layers.QNorm);
+  KeyValueTokens := NN.AddLayerAfter(TNNetReshape.Create(TokenCount, 1,
+    Hidden).SetTrainable(pTrainable), Layers.KVNorm);
+  Layers.QProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(pTrainable), QueryTokens);
+  Layers.KProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(pTrainable), KeyValueTokens);
+  Layers.VProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(pTrainable), KeyValueTokens);
+  Queries := Layers.QProj;
+  Keys := Layers.KProj;
+  if HasRope then
+  begin
+    Queries := EfficientLoFTRAddRope(NN, Layers.QProj, GridW, GridH, Config,
+      pTrainable);
+    Keys := EfficientLoFTRAddRope(NN, Layers.KProj, GridW, GridH, Config,
+      pTrainable);
+  end;
+  NN.AddLayer(TNNetDeepConcat.Create([Queries, Keys,
+    Layers.VProj]).SetTrainable(pTrainable));
+  Attention := TNNetFusedSDPA.Create(Config.NumAttentionHeads,
+    Config.NumAttentionHeads, HeadDim);
+  Attention.SetTrainable(pTrainable);
+  NN.AddLayer(Attention);
+  Layers.OProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetReshape.Create(GridW, GridH,
+    Hidden).SetTrainable(pTrainable));
+  Upsampled := NN.AddLayer(TNNetBilinearUpsample.Create(
+    Config.AggregationSize).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetDeepConcat.Create([X, Upsampled]).SetTrainable(pTrainable));
+  Layers.FC1 := NN.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hidden,
+    {pSuppressBias=}1).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetLeakyReLU.Create().SetTrainable(pTrainable));
+  Layers.FC2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(pTrainable));
+  Layers.MLPNorm := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(1e-5).SetTrainable(pTrainable));
+  Result := NN.AddLayer(TNNetSum.Create([X,
+    Layers.MLPNorm]).SetTrainable(pTrainable));
+end;
+
+// Loads one aggregated-attention block from Prefix (…layers.N.self_attention).
+procedure LoadEfficientLoFTRAttention(Reader: TNNetSafeTensorsReader;
+  const Layers: TEfficientLoFTRAttentionLayers; const Prefix: string;
+  const Config: TEfficientLoFTRConfig; HasRope: boolean);
+var
+  Hidden: integer;
+
+  // Writes torch Linear row n of WName to neuron Order[n] of Layer.
+  procedure LoadRotaryRows(Layer: TNNetLayer; const WName: string);
+  var
+    Weights: TNNetVolume;
+    Order: TNeuralIntegerArray;
+    RowPos, MaxRowPos: integer;
+  begin
+    EnsureWritableImportWeights(Layer);
+    if (not Reader.HasTensor(WName)) or (Reader.DimCount(WName) <> 2) or
+       (Reader.DimSize(WName, 0) <> Hidden) or
+       (Reader.DimSize(WName, 1) <> Hidden) then
+      ImportError('EfficientLoFTR import: "' + WName + '" must exist with ' +
+        'shape [' + IntToStr(Hidden) + ', ' + IntToStr(Hidden) + '].');
+    Order := EfficientLoFTRRopeOrder(Hidden);
+    Weights := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(WName, Weights);
+      MaxRowPos := Hidden - 1;
+      for RowPos := 0 to MaxRowPos do
+      begin
+        Move(Weights.FData[RowPos * Hidden],
+          Layer.FArrNeurons[Order[RowPos]].Weights.FData[0],
+          Hidden * csNeuralFloatSize);
+        Layer.FArrNeurons[Order[RowPos]].BiasWeight := 0;
+      end;
+      Layer.FlushWeightCache();
+    finally
+      Weights.Free;
+    end;
+  end;
+
+begin
+  Hidden := Config.HiddenSize;
+  LoadConvNeXtDepthwise(Reader, Layers.QAggregation,
+    Prefix + '.aggregation.q_aggregation.weight', '', Hidden,
+    Config.AggregationSize);
+  LoadLayerNormWeights(Reader, Layers.QNorm, Prefix + '.aggregation.norm.weight',
+    Prefix + '.aggregation.norm.bias', Hidden);
+  LoadLayerNormWeights(Reader, Layers.KVNorm, Prefix + '.aggregation.norm.weight',
+    Prefix + '.aggregation.norm.bias', Hidden);
+  if HasRope then
+  begin
+    LoadRotaryRows(Layers.QProj, Prefix + '.attention.q_proj.weight');
+    LoadRotaryRows(Layers.KProj, Prefix + '.attention.k_proj.weight');
+  end
+  else
+  begin
+    LoadLinearWeights(Reader, Layers.QProj, Prefix + '.attention.q_proj.weight',
+      '', Hidden, Hidden, false);
+    LoadLinearWeights(Reader, Layers.KProj, Prefix + '.attention.k_proj.weight',
+      '', Hidden, Hidden, false);
+  end;
+  LoadLinearWeights(Reader, Layers.VProj, Prefix + '.attention.v_proj.weight',
+    '', Hidden, Hidden, false);
+  LoadLinearWeights(Reader, Layers.OProj, Prefix + '.attention.o_proj.weight',
+    '', Hidden, Hidden, false);
+  LoadLinearWeights(Reader, Layers.FC1, Prefix + '.mlp.fc1.weight', '',
+    2 * Hidden, 2 * Hidden, false);
+  LoadLinearWeights(Reader, Layers.FC2, Prefix + '.mlp.fc2.weight', '',
+    2 * Hidden, Hidden, false);
+  LoadLayerNormWeights(Reader, Layers.MLPNorm, Prefix + '.mlp.layer_norm.weight',
+    Prefix + '.mlp.layer_norm.bias', Hidden);
+end;
+
+function BuildEfficientLoFTR(Reader: TNNetSafeTensorsReader;
+  const Config: TEfficientLoFTRConfig; pTrainable: boolean): TNNet;
+const
+  csBackbonePrefix = 'efficientloftr.backbone.stages.';
+  csTransformerPrefix = 'efficientloftr.local_feature_transformer.layers.';
+var
+  NN: TNNet;
+  Inputs, Coarse: array[0..1] of TNNetLayer;
+  StageOutputs: array[0..1, 0..3] of TNNetLayer;
+  Blocks: array[0..1] of array of TNNetLayer;
+  SelfLayers, CrossLayers: array[0..1] of array of TEfficientLoFTRAttentionLayers;
+  Pyramids: array[0..1] of TEfficientLoFTRPyramidLayers;
+  FineDims: array[0..2] of integer;
+  Side, Stage, BlockPos, MaxBlockPos, BlockCount, LayerPos, MaxLayerPos: integer;
+  Step, InWidth, OutWidth, Stride, ResidualWidth: integer;
+  Previous, Residual: TNNetLayer;
+  Prefix, StepPrefix: string;
+  WeightScale: TNeuralFloat;
+  NeuronPos, MaxNeuronPos: integer;
+begin
+  CheckEfficientLoFTRConfig(Config);
+  BlockCount := 0;
+  for Stage := 0 to 3 do Inc(BlockCount, Config.StageNumBlocks[Stage]);
+  FineDims[0] := Config.OutFeatures[3];
+  FineDims[1] := Config.OutFeatures[2];
+  FineDims[2] := Config.OutFeatures[1];
+  MaxLayerPos := Config.NumAttentionLayers - 1;
+  NN := TNNet.Create();
+  try
+    // Set before the layers are added, so the build releases every output
+    // a later forward plans by liveness instead of holding them all.
+    if not pTrainable then NN.ShareHostOutputsByLiveness := true;
+    // Two inputs at indices 0 and 1: NN.Compute([Image0, Image1]).
+    for Side := 0 to 1 do
+      Inputs[Side] := NN.AddLayer(TNNetInput.Create(Config.InputWidth,
+        Config.InputHeight, 1).SetTrainable(pTrainable));
+    // RepVGG backbone per image: every block folds to one 3x3 conv + ReLU.
+    for Side := 0 to 1 do
+    begin
+      SetLength(Blocks[Side], BlockCount);
+      Previous := Inputs[Side];
+      BlockCount := 0;
+      for Stage := 0 to 3 do
+      begin
+        MaxBlockPos := Config.StageNumBlocks[Stage] - 1;
+        for BlockPos := 0 to MaxBlockPos do
+        begin
+          if BlockPos = 0 then Stride := Config.StageStride[Stage]
+          else Stride := 1;
+          Previous := NN.AddLayerAfter(TNNetConvolutionReLU.Create(
+            Config.OutFeatures[Stage], 3, {pad=}1, Stride, {suppressBias=}0)
+            .SetTrainable(pTrainable), Previous);
+          Blocks[Side][BlockCount] := Previous;
+          Inc(BlockCount);
+        end;
+        StageOutputs[Side][Stage] := Previous;
+      end;
+      Coarse[Side] := StageOutputs[Side][3];
+    end;
+    // Coarse attention: self on each image, then cross 0<-1 and 1<-(new 0).
+    for Side := 0 to 1 do
+    begin
+      SetLength(SelfLayers[Side], Config.NumAttentionLayers);
+      SetLength(CrossLayers[Side], Config.NumAttentionLayers);
+    end;
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      for Side := 0 to 1 do
+        Coarse[Side] := EfficientLoFTRAddAttention(NN, Coarse[Side],
+          Coarse[Side], Config, {HasRope=}true, pTrainable,
+          SelfLayers[Side][LayerPos]);
+      Coarse[0] := EfficientLoFTRAddAttention(NN, Coarse[0], Coarse[1], Config,
+        {HasRope=}false, pTrainable, CrossLayers[0][LayerPos]);
+      Coarse[1] := EfficientLoFTRAddAttention(NN, Coarse[1], Coarse[0], Config,
+        {HasRope=}false, pTrainable, CrossLayers[1][LayerPos]);
+    end;
+    // Fine fusion pyramid per image: 1/8 -> 1/4 -> 1/2 -> full resolution.
+    for Side := 0 to 1 do
+    begin
+      Pyramids[Side].OutConv := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+        FineDims[0], {pSuppressBias=}1).SetTrainable(pTrainable), Coarse[Side]);
+      Previous := NN.AddLayer(
+        TNNetBilinearUpsample.Create(2).SetTrainable(pTrainable));
+      for Step := 0 to 1 do
+      begin
+        Residual := StageOutputs[Side][2 - Step];
+        Pyramids[Side].OutConv1[Step] := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(FineDims[Step],
+          {pSuppressBias=}1).SetTrainable(pTrainable), Residual);
+        NN.AddLayer(TNNetSum.Create([Pyramids[Side].OutConv1[Step],
+          Previous]).SetTrainable(pTrainable));
+        Pyramids[Side].OutConv2[Step] := NN.AddLayer(TNNetConvolutionLinear.Create(
+          FineDims[Step], 3, 1, 1, 0).SetTrainable(pTrainable));
+        NN.AddLayer(TNNetLeakyReLU.Create().SetTrainable(pTrainable));
+        Pyramids[Side].OutConv3[Step] := NN.AddLayer(TNNetConvolutionLinear.Create(
+          FineDims[Step + 1], 3, 1, 1, 1).SetTrainable(pTrainable));
+        Previous := NN.AddLayer(
+          TNNetBilinearUpsample.Create(2).SetTrainable(pTrainable));
+      end;
+      // The matcher reads the coarse and fine maps after the forward.
+      Coarse[Side].OutputPinned := true;
+      Previous.OutputPinned := true;
+    end;
+    if not pTrainable then NN.SetTrainable();
+
+    // ---------------- Weights (both images load the same tensors) ----------
+    for Side := 0 to 1 do
+    begin
+      BlockCount := 0;
+      InWidth := 1;
+      for Stage := 0 to 3 do
+      begin
+        OutWidth := Config.OutFeatures[Stage];
+        MaxBlockPos := Config.StageNumBlocks[Stage] - 1;
+        for BlockPos := 0 to MaxBlockPos do
+        begin
+          if BlockPos = 0 then Stride := Config.StageStride[Stage]
+          else Stride := 1;
+          ReparamRepVGGBlock(Reader, Blocks[Side][BlockCount], csBackbonePrefix +
+            IntToStr(Stage) + '.blocks.' + IntToStr(BlockPos), OutWidth, InWidth,
+            {Has1x1=}true, {HasIdentity=}(Stride = 1) and (InWidth = OutWidth),
+            Config.BatchNormEps, 'conv1', 'conv2', 'identity', 'norm');
+          Inc(BlockCount);
+          InWidth := OutWidth;
+        end;
+      end;
+      for LayerPos := 0 to MaxLayerPos do
+      begin
+        Prefix := csTransformerPrefix + IntToStr(LayerPos);
+        LoadEfficientLoFTRAttention(Reader, SelfLayers[Side][LayerPos],
+          Prefix + '.self_attention', Config, {HasRope=}true);
+        LoadEfficientLoFTRAttention(Reader, CrossLayers[Side][LayerPos],
+          Prefix + '.cross_attention', Config, {HasRope=}false);
+      end;
+      // The pyramid reads the coarse map divided by sqrt(hidden_size): folded
+      // into the bias-free out_conv.
+      LoadResNetConvFoldBN(Reader, Pyramids[Side].OutConv,
+        'refinement_layer.out_conv.weight', '', FineDims[0], FineDims[0], 1,
+        Config.BatchNormEps);
+      WeightScale := 1 / Sqrt(Config.HiddenSize);
+      MaxNeuronPos := FineDims[0] - 1;
+      for NeuronPos := 0 to MaxNeuronPos do
+        Pyramids[Side].OutConv.FArrNeurons[NeuronPos].Weights.Mul(WeightScale);
+      Pyramids[Side].OutConv.FlushWeightCache();
+      for Step := 0 to 1 do
+      begin
+        StepPrefix := 'refinement_layer.out_conv_layers.' + IntToStr(Step);
+        ResidualWidth := Config.OutFeatures[2 - Step];
+        LoadResNetConvFoldBN(Reader, Pyramids[Side].OutConv1[Step],
+          StepPrefix + '.out_conv1.weight', '', FineDims[Step], ResidualWidth, 1,
+          Config.BatchNormEps);
+        LoadResNetConvFoldBN(Reader, Pyramids[Side].OutConv2[Step],
+          StepPrefix + '.out_conv2.weight', StepPrefix + '.batch_norm',
+          FineDims[Step], FineDims[Step], 3, Config.BatchNormEps);
+        LoadResNetConvFoldBN(Reader, Pyramids[Side].OutConv3[Step],
+          StepPrefix + '.out_conv3.weight', '', FineDims[Step + 1],
+          FineDims[Step], 3, Config.BatchNormEps);
+      end;
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildEfficientLoFTRFromSafeTensorsEx(const FileName: string;
+  const Config: TEfficientLoFTRConfig; pTrainable: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildEfficientLoFTR(Reader, Config, pTrainable);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildEfficientLoFTRFromSafeTensors(const FileName: string;
+  pInputWidth, pInputHeight: integer; out Config: TEfficientLoFTRConfig;
+  pTrainable: boolean; const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadEfficientLoFTRConfigFromJSONFile(ConfigPath, pInputWidth,
+    pInputHeight);
+  Result := BuildEfficientLoFTRFromSafeTensorsEx(FileName, Config, pTrainable);
+end;
+
+procedure GetEfficientLoFTROutputs(NN: TNNet;
+  out Coarse0, Coarse1, Fine0, Fine1: TNNetLayer);
+var
+  LayerPos, MaxLayerPos, InputWidth, InputHeight: integer;
+  Layer: TNNetLayer;
+begin
+  Coarse0 := nil;
+  Coarse1 := nil;
+  Fine0 := nil;
+  Fine1 := nil;
+  InputWidth := NN.Layers[0].Output.SizeX;
+  InputHeight := NN.Layers[0].Output.SizeY;
+  MaxLayerPos := NN.CountLayers() - 1;
+  // The last two 1/8 sums close the cross blocks; the two full-size
+  // upsamples close the pyramids.
+  for LayerPos := 2 to MaxLayerPos do
+  begin
+    Layer := NN.Layers[LayerPos];
+    if (Layer is TNNetSum) and (Layer.Output.SizeX * 8 = InputWidth) and
+       (Layer.Output.SizeY * 8 = InputHeight) then
+    begin
+      Coarse0 := Coarse1;
+      Coarse1 := Layer;
+    end
+    else if (Layer is TNNetBilinearUpsample) and
+       (Layer.Output.SizeX = InputWidth) and
+       (Layer.Output.SizeY = InputHeight) then
+    begin
+      if Fine0 = nil then Fine0 := Layer else Fine1 := Layer;
+    end;
+  end;
+  if (Coarse0 = nil) or (Fine1 = nil) then
+    raise Exception.Create('GetEfficientLoFTROutputs: NN is not a ' +
+      'BuildEfficientLoFTR net.');
+end;
+
+constructor TEfficientLoFTRMatcher.Create(const pConfig: TEfficientLoFTRConfig);
+begin
+  inherited Create();
+  FConfig := pConfig;
+  FCount := 0;
+  FConfidence := TNNetVolume.Create;
+  FPacked := TNNetVolume.Create;
+  FRowScratch := TNNetVolume.Create;
+  FColumnMax := TNNetVolume.Create;
+  FColumnLogSumExp := TNNetVolume.Create;
+  FWindow0 := TNNetVolume.Create;
+  FWindow1 := TNNetVolume.Create;
+  FRegress0 := TNNetVolume.Create;
+  FRegress1 := TNNetVolume.Create;
+  FFineScores := TNNetVolume.Create;
+  FFinePacked := TNNetVolume.Create;
+  FFineColumnMax := TNNetVolume.Create;
+  FFineColumnLogSumExp := TNNetVolume.Create;
+  FFineRowScratch := TNNetVolume.Create;
+end;
+
+destructor TEfficientLoFTRMatcher.Destroy();
+begin
+  FFineRowScratch.Free;
+  FFineColumnLogSumExp.Free;
+  FFineColumnMax.Free;
+  FFinePacked.Free;
+  FFineScores.Free;
+  FRegress1.Free;
+  FRegress0.Free;
+  FWindow1.Free;
+  FWindow0.Free;
+  FColumnLogSumExp.Free;
+  FColumnMax.Free;
+  FRowScratch.Free;
+  FPacked.Free;
+  FConfidence.Free;
+  inherited Destroy();
+end;
+
+function TEfficientLoFTRMatcher.GetX0(Index: integer): TNeuralFloat;
+begin
+  Result := FX0[Index];
+end;
+
+function TEfficientLoFTRMatcher.GetY0(Index: integer): TNeuralFloat;
+begin
+  Result := FY0[Index];
+end;
+
+function TEfficientLoFTRMatcher.GetX1(Index: integer): TNeuralFloat;
+begin
+  Result := FX1[Index];
+end;
+
+function TEfficientLoFTRMatcher.GetY1(Index: integer): TNeuralFloat;
+begin
+  Result := FY1[Index];
+end;
+
+function TEfficientLoFTRMatcher.GetScore(Index: integer): TNeuralFloat;
+begin
+  Result := FScores[Index];
+end;
+
+function TEfficientLoFTRMatcher.GetCoarseIndex0(Index: integer): integer;
+begin
+  Result := FCoarseIndex0[Index];
+end;
+
+function TEfficientLoFTRMatcher.GetCoarseIndex1(Index: integer): integer;
+begin
+  Result := FCoarseIndex1[Index];
+end;
+
+function TEfficientLoFTRMatcher.ImageX(X: TNeuralFloat;
+  ImageWidth: integer): integer;
+begin
+  Result := Trunc((X / FConfig.InputWidth) * ImageWidth);
+end;
+
+function TEfficientLoFTRMatcher.ImageY(Y: TNeuralFloat;
+  ImageHeight: integer): integer;
+begin
+  Result := Trunc((Y / FConfig.InputHeight) * ImageHeight);
+end;
+
+// Writes ColumnLogSumExp[c] := log sum_r exp(Scores[r, c]) for the RowCount x
+// ColumnCount row-major Scores, through ColumnMax and the row scratch.
+procedure EfficientLoFTRColumnLogSumExp(Scores, ColumnMax, ColumnLogSumExp,
+  RowScratch: TNNetVolume; RowCount, ColumnCount: integer);
+var
+  RowPos, MaxRowPos, RowBytes: integer;
+begin
+  RowBytes := ColumnCount * csNeuralFloatSize;
+  MaxRowPos := RowCount - 1;
+  Move(Scores.FData[0], ColumnMax.FData[0], RowBytes);
+  for RowPos := 1 to MaxRowPos do
+    TNNetVolume.MaxElements(ColumnMax.DataPtr,
+      Scores.GetRawPtr(RowPos * ColumnCount), ColumnCount);
+  ColumnLogSumExp.Fill(0);
+  for RowPos := 0 to MaxRowPos do
+  begin
+    Move(Scores.FData[RowPos * ColumnCount], RowScratch.FData[0], RowBytes);
+    TNNetVolume.MulAdd(RowScratch.DataPtr, ColumnMax.DataPtr, -1, ColumnCount);
+    TNNetVolume.Exp(RowScratch.DataPtr, RowScratch.DataPtr, ColumnCount);
+    TNNetVolume.Add(ColumnLogSumExp.DataPtr, RowScratch.DataPtr, ColumnCount);
+  end;
+  TNNetVolume.Ln(ColumnLogSumExp.DataPtr, ColumnLogSumExp.DataPtr, ColumnCount);
+  TNNetVolume.Add(ColumnLogSumExp.DataPtr, ColumnMax.DataPtr, ColumnCount);
+end;
+
+procedure TEfficientLoFTRMatcher.ComputeConfidence(Coarse0, Coarse1: TNNetVolume);
+var
+  Dim, Count0, Count1, RowPos, MaxRowPos: integer;
+  RowPtr: TNeuralFloatArrPtr;
+  RowMax, RowLogSumExp: TNeuralFloat;
+begin
+  Dim := Coarse0.Depth;
+  Count0 := Coarse0.SizeX * Coarse0.SizeY;
+  Count1 := Coarse1.SizeX * Coarse1.SizeY;
+  FConfidence.ReSize(Count1, Count0, 1);
+  FPacked.ReSize(TNNetVolume.PackedDotProductFloats(Count1, Dim), 1, 1);
+  TNNetVolume.PackDotProductRows(FPacked.DataPtr, Coarse1.DataPtr, Count1, Dim);
+  TNNetVolume.DotProductsPacked(FConfidence.DataPtr, Count1, FPacked.DataPtr,
+    Count1, Coarse0.DataPtr, Dim, Count0, Dim, nil);
+  // Both feature maps are divided by sqrt(Dim), the similarity by temperature.
+  FConfidence.Mul(1 / (Dim * FConfig.CoarseMatchingTemperature));
+  if FConfig.CoarseMatchingSkipSoftmax then exit;
+  // softmax over image 0 * softmax over image 1 =
+  // exp(2 s - row log-sum-exp - column log-sum-exp).
+  FColumnMax.ReSize(Count1, 1, 1);
+  FColumnLogSumExp.ReSize(Count1, 1, 1);
+  FRowScratch.ReSize(Count1, 1, 1);
+  EfficientLoFTRColumnLogSumExp(FConfidence, FColumnMax, FColumnLogSumExp,
+    FRowScratch, Count0, Count1);
+  MaxRowPos := Count0 - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    RowPtr := FConfidence.GetRawPtr(RowPos * Count1);
+    RowMax := TNNetVolume.MaxValue(RowPtr, Count1);
+    RowLogSumExp := RowMax + Ln(TNNetVolume.ExpShiftSum(FRowScratch.DataPtr,
+      RowPtr, RowMax, Count1));
+    TNNetVolume.MulMulAdd(RowPtr, FColumnLogSumExp.DataPtr, 2, -1, Count1);
+    TNNetVolume.AddScalar(RowPtr, -RowLogSumExp, Count1);
+    TNNetVolume.Exp(RowPtr, RowPtr, Count1);
+  end;
+end;
+
+procedure TEfficientLoFTRMatcher.SelectCoarseMatches();
+var
+  Count0, Count1, Border, RowPos, MaxRowPos, ColumnPos, MaxColumnPos: integer;
+  BestPos, MinCoarse, MaxCoarseX, MaxCoarseY: integer;
+  RowPtr: TNeuralFloatArrPtr;
+  BestValue, Threshold, Scale: TNeuralFloat;
+
+  function IsInside(Cell: integer): boolean;
+  var
+    CellX, CellY: integer;
+  begin
+    CellX := Cell mod FCoarseWidth;
+    CellY := Cell div FCoarseWidth;
+    Result := (CellX >= MinCoarse) and (CellX <= MaxCoarseX) and
+      (CellY >= MinCoarse) and (CellY <= MaxCoarseY);
+  end;
+
+begin
+  Count1 := FConfidence.SizeX;
+  Count0 := FConfidence.SizeY;
+  FColumnMax.ReSize(Count1, 1, 1);
+  Move(FConfidence.FData[0], FColumnMax.FData[0], Count1 * csNeuralFloatSize);
+  MaxRowPos := Count0 - 1;
+  for RowPos := 1 to MaxRowPos do
+    TNNetVolume.MaxElements(FColumnMax.DataPtr,
+      FConfidence.GetRawPtr(RowPos * Count1), Count1);
+  Border := Max(FConfig.CoarseMatchingBorderRemoval, 0);
+  MinCoarse := Border;
+  MaxCoarseX := FCoarseWidth - 1 - Border;
+  MaxCoarseY := FCoarseHeight - 1 - Border;
+  if Length(FCoarseIndex0) < Count0 then
+  begin
+    SetLength(FCoarseIndex0, Count0);
+    SetLength(FCoarseIndex1, Count0);
+    SetLength(FScores, Count0);
+    SetLength(FX0, Count0);
+    SetLength(FY0, Count0);
+    SetLength(FX1, Count0);
+    SetLength(FY1, Count0);
+  end;
+  Threshold := FConfig.CoarseMatchingThreshold;
+  Scale := FConfig.InputHeight / FCoarseHeight;
+  MaxColumnPos := Count1 - 1;
+  FCount := 0;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    if not IsInside(RowPos) then continue;
+    RowPtr := FConfidence.GetRawPtr(RowPos * Count1);
+    BestValue := TNNetVolume.MaxPos(RowPtr, Count1, BestPos);
+    if not (BestValue > Threshold) then continue;
+    // The first column holding the row maximum that is also its column's
+    // maximum and inside the border, as torch's mask.max(dim=2).
+    for ColumnPos := BestPos to MaxColumnPos do
+      if (RowPtr^[ColumnPos] = BestValue) and
+         (FColumnMax.FData[ColumnPos] = BestValue) and IsInside(ColumnPos) then
+      begin
+        FCoarseIndex0[FCount] := RowPos;
+        FCoarseIndex1[FCount] := ColumnPos;
+        FScores[FCount] := BestValue;
+        FX0[FCount] := (RowPos mod FCoarseWidth) * Scale;
+        FY0[FCount] := (RowPos div FCoarseWidth) * Scale;
+        FX1[FCount] := (ColumnPos mod FCoarseWidth) * Scale;
+        FY1[FCount] := (ColumnPos div FCoarseWidth) * Scale;
+        Inc(FCount);
+        break;
+      end;
+  end;
+end;
+
+procedure TEfficientLoFTRMatcher.ExtractWindows(Fine0, Fine1: TNNetVolume;
+  Cell0, Cell1: integer);
+var
+  KernelSize, WideSize, Stride, Dim, SliceDim, MainDim: integer;
+  StartX, StartY, RowPos, ColumnPos, MaxRowPos, MaxColumnPos, WindowPos: integer;
+  PixelX, PixelY, MainBytes, SliceBytes: integer;
+  SourcePtr: TNeuralFloatArrPtr;
+begin
+  KernelSize := FConfig.FineKernelSize;
+  WideSize := KernelSize + 2;
+  Stride := Fine0.SizeY div FCoarseHeight;
+  Dim := Fine0.Depth;
+  SliceDim := FConfig.FineMatchingSliceDim;
+  MainDim := Dim - SliceDim;
+  MainBytes := MainDim * csNeuralFloatSize;
+  SliceBytes := SliceDim * csNeuralFloatSize;
+  FWindow0.ReSize(KernelSize * KernelSize, 1, MainDim);
+  FRegress0.ReSize(KernelSize * KernelSize, 1, SliceDim);
+  FWindow1.ReSize(WideSize * WideSize, 1, MainDim);
+  FRegress1.ReSize(WideSize * WideSize, 1, SliceDim);
+  // Image 0: the KernelSize x KernelSize window at the cell's corner.
+  StartX := (Cell0 mod FCoarseWidth) * Stride;
+  StartY := (Cell0 div FCoarseWidth) * Stride;
+  MaxRowPos := KernelSize - 1;
+  WindowPos := 0;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    SourcePtr := Fine0.GetRawPtr(StartX, StartY + RowPos);
+    for ColumnPos := 0 to MaxRowPos do
+    begin
+      Move(SourcePtr^[0], FWindow0.FData[WindowPos * MainDim], MainBytes);
+      Move(SourcePtr^[MainDim], FRegress0.FData[WindowPos * SliceDim], SliceBytes);
+      SourcePtr := TNeuralFloatArrPtr(@SourcePtr^[Dim]);
+      Inc(WindowPos);
+    end;
+  end;
+  // Image 1: the window one pixel wider on each side, zero outside the map.
+  FWindow1.Fill(0);
+  FRegress1.Fill(0);
+  StartX := (Cell1 mod FCoarseWidth) * Stride - 1;
+  StartY := (Cell1 div FCoarseWidth) * Stride - 1;
+  MaxRowPos := WideSize - 1;
+  MaxColumnPos := WideSize - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    PixelY := StartY + RowPos;
+    if (PixelY < 0) or (PixelY >= Fine1.SizeY) then continue;
+    for ColumnPos := 0 to MaxColumnPos do
+    begin
+      PixelX := StartX + ColumnPos;
+      if (PixelX < 0) or (PixelX >= Fine1.SizeX) then continue;
+      SourcePtr := Fine1.GetRawPtr(PixelX, PixelY);
+      WindowPos := RowPos * WideSize + ColumnPos;
+      Move(SourcePtr^[0], FWindow1.FData[WindowPos * MainDim], MainBytes);
+      Move(SourcePtr^[MainDim], FRegress1.FData[WindowPos * SliceDim], SliceBytes);
+    end;
+  end;
+end;
+
+procedure TEfficientLoFTRMatcher.RefineMatch(MatchPos: integer);
+var
+  KernelSize, WideSize, WindowCount, WideCount, MainDim, SliceDim, HalfKernel: integer;
+  RowPos, MaxRowPos, InnerRow, InnerColumn, MaxInnerPos, ScorePos: integer;
+  BestRow, BestInner, OffsetY, OffsetX, WideRow, WideColumn, HeatPos: integer;
+  RowPtr: TNeuralFloatArrPtr;
+  RowMax, RowLogSumExp, Value, BestValue, FineScale, HeatMax, HeatSum: TNeuralFloat;
+  RegressScale, ExpectX, ExpectY: TNeuralFloat;
+  Heat: array[0..8] of TNeuralFloat;
+begin
+  KernelSize := FConfig.FineKernelSize;
+  WideSize := KernelSize + 2;
+  WindowCount := KernelSize * KernelSize;
+  WideCount := WideSize * WideSize;
+  MainDim := FWindow0.Depth;
+  SliceDim := FRegress0.Depth;
+  HalfKernel := KernelSize div 2;
+  // Stage 1: dual softmax of the (WindowCount x WideCount) similarity, both
+  // windows divided by sqrt(full fine width); argmax over the inner columns.
+  FFineScores.ReSize(WideCount, WindowCount, 1);
+  FFinePacked.ReSize(TNNetVolume.PackedDotProductFloats(WideCount, MainDim), 1, 1);
+  TNNetVolume.PackDotProductRows(FFinePacked.DataPtr, FWindow1.DataPtr,
+    WideCount, MainDim);
+  TNNetVolume.DotProductsPacked(FFineScores.DataPtr, WideCount,
+    FFinePacked.DataPtr, WideCount, FWindow0.DataPtr, MainDim, WindowCount,
+    MainDim, nil);
+  FFineScores.Mul(1 / (MainDim + SliceDim));
+  FFineColumnMax.ReSize(WideCount, 1, 1);
+  FFineColumnLogSumExp.ReSize(WideCount, 1, 1);
+  FFineRowScratch.ReSize(WideCount, 1, 1);
+  EfficientLoFTRColumnLogSumExp(FFineScores, FFineColumnMax, FFineColumnLogSumExp,
+    FFineRowScratch, WindowCount, WideCount);
+  // exp() is monotonic: rank on 2 s - row LSE - column LSE.
+  BestValue := -MaxSingle;
+  BestRow := 0;
+  BestInner := 0;
+  MaxRowPos := WindowCount - 1;
+  MaxInnerPos := KernelSize - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    RowPtr := FFineScores.GetRawPtr(RowPos * WideCount);
+    RowMax := TNNetVolume.MaxValue(RowPtr, WideCount);
+    RowLogSumExp := RowMax + Ln(TNNetVolume.ExpShiftSum(FFineRowScratch.DataPtr,
+      RowPtr, RowMax, WideCount));
+    for InnerRow := 0 to MaxInnerPos do
+    begin
+      ScorePos := (InnerRow + 1) * WideSize + 1;
+      for InnerColumn := 0 to MaxInnerPos do
+      begin
+        Value := 2 * RowPtr^[ScorePos] - FFineColumnLogSumExp.FData[ScorePos] -
+          RowLogSumExp;
+        if Value > BestValue then
+        begin
+          BestValue := Value;
+          BestRow := RowPos;
+          BestInner := InnerRow * KernelSize + InnerColumn;
+        end;
+        Inc(ScorePos);
+      end;
+    end;
+  end;
+  FineScale := FConfig.InputHeight / (FCoarseHeight * 8);
+  FX0[MatchPos] := FX0[MatchPos] +
+    ((BestRow mod KernelSize) - HalfKernel + 0.5) * FineScale;
+  FY0[MatchPos] := FY0[MatchPos] +
+    ((BestRow div KernelSize) - HalfKernel + 0.5) * FineScale;
+  FX1[MatchPos] := FX1[MatchPos] +
+    ((BestInner mod KernelSize) - HalfKernel + 0.5) * FineScale;
+  FY1[MatchPos] := FY1[MatchPos] +
+    ((BestInner div KernelSize) - HalfKernel + 0.5) * FineScale;
+  // Stage 2: the 3x3 neighbourhood of the regress similarity, indexed like the
+  // original (inner index - 1..+1 on the wide grid, -1 wrapping to the end).
+  RegressScale := 1 / (Sqrt(SliceDim) * FConfig.FineMatchingRegressTemperature);
+  HeatPos := 0;
+  for OffsetY := -1 to 1 do
+    for OffsetX := -1 to 1 do
+    begin
+      WideRow := (BestInner div KernelSize) + OffsetY;
+      WideColumn := (BestInner mod KernelSize) + OffsetX;
+      if WideRow < 0 then Inc(WideRow, WideSize);
+      if WideColumn < 0 then Inc(WideColumn, WideSize);
+      Heat[HeatPos] := TNNetVolume.DotProduct(
+        FRegress0.GetRawPtr(BestRow * SliceDim),
+        FRegress1.GetRawPtr((WideRow * WideSize + WideColumn) * SliceDim),
+        SliceDim) * RegressScale;
+      Inc(HeatPos);
+    end;
+  HeatMax := TNNetVolume.MaxValue(TNeuralFloatArrPtr(@Heat[0]), 9);
+  HeatSum := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@Heat[0]),
+    TNeuralFloatArrPtr(@Heat[0]), HeatMax, 9);
+  ExpectX := (Heat[2] + Heat[5] + Heat[8] - Heat[0] - Heat[3] - Heat[6]) / HeatSum;
+  ExpectY := (Heat[6] + Heat[7] + Heat[8] - Heat[0] - Heat[1] - Heat[2]) / HeatSum;
+  FX1[MatchPos] := FX1[MatchPos] + ExpectX * FineScale;
+  FY1[MatchPos] := FY1[MatchPos] + ExpectY * FineScale;
+end;
+
+procedure TEfficientLoFTRMatcher.MatchFromOutputs(NN: TNNet);
+var
+  Coarse0, Coarse1, Fine0, Fine1: TNNetLayer;
+  MatchPos, MaxMatchPos: integer;
+begin
+  GetEfficientLoFTROutputs(NN, Coarse0, Coarse1, Fine0, Fine1);
+  Coarse0.ForceOutputOnRAM();
+  Coarse1.ForceOutputOnRAM();
+  Fine0.ForceOutputOnRAM();
+  Fine1.ForceOutputOnRAM();
+  FCoarseWidth := Coarse0.Output.SizeX;
+  FCoarseHeight := Coarse0.Output.SizeY;
+  ComputeConfidence(Coarse0.Output, Coarse1.Output);
+  SelectCoarseMatches();
+  MaxMatchPos := FCount - 1;
+  for MatchPos := 0 to MaxMatchPos do
+  begin
+    ExtractWindows(Fine0.Output, Fine1.Output, FCoarseIndex0[MatchPos],
+      FCoarseIndex1[MatchPos]);
+    RefineMatch(MatchPos);
+  end;
+end;
+
+procedure TEfficientLoFTRMatcher.Match(NN: TNNet; Image0, Image1: TNNetVolume);
+begin
+  NN.Compute([Image0, Image1]);
+  MatchFromOutputs(NN);
 end;
 
 function ReadClipImageProcessorConfig(

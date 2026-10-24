@@ -1,18 +1,21 @@
 program KeypointMatching;
 (*
-KeypointMatching: SuperPoint keypoints + LightGlue matching between two images
-with the importers in neuralpretrained.pas (TSuperPointKeypoints,
-TLightGlueMatcher).
+KeypointMatching: matches two images with the importers in
+neuralpretrained.pas, either SuperPoint keypoints + LightGlue matching
+(TSuperPointKeypoints, TLightGlueMatcher; the default) or EfficientLoFTR
+detector-free semi-dense matching (--matcher loftr, TEfficientLoFTRMatcher).
 
 Two modes:
-  * no arguments: a smoke of the committed random pico fixture
-    tests/fixtures/tiny_lightglue (its SuperPoint is the pico one): synthesize
-    a 64x48 texture and the same texture shifted by 8 pixels, match them and
-    write a side-by-side PNG with the match lines.
+  * no arguments: a smoke of a committed random pico fixture
+    (tests/fixtures/tiny_lightglue, or tiny_efficientloftr with --matcher
+    loftr): synthesize a texture and the same texture shifted by 8 pixels,
+    match them and write a side-by-side PNG with the match lines.
   * --model FILE --image0 IMG --image1 IMG --output PNG: match two real images
     with a LightGlue checkpoint (ETH-CVG/lightglue_superpoint model.safetensors,
     which also holds its SuperPoint) or with --superpoint FILE for a separate
-    SuperPoint checkpoint (magic-leap-community/superpoint).
+    SuperPoint checkpoint (magic-leap-community/superpoint); with --matcher
+    loftr, --model is an EfficientLoFTR checkpoint
+    (zju-community/efficientloftr model.safetensors).
 
 Both images are resized to --width x --height (640 x 480 by default, as
 LightGlueImageProcessor does), turned gray, and the keypoints are drawn back
@@ -39,6 +42,7 @@ const
 
 type
   TMatchOptions = record
+    MatcherName: string; // 'lightglue' or 'loftr'
     ModelFile, ConfigFile, SuperPointFile, SuperPointConfigFile: string;
     ImageFiles: array[0..1] of string;
     OutputFile: string;
@@ -46,14 +50,24 @@ type
     KeypointThreshold, FilterThreshold: TNeuralFloat;
     DepthConfidence, WidthConfidence: TNeuralFloat;
     HasDepthConfidence, HasWidthConfidence: boolean;
+    CoarseThreshold: TNeuralFloat; // < 0 keeps the config value
   end;
+
+  // One match in original-image pixels, Score in [0, 1].
+  TMatchLine = record
+    X0, Y0, X1, Y1: integer;
+    Score: TNeuralFloat;
+  end;
+  TMatchLines = array of TMatchLine;
 
 procedure PrintUsage();
 begin
-  WriteLn('Usage: KeypointMatching                        (pico fixture smoke)');
+  WriteLn('Usage: KeypointMatching [--matcher loftr]       (pico fixture smoke)');
   WriteLn('       KeypointMatching --model FILE --image0 IMG --image1 IMG ',
     '--output PNG [options]');
-  WriteLn('  --model FILE             LightGlue model.safetensors');
+  WriteLn('  --matcher NAME           lightglue (SuperPoint + LightGlue, default) ',
+    'or loftr (EfficientLoFTR)');
+  WriteLn('  --model FILE             LightGlue or EfficientLoFTR model.safetensors');
   WriteLn('  --config FILE            its config.json (default: next to --model)');
   WriteLn('  --superpoint FILE        SuperPoint model.safetensors (default: the');
   WriteLn('                           keypoint_detector inside --model)');
@@ -62,7 +76,7 @@ begin
   WriteLn('  --image0 IMG, --image1 IMG  the two images (PNG / JPEG / BMP)');
   WriteLn('  --output PNG             side-by-side image with the match lines');
   WriteLn('  --width N, --height N    net input size, multiples of 8 ',
-    '(default 640 x 480)');
+    '(32 for loftr; default 640 x 480)');
   WriteLn('  --max-keypoints N        keypoints kept per image, -1 = all ',
     '(default: config)');
   WriteLn('  --keypoint-threshold X   SuperPoint score threshold (default: config)');
@@ -71,6 +85,8 @@ begin
     '(default: config)');
   WriteLn('  --width-confidence X     point pruning, <= 0 keeps every point ',
     '(default: config)');
+  WriteLn('  --coarse-threshold X     loftr coarse match threshold ',
+    '(default: config, 0.2)');
 end;
 
 function ParseOptions(out Opt: TMatchOptions): boolean;
@@ -87,6 +103,8 @@ var
   end;
 
 begin
+  Opt.MatcherName := 'lightglue';
+  Opt.CoarseThreshold := -1;
   Opt.ModelFile := '';
   Opt.ConfigFile := '';
   Opt.SuperPointFile := '';
@@ -108,7 +126,8 @@ begin
   while ArgPos <= ParamCount do
   begin
     Arg := ParamStr(ArgPos);
-    if Arg = '--model' then Opt.ModelFile := NextArg()
+    if Arg = '--matcher' then Opt.MatcherName := LowerCase(NextArg())
+    else if Arg = '--model' then Opt.ModelFile := NextArg()
     else if Arg = '--config' then Opt.ConfigFile := NextArg()
     else if Arg = '--superpoint' then Opt.SuperPointFile := NextArg()
     else if Arg = '--superpoint-config' then Opt.SuperPointConfigFile := NextArg()
@@ -132,6 +151,8 @@ begin
       Opt.WidthConfidence := StrToFloat(NextArg());
       Opt.HasWidthConfidence := true;
     end
+    else if Arg = '--coarse-threshold' then
+      Opt.CoarseThreshold := StrToFloat(NextArg())
     else if (Arg = '--help') or (Arg = '-h') then
     begin
       PrintUsage();
@@ -142,6 +163,8 @@ begin
       raise Exception.Create('unknown argument: ' + Arg);
     Inc(ArgPos);
   end;
+  if (Opt.MatcherName <> 'lightglue') and (Opt.MatcherName <> 'loftr') then
+    raise Exception.Create('--matcher must be lightglue or loftr');
   if (Opt.ModelFile <> '') and ((Opt.ImageFiles[0] = '') or
      (Opt.ImageFiles[1] = '') or (Opt.OutputFile = '')) then
     raise Exception.Create('--model needs --image0, --image1 and --output');
@@ -228,13 +251,11 @@ end;
 // Side by side Images[0] | Images[1] with every match drawn as a line colored
 // from red (score 0) to green (score 1), as transformers' visualization does.
 procedure SaveMatchImage(const FileName: string;
-  const Images: array of TNNetVolume;
-  const Keypoints: array of TSuperPointKeypoints; Matcher: TLightGlueMatcher);
+  const Images: array of TNNetVolume; const Lines: TMatchLines);
 var
   Canvas: TNNetVolume;
   Side, PixelX, PixelY, MaxPixelX, MaxPixelY, Channel: integer;
-  PointPos, MaxPointPos, Partner, OffsetX, Thickness: integer;
-  X0, Y0, X1, Y1: integer;
+  LinePos, MaxLinePos, OffsetX, Thickness: integer;
   Score: TNeuralFloat;
 begin
   Canvas := TNNetVolume.Create(Images[0].SizeX + Images[1].SizeX,
@@ -253,21 +274,17 @@ begin
       Inc(OffsetX, Images[Side].SizeX);
     end;
     Thickness := Max(1, Canvas.SizeX div 400);
-    MaxPointPos := Matcher.Count0 - 1;
-    for PointPos := 0 to MaxPointPos do
+    OffsetX := Images[0].SizeX;
+    MaxLinePos := High(Lines);
+    for LinePos := 0 to MaxLinePos do
     begin
-      Partner := Matcher.Matches0[PointPos];
-      if Partner < 0 then continue;
-      // post_process_keypoint_matching: net-input pixels to each original image.
-      X0 := Keypoints[0].ImageX(PointPos, Images[0].SizeX);
-      Y0 := Keypoints[0].ImageY(PointPos, Images[0].SizeY);
-      X1 := Keypoints[1].ImageX(Partner, Images[1].SizeX) + Images[0].SizeX;
-      Y1 := Keypoints[1].ImageY(Partner, Images[1].SizeY);
-      Score := Min(Max(Matcher.MatchScores0[PointPos], 0), 1);
-      DrawLine(Canvas, X0, Y0, X1, Y1, Thickness, 255 * (1 - Score),
-        255 * Score, 0);
-      DrawDot(Canvas, X0, Y0, Thickness + 1);
-      DrawDot(Canvas, X1, Y1, Thickness + 1);
+      Score := Min(Max(Lines[LinePos].Score, 0), 1);
+      DrawLine(Canvas, Lines[LinePos].X0, Lines[LinePos].Y0,
+        Lines[LinePos].X1 + OffsetX, Lines[LinePos].Y1, Thickness,
+        255 * (1 - Score), 255 * Score, 0);
+      DrawDot(Canvas, Lines[LinePos].X0, Lines[LinePos].Y0, Thickness + 1);
+      DrawDot(Canvas, Lines[LinePos].X1 + OffsetX, Lines[LinePos].Y1,
+        Thickness + 1);
     end;
     if not SaveImageFromVolumeIntoFile(Canvas, FileName) then
       raise Exception.Create('could not save ' + FileName);
@@ -276,7 +293,33 @@ begin
   end;
 end;
 
-procedure MatchFiles(const Opt: TMatchOptions);
+// The LightGlue matches mapped to each original image, as transformers'
+// post_process_keypoint_matching does.
+function LightGlueMatchLines(const Images: array of TNNetVolume;
+  const Keypoints: array of TSuperPointKeypoints;
+  Matcher: TLightGlueMatcher): TMatchLines;
+var
+  PointPos, MaxPointPos, Partner, LineCount: integer;
+begin
+  Result := nil;
+  SetLength(Result, Matcher.Count0);
+  LineCount := 0;
+  MaxPointPos := Matcher.Count0 - 1;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    Partner := Matcher.Matches0[PointPos];
+    if Partner < 0 then continue;
+    Result[LineCount].X0 := Keypoints[0].ImageX(PointPos, Images[0].SizeX);
+    Result[LineCount].Y0 := Keypoints[0].ImageY(PointPos, Images[0].SizeY);
+    Result[LineCount].X1 := Keypoints[1].ImageX(Partner, Images[1].SizeX);
+    Result[LineCount].Y1 := Keypoints[1].ImageY(Partner, Images[1].SizeY);
+    Result[LineCount].Score := Matcher.MatchScores0[PointPos];
+    Inc(LineCount);
+  end;
+  SetLength(Result, LineCount);
+end;
+
+procedure MatchFilesLightGlue(const Opt: TMatchOptions);
 var
   Config: TLightGlueConfig;
   Detector: TNNet;
@@ -347,7 +390,8 @@ begin
        ScoreSum / Max(MatchCount, 1), Matcher.StopLayer + 1,
        Config.NumHiddenLayers, Matcher.KeptCount0, Matcher.KeptCount1,
        Matcher.Count0, Matcher.Count1]));
-    SaveMatchImage(Opt.OutputFile, Images, Keypoints, Matcher);
+    SaveMatchImage(Opt.OutputFile, Images,
+      LightGlueMatchLines(Images, Keypoints, Matcher));
     WriteLn('  wrote ', Opt.OutputFile);
   finally
     for Side := 0 to 1 do
@@ -359,6 +403,83 @@ begin
     Matcher.Free;
     Detector.Free;
   end;
+end;
+
+procedure MatchFilesLoFTR(const Opt: TMatchOptions);
+var
+  Config: TEfficientLoFTRConfig;
+  NN: TNNet;
+  Matcher: TEfficientLoFTRMatcher;
+  Images: array[0..1] of TNNetVolume;
+  Grays: array[0..1] of TNNetVolume;
+  Lines: TMatchLines;
+  Side, MatchPos, MaxMatchPos: integer;
+  StartTime: TDateTime;
+  ScoreSum: double;
+begin
+  NN := nil;
+  Matcher := nil;
+  for Side := 0 to 1 do
+  begin
+    Images[Side] := TNNetVolume.Create;
+    Grays[Side] := TNNetVolume.Create;
+  end;
+  try
+    StartTime := Now();
+    NN := BuildEfficientLoFTRFromSafeTensors(Opt.ModelFile, Opt.Width,
+      Opt.Height, Config, {pTrainable=}false, Opt.ConfigFile);
+    if Opt.CoarseThreshold >= 0 then
+      Config.CoarseMatchingThreshold := Opt.CoarseThreshold;
+    WriteLn(EfficientLoFTRConfigToString(Config));
+    WriteLn(Format('  load: %.2f s', [(Now() - StartTime) * 86400.0]));
+    Matcher := TEfficientLoFTRMatcher.Create(Config);
+    for Side := 0 to 1 do
+    begin
+      LoadRGB(Opt.ImageFiles[Side], Images[Side]);
+      SuperPointPreprocessImage(Images[Side], Grays[Side], Opt.Width, Opt.Height);
+      WriteLn(Format('  image%d %s: %dx%d', [Side, Opt.ImageFiles[Side],
+        Images[Side].SizeX, Images[Side].SizeY]));
+    end;
+    StartTime := Now();
+    Matcher.Match(NN, Grays[0], Grays[1]);
+    ScoreSum := 0;
+    Lines := nil;
+    SetLength(Lines, Matcher.Count);
+    MaxMatchPos := Matcher.Count - 1;
+    for MatchPos := 0 to MaxMatchPos do
+    begin
+      Lines[MatchPos].X0 := Matcher.ImageX(Matcher.KeypointX0[MatchPos],
+        Images[0].SizeX);
+      Lines[MatchPos].Y0 := Matcher.ImageY(Matcher.KeypointY0[MatchPos],
+        Images[0].SizeY);
+      Lines[MatchPos].X1 := Matcher.ImageX(Matcher.KeypointX1[MatchPos],
+        Images[1].SizeX);
+      Lines[MatchPos].Y1 := Matcher.ImageY(Matcher.KeypointY1[MatchPos],
+        Images[1].SizeY);
+      Lines[MatchPos].Score := Matcher.Scores[MatchPos];
+      ScoreSum := ScoreSum + Matcher.Scores[MatchPos];
+    end;
+    WriteLn(Format('  EfficientLoFTR: %.2f s, %d matches (mean score %.3f) ' +
+      'on a %dx%d coarse grid', [(Now() - StartTime) * 86400.0, Matcher.Count,
+      ScoreSum / Max(Matcher.Count, 1), Matcher.CoarseWidth,
+      Matcher.CoarseHeight]));
+    SaveMatchImage(Opt.OutputFile, Images, Lines);
+    WriteLn('  wrote ', Opt.OutputFile);
+  finally
+    for Side := 0 to 1 do
+    begin
+      Grays[Side].Free;
+      Images[Side].Free;
+    end;
+    Matcher.Free;
+    NN.Free;
+  end;
+end;
+
+procedure MatchFiles(const Opt: TMatchOptions);
+begin
+  if Opt.MatcherName = 'loftr' then MatchFilesLoFTR(Opt)
+  else MatchFilesLightGlue(Opt);
 end;
 
 // A blocky gray texture and the same texture shifted right by Shift pixels.
@@ -400,19 +521,27 @@ begin
   end;
 end;
 
-procedure RunFixtureSmoke();
-var
-  Opt: TMatchOptions;
+procedure RunFixtureSmoke(Opt: TMatchOptions);
 begin
-  ParseOptions(Opt);
-  MakeSmokePair('keypoint_in0.png', 'keypoint_in1.png', 64, 48, 8);
-  Opt.ModelFile := FixturesDir + 'tiny_lightglue.safetensors';
-  Opt.ConfigFile := FixturesDir + 'tiny_lightglue_config.json';
   Opt.ImageFiles[0] := 'keypoint_in0.png';
   Opt.ImageFiles[1] := 'keypoint_in1.png';
   Opt.OutputFile := 'keypoint_matches.png';
-  Opt.Width := 64;
-  Opt.Height := 48;
+  if Opt.MatcherName = 'loftr' then
+  begin
+    // The pico EfficientLoFTR input is 128 x 96 (a multiple of 32).
+    Opt.ModelFile := FixturesDir + 'tiny_efficientloftr.safetensors';
+    Opt.ConfigFile := FixturesDir + 'tiny_efficientloftr_config.json';
+    Opt.Width := 128;
+    Opt.Height := 96;
+  end
+  else
+  begin
+    Opt.ModelFile := FixturesDir + 'tiny_lightglue.safetensors';
+    Opt.ConfigFile := FixturesDir + 'tiny_lightglue_config.json';
+    Opt.Width := 64;
+    Opt.Height := 48;
+  end;
+  MakeSmokePair(Opt.ImageFiles[0], Opt.ImageFiles[1], Opt.Width, Opt.Height, 8);
   MatchFiles(Opt);
 end;
 
@@ -425,9 +554,12 @@ begin
       MatchFiles(Options)
     else
     begin
-      WriteLn('SuperPoint + LightGlue keypoint matching smoke (random pico weights)');
+      if Options.MatcherName = 'loftr' then
+        WriteLn('EfficientLoFTR dense matching smoke (random pico weights)')
+      else
+        WriteLn('SuperPoint + LightGlue keypoint matching smoke (random pico weights)');
       WriteLn('===================================================================');
-      RunFixtureSmoke();
+      RunFixtureSmoke(Options);
       WriteLn('Done.');
     end;
   except

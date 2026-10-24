@@ -2423,7 +2423,7 @@ rather than acted on.
             processor (uint8 grayscale before an antialiased resize) is not
             matched, only the PIL backend.
 
-- [ ] EfficientLoFTR detector-free dense matching importer
+- [X] EfficientLoFTR detector-free dense matching importer
       (`BuildEfficientLoFTRFromSafeTensors[Ex]` + `TEfficientLoFTRMatcher`,
       checkpoint zju-community/efficientloftr, transformers model_type
       `efficientloftr`; Wang et al. 2024, *Efficient LoFTR: Semi-Dense Local
@@ -2446,6 +2446,38 @@ rather than acted on.
       `EfficientLoFTRForKeypointMatching` (in the ~/x venv) on the coarse
       confidence matrix and the final keypoints; ask the user before adding the
       Python fixture script to tools/.
+      - [X] One two-input TNNet (RepVGG folded by `ReparamRepVGGBlock`, now
+            with branch-name parameters; RoPE by `TNNetAxialRotaryEmbedding`
+            plus a `TNNetSplitChannels` reorder; `TNNetFusedSDPA`), the host
+            matcher, `--matcher loftr` in examples/KeypointMatching, README
+            rows, `tools/make_pico_efficientloftr_fixture.py` and
+            `TestEfficientLoFTR*` (confidence 9.0e-6, scores 4.2e-6, fine
+            windows 1.2e-5; keypoints equal to float32 rounding). The fine
+            refinement follows the original zju3dv code, because transformers
+            5.17 differs there (see examples/KeypointMatching/README.md).
+            Real checkpoint against transformers at 256 x 192: 463/463
+            matches, confidence 9.2e-6, keypoints 1.5e-5 px.
+      - [ ] Memory: about 22 KB of RAM per input pixel (1.35 GB at 256 x 192,
+            about 6.9 GB at 640 x 480). Every CPU 3x3 convolution keeps its
+            im2col (`FInputPrepared`), its padded input copy (`FInputCopy`),
+            `FOutputRaw` and `FBiasOutput` for the life of the net, and
+            `ShareHostOutputsByLiveness` shares only `FOutput`. Candidates:
+            one conv scratch shared by every layer of an inference-only net
+            (it must stay safe with the parallel layer scheduler), and
+            `CanShareHostOutput` overrides on `TNNetBilinearUpsample`,
+            `TNNetLeakyReLU` and `TNNetTokenLayerNorm`. A 640 x 480 run fits
+            the dev box only after this.
+      - [ ] Real-checkpoint run at 640 x 480 on a real image pair, user-tested,
+            with the transformers comparison (the 256 x 192 check used
+            docs/park.jpg and a crop of it).
+      - [ ] The backbone, attention and pyramid weights are loaded twice, once
+            per image branch (+64 MB at the real size). Borrow them with
+            `LinkWeightsFrom` / `BuildWeightOwner` instead.
+      - [ ] Speed: the coarse similarity (`DotProductsPacked`, 4800 x 4800 x
+            256 at 640 x 480) and the per-match refinement run on one thread;
+            no OpenCL path has been tested.
+      - [ ] Image pairs of different sizes (the original code supports them,
+            transformers does not).
 
 - [ ] CoTracker3 point tracking importer + examples/PointTracking (Karaev et al.
       2024, *CoTracker3: Simpler and Better Point Tracking by Pseudo-Labelling

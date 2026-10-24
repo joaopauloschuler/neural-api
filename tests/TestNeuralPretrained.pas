@@ -1666,6 +1666,10 @@ type
     // Only the matchability prunes; matches still map to keypoint indices.
     procedure TestLightGluePruningWithoutEarlyExit;
     procedure TestLightGlueNoKeypoints;
+    procedure TestEfficientLoFTRConfigFromJSONFile;
+    // Pico net + matcher: coarse confidence, matches, fine windows, keypoints.
+    procedure TestEfficientLoFTRParity;
+    procedure TestEfficientLoFTRRejectsInputSize;
     procedure TestRIFEConfigFromJSONFile;
     procedure TestRIFEParity;
     procedure TestRIFETimestepParity;
@@ -58828,6 +58832,197 @@ begin
     Detector.Free;
     Matcher.Free;
   end;
+end;
+
+// ReadEfficientLoFTRConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestEfficientLoFTRConfigFromJSONFile;
+var
+  Config: TEfficientLoFTRConfig;
+begin
+  Config := ReadEfficientLoFTRConfigFromJSONFile(
+    FixturePath('tiny_efficientloftr_config.json'), 128, 96);
+  AssertEquals('model_type', 'efficientloftr', Config.ModelType);
+  AssertEquals('stages', 4, Length(Config.StageNumBlocks));
+  AssertEquals('stage 3 blocks', 2, Config.StageNumBlocks[3]);
+  AssertEquals('out_features[0]', 16, Config.OutFeatures[0]);
+  AssertEquals('hidden', 32, Config.HiddenSize);
+  AssertEquals('heads', 8, Config.NumAttentionHeads);
+  AssertEquals('layers', 2, Config.NumAttentionLayers);
+  AssertEquals('aggregation', 4, Config.AggregationSize);
+  AssertEquals('rope theta', 10000, Config.RopeTheta, 1e-3);
+  AssertEquals('partial rotary', 4, Config.PartialRotaryFactor, 1e-6);
+  AssertEquals('threshold', 0.2, Config.CoarseMatchingThreshold, 1e-6);
+  AssertEquals('temperature', 0.1, Config.CoarseMatchingTemperature, 1e-6);
+  AssertEquals('border', 2, Config.CoarseMatchingBorderRemoval);
+  AssertEquals('fine kernel', 8, Config.FineKernelSize);
+  AssertEquals('slice', 8, Config.FineMatchingSliceDim);
+  AssertEquals('regress temperature', 10, Config.FineMatchingRegressTemperature,
+    1e-6);
+  AssertEquals('input width', 128, Config.InputWidth);
+  AssertEquals('input height', 96, Config.InputHeight);
+end;
+
+// The pico net + TEfficientLoFTRMatcher against the transformers 5.17 float64
+// confidence and fine windows, and the original EfficientLoFTR refinement.
+procedure TTestNeuralPretrained.TestEfficientLoFTRParity;
+var
+  Config: TEfficientLoFTRConfig;
+  NN: TNNet;
+  IO: TNNetSafeTensorsReader;
+  Matcher: TEfficientLoFTRMatcher;
+  Images: array[0..1] of TNNetVolume;
+  Flat, Expected, Expected1, ExpectedWindow: TNNetVolume;
+  Coarse0, Coarse1, Fine0, Fine1: TNNetLayer;
+  Width, Height, Side, MatchPos, MaxMatchPos, Dim, CoarseWidth: integer;
+  WindowPos, MaxWindowPos, StartX, StartY, PixelX, PixelY, Channel: integer;
+  MaxChannel, WindowSide: integer;
+  Diff, WindowDiff, Value: double;
+begin
+  IO := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_efficientloftr_io.safetensors'));
+  Flat := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Expected1 := TNNetVolume.Create;
+  ExpectedWindow := TNNetVolume.Create;
+  Images[0] := TNNetVolume.Create;
+  Images[1] := TNNetVolume.Create;
+  NN := nil;
+  Matcher := nil;
+  try
+    Height := IO.DimSize('image0', 0);
+    Width := IO.DimSize('image0', 1);
+    for Side := 0 to 1 do
+    begin
+      IO.LoadTensorFlat('image' + IntToStr(Side), Flat);
+      Images[Side].ReSize(Width, Height, 1);
+      Images[Side].CopyNoChecks(Flat);
+    end;
+    NN := BuildEfficientLoFTRFromSafeTensors(
+      FixturePath('tiny_efficientloftr.safetensors'), Width, Height, Config,
+      {pTrainable=}false, FixturePath('tiny_efficientloftr_config.json'));
+    Matcher := TEfficientLoFTRMatcher.Create(Config);
+    Matcher.Match(NN, Images[0], Images[1]);
+    // Coarse dual-softmax confidence, every cell pair.
+    IO.LoadTensorFlat('confidence', Expected);
+    AssertEquals('confidence size', Expected.Size, Matcher.Confidence.Size);
+    Diff := 0;
+    MaxWindowPos := Expected.Size - 1;
+    for WindowPos := 0 to MaxWindowPos do
+      Diff := Max(Diff, Abs(Expected.FData[WindowPos] -
+        Matcher.Confidence.FData[WindowPos]));
+    AssertTrue('confidence max |diff| = ' + FloatToStr(Diff), Diff < 1e-4);
+    // Coarse matches: cells exact, scores < 1e-4.
+    IO.LoadTensorFlat('matches', Expected);
+    AssertEquals('match count', Expected.Size div 2, Matcher.Count);
+    IO.LoadTensorFlat('match_scores', Expected1);
+    MaxMatchPos := Matcher.Count - 1;
+    Diff := 0;
+    for MatchPos := 0 to MaxMatchPos do
+    begin
+      AssertEquals('cell 0 of match ' + IntToStr(MatchPos),
+        Round(Expected.FData[2 * MatchPos]), Matcher.CoarseIndex0[MatchPos]);
+      AssertEquals('cell 1 of match ' + IntToStr(MatchPos),
+        Round(Expected.FData[2 * MatchPos + 1]), Matcher.CoarseIndex1[MatchPos]);
+      Diff := Max(Diff, Abs(Expected1.FData[MatchPos] - Matcher.Scores[MatchPos]));
+    end;
+    AssertTrue('match score max |diff| = ' + FloatToStr(Diff), Diff < 1e-4);
+    // Fine maps: the 8x8 window of image 0 and the 10x10 one of image 1.
+    GetEfficientLoFTROutputs(NN, Coarse0, Coarse1, Fine0, Fine1);
+    Dim := Fine0.Output.Depth;
+    CoarseWidth := Matcher.CoarseWidth;
+    WindowDiff := 0;
+    MaxChannel := Dim - 1;
+    for Side := 0 to 1 do
+    begin
+      IO.LoadTensorFlat('window' + IntToStr(Side), ExpectedWindow);
+      WindowSide := 8 + 2 * Side;
+      MaxWindowPos := WindowSide * WindowSide - 1;
+      for MatchPos := 0 to MaxMatchPos do
+        for WindowPos := 0 to MaxWindowPos do
+        begin
+          if Side = 0 then
+          begin
+            StartX := (Matcher.CoarseIndex0[MatchPos] mod CoarseWidth) * 8;
+            StartY := (Matcher.CoarseIndex0[MatchPos] div CoarseWidth) * 8;
+            PixelX := StartX + WindowPos mod 8;
+            PixelY := StartY + WindowPos div 8;
+          end
+          else
+          begin
+            StartX := (Matcher.CoarseIndex1[MatchPos] mod CoarseWidth) * 8 - 1;
+            StartY := (Matcher.CoarseIndex1[MatchPos] div CoarseWidth) * 8 - 1;
+            PixelX := StartX + WindowPos mod WindowSide;
+            PixelY := StartY + WindowPos div WindowSide;
+          end;
+          for Channel := 0 to MaxChannel do
+          begin
+            if (PixelX < 0) or (PixelY < 0) or (PixelX >= Width) or
+               (PixelY >= Height) then Value := 0
+            else if Side = 0 then Value := Fine0.Output[PixelX, PixelY, Channel]
+            else Value := Fine1.Output[PixelX, PixelY, Channel];
+            WindowDiff := Max(WindowDiff, Abs(Value - ExpectedWindow.FData[
+              (MatchPos * WindowSide * WindowSide + WindowPos) * Dim +
+              Channel]));
+          end;
+        end;
+    end;
+    AssertTrue('fine window max |diff| = ' + FloatToStr(WindowDiff),
+      WindowDiff < 1e-4);
+    // Refined keypoints (net-input pixels).
+    IO.LoadTensorFlat('keypoints0', Expected);
+    IO.LoadTensorFlat('keypoints1', Expected1);
+    Diff := 0;
+    for MatchPos := 0 to MaxMatchPos do
+    begin
+      Diff := Max(Diff, Abs(Expected.FData[2 * MatchPos] -
+        Matcher.KeypointX0[MatchPos]));
+      Diff := Max(Diff, Abs(Expected.FData[2 * MatchPos + 1] -
+        Matcher.KeypointY0[MatchPos]));
+      Diff := Max(Diff, Abs(Expected1.FData[2 * MatchPos] -
+        Matcher.KeypointX1[MatchPos]));
+      Diff := Max(Diff, Abs(Expected1.FData[2 * MatchPos + 1] -
+        Matcher.KeypointY1[MatchPos]));
+    end;
+    AssertTrue('keypoint max |diff| = ' + FloatToStr(Diff), Diff < 1e-4);
+    // A threshold above every confidence leaves no match.
+    Matcher.CoarseMatchingThreshold := 2;
+    Matcher.MatchFromOutputs(NN);
+    AssertEquals('no match above 2', 0, Matcher.Count);
+  finally
+    Matcher.Free;
+    NN.Free;
+    Images[1].Free;
+    Images[0].Free;
+    ExpectedWindow.Free;
+    Expected1.Free;
+    Expected.Free;
+    Flat.Free;
+    IO.Free;
+  end;
+end;
+
+// An input that is not a multiple of 32 is rejected at build time.
+procedure TTestNeuralPretrained.TestEfficientLoFTRRejectsInputSize;
+var
+  Config: TEfficientLoFTRConfig;
+  NN: TNNet;
+  Raised: boolean;
+begin
+  Config := ReadEfficientLoFTRConfigFromJSONFile(
+    FixturePath('tiny_efficientloftr_config.json'), 120, 96);
+  Raised := false;
+  NN := nil;
+  try
+    try
+      NN := BuildEfficientLoFTRFromSafeTensorsEx(
+        FixturePath('tiny_efficientloftr.safetensors'), Config, false);
+    except
+      Raised := true;
+    end;
+  finally
+    NN.Free;
+  end;
+  AssertTrue('120 x 96 must be rejected', Raised);
 end;
 
 procedure TTestNeuralPretrained.TestLaMaOutpaintKeepsOriginal;
