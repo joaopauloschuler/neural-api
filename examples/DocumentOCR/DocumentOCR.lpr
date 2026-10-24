@@ -5,6 +5,8 @@ DocumentOCR: reads the text of a whole page or photo. A docTR DBNet detector
 SortDBNetTextBoxesInReadingOrder puts them in reading order, and a TrOCR
 recognizer (BuildTrOCRFromSafeTensors, TranscribeTrOCRImageRegion) reads each
 box with a KV-cache greedy decode. The text is printed line by line.
+--merge-lines reads one crop per text line (MergeDBNetTextBoxesIntoLines);
+--rotated decodes rotated boxes and turns each crop upright (CropRotatedRect).
 
 Two modes:
   * --smoke (or no arguments): the committed random pico fixtures
@@ -45,7 +47,7 @@ type
     MaxNewTokens: integer;
     BinThreshold, BoxThreshold: TNeuralFloat; // 0 = the detector config's
     LineGapFactor: TNeuralFloat;              // --merge-lines split gap / height
-    IsSmoke, UseOpenCL, UseInt8, MergesLines: boolean;
+    IsSmoke, UseOpenCL, UseInt8, MergesLines, IsRotated: boolean;
     OpenCLPlatform, OpenCLDevice: integer;
   end;
 
@@ -71,6 +73,8 @@ begin
   WriteLn('  --merge-lines             read whole text lines: merge the word boxes of a line');
   WriteLn('                            (split at a gap above --line-gap x the box height)');
   WriteLn('  --line-gap FACTOR         --merge-lines split gap in box heights (default 2)');
+  WriteLn('  --rotated                 rotated boxes (docTR assume_straight_pages=False),');
+  WriteLn('                            each crop turned upright before TrOCR');
   WriteLn('  --int8                    store the weights in int8 (less RAM, small ',
     'accuracy loss)');
   WriteLn('  --gpu                     run the nets on OpenCL (needs a build with ',
@@ -106,6 +110,7 @@ begin
   Opt.BoxThreshold := 0;
   Opt.LineGapFactor := 2;
   Opt.MergesLines := false;
+  Opt.IsRotated := false;
   Opt.IsSmoke := false;
   Opt.UseOpenCL := false;
   Opt.UseInt8 := false;
@@ -131,6 +136,7 @@ begin
     else if Arg = '--box-threshold' then Opt.BoxThreshold := StrToFloat(NextArg())
     else if Arg = '--merge-lines' then Opt.MergesLines := true
     else if Arg = '--line-gap' then Opt.LineGapFactor := StrToFloat(NextArg())
+    else if Arg = '--rotated' then Opt.IsRotated := true
     else if Arg = '--int8' then Opt.UseInt8 := true
     else if Arg = '--gpu' then Opt.UseOpenCL := true
     else if Arg = '--gpu-platform' then Opt.OpenCLPlatform := StrToInt(NextArg())
@@ -154,6 +160,8 @@ begin
     raise Exception.Create('--max-tokens must be at least 1');
   if Opt.LineGapFactor <= 0 then
     raise Exception.Create('--line-gap must be positive');
+  if Opt.MergesLines and Opt.IsRotated then
+    raise Exception.Create('--merge-lines works on straight boxes, not with --rotated');
 end;
 
 // FileName in the first fixture folder that has it (repo root or example dir).
@@ -228,22 +236,29 @@ begin
   Result := '[' + Result + ']';
 end;
 
+// The --boxes colour of text line LineId.
+procedure GetLineColor(LineId: integer; out Color: array of TNeuralFloat);
+var
+  RGB: cardinal;
+begin
+  RGB := csLinePalette[LineId mod Length(csLinePalette)];
+  Color[0] := (RGB shr 16) and $FF;
+  Color[1] := (RGB shr 8) and $FF;
+  Color[2] := RGB and $FF;
+end;
+
 // Draws each box in the colour of its line, numbered in reading order.
 procedure DrawTextBoxes(Image: TNNetVolume; const Boxes: TDBNetTextBoxArray;
   const LineIds: TNeuralIntegerArray);
 var
   BoxPos, MaxBoxPos, PixelSize, Left, Top: integer;
-  RGB: cardinal;
   BoxColor: array[0..2] of TNeuralFloat;
 begin
   PixelSize := Max(1, Min(Image.SizeX, Image.SizeY) div 400);
   MaxBoxPos := High(Boxes);
   for BoxPos := 0 to MaxBoxPos do
   begin
-    RGB := csLinePalette[LineIds[BoxPos] mod Length(csLinePalette)];
-    BoxColor[0] := (RGB shr 16) and $FF;
-    BoxColor[1] := (RGB shr 8) and $FF;
-    BoxColor[2] := RGB and $FF;
+    GetLineColor(LineIds[BoxPos], BoxColor);
     Left := Floor(Boxes[BoxPos].X1);
     Top := Floor(Boxes[BoxPos].Y1);
     DrawRectangleOutline(Image, Left, Top, Ceil(Boxes[BoxPos].X2) - 1,
@@ -253,8 +268,40 @@ begin
   end;
 end;
 
+// DrawTextBoxes for rotated boxes: the four sides, the number at the first corner.
+procedure DrawRotatedTextBoxes(Image: TNNetVolume;
+  const Boxes: TDBNetRotatedTextBoxArray; const LineIds: TNeuralIntegerArray);
+var
+  BoxPos, MaxBoxPos, PixelSize, CornerPos, NextCornerPos, Shift,
+    MaxShift: integer;
+  BoxColor: array[0..2] of TNeuralFloat;
+begin
+  PixelSize := Max(1, Min(Image.SizeX, Image.SizeY) div 400);
+  MaxShift := PixelSize - 1;
+  MaxBoxPos := High(Boxes);
+  for BoxPos := 0 to MaxBoxPos do
+  begin
+    GetLineColor(LineIds[BoxPos], BoxColor);
+    for CornerPos := 0 to 3 do
+    begin
+      NextCornerPos := (CornerPos + 1) and 3;
+      for Shift := 0 to MaxShift do
+        DrawLineCV2(Image, Round(Boxes[BoxPos].Rect.CornerX[CornerPos]) + Shift,
+          Round(Boxes[BoxPos].Rect.CornerY[CornerPos]) + Shift,
+          Round(Boxes[BoxPos].Rect.CornerX[NextCornerPos]) + Shift,
+          Round(Boxes[BoxPos].Rect.CornerY[NextCornerPos]) + Shift, BoxColor);
+    end;
+    DrawBitmapText(Image, Round(Boxes[BoxPos].Rect.CornerX[0]) + 2 * PixelSize,
+      Round(Boxes[BoxPos].Rect.CornerY[0]) + 2 * PixelSize,
+      IntToStr(BoxPos + 1), BoxColor, PixelSize);
+  end;
+end;
+
 // Detects, orders and reads the text of Image; prints one output line per text line.
 procedure ReadDocument(Image: TNNetVolume; const Opt: TDocumentOCROptions);
+const
+  // Rotated crops past the image edge read white.
+  csCropBorder: array[0..2] of TNeuralFloat = (255, 255, 255);
 var
   Detector, Encoder, Decoder: TNNet;
   DetectorConfig: TDBNetConfig;
@@ -262,10 +309,11 @@ var
   Processor: TClipImageProcessorConfig;
   Tokenizer: TNeuralHFTokenizer;
   Boxes: TDBNetTextBoxArray;
+  RotatedBoxes: TDBNetRotatedTextBoxArray;
   LineIds, MergedLineIds, Ids: TNeuralIntegerArray;
-  BoxesImage: TNNetVolume;
+  BoxesImage, Crop: TNNetVolume;
   BoxPos, MaxBoxPos, Left, Top: integer;
-  ComputeText, ProcessorFile, TokenizerFile, WordText,
+  ComputeText, ProcessorFile, TokenizerFile, WordText, BoxText,
     LineText: string;
   StartTime: TDateTime;
   {$IFDEF OpenCL}
@@ -276,6 +324,7 @@ begin
   Encoder := nil;
   Decoder := nil;
   Tokenizer := nil;
+  Crop := nil;
   {$IFDEF OpenCL}
   OpenCLDevices := nil;
   {$ENDIF}
@@ -316,32 +365,62 @@ begin
        DetectorConfig.InputHeight]));
 
     StartTime := Now();
-    Boxes := DetectDBNetTextBoxes(Detector, DetectorConfig, Image);
-    SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
-    WriteLn(Format('  %d text boxes in %.2f s', [Length(Boxes),
+    if Opt.IsRotated then
+    begin
+      RotatedBoxes := DetectDBNetRotatedTextBoxes(Detector, DetectorConfig, Image);
+      SortDBNetRotatedTextBoxesInReadingOrder(RotatedBoxes, LineIds);
+      MaxBoxPos := High(RotatedBoxes);
+    end
+    else
+    begin
+      Boxes := DetectDBNetTextBoxes(Detector, DetectorConfig, Image);
+      SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
+      MaxBoxPos := High(Boxes);
+    end;
+    WriteLn(Format('  %d text boxes in %.2f s', [MaxBoxPos + 1,
       (Now() - StartTime) * 86400.0]));
     if Opt.MergesLines then
     begin
       Boxes := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds,
         Opt.LineGapFactor);
       LineIds := MergedLineIds;
-      WriteLn(Format('  merged into %d line boxes', [Length(Boxes)]));
+      MaxBoxPos := High(Boxes);
+      WriteLn(Format('  merged into %d line boxes', [MaxBoxPos + 1]));
     end;
     StartTime := Now();
     LineText := '';
-    MaxBoxPos := High(Boxes);
+    Crop := TNNetVolume.Create;
     for BoxPos := 0 to MaxBoxPos do
     begin
-      Left := Floor(Boxes[BoxPos].X1);
-      Top := Floor(Boxes[BoxPos].Y1);
-      Ids := TranscribeTrOCRImageRegion(Encoder, Decoder, RecognizerConfig,
-        Processor, Image, Left, Top, Ceil(Boxes[BoxPos].X2) - Left,
-        Ceil(Boxes[BoxPos].Y2) - Top, Opt.MaxNewTokens);
+      if Opt.IsRotated then
+      begin
+        CropRotatedRect(Image, Crop, RotatedBoxes[BoxPos].Rect, csCropBorder);
+        Ids := TranscribeTrOCRImage(Encoder, Decoder, RecognizerConfig,
+          Processor, Crop, Opt.MaxNewTokens);
+        BoxText := Format('(%.0f,%.0f) %dx%d at %.0f deg score %.3f',
+          [RotatedBoxes[BoxPos].Rect.CornerX[0],
+           RotatedBoxes[BoxPos].Rect.CornerY[0], Crop.SizeX, Crop.SizeY,
+           RadToDeg(ArcTan2(RotatedBoxes[BoxPos].Rect.CornerY[1] -
+             RotatedBoxes[BoxPos].Rect.CornerY[0],
+             RotatedBoxes[BoxPos].Rect.CornerX[1] -
+             RotatedBoxes[BoxPos].Rect.CornerX[0])),
+           RotatedBoxes[BoxPos].Score]);
+      end
+      else
+      begin
+        Left := Floor(Boxes[BoxPos].X1);
+        Top := Floor(Boxes[BoxPos].Y1);
+        Ids := TranscribeTrOCRImageRegion(Encoder, Decoder, RecognizerConfig,
+          Processor, Image, Left, Top, Ceil(Boxes[BoxPos].X2) - Left,
+          Ceil(Boxes[BoxPos].Y2) - Top, Opt.MaxNewTokens);
+        BoxText := Format('(%.0f,%.0f)-(%.0f,%.0f) score %.3f',
+          [Boxes[BoxPos].X1, Boxes[BoxPos].Y1, Boxes[BoxPos].X2,
+           Boxes[BoxPos].Y2, Boxes[BoxPos].Score]);
+      end;
       if Tokenizer <> nil then WordText := Trim(Tokenizer.Decode(Ids))
       else WordText := TokenIdsText(Ids, RecognizerConfig.EosTokenId);
-      WriteLn(Format('  box %d line %d (%.0f,%.0f)-(%.0f,%.0f) score %.3f: %s',
-        [BoxPos + 1, LineIds[BoxPos], Boxes[BoxPos].X1, Boxes[BoxPos].Y1,
-         Boxes[BoxPos].X2, Boxes[BoxPos].Y2, Boxes[BoxPos].Score, WordText]));
+      WriteLn(Format('  box %d line %d %s: %s', [BoxPos + 1, LineIds[BoxPos],
+        BoxText, WordText]));
       if (BoxPos > 0) and (LineIds[BoxPos] <> LineIds[BoxPos - 1]) then
         LineText := LineText + LineEnding
       else if BoxPos > 0 then
@@ -356,7 +435,8 @@ begin
       BoxesImage := TNNetVolume.Create;
       try
         BoxesImage.Copy(Image);
-        DrawTextBoxes(BoxesImage, Boxes, LineIds);
+        if Opt.IsRotated then DrawRotatedTextBoxes(BoxesImage, RotatedBoxes, LineIds)
+        else DrawTextBoxes(BoxesImage, Boxes, LineIds);
         if not SaveImageFromVolumeIntoFile(BoxesImage, Opt.BoxesFile) then
           raise Exception.Create('could not save ' + Opt.BoxesFile);
         WriteLn('Boxes written to ', Opt.BoxesFile);
@@ -365,6 +445,7 @@ begin
       end;
     end;
   finally
+    Crop.Free;
     Tokenizer.Free;
     Decoder.Free;
     Encoder.Free;

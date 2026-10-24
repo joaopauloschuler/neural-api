@@ -17650,6 +17650,13 @@ type
     ClassId: integer;
   end;
   TDBNetTextBoxArray = array of TDBNetTextBox;
+  // One rotated text box: Rect corners in input-image pixels, ClassId = probability channel.
+  TDBNetRotatedTextBox = record
+    Rect: TImageRotatedRect;
+    Score: TNeuralFloat;
+    ClassId: integer;
+  end;
+  TDBNetRotatedTextBoxArray = array of TDBNetRotatedTextBox;
 
 // docTR defaults: 1024x1024, mean (0.798, 0.785, 0.772), std (0.264, 0.2749,
 // 0.287), aspect-preserving symmetric pad, bin 0.3, box 0.1, unclip 1.5.
@@ -17696,10 +17703,29 @@ function DecodeDBNetTextBoxes(ProbMap: TNNetVolume; const Config: TDBNetConfig;
 function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
   Image: TNNetVolume; ProbMap: TNNetVolume = nil): TDBNetTextBoxArray;
 
+// docTR DBPostProcessor (assume_straight_pages=False): per region the convex hull, its
+// min-area rectangle grown by hull area x UnclipRatio / perimeter, mean region probability.
+function DecodeDBNetRotatedTextBoxes(ProbMap: TNNetVolume;
+  const Config: TDBNetConfig; const Placement: TYoloLetterbox; ImageWidth,
+  ImageHeight: integer): TDBNetRotatedTextBoxArray;
+
+// DetectDBNetTextBoxes with DecodeDBNetRotatedTextBoxes.
+function DetectDBNetRotatedTextBoxes(NN: TNNet; const Config: TDBNetConfig;
+  Image: TNNetVolume; ProbMap: TNNetVolume = nil): TDBNetRotatedTextBoxArray;
+
 // Reorders Boxes by text line from the top, left to right inside a line; LineIds[i]
 // (from 0) is the line of Boxes[i]; a box joins a line while its centre is above its mean bottom.
 procedure SortDBNetTextBoxesInReadingOrder(var Boxes: TDBNetTextBoxArray;
   out LineIds: TNeuralIntegerArray);
+
+// The SortDBNetTextBoxesInReadingOrder permutation: Boxes[Result[i]] is the i-th box
+// in reading order and LineIds[i] its line; Boxes is not changed.
+function ComputeDBNetReadingOrder(const Boxes: TDBNetTextBoxArray;
+  out LineIds: TNeuralIntegerArray): TNeuralIntegerArray;
+
+// SortDBNetTextBoxesInReadingOrder on the axis-aligned bounds of each Rect.
+procedure SortDBNetRotatedTextBoxesInReadingOrder(
+  var Boxes: TDBNetRotatedTextBoxArray; out LineIds: TNeuralIntegerArray);
 
 // Unions each left-to-right run of one line of sorted Boxes into a line box (mean score); a gap
 // above GapFactor x the run's mean box height starts a new run. MergedLineIds = line per result.
@@ -17718,6 +17744,12 @@ function TranscribeTrOCRImageRegion(EncoderNet, DecoderNet: TNNet;
   const Config: TTrOCRConfig; const Processor: TClipImageProcessorConfig;
   Image: TNNetVolume; Left, Top, Width, Height,
   MaxNewTokens: integer): TNeuralIntegerArray;
+
+// DecodeTrOCRGreedy ids of a whole Image (RGB 0..255, e.g. a CropRotatedRect crop)
+// after the Processor resize + normalize.
+function TranscribeTrOCRImage(EncoderNet, DecoderNet: TNNet;
+  const Config: TTrOCRConfig; const Processor: TClipImageProcessorConfig;
+  Image: TNNetVolume; MaxNewTokens: integer): TNeuralIntegerArray;
 
 type
   // One person: the xyxy detector box in photo pixels, its score and the joints.
@@ -120406,49 +120438,201 @@ begin
   SetLength(Result, BoxCount);
 end;
 
-function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
-  Image: TNNetVolume; ProbMap: TNNetVolume): TDBNetTextBoxArray;
+function DecodeDBNetRotatedTextBoxes(ProbMap: TNNetVolume;
+  const Config: TDBNetConfig; const Placement: TYoloLetterbox; ImageWidth,
+  ImageHeight: integer): TDBNetRotatedTextBoxArray;
 var
-  NetInput, Output: TNNetVolume;
-  Placement: TYoloLetterbox;
+  Labels, MinX, MaxX, MinY, MaxY, PixelCounts: TNeuralIntegerArray;
+  ScoreSums, BoundaryX, BoundaryY, HullX, HullY: TNeuralFloatDynArr;
+  ClassId, MaxClassId, ComponentCount, Component, PixelPos, X, Y, Depth: integer;
+  BoxCount, MapMaxX, MapMaxY, BoundaryCount, RowFirstX, RowLastX, CornerPos: integer;
+  Score, Perimeter, UnclipDistance, ToImageX, ToImageY: TNeuralFloat;
+  Rect: TImageRotatedRect;
+begin
+  Result := nil;
+  if (ProbMap.SizeX = 0) or (ProbMap.SizeY = 0) or
+    (Placement.ContentX < 1) or (Placement.ContentY < 1) then Exit;
+  Depth := ProbMap.Depth;
+  MapMaxX := ProbMap.SizeX - 1;
+  MapMaxY := ProbMap.SizeY - 1;
+  ToImageX := ImageWidth / Placement.ContentX;
+  ToImageY := ImageHeight / Placement.ContentY;
+  // The leftmost and rightmost pixel of each row span the hull of a region.
+  SetLength(BoundaryX, 2 * ProbMap.SizeY);
+  SetLength(BoundaryY, 2 * ProbMap.SizeY);
+  BoxCount := 0;
+  MaxClassId := Depth - 1;
+  for ClassId := 0 to MaxClassId do
+  begin
+    ComponentCount := LabelEightConnectedComponents(ProbMap, ClassId,
+      Config.BinThreshold, Labels);
+    SetLength(MinX, ComponentCount + 1);
+    SetLength(MaxX, ComponentCount + 1);
+    SetLength(MinY, ComponentCount + 1);
+    SetLength(MaxY, ComponentCount + 1);
+    SetLength(PixelCounts, ComponentCount + 1);
+    SetLength(ScoreSums, ComponentCount + 1);
+    for Component := 1 to ComponentCount do
+    begin
+      MinX[Component] := MapMaxX;
+      MaxX[Component] := 0;
+      MinY[Component] := MapMaxY;
+      MaxY[Component] := 0;
+      PixelCounts[Component] := 0;
+      ScoreSums[Component] := 0;
+    end;
+    PixelPos := 0;
+    for Y := 0 to MapMaxY do
+      for X := 0 to MapMaxX do
+      begin
+        Component := Labels[PixelPos];
+        if Component > 0 then
+        begin
+          if X < MinX[Component] then MinX[Component] := X;
+          if X > MaxX[Component] then MaxX[Component] := X;
+          if Y < MinY[Component] then MinY[Component] := Y;
+          if Y > MaxY[Component] then MaxY[Component] := Y;
+          Inc(PixelCounts[Component]);
+          ScoreSums[Component] := ScoreSums[Component] +
+            ProbMap.FData[PixelPos * Depth + ClassId];
+        end;
+        Inc(PixelPos);
+      end;
+    SetLength(Result, BoxCount + ComponentCount);
+    for Component := 1 to ComponentCount do
+    begin
+      if (MaxX[Component] - MinX[Component] < Config.MinBoxSize) or
+        (MaxY[Component] - MinY[Component] < Config.MinBoxSize) then continue;
+      // docTR averages over the filled outer contour; the region's own pixels
+      // are the same set unless the region has holes.
+      Score := ScoreSums[Component] / PixelCounts[Component];
+      if Score < Config.BoxThreshold then continue;
+      BoundaryCount := 0;
+      for Y := MinY[Component] to MaxY[Component] do
+      begin
+        PixelPos := Y * ProbMap.SizeX + MinX[Component];
+        RowFirstX := -1;
+        RowLastX := -1;
+        for X := MinX[Component] to MaxX[Component] do
+        begin
+          if Labels[PixelPos] = Component then
+          begin
+            if RowFirstX < 0 then RowFirstX := X;
+            RowLastX := X;
+          end;
+          Inc(PixelPos);
+        end;
+        if RowFirstX < 0 then continue;
+        BoundaryX[BoundaryCount] := RowFirstX;
+        BoundaryY[BoundaryCount] := Y;
+        Inc(BoundaryCount);
+        if RowLastX <> RowFirstX then
+        begin
+          BoundaryX[BoundaryCount] := RowLastX;
+          BoundaryY[BoundaryCount] := Y;
+          Inc(BoundaryCount);
+        end;
+      end;
+      ConvexHullOfPoints(Slice(BoundaryX, BoundaryCount),
+        Slice(BoundaryY, BoundaryCount), HullX, HullY);
+      // DB unclip: pyclipper offsets the polygon by D, then cv2.minAreaRect;
+      // here the hull's min-area rectangle itself is offset by D.
+      Perimeter := PolygonPerimeter(HullX, HullY);
+      if Perimeter > 0 then
+        UnclipDistance := PolygonArea(HullX, HullY) * Config.UnclipRatio / Perimeter
+      else
+        UnclipDistance := 0;
+      Rect := MinAreaRectOfConvexHull(HullX, HullY);
+      OffsetRotatedRect(Rect, UnclipDistance);
+      if Hypot(Rect.CornerX[2] - Rect.CornerX[0],
+        Rect.CornerY[2] - Rect.CornerY[0]) < Config.MinBoxSize then continue;
+      for CornerPos := 0 to 3 do
+      begin
+        Rect.CornerX[CornerPos] := (Rect.CornerX[CornerPos] - Placement.Left) * ToImageX;
+        Rect.CornerY[CornerPos] := (Rect.CornerY[CornerPos] - Placement.Top) * ToImageY;
+      end;
+      Result[BoxCount].Rect := Rect;
+      Result[BoxCount].Score := Score;
+      Result[BoxCount].ClassId := ClassId;
+      Inc(BoxCount);
+    end;
+  end;
+  SetLength(Result, BoxCount);
+end;
+
+// DBNetPrepareInput -> NN.Compute -> ProbMap (the net output).
+procedure ComputeDBNetProbMap(NN: TNNet; const Config: TDBNetConfig;
+  Image, ProbMap: TNNetVolume; out Placement: TYoloLetterbox);
+var
+  NetInput: TNNetVolume;
 begin
   NetInput := TNNetVolume.Create;
-  if ProbMap <> nil then Output := ProbMap
-  else Output := TNNetVolume.Create;
   try
     DBNetPrepareInput(Image, Config, NetInput, Placement);
     NN.Compute(NetInput);
-    NN.GetOutput(Output);
-    Result := DecodeDBNetTextBoxes(Output, Config, Placement, Image.SizeX,
-      Image.SizeY);
+    NN.GetOutput(ProbMap);
   finally
-    if Output <> ProbMap then Output.Free;
     NetInput.Free;
   end;
 end;
 
-procedure SortDBNetTextBoxesInReadingOrder(var Boxes: TDBNetTextBoxArray;
-  out LineIds: TNeuralIntegerArray);
+function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
+  Image: TNNetVolume; ProbMap: TNNetVolume): TDBNetTextBoxArray;
 var
-  Moving: TDBNetTextBox;
-  BoxPos, InsertPos, MaxBoxPos, LineStart, LineCount, LineId: integer;
+  Output: TNNetVolume;
+  Placement: TYoloLetterbox;
+begin
+  if ProbMap <> nil then Output := ProbMap
+  else Output := TNNetVolume.Create;
+  try
+    ComputeDBNetProbMap(NN, Config, Image, Output, Placement);
+    Result := DecodeDBNetTextBoxes(Output, Config, Placement, Image.SizeX,
+      Image.SizeY);
+  finally
+    if Output <> ProbMap then Output.Free;
+  end;
+end;
+
+function DetectDBNetRotatedTextBoxes(NN: TNNet; const Config: TDBNetConfig;
+  Image: TNNetVolume; ProbMap: TNNetVolume): TDBNetRotatedTextBoxArray;
+var
+  Output: TNNetVolume;
+  Placement: TYoloLetterbox;
+begin
+  if ProbMap <> nil then Output := ProbMap
+  else Output := TNNetVolume.Create;
+  try
+    ComputeDBNetProbMap(NN, Config, Image, Output, Placement);
+    Result := DecodeDBNetRotatedTextBoxes(Output, Config, Placement,
+      Image.SizeX, Image.SizeY);
+  finally
+    if Output <> ProbMap then Output.Free;
+  end;
+end;
+
+function ComputeDBNetReadingOrder(const Boxes: TDBNetTextBoxArray;
+  out LineIds: TNeuralIntegerArray): TNeuralIntegerArray;
+var
+  BoxPos, InsertPos, MaxBoxPos, LineStart, LineCount, LineId, MovingId: integer;
   MovingKey, LineBottomSum, CentreY: TNeuralFloat;
 begin
   MaxBoxPos := High(Boxes);
   SetLength(LineIds, MaxBoxPos + 1);
+  SetLength(Result, MaxBoxPos + 1);
+  for BoxPos := 0 to MaxBoxPos do Result[BoxPos] := BoxPos;
   // Insertion sort by centre Y (Y1 + Y2 orders the same as the centre).
   for BoxPos := 1 to MaxBoxPos do
   begin
-    Moving := Boxes[BoxPos];
-    MovingKey := Moving.Y1 + Moving.Y2;
+    MovingId := Result[BoxPos];
+    MovingKey := Boxes[MovingId].Y1 + Boxes[MovingId].Y2;
     InsertPos := BoxPos;
-    while (InsertPos > 0) and
-      (Boxes[InsertPos - 1].Y1 + Boxes[InsertPos - 1].Y2 > MovingKey) do
+    while (InsertPos > 0) and (Boxes[Result[InsertPos - 1]].Y1 +
+      Boxes[Result[InsertPos - 1]].Y2 > MovingKey) do
     begin
-      Boxes[InsertPos] := Boxes[InsertPos - 1];
+      Result[InsertPos] := Result[InsertPos - 1];
       Dec(InsertPos);
     end;
-    Boxes[InsertPos] := Moving;
+    Result[InsertPos] := MovingId;
   end;
   // Centres only grow, so a box leaves the line once its centre passes the
   // mean bottom of the boxes the line holds.
@@ -120458,7 +120642,8 @@ begin
   LineBottomSum := 0;
   for BoxPos := 0 to MaxBoxPos do
   begin
-    CentreY := (Boxes[BoxPos].Y1 + Boxes[BoxPos].Y2) * 0.5;
+    MovingId := Result[BoxPos];
+    CentreY := (Boxes[MovingId].Y1 + Boxes[MovingId].Y2) * 0.5;
     if (LineCount = 0) or (CentreY > LineBottomSum / LineCount) then
     begin
       Inc(LineId);
@@ -120467,18 +120652,53 @@ begin
       LineBottomSum := 0;
     end;
     Inc(LineCount);
-    LineBottomSum := LineBottomSum + Boxes[BoxPos].Y2;
+    LineBottomSum := LineBottomSum + Boxes[MovingId].Y2;
     LineIds[BoxPos] := LineId;
     // Insertion sort of the current line by left edge.
-    Moving := Boxes[BoxPos];
     InsertPos := BoxPos;
-    while (InsertPos > LineStart) and (Boxes[InsertPos - 1].X1 > Moving.X1) do
+    while (InsertPos > LineStart) and
+      (Boxes[Result[InsertPos - 1]].X1 > Boxes[MovingId].X1) do
     begin
-      Boxes[InsertPos] := Boxes[InsertPos - 1];
+      Result[InsertPos] := Result[InsertPos - 1];
       Dec(InsertPos);
     end;
-    Boxes[InsertPos] := Moving;
+    Result[InsertPos] := MovingId;
   end;
+end;
+
+procedure SortDBNetTextBoxesInReadingOrder(var Boxes: TDBNetTextBoxArray;
+  out LineIds: TNeuralIntegerArray);
+var
+  Order: TNeuralIntegerArray;
+  Unsorted: TDBNetTextBoxArray;
+  BoxPos, MaxBoxPos: integer;
+begin
+  Order := ComputeDBNetReadingOrder(Boxes, LineIds);
+  Unsorted := Copy(Boxes);
+  MaxBoxPos := High(Boxes);
+  for BoxPos := 0 to MaxBoxPos do Boxes[BoxPos] := Unsorted[Order[BoxPos]];
+end;
+
+procedure SortDBNetRotatedTextBoxesInReadingOrder(
+  var Boxes: TDBNetRotatedTextBoxArray; out LineIds: TNeuralIntegerArray);
+var
+  Order: TNeuralIntegerArray;
+  Bounds: TDBNetTextBoxArray;
+  Unsorted: TDBNetRotatedTextBoxArray;
+  BoxPos, MaxBoxPos: integer;
+begin
+  MaxBoxPos := High(Boxes);
+  SetLength(Bounds, MaxBoxPos + 1);
+  for BoxPos := 0 to MaxBoxPos do
+  begin
+    Bounds[BoxPos].X1 := MinValue(Boxes[BoxPos].Rect.CornerX);
+    Bounds[BoxPos].Y1 := MinValue(Boxes[BoxPos].Rect.CornerY);
+    Bounds[BoxPos].X2 := MaxValue(Boxes[BoxPos].Rect.CornerX);
+    Bounds[BoxPos].Y2 := MaxValue(Boxes[BoxPos].Rect.CornerY);
+  end;
+  Order := ComputeDBNetReadingOrder(Bounds, LineIds);
+  Unsorted := Copy(Boxes);
+  for BoxPos := 0 to MaxBoxPos do Boxes[BoxPos] := Unsorted[Order[BoxPos]];
 end;
 
 function MergeDBNetTextBoxesIntoLines(const Boxes: TDBNetTextBoxArray;
@@ -120559,22 +120779,35 @@ function TranscribeTrOCRImageRegion(EncoderNet, DecoderNet: TNNet;
   Image: TNNetVolume; Left, Top, Width, Height,
   MaxNewTokens: integer): TNeuralIntegerArray;
 var
-  Region, PixelValues: TNNetVolume;
+  Region: TNNetVolume;
 begin
   Left := EnsureRange(Left, 0, Image.SizeX - 1);
   Top := EnsureRange(Top, 0, Image.SizeY - 1);
   Width := EnsureRange(Width, 1, Image.SizeX - Left);
   Height := EnsureRange(Height, 1, Image.SizeY - Top);
   Region := TNNetVolume.Create;
-  PixelValues := TNNetVolume.Create;
   try
     Region.CopyCropping(Image, Left, Top, Width, Height);
-    ClipPreprocessImage(Region, PixelValues, Processor);
+    Result := TranscribeTrOCRImage(EncoderNet, DecoderNet, Config, Processor,
+      Region, MaxNewTokens);
+  finally
+    Region.Free;
+  end;
+end;
+
+function TranscribeTrOCRImage(EncoderNet, DecoderNet: TNNet;
+  const Config: TTrOCRConfig; const Processor: TClipImageProcessorConfig;
+  Image: TNNetVolume; MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  PixelValues: TNNetVolume;
+begin
+  PixelValues := TNNetVolume.Create;
+  try
+    ClipPreprocessImage(Image, PixelValues, Processor);
     Result := DecodeTrOCRGreedy(EncoderNet, DecoderNet, PixelValues, Config,
       MaxNewTokens);
   finally
     PixelValues.Free;
-    Region.Free;
   end;
 end;
 

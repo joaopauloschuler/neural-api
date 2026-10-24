@@ -150,6 +150,14 @@ type
     procedure TestBitmapTextClipsAtBorder;
     // DrawRectangleOutline: swapped corners, a 2 px ring inwards, border clipping.
     procedure TestDrawRectangleOutline;
+    // ConvexHullOfPoints of a square with interior, edge and repeated points;
+    // collinear, single and empty point sets.
+    procedure TestConvexHullOfKnownPoints;
+    // MinAreaRectOfConvexHull of a 20 x 10 rectangle, its DB unclip, a 45 degree
+    // lattice rectangle and a vertical bar.
+    procedure TestMinAreaRectAndUnclip;
+    // CropRotatedRect of a linear image (exact bilinear) and of a 45 degree bar.
+    procedure TestCropRotatedRect;
   end;
 
 implementation
@@ -2142,6 +2150,155 @@ begin
     AssertEquals('clipped to the top edge', 8, Image.GetSum(), 0);
     AssertEquals('row 2', 1, Image[7, 2, 0], 0);
   finally
+    Image.Free;
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestConvexHullOfKnownPoints;
+const
+  csPointX: array[0..7] of TNeuralFloat = (2, 0, 4, 1, 4, 0, 2, 4);
+  csPointY: array[0..7] of TNeuralFloat = (2, 0, 0, 3, 4, 4, 0, 4);
+var
+  HullX, HullY: TNeuralFloatDynArr;
+  HullPos, CornerPos, Matches: integer;
+begin
+  // A 4 x 4 square with an interior point, a point on an edge and a duplicate.
+  AssertEquals('hull points', 4, ConvexHullOfPoints(csPointX, csPointY, HullX,
+    HullY));
+  for CornerPos := 0 to 3 do
+  begin
+    Matches := 0;
+    for HullPos := 0 to 3 do
+      if (HullX[HullPos] = 4 * (CornerPos mod 2)) and
+        (HullY[HullPos] = 4 * (CornerPos div 2)) then Inc(Matches);
+    AssertEquals('corner ' + IntToStr(CornerPos) + ' once', 1, Matches);
+  end;
+  AssertEquals('area', 16, PolygonArea(HullX, HullY), 1e-6);
+  AssertEquals('perimeter', 16, PolygonPerimeter(HullX, HullY), 1e-6);
+  AssertEquals('collinear points keep the ends', 2,
+    ConvexHullOfPoints([0, 1, 2, 3], [0, 1, 2, 3], HullX, HullY));
+  AssertEquals('repeated point', 1, ConvexHullOfPoints([5, 5], [7, 7], HullX,
+    HullY));
+  AssertEquals('no points', 0, ConvexHullOfPoints([], [], HullX, HullY));
+end;
+
+procedure TTestNeuralImagePreprocess.TestMinAreaRectAndUnclip;
+var
+  PointX, PointY, HullX, HullY: TNeuralFloatDynArr;
+  Rect: TImageRotatedRect;
+  OffsetX, OffsetY, PointCount: integer;
+  Distance: TNeuralFloat;
+begin
+  // 20 x 10 rectangle: itself, then the DB unclip D = 200 * 1.5 / 60 = 5.
+  ConvexHullOfPoints([20, 0, 20, 0, 10], [10, 0, 0, 10, 5], HullX, HullY);
+  Rect := MinAreaRectOfConvexHull(HullX, HullY);
+  AssertEquals('TL x', 0, Rect.CornerX[0], 1e-5);
+  AssertEquals('TL y', 0, Rect.CornerY[0], 1e-5);
+  AssertEquals('TR x', 20, Rect.CornerX[1], 1e-5);
+  AssertEquals('TR y', 0, Rect.CornerY[1], 1e-5);
+  AssertEquals('BR x', 20, Rect.CornerX[2], 1e-5);
+  AssertEquals('BR y', 10, Rect.CornerY[2], 1e-5);
+  AssertEquals('BL x', 0, Rect.CornerX[3], 1e-5);
+  AssertEquals('BL y', 10, Rect.CornerY[3], 1e-5);
+  Distance := PolygonArea(HullX, HullY) * 1.5 / PolygonPerimeter(HullX, HullY);
+  AssertEquals('unclip distance', 5, Distance, 1e-6);
+  OffsetRotatedRect(Rect, Distance);
+  AssertEquals('unclipped TL x', -5, Rect.CornerX[0], 1e-5);
+  AssertEquals('unclipped TL y', -5, Rect.CornerY[0], 1e-5);
+  AssertEquals('unclipped BR x', 25, Rect.CornerX[2], 1e-5);
+  AssertEquals('unclipped BR y', 15, Rect.CornerY[2], 1e-5);
+  AssertEquals('unclipped width', 30, RotatedRectWidth(Rect), 1e-5);
+  AssertEquals('unclipped height', 20, RotatedRectHeight(Rect), 1e-5);
+  // Lattice points with |dx + dy| <= 20 and |dx - dy| <= 6 around (30, 30): a
+  // 45 degree rectangle 40 / sqrt(2) long and 12 / sqrt(2) wide.
+  SetLength(PointX, 41 * 41);
+  SetLength(PointY, 41 * 41);
+  PointCount := 0;
+  for OffsetY := -20 to 20 do
+    for OffsetX := -20 to 20 do
+      if (Abs(OffsetX + OffsetY) <= 20) and (Abs(OffsetX - OffsetY) <= 6) then
+      begin
+        PointX[PointCount] := 30 + OffsetX;
+        PointY[PointCount] := 30 + OffsetY;
+        Inc(PointCount);
+      end;
+  SetLength(PointX, PointCount);
+  SetLength(PointY, PointCount);
+  AssertEquals('45 degree hull corners', 4, ConvexHullOfPoints(PointX, PointY,
+    HullX, HullY));
+  Rect := MinAreaRectOfConvexHull(HullX, HullY);
+  AssertEquals('45 degree width', 40 / Sqrt(2), RotatedRectWidth(Rect), 1e-4);
+  AssertEquals('45 degree height', 12 / Sqrt(2), RotatedRectHeight(Rect), 1e-4);
+  AssertEquals('45 degree angle', Pi / 4, ArcTan2(Rect.CornerY[1] -
+    Rect.CornerY[0], Rect.CornerX[1] - Rect.CornerX[0]), 1e-5);
+  AssertEquals('TL is (23, 17)', 23, Rect.CornerX[0], 1e-4);
+  AssertEquals('TL y', 17, Rect.CornerY[0], 1e-4);
+  AssertEquals('BR is (37, 43)', 37, Rect.CornerX[2], 1e-4);
+  AssertEquals('BR y', 43, Rect.CornerY[2], 1e-4);
+  // A vertical bar: the long side runs straight down.
+  ConvexHullOfPoints([3, 5, 5, 3], [2, 2, 30, 30], HullX, HullY);
+  Rect := MinAreaRectOfConvexHull(HullX, HullY);
+  AssertEquals('vertical width', 28, RotatedRectWidth(Rect), 1e-5);
+  AssertEquals('vertical TL x', 5, Rect.CornerX[0], 1e-5);
+  AssertEquals('vertical TL y', 2, Rect.CornerY[0], 1e-5);
+  AssertEquals('vertical TR y', 30, Rect.CornerY[1], 1e-5);
+end;
+
+procedure TTestNeuralImagePreprocess.TestCropRotatedRect;
+var
+  Image, Crop: TNNetVolume;
+  Rect: TImageRotatedRect;
+  HullX, HullY: TNeuralFloatDynArr;
+  X, Y, Channel, OffsetX, OffsetY: integer;
+  SourceX, SourceY: TNeuralFloat;
+begin
+  Image := TNNetVolume.Create(48, 40, 3);
+  Crop := TNNetVolume.Create;
+  try
+    // A linear image: bilinear sampling reproduces 2x + 3y + channel exactly.
+    for Y := 0 to 39 do
+      for X := 0 to 47 do
+        for Channel := 0 to 2 do Image[X, Y, Channel] := 2 * X + 3 * Y + Channel;
+    // 20 x 10 at angle atan(3/4): width axis (0.8, 0.6), height axis (-0.6, 0.8).
+    Rect.CornerX[0] := 10;  Rect.CornerY[0] := 8;
+    Rect.CornerX[1] := 26;  Rect.CornerY[1] := 20;
+    Rect.CornerX[2] := 20;  Rect.CornerY[2] := 28;
+    Rect.CornerX[3] := 4;   Rect.CornerY[3] := 16;
+    CropRotatedRect(Image, Crop, Rect, [255, 255, 255]);
+    AssertEquals('crop width', 20, Crop.SizeX);
+    AssertEquals('crop height', 10, Crop.SizeY);
+    AssertEquals('crop depth', 3, Crop.Depth);
+    for Y := 0 to 9 do
+      for X := 0 to 19 do
+      begin
+        SourceX := 10 + X * 16 / 19 - Y * 6 / 9;
+        SourceY := 8 + X * 12 / 19 + Y * 8 / 9;
+        for Channel := 0 to 2 do
+          AssertEquals('crop pixel ' + IntToStr(X) + ',' + IntToStr(Y),
+            2 * SourceX + 3 * SourceY + Channel, Crop[X, Y, Channel], 1e-3);
+      end;
+    // A dark bar 3 px wide along 45 degrees on white: the upright crop of its
+    // 28.3 x 8.5 box is dark along the middle and white along the top and bottom.
+    Image.ReSize(64, 64, 3);
+    Image.Fill(255);
+    for OffsetY := -20 to 20 do
+      for OffsetX := -20 to 20 do
+        if (Abs(OffsetX - OffsetY) <= 2) and (Abs(OffsetX + OffsetY) <= 20) then
+          for Channel := 0 to 2 do Image[32 + OffsetX, 32 + OffsetY, Channel] := 0;
+    ConvexHullOfPoints([45, 39, 19, 25], [39, 45, 25, 19], HullX, HullY);
+    Rect := MinAreaRectOfConvexHull(HullX, HullY);
+    CropRotatedRect(Image, Crop, Rect, [255, 255, 255]);
+    AssertEquals('bar crop width', 28, Crop.SizeX);
+    AssertEquals('bar crop height', 8, Crop.SizeY);
+    for X := 5 to 22 do
+    begin
+      AssertEquals('bar middle row ' + IntToStr(X), 0, Crop[X, 3, 0], 1e-3);
+      AssertEquals('bar middle row 4 ' + IntToStr(X), 0, Crop[X, 4, 1], 1e-3);
+      AssertEquals('top row white ' + IntToStr(X), 255, Crop[X, 0, 0], 1e-3);
+      AssertEquals('bottom row white ' + IntToStr(X), 255, Crop[X, 7, 2], 1e-3);
+    end;
+  finally
+    Crop.Free;
     Image.Free;
   end;
 end;

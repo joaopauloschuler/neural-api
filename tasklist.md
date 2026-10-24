@@ -1585,10 +1585,25 @@ rather than acted on.
         `--merge-lines` / `--line-gap` (TestDBNetMergeLines).
     - [ ] Compare the character accuracy of word-by-word vs `--merge-lines` crops
           on a real page (needs the real-run item above).
-  - [ ] Rotated boxes (docTR assume_straight_pages=False): min-area rectangle of each
-        component's contour + polygon unclip; `DecodeDBNetTextBoxes` is
-        axis-aligned only. Also not ported: cv2.findContours RETR_EXTERNAL drops a
-        region that sits inside another region's hole; the labelling keeps it.
+  - [X] Rotated boxes (docTR assume_straight_pages=False): `DecodeDBNetRotatedTextBoxes`
+        / `DetectDBNetRotatedTextBoxes` (convex hull `ConvexHullOfPoints`, rotating-
+        calipers `MinAreaRectOfConvexHull`, the rectangle offset by D = hull area x
+        unclip_ratio / hull perimeter via `OffsetRotatedRect`),
+        `SortDBNetRotatedTextBoxesInReadingOrder`, upright crops by `CropRotatedRect`
+        (WarpImageAffine bilinear), `TranscribeTrOCRImage`; DocumentOCR `--rotated`
+        (TestDBNetDecodeRotatedMap, TestConvexHullOfKnownPoints,
+        TestMinAreaRectAndUnclip, TestCropRotatedRect). Differences from docTR, none
+        checked against a docTR oracle yet:
+    - [ ] docTR offsets the CONTOUR polygon with pyclipper (round joins, area and
+          perimeter of the possibly concave contour), then cv2.minAreaRect; here the
+          hull's min-area rectangle is offset directly. Same for convex regions up
+          to the orientation choice and the arc approximation; a concave region
+          (curved text) gets a different D. Port a polygon offset if a real page shows it.
+    - [ ] Score = mean over the region's pixels; docTR fills the outer contour (holes
+          included). Corners are not clipped to [0, 1] as docTR does.
+    - [ ] Not ported: cv2.findContours RETR_EXTERNAL drops a region that sits inside
+          another region's hole; the labelling keeps it (both decoders).
+    - [ ] Real rotated page (street photo) through `--rotated`, after the real-run item.
 - [ ] EfficientNet (timm / torchvision efficientnet_b0..b7) importer follow-up
       (BuildEfficientNetFromSafeTensors LANDED, commit d35970c; AddEfficientNetMBConv
       reusing MobileNetV3 MBConv + conv-BN fold, b0..b7 share one JSON-driven builder,

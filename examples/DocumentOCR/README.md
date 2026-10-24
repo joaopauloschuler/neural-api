@@ -24,6 +24,8 @@ page or photo (RGB)
   -> DetectDBNetTextBoxes          docTR resize + pad + normalize, DBNet, DB post-processing
   -> SortDBNetTextBoxesInReadingOrder   lines top to bottom, words left to right
   -> MergeDBNetTextBoxesIntoLines      (--merge-lines) one box per run of words in a line
+     (--rotated: DetectDBNetRotatedTextBoxes + SortDBNetRotatedTextBoxesInReadingOrder,
+      then CropRotatedRect turns each box upright for TranscribeTrOCRImage)
   -> for each box: TranscribeTrOCRImageRegion
        crop, TrOCR resize + normalize, DeiT encoder once,
        greedy decode with the self-attention KV cache
@@ -40,6 +42,19 @@ page or photo (RGB)
   what it was trained on. A horizontal gap wider than `--line-gap` times the
   mean box height of the run so far (default 2) starts a new box in the same
   line, so two columns stay apart. The line box score is the mean word score.
+- With `--rotated` (docTR `assume_straight_pages=False`),
+  `DecodeDBNetRotatedTextBoxes` takes the convex hull of each text region
+  (`ConvexHullOfPoints`), its minimum-area rectangle by rotating calipers
+  (`MinAreaRectOfConvexHull`, as `cv2.minAreaRect`) and grows that rectangle
+  on every side by D = hull area x unclip ratio / hull perimeter. docTR
+  instead offsets the contour polygon by D with pyclipper (round joins) and
+  then takes `cv2.minAreaRect`; for a convex region the two agree up to the
+  orientation choice and pyclipper's arc approximation. The score is the mean
+  probability over the region's own pixels (docTR fills the outer contour, so
+  the two differ only for regions with holes). Corners are not clipped to the
+  image; `CropRotatedRect` warps each box to an upright crop with bilinear
+  sampling (`WarpImageAffine`, white outside the image). `--rotated` and
+  `--merge-lines` do not combine.
 - The TrOCR decoder is built with `DecSeqLen=1`, so `DecodeTrOCRGreedy` feeds
   one token per step through `TNNetStreamingDecoder` (KV cache) instead of
   re-running the whole prefix every step.
@@ -49,6 +64,7 @@ page or photo (RGB)
 ```
 ./DocumentOCR --smoke --boxes smoke_boxes.png       # pico fixture smoke run
 ./DocumentOCR --smoke --merge-lines                  # same, one crop per text line
+./DocumentOCR --smoke --rotated --boxes rot.png     # same, rotated boxes
 ./DocumentOCR --detector db_mobilenet_v3_large.safetensors \
   --recognizer trocr-small-printed/model.safetensors \
   --input page.png --boxes page_boxes.png
@@ -69,6 +85,7 @@ page or photo (RGB)
 | `--bin-threshold X`, `--box-threshold X` | DBNet pixel and box thresholds | the detector config |
 | `--merge-lines` | read one crop per text line (word boxes merged) instead of one per word | off |
 | `--line-gap FACTOR` | with `--merge-lines`: a gap wider than FACTOR x the box height splits the line | 2 |
+| `--rotated` | rotated boxes, each crop turned upright before TrOCR; `--boxes` draws the rotated outlines | off |
 | `--int8` | store the weights of all three nets in int8 (`TNNet.QuantizeWeightsInt8`) | FP32 |
 | `--gpu`, `--gpu-platform N`, `--gpu-device N` | run the nets on OpenCL (a build with `-dOpenCL`, the `.lpi` default) | CPU |
 
@@ -89,5 +106,7 @@ Not checked yet:
   words works in principle; `--merge-lines` gives TrOCR line crops instead.
   The character accuracy of the two modes on a real page has not been
   measured.
+- `--rotated` has only run on the pico smoke and the hand-made unit tests,
+  not on a real rotated page.
 
 Coded by Claude (AI).

@@ -1716,6 +1716,7 @@ type
     procedure TestDBNetReadingOrder;
     // MergeDBNetTextBoxesIntoLines on hand-made word boxes.
     procedure TestDBNetMergeLines;
+    procedure TestDBNetDecodeRotatedMap;
     // FaceAlignmentMatrix + AlignWarpFace + PasteFaceIntoImage against a numpy
     // port of facexlib (float warp, cv2 4.10 erode / GaussianBlur / Lanczos4).
     procedure TestFacePasteMatchesFacexlibOracle;
@@ -61147,6 +61148,82 @@ begin
   SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
   Lines := MergeDBNetTextBoxesIntoLines(Boxes, LineIds, MergedLineIds);
   AssertEquals('no boxes', 0, Length(Lines));
+end;
+
+// A 64x64 map with an axis-aligned 20x10 region and a 45 degree lattice
+// rectangle: hull, min-area rectangle, unclip, region score, pixel mapping.
+procedure TTestNeuralPretrained.TestDBNetDecodeRotatedMap;
+var
+  ProbMap: TNNetVolume;
+  Config: TDBNetConfig;
+  Placement: TYoloLetterbox;
+  Boxes: TDBNetRotatedTextBoxArray;
+  LineIds: TNeuralIntegerArray;
+  X, Y, OffsetX, OffsetY: integer;
+  DistanceA, DistanceB: TNeuralFloat;
+begin
+  ProbMap := TNNetVolume.Create(64, 64, 1);
+  try
+    ProbMap.Fill(0.05);
+    for Y := 5 to 14 do                     // A: pixels x 10..29, y 5..14
+      for X := 10 to 29 do ProbMap[X, Y, 0] := 0.9;
+    for OffsetY := -20 to 20 do             // B: 45 degrees around (32, 40)
+      for OffsetX := -20 to 20 do
+        if (Abs(OffsetX + OffsetY) <= 20) and (Abs(OffsetX - OffsetY) <= 6) then
+          ProbMap[32 + OffsetX, 40 + OffsetY, 0] := 0.8;
+    Config := DefaultDBNetConfig();
+    Placement.Left := 0;
+    Placement.Top := 0;
+    Placement.ContentX := 64;
+    Placement.ContentY := 64;
+    Placement.Scale := 1;
+    Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 64, 64);
+    AssertEquals('two regions', 2, Length(Boxes));
+    // A's hull is the 19 x 9 rectangle of pixel centres: D = 171 * 1.5 / 56.
+    DistanceA := 171 * 1.5 / 56;
+    AssertEquals('A TL x', 10 - DistanceA, Boxes[0].Rect.CornerX[0], 1e-4);
+    AssertEquals('A TL y', 5 - DistanceA, Boxes[0].Rect.CornerY[0], 1e-4);
+    AssertEquals('A TR x', 29 + DistanceA, Boxes[0].Rect.CornerX[1], 1e-4);
+    AssertEquals('A TR y', 5 - DistanceA, Boxes[0].Rect.CornerY[1], 1e-4);
+    AssertEquals('A BR x', 29 + DistanceA, Boxes[0].Rect.CornerX[2], 1e-4);
+    AssertEquals('A BR y', 14 + DistanceA, Boxes[0].Rect.CornerY[2], 1e-4);
+    AssertEquals('A BL x', 10 - DistanceA, Boxes[0].Rect.CornerX[3], 1e-4);
+    AssertEquals('A score', 0.9, Boxes[0].Score, 1e-5);
+    // B: 40 / sqrt(2) x 12 / sqrt(2), D = 240 * 1.5 / (2 * 52 / sqrt(2)).
+    DistanceB := 240 * 1.5 / (104 / Sqrt(2));
+    AssertEquals('B width', 40 / Sqrt(2) + 2 * DistanceB,
+      RotatedRectWidth(Boxes[1].Rect), 1e-3);
+    AssertEquals('B height', 12 / Sqrt(2) + 2 * DistanceB,
+      RotatedRectHeight(Boxes[1].Rect), 1e-3);
+    AssertEquals('B angle', Pi / 4, ArcTan2(Boxes[1].Rect.CornerY[1] -
+      Boxes[1].Rect.CornerY[0], Boxes[1].Rect.CornerX[1] -
+      Boxes[1].Rect.CornerX[0]), 1e-4);
+    AssertEquals('B centre x', 32, (Boxes[1].Rect.CornerX[0] +
+      Boxes[1].Rect.CornerX[2]) * 0.5, 1e-3);
+    AssertEquals('B centre y', 40, (Boxes[1].Rect.CornerY[0] +
+      Boxes[1].Rect.CornerY[2]) * 0.5, 1e-3);
+    AssertEquals('B score', 0.8, Boxes[1].Score, 1e-5);
+    // Content at (4, 2) holding 32 x 32 net pixels of a 128 x 64 image.
+    Placement.Left := 4;
+    Placement.Top := 2;
+    Placement.ContentX := 32;
+    Placement.ContentY := 32;
+    Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 128, 64);
+    AssertEquals('A TL x in image pixels', (10 - DistanceA - 4) * 4,
+      Boxes[0].Rect.CornerX[0], 1e-3);
+    AssertEquals('A BR y in image pixels', (14 + DistanceA - 2) * 2,
+      Boxes[0].Rect.CornerY[2], 1e-3);
+    // Reading order: A's bounds are above B's centre.
+    SortDBNetRotatedTextBoxesInReadingOrder(Boxes, LineIds);
+    AssertEquals('A first', 0.9, Boxes[0].Score, 1e-5);
+    AssertEquals('A line', 0, LineIds[0]);
+    AssertEquals('B on the next line', 1, LineIds[1]);
+    Config.BoxThreshold := 0.85;
+    Boxes := DecodeDBNetRotatedTextBoxes(ProbMap, Config, Placement, 128, 64);
+    AssertEquals('box_thresh 0.85 keeps A', 1, Length(Boxes));
+  finally
+    ProbMap.Free;
+  end;
 end;
 
 // A FastSAM-x config with only widths/depths derives the ultralytics head widths.

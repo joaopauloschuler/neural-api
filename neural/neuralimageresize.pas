@@ -217,6 +217,38 @@ procedure WarpImageAffine(Source, Dest: TNNetVolume;
   const BorderValue: array of TNeuralFloat; BlendsBorder: boolean = true);
 
 type
+  // Rotated rectangle corners: top-left, top-right, bottom-right, bottom-left; corner 0 -> 1
+  // is the long side, pointing right (dx > 0; straight down when vertical).
+  TImageRotatedRect = record
+    CornerX, CornerY: array[0..3] of TNeuralFloat;
+  end;
+
+// Andrew's monotone chain: the convex hull of the points in boundary order, without
+// repeated or collinear points; returns the hull point count.
+function ConvexHullOfPoints(const PointX, PointY: array of TNeuralFloat;
+  out HullX, HullY: TNeuralFloatDynArr): integer;
+
+// Shoelace area (absolute) and closed-boundary length of a polygon.
+function PolygonArea(const PointX, PointY: array of TNeuralFloat): TNeuralFloat;
+function PolygonPerimeter(const PointX, PointY: array of TNeuralFloat): TNeuralFloat;
+
+// cv2.minAreaRect of a convex hull (ConvexHullOfPoints) by rotating calipers;
+// one or two points give a zero-height rectangle.
+function MinAreaRectOfConvexHull(const HullX,
+  HullY: array of TNeuralFloat): TImageRotatedRect;
+
+function RotatedRectWidth(const Rect: TImageRotatedRect): TNeuralFloat;
+function RotatedRectHeight(const Rect: TImageRotatedRect): TNeuralFloat;
+
+// Moves each side of Rect outward by Distance (inward when negative).
+procedure OffsetRotatedRect(var Rect: TImageRotatedRect; Distance: TNeuralFloat);
+
+// Crop := Rect of Image made upright, Round(width) x Round(height) (at least 1):
+// corners 0, 1, 2 go to (0, 0), (W - 1, 0), (W - 1, H - 1); WarpImageAffine bilinear.
+procedure CropRotatedRect(Image, Crop: TNNetVolume; const Rect: TImageRotatedRect;
+  const BorderValue: array of TNeuralFloat);
+
+type
   // Resize + crop of a HF image processor: shortest-edge (KeepsAspect) or
   // direct (ResizeHeight,ResizeWidth) resize, then a (CropHeight,CropWidth) crop.
   THFImageResize = record
@@ -1806,6 +1838,309 @@ begin
       end;
     end;
   end;
+end;
+
+function ConvexHullOfPoints(const PointX, PointY: array of TNeuralFloat;
+  out HullX, HullY: TNeuralFloatDynArr): integer;
+var
+  Order: TNeuralIntegerArray;
+  PointCount, MaxPointPos, PointPos, InsertPos, MovingPos, LowerCount: integer;
+  HullCount: integer;
+
+  // Pops the hull tail while it does not turn strictly left at PointPos.
+  procedure PushHullPoint(PointPos, MinCount: integer);
+  var
+    OriginX, OriginY: double;
+  begin
+    while HullCount >= MinCount do
+    begin
+      OriginX := HullX[HullCount - 2];
+      OriginY := HullY[HullCount - 2];
+      if (HullX[HullCount - 1] - OriginX) * (PointY[PointPos] - OriginY) -
+        (HullY[HullCount - 1] - OriginY) * (PointX[PointPos] - OriginX) > 0 then
+        break;
+      Dec(HullCount);
+    end;
+    HullX[HullCount] := PointX[PointPos];
+    HullY[HullCount] := PointY[PointPos];
+    Inc(HullCount);
+  end;
+
+begin
+  PointCount := Length(PointX);
+  if Length(PointY) <> PointCount then
+    raise Exception.Create('ConvexHullOfPoints: ' + IntToStr(PointCount) +
+      ' X and ' + IntToStr(Length(PointY)) + ' Y coordinates.');
+  SetLength(HullX, 2 * PointCount);
+  SetLength(HullY, 2 * PointCount);
+  HullCount := 0;
+  if PointCount > 0 then
+  begin
+    MaxPointPos := PointCount - 1;
+    SetLength(Order, PointCount);
+    for PointPos := 0 to MaxPointPos do Order[PointPos] := PointPos;
+    QuickSortOrderByDist(Order, PointX, 0, MaxPointPos);
+    // Ties in X end up in Y order; this pass moves only inside equal-X runs.
+    for PointPos := 1 to MaxPointPos do
+    begin
+      MovingPos := Order[PointPos];
+      InsertPos := PointPos;
+      while (InsertPos > 0) and (PointX[Order[InsertPos - 1]] = PointX[MovingPos]) and
+        (PointY[Order[InsertPos - 1]] > PointY[MovingPos]) do
+      begin
+        Order[InsertPos] := Order[InsertPos - 1];
+        Dec(InsertPos);
+      end;
+      Order[InsertPos] := MovingPos;
+    end;
+    for PointPos := 0 to MaxPointPos do PushHullPoint(Order[PointPos], 2);
+    LowerCount := HullCount + 1;
+    for PointPos := MaxPointPos - 1 downto 0 do
+      PushHullPoint(Order[PointPos], LowerCount);
+    // The upper chain ends on the first point again.
+    if PointCount > 1 then Dec(HullCount);
+    if (HullCount = 2) and (HullX[0] = HullX[1]) and (HullY[0] = HullY[1]) then
+      HullCount := 1;
+  end;
+  SetLength(HullX, HullCount);
+  SetLength(HullY, HullCount);
+  Result := HullCount;
+end;
+
+function PolygonArea(const PointX, PointY: array of TNeuralFloat): TNeuralFloat;
+var
+  PointPos, PreviousPos, MaxPointPos: integer;
+  DoubleArea: double;
+begin
+  DoubleArea := 0;
+  MaxPointPos := High(PointX);
+  PreviousPos := MaxPointPos;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    DoubleArea := DoubleArea + double(PointX[PreviousPos]) * PointY[PointPos] -
+      double(PointX[PointPos]) * PointY[PreviousPos];
+    PreviousPos := PointPos;
+  end;
+  Result := Abs(DoubleArea) * 0.5;
+end;
+
+function PolygonPerimeter(const PointX, PointY: array of TNeuralFloat): TNeuralFloat;
+var
+  PointPos, PreviousPos, MaxPointPos: integer;
+  BoundaryLength: double;
+begin
+  BoundaryLength := 0;
+  MaxPointPos := High(PointX);
+  PreviousPos := MaxPointPos;
+  for PointPos := 0 to MaxPointPos do
+  begin
+    BoundaryLength := BoundaryLength + Hypot(PointX[PointPos] - PointX[PreviousPos],
+      PointY[PointPos] - PointY[PreviousPos]);
+    PreviousPos := PointPos;
+  end;
+  Result := BoundaryLength;
+end;
+
+// The rectangle centred at (CentreX, CentreY) with sides LengthA along (AxisX, AxisY)
+// and LengthB across it, in TImageRotatedRect corner order; a zero axis means X.
+function RotatedRectFromAxis(CentreX, CentreY, AxisX, AxisY, LengthA,
+  LengthB: double): TImageRotatedRect;
+var
+  AxisLength, WidthX, WidthY, PreviousWidthX, HalfWidth, HalfHeight: double;
+begin
+  AxisLength := Hypot(AxisX, AxisY);
+  if AxisLength > 0 then
+  begin
+    WidthX := AxisX / AxisLength;
+    WidthY := AxisY / AxisLength;
+  end
+  else
+  begin
+    WidthX := 1;
+    WidthY := 0;
+  end;
+  if LengthB > LengthA then
+  begin
+    PreviousWidthX := WidthX;
+    WidthX := -WidthY;
+    WidthY := PreviousWidthX;
+    HalfWidth := LengthB * 0.5;
+    HalfHeight := LengthA * 0.5;
+  end
+  else
+  begin
+    HalfWidth := LengthA * 0.5;
+    HalfHeight := LengthB * 0.5;
+  end;
+  if (WidthX < -1e-6) or ((Abs(WidthX) <= 1e-6) and (WidthY < 0)) then
+  begin
+    WidthX := -WidthX;
+    WidthY := -WidthY;
+  end;
+  // The height axis (-WidthY, WidthX) points down for a left-to-right width axis.
+  Result.CornerX[0] := CentreX - WidthX * HalfWidth + WidthY * HalfHeight;
+  Result.CornerY[0] := CentreY - WidthY * HalfWidth - WidthX * HalfHeight;
+  Result.CornerX[1] := CentreX + WidthX * HalfWidth + WidthY * HalfHeight;
+  Result.CornerY[1] := CentreY + WidthY * HalfWidth - WidthX * HalfHeight;
+  Result.CornerX[2] := CentreX + WidthX * HalfWidth - WidthY * HalfHeight;
+  Result.CornerY[2] := CentreY + WidthY * HalfWidth + WidthX * HalfHeight;
+  Result.CornerX[3] := CentreX - WidthX * HalfWidth - WidthY * HalfHeight;
+  Result.CornerY[3] := CentreY - WidthY * HalfWidth + WidthX * HalfHeight;
+end;
+
+function MinAreaRectOfConvexHull(const HullX,
+  HullY: array of TNeuralFloat): TImageRotatedRect;
+var
+  PointCount, MaxPointPos, EdgePos, PointPos, MaxDotPos, MinDotPos, FarPos: integer;
+  EdgeX, EdgeY, EdgeLength, AxisX, AxisY, BaseX, BaseY: double;
+  MaxDot, MinDot, FarHeight, Area, BestArea: double;
+  BestCentreX, BestCentreY, BestAxisX, BestAxisY, BestLength, BestHeight: double;
+
+  function DotAt(PointPos: integer): double;
+  begin
+    Result := (HullX[PointPos] - BaseX) * AxisX + (HullY[PointPos] - BaseY) * AxisY;
+  end;
+
+  // Signed distance from the edge line, along (-AxisY, AxisX).
+  function HeightAt(PointPos: integer): double;
+  begin
+    Result := (HullY[PointPos] - BaseY) * AxisX - (HullX[PointPos] - BaseX) * AxisY;
+  end;
+
+  function NextPos(PointPos: integer): integer;
+  begin
+    if PointPos = MaxPointPos then Result := 0 else Result := PointPos + 1;
+  end;
+
+begin
+  PointCount := Length(HullX);
+  MaxPointPos := PointCount - 1;
+  if PointCount = 0 then
+    exit(RotatedRectFromAxis(0, 0, 1, 0, 0, 0));
+  if PointCount < 3 then
+    exit(RotatedRectFromAxis((HullX[0] + HullX[MaxPointPos]) * 0.5,
+      (HullY[0] + HullY[MaxPointPos]) * 0.5, HullX[MaxPointPos] - HullX[0],
+      HullY[MaxPointPos] - HullY[0], Hypot(HullX[MaxPointPos] - HullX[0],
+      HullY[MaxPointPos] - HullY[0]), 0));
+  BestArea := MaxDouble;
+  MaxDotPos := 0;
+  MinDotPos := 0;
+  FarPos := 0;
+  BestCentreX := 0;
+  BestCentreY := 0;
+  BestAxisX := 1;
+  BestAxisY := 0;
+  BestLength := 0;
+  BestHeight := 0;
+  for EdgePos := 0 to MaxPointPos do
+  begin
+    BaseX := HullX[EdgePos];
+    BaseY := HullY[EdgePos];
+    EdgeX := HullX[NextPos(EdgePos)] - BaseX;
+    EdgeY := HullY[NextPos(EdgePos)] - BaseY;
+    EdgeLength := Hypot(EdgeX, EdgeY);
+    if EdgeLength = 0 then continue;
+    AxisX := EdgeX / EdgeLength;
+    AxisY := EdgeY / EdgeLength;
+    if EdgePos = 0 then
+      for PointPos := 1 to MaxPointPos do
+      begin
+        if DotAt(PointPos) > DotAt(MaxDotPos) then MaxDotPos := PointPos;
+        if DotAt(PointPos) < DotAt(MinDotPos) then MinDotPos := PointPos;
+        if Abs(HeightAt(PointPos)) > Abs(HeightAt(FarPos)) then FarPos := PointPos;
+      end;
+    // Rotating calipers: each support point only moves forward along the hull.
+    while DotAt(NextPos(MaxDotPos)) > DotAt(MaxDotPos) do
+      MaxDotPos := NextPos(MaxDotPos);
+    while DotAt(NextPos(MinDotPos)) < DotAt(MinDotPos) do
+      MinDotPos := NextPos(MinDotPos);
+    while Abs(HeightAt(NextPos(FarPos))) > Abs(HeightAt(FarPos)) do
+      FarPos := NextPos(FarPos);
+    MaxDot := DotAt(MaxDotPos);
+    MinDot := DotAt(MinDotPos);
+    FarHeight := HeightAt(FarPos);
+    Area := (MaxDot - MinDot) * Abs(FarHeight);
+    if Area < BestArea then
+    begin
+      BestArea := Area;
+      BestCentreX := BaseX + AxisX * (MaxDot + MinDot) * 0.5 - AxisY * FarHeight * 0.5;
+      BestCentreY := BaseY + AxisY * (MaxDot + MinDot) * 0.5 + AxisX * FarHeight * 0.5;
+      BestAxisX := AxisX;
+      BestAxisY := AxisY;
+      BestLength := MaxDot - MinDot;
+      BestHeight := Abs(FarHeight);
+    end;
+  end;
+  Result := RotatedRectFromAxis(BestCentreX, BestCentreY, BestAxisX, BestAxisY,
+    BestLength, BestHeight);
+end;
+
+function RotatedRectWidth(const Rect: TImageRotatedRect): TNeuralFloat;
+begin
+  Result := Hypot(Rect.CornerX[1] - Rect.CornerX[0],
+    Rect.CornerY[1] - Rect.CornerY[0]);
+end;
+
+function RotatedRectHeight(const Rect: TImageRotatedRect): TNeuralFloat;
+begin
+  Result := Hypot(Rect.CornerX[3] - Rect.CornerX[0],
+    Rect.CornerY[3] - Rect.CornerY[0]);
+end;
+
+procedure OffsetRotatedRect(var Rect: TImageRotatedRect; Distance: TNeuralFloat);
+begin
+  Rect := RotatedRectFromAxis((Rect.CornerX[0] + Rect.CornerX[2]) * 0.5,
+    (Rect.CornerY[0] + Rect.CornerY[2]) * 0.5, Rect.CornerX[1] - Rect.CornerX[0],
+    Rect.CornerY[1] - Rect.CornerY[0],
+    Max(RotatedRectWidth(Rect) + 2 * Distance, 0),
+    Max(RotatedRectHeight(Rect) + 2 * Distance, 0));
+end;
+
+procedure CropRotatedRect(Image, Crop: TNNetVolume; const Rect: TImageRotatedRect;
+  const BorderValue: array of TNeuralFloat);
+var
+  CropSizeX, CropSizeY: integer;
+  RectWidth, UnitX, UnitY: TNeuralFloat;
+  CropToImage: TImageAffineMatrix;
+begin
+  RectWidth := RotatedRectWidth(Rect);
+  CropSizeX := Max(1, Round(RectWidth));
+  CropSizeY := Max(1, Round(RotatedRectHeight(Rect)));
+  if RectWidth > 0 then
+  begin
+    UnitX := (Rect.CornerX[1] - Rect.CornerX[0]) / RectWidth;
+    UnitY := (Rect.CornerY[1] - Rect.CornerY[0]) / RectWidth;
+  end
+  else
+  begin
+    UnitX := 1;
+    UnitY := 0;
+  end;
+  // Columns: one crop pixel step along the width and along the height.
+  if CropSizeX > 1 then
+  begin
+    CropToImage[0] := (Rect.CornerX[1] - Rect.CornerX[0]) / (CropSizeX - 1);
+    CropToImage[3] := (Rect.CornerY[1] - Rect.CornerY[0]) / (CropSizeX - 1);
+  end
+  else
+  begin
+    CropToImage[0] := UnitX;
+    CropToImage[3] := UnitY;
+  end;
+  if CropSizeY > 1 then
+  begin
+    CropToImage[1] := (Rect.CornerX[2] - Rect.CornerX[1]) / (CropSizeY - 1);
+    CropToImage[4] := (Rect.CornerY[2] - Rect.CornerY[1]) / (CropSizeY - 1);
+  end
+  else
+  begin
+    CropToImage[1] := -UnitY;
+    CropToImage[4] := UnitX;
+  end;
+  CropToImage[2] := Rect.CornerX[0];
+  CropToImage[5] := Rect.CornerY[0];
+  WarpImageAffine(Image, Crop, InvertImageAffineMatrix(CropToImage), CropSizeX,
+    CropSizeY, BorderValue);
 end;
 
 procedure GaussianBlurImage(Source, Dest: TNNetVolume; Radius: TNeuralFloat);
