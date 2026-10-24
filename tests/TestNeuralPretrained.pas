@@ -59179,6 +59179,16 @@ begin
       ATest.AssertTrue(Name + ' ' + Layer.ClassName + ' #' + IntToStr(LayerPos) +
         ' must reach OpenCL', Layer.ForwardGPUCnt > 0);
     end;
+    // The D-FINE LQE head reads the bin probabilities where they lie.
+    if Layer is TNNetTopKValues then
+    begin
+      ATest.AssertTrue(Name + ' TNNetTopKValues #' + IntToStr(LayerPos) +
+        ' must reach OpenCL', Layer.ForwardGPUCnt > 0);
+      ATest.AssertEquals(Name + ' TNNetTopKValues #' + IntToStr(LayerPos) +
+        ' sources pulled to RAM', 0, Layer.ProfiledResidency.SourcePulledToRAMCnt);
+      ATest.AssertTrue(Name + ' TNNetTopKValues #' + IntToStr(LayerPos) +
+        ' binds its resident source', Layer.ProfiledResidency.SourceBoundCnt > 0);
+    end;
     if InDecoder and (Layer.ProfiledResidency.SourcePulledToRAMCnt > 0) and
        (Pos(' ' + Layer.ClassName + ' ', Pulled + ' ') = 0) then
       Pulled := Pulled + ' ' + Layer.ClassName;

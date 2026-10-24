@@ -74,6 +74,10 @@ type
     // draws the gate weights from four values so ties decide the selection.
     procedure RunTopKGateOpenCLParity(TokenCnt, ExpertCnt, TopCnt: integer;
       Variant: TTopKGateParityVariant; WithTies: boolean; const Msg: string);
+    // CPU-vs-OpenCL parity of TNNetTopKValues: WithTies draws from five
+    // quarter steps around 0; ExpectDevice False pins the host fallback.
+    procedure RunTopKValuesOpenCLParity(SizeX, SizeY, Depth, TopCnt: integer;
+      WithTies, ExpectDevice: boolean; const Msg: string);
     procedure RunMoEBankOpenCLParity(TokenCnt, HiddenSize, ExpertCnt,
       ExpertWidth, TopCnt: integer; Options: TMoEBankParityOptions;
       const Msg: string; Tolerance: TNeuralFloat);
@@ -968,6 +972,13 @@ type
     procedure BiasBalancedTopKGateOpenCLParityTies;
     procedure BiasBalancedTopKGateOpenCLParityTop3;
     procedure BiasBalancedTopKGateOpenCLParityIdentity;
+    // CPU-vs-OpenCL parity of TNNetTopKValues over a resident source (ties,
+    // negative values, k = 1, k = depth, and k > 32 staying on the host).
+    procedure TopKValuesOpenCLParityTies;
+    procedure TopKValuesOpenCLParityNegative;
+    procedure TopKValuesOpenCLParityTop1;
+    procedure TopKValuesOpenCLParityAllDepth;
+    procedure TopKValuesOpenCLParityHostFallback;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -83901,6 +83912,131 @@ procedure TTestNeuralNumerical.BiasBalancedTopKGateOpenCLParityIdentity;
 begin
   RunTopKGateOpenCLParity(3, 4, 6, tgBiasBalanced, false,
     'bias-balanced identity k>E');
+end;
+
+procedure TTestNeuralNumerical.RunTopKValuesOpenCLParity(SizeX, SizeY, Depth,
+  TopCnt: integer; WithTies, ExpectDevice: boolean; const Msg: string);
+{$IFDEF OpenCL}
+const
+  csValuesSentinel = 12345.0;
+var
+  NN: TNNet;
+  Input, OutCPU, OutDev: TNNetVolume;
+  Source, TopValues: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos, NeuronPos, SourceSentinels, NegativeCount: integer;
+  Diff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  OutCPU := TNNetVolume.Create();
+  OutDev := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth));
+    // Identity pointwise convolution: a resident source holding the input's
+    // exact values, so ties survive.
+    Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(Depth).
+      SetTrainable(False, False));
+    for NeuronPos := 0 to Source.Neurons.Count - 1 do
+    begin
+      Source.Neurons[NeuronPos].Weights.Fill(0);
+      Source.Neurons[NeuronPos].Weights.FData[NeuronPos] := 1;
+      Source.Neurons[NeuronPos].BiasWeight := 0;
+    end;
+    Source.FlushWeightCache();
+    TopValues := NN.AddLayer(TNNetTopKValues.Create(TopCnt).
+      SetTrainable(False, False));
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do
+      if WithTies
+        then Input.FData[Pos] := (((Pos * 7 + (Pos div Depth) * 3) mod 5) - 2) * 0.25
+        else Input.FData[Pos] := -0.6 + Sin(Pos * 0.37) * 0.35;
+    NN.Compute(Input);
+    OutCPU.Copy(TopValues.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      TopValues.ForwardGPUCnt := 0;
+      NN.Compute(Input);
+      Source.Output.Fill(csValuesSentinel);
+      TopValues.Output.Fill(csValuesSentinel);
+      NN.Compute(Input);
+      if ExpectDevice then
+      begin
+        SourceSentinels := 0;
+        for Pos := 0 to Source.Output.Size - 1 do
+          if Source.Output.FData[Pos] = csValuesSentinel then Inc(SourceSentinels);
+        AssertEquals(Msg + ' - TNNetTopKValues takes the OpenCL path', 2,
+          TopValues.ForwardGPUCnt);
+        AssertTrue(Msg + ' - the result stays in OpenCL memory',
+          TopValues.OutputBindableOnOpenCL());
+        AssertEquals(Msg + ' - the resident source is not downloaded',
+          Source.Output.Size, SourceSentinels);
+      end
+      else
+        AssertEquals(Msg + ' - k > 32 stays on the host', 0,
+          TopValues.ForwardGPUCnt);
+      TopValues.ForceOutputOnRAM();
+      OutDev.Copy(TopValues.Output);
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertEquals(Msg + ' - output size', SizeX * SizeY * TopCnt, OutDev.Size);
+    Diff := 0;
+    NegativeCount := 0;
+    for Pos := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Max(Diff, Abs(OutCPU.FData[Pos] - OutDev.FData[Pos]));
+      if OutCPU.FData[Pos] < 0 then Inc(NegativeCount);
+    end;
+    WriteLn('  TopKValues OpenCL parity (', Msg, '): max|diff|=', Diff:0:9,
+      ' negative outputs=', NegativeCount, '/', OutCPU.Size);
+    AssertTrue(Msg + ' - CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+    // A selection copies source values, so any difference is a selection bug.
+    AssertEquals(Msg + ' - max |diff|', 0, Diff, 0);
+  finally
+    OutDev.Free;
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TopKValuesOpenCLParityTies;
+begin
+  RunTopKValuesOpenCLParity(5, 3, 33, 4, true, true, 'ties k=4 of 33');
+end;
+
+procedure TTestNeuralNumerical.TopKValuesOpenCLParityNegative;
+begin
+  RunTopKValuesOpenCLParity(7, 2, 17, 4, false, true, 'negative k=4 of 17');
+end;
+
+procedure TTestNeuralNumerical.TopKValuesOpenCLParityTop1;
+begin
+  RunTopKValuesOpenCLParity(6, 1, 9, 1, true, true, 'ties k=1 of 9');
+end;
+
+procedure TTestNeuralNumerical.TopKValuesOpenCLParityAllDepth;
+begin
+  RunTopKValuesOpenCLParity(4, 2, 6, 6, true, true, 'ties k=depth=6');
+end;
+
+procedure TTestNeuralNumerical.TopKValuesOpenCLParityHostFallback;
+begin
+  RunTopKValuesOpenCLParity(3, 1, 40, 33, true, false, 'host k=33 of 40');
 end;
 
 // General-convolution BACKWARD device offload parity (vs CPU). Builds a small

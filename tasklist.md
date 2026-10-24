@@ -1985,8 +1985,9 @@ rather than acted on.
       memory (no value/output projection), pre_bbox_head initial box,
       Fine-grained Distribution Refinement (bin softmax, DFineWeightingFunction
       folded with distance2bbox into one fixed Linear, corners accumulated
-      across layers) and the LQE head (new TNNetTopKValues layer; the mean
-      folded into the first Linear). Layers after eval_idx are not built.
+      across layers) and the LQE head (new TNNetTopKValues layer, OpenCL
+      forward cai_topk_values; the mean folded into the first Linear). Layers
+      after eval_idx are not built.
       Post-process is DecodeRtDetrDetections. Parity on tiny_dfine and
       tiny_dfine_perlevel, CPU and forced OpenCL: logits < 1.8e-6, boxes
       < 1.5e-7, post-process scores and xyxy < 1.5e-7 (TestDFineParity,
@@ -1995,9 +1996,6 @@ rather than acted on.
               (dfine-nano-coco at 640 x 640 under the 2 GB cap): same
               detections as transformers. Not run on the dev box.
         - [ ] decoder_method "discrete" (rejected at load now).
-        - [ ] TNNetTopKValues has no OpenCL path, so under OpenCL the LQE
-              downloads the eval layer's bin probabilities (4 x queries x
-              (max_num_bins + 1) floats) once per forward.
         - Inference only; training (FDR/GO-LSD distillation losses) is out of
           scope.
 

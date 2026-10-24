@@ -6860,6 +6860,24 @@ type
     function BufferBytes(): int64; override;
   end;
 
+  /// OpenCL forward helper for TNNetTopKValues (cai_topk_values, one work-item
+  // per cell). The result stays in OpenCL memory (ResultBuffer). Coded by Claude (AI).
+  TNNetTopKValuesCL = class(TNNetKernelCL)
+  private
+    FBufSource, FBufOut: cl_mem;
+    FCapSource, FCapOut: csize_t;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // OutVol := the TopK largest of each of CellCnt cells of Depth values in
+    // Source; binds pExternalSrc, else uploads Source.
+    procedure Compute(Source: TNNetVolume; pExternalSrc: cl_mem;
+      OutVol: TNNetVolume; CellCnt, Depth, TopK: integer);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+
   // OpenCL forward helper shared by both fused MoE expert banks. pGateUp picks
   // the gate|up entry points (cai_moe_expert_gateup*) over the down ones
   // (cai_moe_expert_down*), pInt8 the per-row int8 twin of either; both are
@@ -16856,10 +16874,25 @@ type
   TNNetTopKValues = class(TNNetTopK)
     private
       FSelectedDepth: array of integer; // source depth of every output element
+      {$IFDEF OpenCL}
+      // cai_topk_values forward; nil until EnableOpenCL.
+      FTopKValuesCL: TNNetTopKValuesCL;
+      procedure ComputeOpenCL();
+      {$ENDIF}
     public
+      destructor Destroy(); override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
+      {$IFDEF OpenCL}
+      // Inference only: the backward reads FSelectedDepth, which only the host fills.
+      function WillOpenCL(): boolean; override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      function OpenCLBufferBytes(): int64; override;
+      {$ENDIF}
   end;
 
   /// Hard top-k gate renormalizer for sparse Mixture-of-Experts routing.
@@ -46137,6 +46170,56 @@ end;
 function TNNetTopKGateCL.BufferBytes(): int64;
 begin
   Result := int64(FCapSource) + FCapOut + FCapBias + FCapLoad;
+end;
+
+{ TNNetTopKValuesCL }
+
+constructor TNNetTopKValuesCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_topk_values');
+end;
+
+destructor TNNetTopKValuesCL.Destroy();
+begin
+  if Assigned(FBufSource) then clReleaseMemObject(FBufSource);
+  if Assigned(FBufOut) then clReleaseMemObject(FBufOut);
+  inherited Destroy();
+end;
+
+procedure TNNetTopKValuesCL.Compute(Source: TNNetVolume; pExternalSrc: cl_mem;
+  OutVol: TNNetVolume; CellCnt, Depth, TopK: integer);
+var
+  bufSrc, bufO: cl_mem;
+  k: cl_kernel;
+begin
+  k := FKernel.Kernel;
+  if pExternalSrc <> nil
+    then bufSrc := pExternalSrc
+    // Blocking: the host source may be rewritten before this queue drains.
+    else bufSrc := FKernel.EnsureWriteBuffer(FBufSource, FCapSource, Source,
+      {DoWrite=}true, {pBlocking=}true);
+  bufO := FKernel.EnsureOutputBuffer(FBufOut, FCapOut, OutVol);
+  clSetKernelArg(k, 0, csLongintSize, @CellCnt);
+  clSetKernelArg(k, 1, csLongintSize, @Depth);
+  clSetKernelArg(k, 2, csLongintSize, @TopK);
+  clSetKernelArg(k, 3, csCLMemSize, @bufSrc);
+  clSetKernelArg(k, 4, csCLMemSize, @bufO);
+  FKernel.RunKernel(k, CellCnt);
+end;
+
+function TNNetTopKValuesCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufOut;
+end;
+
+function TNNetTopKValuesCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetTopKValuesCL.BufferBytes(): int64;
+begin
+  Result := int64(FCapSource) + FCapOut;
 end;
 
 { TNNetMoEExpertBankCL }
@@ -118555,6 +118638,90 @@ end;
 
 { TNNetTopKValues }
 
+{$IFDEF OpenCL}
+const
+  // CAI_TOPK_GATE_MAX_K in neural.cl: the size of the kernel's private buffers
+  // (cai_topk_gate and cai_topk_values).
+  csTopKGateOpenCLMaxK = 32;
+{$ENDIF}
+
+destructor TNNetTopKValues.Destroy();
+begin
+  {$IFDEF OpenCL} FreeAndNil(FTopKValuesCL); {$ENDIF}
+  inherited Destroy();
+end;
+
+{$IFDEF OpenCL}
+// No size verdict: the work is tiny, so only a resident source (or
+// ForceOpenCL) takes the device path.
+function TNNetTopKValues.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FTopKValuesCL) and FHasOpenCL and (not FIsTrainable) and
+    Assigned(FPrevLayer) and (FOutput.Depth <= csTopKGateOpenCLMaxK) and
+    (FOutput.Depth <= FPrevLayer.FOutput.Depth) and
+    (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY =
+      FOutput.SizeX * FOutput.SizeY) and
+    (FForceOpenCL or PrevOutputOnOpenCL());
+end;
+
+procedure TNNetTopKValues.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+begin
+  if PrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTopKValuesCL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  FTopKValuesCL.Compute(FPrevLayer.FOutput, SourceBuffer, FOutput,
+    FOutput.SizeX * FOutput.SizeY, FPrevLayer.FOutput.Depth, FOutput.Depth);
+  // No read back: the result stays in OpenCL memory until a host reader calls
+  // ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+procedure TNNetTopKValues.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  // Not chained: TNNetIdentity's activation buffer is not this layer's output.
+  FHasOpenCL := true;
+  if Assigned(FNN) and not Assigned(FTopKValuesCL) then
+    FTopKValuesCL := TNNetTopKValuesCL.Create(FNN);
+end;
+
+procedure TNNetTopKValues.DisableOpenCL();
+begin
+  // FTopKValuesCL owns the buffer a resident output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+  FreeAndNil(FTopKValuesCL);
+end;
+
+function TNNetTopKValues.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTopKValuesCL) then Result := FTopKValuesCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTopKValues.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTopKValuesCL) then Result := FTopKValuesCL.OutputKernel()
+  else Result := nil;
+end;
+
+function TNNetTopKValues.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FTopKValuesCL) then Result := Result + FTopKValuesCL.BufferBytes();
+end;
+{$ENDIF}
+
 procedure TNNetTopKValues.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   ValueCount: integer;
@@ -118579,7 +118746,19 @@ var
   CellPos, MaxCellPos, SourceBase, OutputBase, ValueCount, SourceDepth: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  // Runs BEFORE ForceOutputOnRAM because that download is what it avoids.
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  MarkOutputWrittenOnRAM();
+  {$ENDIF}
   Source := FPrevLayer.Output;
   SourceDepth := Source.Depth;
   ValueCount := FOutput.Depth;
@@ -118673,10 +118852,6 @@ begin
 end;
 
 {$IFDEF OpenCL}
-const
-  // CAI_TOPK_GATE_MAX_K in neural.cl: the size of the kernel's private buffers.
-  csTopKGateOpenCLMaxK = 32;
-
 function TNNetTopKGate.PrepareOpenCLLoadCount(): boolean;
 begin
   Result := false;

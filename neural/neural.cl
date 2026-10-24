@@ -7383,6 +7383,44 @@ __kernel void cai_topk_gate
   }
 } // end of kernel
 
+// TNNetTopKValues forward: the FTopK largest of each cell's FDepth values,
+// largest first, written to FOut[cell * FTopK + i]. One work-item per cell runs
+// the host NeuralMarkTopK insertion scan, so a value enters a full buffer only
+// when STRICTLY greater than the worst kept one and equal values keep the lower
+// index first, as on the CPU. The host keeps FTopK <= CAI_TOPK_GATE_MAX_K and
+// FTopK <= FDepth. Coded by Claude (AI).
+__kernel void cai_topk_values
+(
+  const int FCellCnt,
+  const int FDepth,
+  const int FTopK,
+  __global const float* FSource,
+  __global float* FOut
+)
+{
+  const int c = get_global_id(0);
+  if (c >= FCellCnt) return;
+  const int base = c * FDepth;
+  float topVal[CAI_TOPK_GATE_MAX_K];
+  int kept = 0;
+  const int lastK = FTopK - 1;
+  for (int d = 0; d < FDepth; d++)
+  {
+    const float val = FSource[base + d];
+    if ((kept == FTopK) && !(val > topVal[lastK])) continue;
+    if (kept < FTopK) kept++;
+    int ins = kept - 1;
+    while ((ins > 0) && (val > topVal[ins - 1]))
+    {
+      topVal[ins] = topVal[ins - 1];
+      ins--;
+    }
+    topVal[ins] = val;
+  }
+  const int outBase = c * FTopK;
+  for (int i = 0; i < kept; i++) FOut[outBase + i] = topVal[i];
+} // end of kernel
+
 // Device twin of TNNetMoEExpertBankGateUp.BuildSlotMap over a router output
 // left in OpenCL memory (FTokenCnt rows of FNumExperts gate weights): a token's
 // slots take its non-zero gates in ascending expert order, at most FTopK. A
