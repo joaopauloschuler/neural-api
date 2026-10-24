@@ -1402,6 +1402,11 @@ type
     procedure TestSDUNetSDXLParity;
     procedure TestSDUNetPerBlockHeadsParity;
     procedure TestSDUNetClassEmbedOnlyCrossParity;
+    // TripoSR backbone: pico build + shapes, post-processor plane independence,
+    // and a synthetic-checkpoint hand parity with identity blocks.
+    procedure TestTripoSRBackbonePicoShapes;
+    procedure TestTripoSRPostProcessorPlaneIndependence;
+    procedure TestTripoSRBackboneLoadHandParity;
     procedure TestMarigoldDenoiseSmoke;
     procedure TestMarigoldPreprocessPadsReplicate;
     procedure TestMarigoldPreprocessResizesLongSide;
@@ -69030,6 +69035,329 @@ begin
     on E: EPretrainedImportError do Raised := True;
   end;
   AssertTrue('stacked-bidirectional projection must be rejected', Raised);
+end;
+
+// A TripoSR backbone small enough to build and run in a test; Inner (16) differs
+// from TokenChannels (12) so proj_in / proj_out are not square.
+function TripoSRPicoConfig(): TTripoSRConfig;
+begin
+  Result.PlaneSize := 4;
+  Result.TokenChannels := 12;
+  Result.NumHeads := 2;
+  Result.HeadDim := 8;
+  Result.NumLayers := 2;
+  Result.CrossAttentionDim := 10;
+  Result.NormNumGroups := 4;
+  Result.ImageTokenCount := 5;
+  Result.TriplaneChannels := 6;
+end;
+
+procedure TTestNeuralPretrained.TestTripoSRBackbonePicoShapes;
+var
+  Cfg: TTripoSRConfig;
+  Refs: TTripoSRBackboneLayers;
+  NN: TNNet;
+  ImageTokens: TNNetVolume;
+  Triplane: TNNetVolume;
+  ValuePos, MaxValuePos: integer;
+  AbsSum: double;
+begin
+  RandSeed := 9031;
+  Cfg := TripoSRPicoConfig();
+  NN := BuildTripoSRBackbone(Cfg, {pTrainable=}true, Refs);
+  ImageTokens := TNNetVolume.Create(Cfg.ImageTokenCount, 1, Cfg.CrossAttentionDim);
+  try
+    AssertEquals('blocks', Cfg.NumLayers, Length(Refs.Blocks));
+    AssertEquals('tokens', 3 * 4 * 4, Refs.Tokens.Output.SizeX);
+    AssertEquals('token channels', Cfg.TokenChannels, Refs.Tokens.Output.Depth);
+    AssertEquals('proj_in width', 16, Refs.ProjIn.Output.Depth);
+    AssertEquals('proj_out width', Cfg.TokenChannels, Refs.ProjOut.Output.Depth);
+    AssertEquals('pre-upsample X', 4, Refs.Upsample.PrevLayer.Output.SizeX);
+    AssertEquals('pre-upsample Y', 12, Refs.Upsample.PrevLayer.Output.SizeY);
+    Triplane := NN.GetLastLayer().Output;
+    AssertTrue('last layer is the upsample', NN.GetLastLayer() = Refs.Upsample);
+    AssertEquals('triplane X', 8, Triplane.SizeX);
+    AssertEquals('triplane Y', 24, Triplane.SizeY);
+    AssertEquals('triplane channels', 6, Triplane.Depth);
+    ImageTokens.RandomizeGaussian();
+    NN.Compute(ImageTokens);
+    MaxValuePos := Triplane.Size - 1;
+    AbsSum := 0;
+    for ValuePos := 0 to MaxValuePos do
+      AssertFalse('finite triplane', IsNan(Triplane.FData[ValuePos]) or
+        IsInfinite(Triplane.FData[ValuePos]));
+    for ValuePos := 0 to MaxValuePos do
+      AbsSum := AbsSum + Abs(Triplane.FData[ValuePos]);
+    AssertTrue('non-zero triplane', AbsSum > 0);
+  finally
+    ImageTokens.Free;
+    NN.Free;
+  end;
+  // The stabilityai config: TNNetDeconvolution maps (32, 96, 1024) to (64, 192, 40).
+  Cfg := TripoSRDefaultConfig();
+  ValidateTripoSRConfig(Cfg);
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(32 * 96, 1, Cfg.TokenChannels));
+    NN.AddLayer(TNNetReshape.Create(Cfg.PlaneSize, 3 * Cfg.PlaneSize,
+      Cfg.TokenChannels));
+    NN.AddLayer(TNNetDeconvolutionLinear.Create(Cfg.TriplaneChannels, 2, 2, 0));
+    AssertEquals('full triplane X', 64, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('full triplane Y', 192, NN.GetLastLayer().Output.SizeY);
+    AssertEquals('full triplane channels', 40, NN.GetLastLayer().Output.Depth);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestTripoSRPostProcessorPlaneIndependence;
+var
+  Cfg: TTripoSRConfig;
+  Refs: TTripoSRBackboneLayers;
+  NN: TNNet;
+  ImageTokens, Planes, SavedPlanes, Baseline: TNNetVolume;
+  Triplane: TNNetVolume;
+  PlanePos, RowPos, ColPos, ChannelPos, OutRowsPerPlane, InRowsPerPlane: integer;
+  MaxRowPos, MaxColPos, MaxChannelPos: integer;
+  InsidePlane, RowChanged: boolean;
+  NeuronPos: integer;
+begin
+  RandSeed := 9032;
+  Cfg := TripoSRPicoConfig();
+  NN := BuildTripoSRBackbone(Cfg, {pTrainable=}false, Refs);
+  ImageTokens := TNNetVolume.Create(Cfg.ImageTokenCount, 1, Cfg.CrossAttentionDim);
+  SavedPlanes := TNNetVolume.Create;
+  Baseline := TNNetVolume.Create;
+  try
+    ImageTokens.RandomizeGaussian();
+    NN.Compute(ImageTokens);
+    Planes := Refs.Upsample.PrevLayer.Output;
+    Triplane := Refs.Upsample.Output;
+    // The importer net starts with zero weights; any non-zero weights will do here.
+    for NeuronPos := 0 to Refs.Upsample.Neurons.Count - 1 do
+    begin
+      Refs.Upsample.Neurons[NeuronPos].Weights.RandomizeGaussian();
+      Refs.Upsample.Neurons[NeuronPos].BiasWeight := 0.1;
+    end;
+    Refs.Upsample.FlushWeightCache();
+    Planes.RandomizeGaussian();
+    Refs.Upsample.Compute();
+    SavedPlanes.Copy(Planes);
+    Baseline.Copy(Triplane);
+    InRowsPerPlane := Cfg.PlaneSize;
+    OutRowsPerPlane := 2 * Cfg.PlaneSize;
+    MaxRowPos := Triplane.SizeY - 1;
+    MaxColPos := Triplane.SizeX - 1;
+    MaxChannelPos := Triplane.Depth - 1;
+    for PlanePos := 0 to 2 do
+    begin
+      Planes.Copy(SavedPlanes);
+      for RowPos := PlanePos * InRowsPerPlane to (PlanePos + 1) * InRowsPerPlane - 1 do
+        for ColPos := 0 to Planes.SizeX - 1 do
+          for ChannelPos := 0 to Planes.Depth - 1 do
+            Planes[ColPos, RowPos, ChannelPos] :=
+              Planes[ColPos, RowPos, ChannelPos] + 1.0 + ChannelPos;
+      Refs.Upsample.Compute();
+      for RowPos := 0 to MaxRowPos do
+      begin
+        InsidePlane := (RowPos div OutRowsPerPlane) = PlanePos;
+        RowChanged := false;
+        for ColPos := 0 to MaxColPos do
+          for ChannelPos := 0 to MaxChannelPos do
+            if Triplane[ColPos, RowPos, ChannelPos] <>
+               Baseline[ColPos, RowPos, ChannelPos] then
+              RowChanged := true;
+        AssertEquals('plane ' + IntToStr(PlanePos) + ' perturbation reaches row ' +
+          IntToStr(RowPos), InsidePlane, RowChanged);
+      end;
+    end;
+  finally
+    Baseline.Free;
+    SavedPlanes.Free;
+    ImageTokens.Free;
+    NN.Free;
+  end;
+end;
+
+// Synthetic checkpoint with the TripoSR tensor names; every block's to_out.0 and
+// ff.net.2 are zero, so the backbone reduces to a hand-computable map.
+procedure TTestNeuralPretrained.TestTripoSRBackboneLoadHandParity;
+const
+  csPath = 'cai_triposr_backbone_pico.safetensors';
+var
+  Cfg: TTripoSRConfig;
+  Refs: TTripoSRBackboneLayers;
+  NN: TNNet;
+  Writer: TNNetSafeTensorsWriter;
+  Reader: TNNetSafeTensorsReader;
+  Path, BlockPrefix: string;
+  Embeddings, NormW, NormB, ProjInW, ProjInB, ProjOutW, ProjOutB, UpW, UpB: TNNetVolume;
+  Scratch, ImageTokens, Tokens, Normed, Hidden, Planes, Expected: TNNetVolume;
+  TokenCount, Inner, C, P, Co, Groups, GroupSize: integer;
+  BlockPos, TokenPos, ChannelPos, GroupPos, OutPos, InPos, PlanePos: integer;
+  RowPos, ColPos, KX, KY, Texel: integer;
+  Mean, Variance, Acc: double;
+  MaxDiff: TNeuralFloat;
+
+  procedure AddTensor(const Name: string; const Shape: array of Int64;
+    Dst: TNNetVolume; Zero: boolean);
+  var
+    Count, DimPos: integer;
+  begin
+    Count := 1;
+    for DimPos := 0 to High(Shape) do
+      Count := Count * Shape[DimPos];
+    Dst.ReSize(Count, 1, 1);
+    if Zero then Dst.Fill(0) else Dst.RandomizeGaussian(0.5);
+    Writer.AddTensorFlat(Name, Shape, Dst);
+  end;
+
+  procedure AddLinear(const Prefix: string; OutDim, InDim: integer;
+    HasBias, Zero: boolean);
+  begin
+    AddTensor(Prefix + '.weight', [OutDim, InDim], Scratch, Zero);
+    if HasBias then AddTensor(Prefix + '.bias', [OutDim], Scratch, Zero);
+  end;
+
+begin
+  RandSeed := 9033;
+  Cfg := TripoSRPicoConfig();
+  C := Cfg.TokenChannels;
+  P := Cfg.PlaneSize;
+  Co := Cfg.TriplaneChannels;
+  Inner := Cfg.NumHeads * Cfg.HeadDim;
+  TokenCount := 3 * P * P;
+  Groups := Cfg.NormNumGroups;
+  GroupSize := C div Groups;
+  Path := GetTempDir(false) + csPath;
+  Embeddings := TNNetVolume.Create; NormW := TNNetVolume.Create;
+  NormB := TNNetVolume.Create; ProjInW := TNNetVolume.Create;
+  ProjInB := TNNetVolume.Create; ProjOutW := TNNetVolume.Create;
+  ProjOutB := TNNetVolume.Create; UpW := TNNetVolume.Create;
+  UpB := TNNetVolume.Create; Scratch := TNNetVolume.Create;
+  ImageTokens := TNNetVolume.Create(Cfg.ImageTokenCount, 1, Cfg.CrossAttentionDim);
+  Tokens := TNNetVolume.Create(TokenCount, 1, C);
+  Normed := TNNetVolume.Create(TokenCount, 1, C);
+  Hidden := TNNetVolume.Create(TokenCount, 1, Inner);
+  Planes := TNNetVolume.Create(TokenCount, 1, C);
+  Expected := TNNetVolume.Create(2 * P, 6 * P, Co);
+  NN := nil;
+  Reader := nil;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(Path);
+    try
+      AddTensor('tokenizer.embeddings', [3, C, P, P], Embeddings, false);
+      AddTensor('backbone.norm.weight', [C], NormW, false);
+      AddTensor('backbone.norm.bias', [C], NormB, false);
+      AddTensor('backbone.proj_in.weight', [Inner, C], ProjInW, false);
+      AddTensor('backbone.proj_in.bias', [Inner], ProjInB, false);
+      for BlockPos := 0 to Cfg.NumLayers - 1 do
+      begin
+        BlockPrefix := 'backbone.transformer_blocks.' + IntToStr(BlockPos) + '.';
+        AddTensor(BlockPrefix + 'norm1.weight', [Inner], Scratch, false);
+        AddTensor(BlockPrefix + 'norm1.bias', [Inner], Scratch, false);
+        AddTensor(BlockPrefix + 'norm2.weight', [Inner], Scratch, false);
+        AddTensor(BlockPrefix + 'norm2.bias', [Inner], Scratch, false);
+        AddTensor(BlockPrefix + 'norm3.weight', [Inner], Scratch, false);
+        AddTensor(BlockPrefix + 'norm3.bias', [Inner], Scratch, false);
+        AddLinear(BlockPrefix + 'attn1.to_q', Inner, Inner, false, false);
+        AddLinear(BlockPrefix + 'attn1.to_k', Inner, Inner, false, false);
+        AddLinear(BlockPrefix + 'attn1.to_v', Inner, Inner, false, false);
+        AddLinear(BlockPrefix + 'attn1.to_out.0', Inner, Inner, true, true);
+        AddLinear(BlockPrefix + 'attn2.to_q', Inner, Inner, false, false);
+        AddLinear(BlockPrefix + 'attn2.to_k', Inner, Cfg.CrossAttentionDim,
+          false, false);
+        AddLinear(BlockPrefix + 'attn2.to_v', Inner, Cfg.CrossAttentionDim,
+          false, false);
+        AddLinear(BlockPrefix + 'attn2.to_out.0', Inner, Inner, true, true);
+        AddLinear(BlockPrefix + 'ff.net.0.proj', 8 * Inner, Inner, true, false);
+        AddLinear(BlockPrefix + 'ff.net.2', Inner, 4 * Inner, true, true);
+      end;
+      AddTensor('backbone.proj_out.weight', [C, Inner], ProjOutW, false);
+      AddTensor('backbone.proj_out.bias', [C], ProjOutB, false);
+      AddTensor('post_processor.upsample.weight', [C, Co, 2, 2], UpW, false);
+      AddTensor('post_processor.upsample.bias', [Co], UpB, false);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+    NN := BuildTripoSRBackbone(Cfg, {pTrainable=}false, Refs);
+    Reader := TNNetSafeTensorsReader.Create(Path);
+    LoadTripoSRBackbone(Reader, Refs, Cfg);
+    ImageTokens.RandomizeGaussian();
+    NN.Compute(ImageTokens);
+
+    // tokens in "(Np Hp Wp)" order from the [3, C, Hp, Wp] embeddings.
+    for PlanePos := 0 to 2 do
+      for ChannelPos := 0 to C - 1 do
+        for Texel := 0 to P * P - 1 do
+          Tokens[PlanePos * P * P + Texel, 0, ChannelPos] :=
+            Embeddings.FData[(PlanePos * C + ChannelPos) * P * P + Texel];
+    // GroupNorm over (all tokens x GroupSize channels), biased variance, eps 1e-6.
+    for GroupPos := 0 to Groups - 1 do
+    begin
+      Mean := 0;
+      for TokenPos := 0 to TokenCount - 1 do
+        for ChannelPos := GroupPos * GroupSize to (GroupPos + 1) * GroupSize - 1 do
+          Mean := Mean + Tokens[TokenPos, 0, ChannelPos];
+      Mean := Mean / (TokenCount * GroupSize);
+      Variance := 0;
+      for TokenPos := 0 to TokenCount - 1 do
+        for ChannelPos := GroupPos * GroupSize to (GroupPos + 1) * GroupSize - 1 do
+          Variance := Variance + Sqr(Tokens[TokenPos, 0, ChannelPos] - Mean);
+      Variance := Variance / (TokenCount * GroupSize);
+      for TokenPos := 0 to TokenCount - 1 do
+        for ChannelPos := GroupPos * GroupSize to (GroupPos + 1) * GroupSize - 1 do
+          Normed[TokenPos, 0, ChannelPos] :=
+            (Tokens[TokenPos, 0, ChannelPos] - Mean) / Sqrt(Variance + 1e-6) *
+            NormW.FData[ChannelPos] + NormB.FData[ChannelPos];
+    end;
+    // proj_in, identity blocks, proj_out, + tokens.
+    for TokenPos := 0 to TokenCount - 1 do
+      for OutPos := 0 to Inner - 1 do
+      begin
+        Acc := ProjInB.FData[OutPos];
+        for InPos := 0 to C - 1 do
+          Acc := Acc + ProjInW.FData[OutPos * C + InPos] * Normed[TokenPos, 0, InPos];
+        Hidden[TokenPos, 0, OutPos] := Acc;
+      end;
+    for TokenPos := 0 to TokenCount - 1 do
+      for OutPos := 0 to C - 1 do
+      begin
+        Acc := ProjOutB.FData[OutPos] + Tokens[TokenPos, 0, OutPos];
+        for InPos := 0 to Inner - 1 do
+          Acc := Acc + ProjOutW.FData[OutPos * Inner + InPos] *
+            Hidden[TokenPos, 0, InPos];
+        Planes[TokenPos, 0, OutPos] := Acc;
+      end;
+    // ConvTranspose2d k2 s2: out[2x+kx, 2y+ky, o] = sum_i in[x,y,i] W[i,o,ky,kx] + b[o],
+    // with texel (x, y) of the (P, 3P) triplane at token y*P + x.
+    for RowPos := 0 to 3 * P - 1 do
+      for ColPos := 0 to P - 1 do
+        for KY := 0 to 1 do
+          for KX := 0 to 1 do
+            for OutPos := 0 to Co - 1 do
+            begin
+              Acc := UpB.FData[OutPos];
+              for InPos := 0 to C - 1 do
+                Acc := Acc + Planes[RowPos * P + ColPos, 0, InPos] *
+                  UpW.FData[((InPos * Co + OutPos) * 2 + KY) * 2 + KX];
+              Expected[2 * ColPos + KX, 2 * RowPos + KY, OutPos] := Acc;
+            end;
+    MaxDiff := 0;
+    for OutPos := 0 to Expected.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(Expected.FData[OutPos] -
+        NN.GetLastLayer().Output.FData[OutPos]));
+    AssertTrue('hand parity max |diff| ' + FloatToStr(MaxDiff), MaxDiff < 1e-4);
+  finally
+    Reader.Free;
+    NN.Free;
+    Embeddings.Free; NormW.Free; NormB.Free; ProjInW.Free; ProjInB.Free;
+    ProjOutW.Free; ProjOutB.Free; UpW.Free; UpB.Free; Scratch.Free;
+    ImageTokens.Free; Tokens.Free; Normed.Free; Hidden.Free; Planes.Free;
+    Expected.Free;
+    DeleteFile(Path);
+  end;
 end;
 
 // Registers the methods TTestNeuralPretrainedSlow adds (not the inherited

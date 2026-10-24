@@ -1934,8 +1934,8 @@ rather than acted on.
       Radius = 0.87, Pad, AlignCorners)`; triplane input (Wp, 3*Hp, Cp) with
       plane k (XY, XZ, YZ) on rows [k*Hp, (k+1)*Hp), so the 3 x 32 x 32 tokens
       reshape to (32, 96, 1024) and a 2x2 stride-2 transposed conv (kernel =
-      stride, planes do not mix) yields (64, 192, 40) - not yet checked against
-      TNNetDeconvolution's padding; points (SizeX, SizeY, 3) -> (SizeX, SizeY,
+      stride, planes do not mix) yields (64, 192, 40), checked on
+      TNNetDeconvolution in T4; points (SizeX, SizeY, 3) -> (SizeX, SizeY,
       3*Cp), plane-major concat. CPU forward + backward (triplane and points),
       OpenCL inference forward `cai_triplane_sample` (binds resident sources,
       output stays resident). Tests: hand-derived bilinear cases, save/load,
@@ -1949,13 +1949,43 @@ rather than acted on.
         BuildViTFromSafeTensors' name mapping and whether the checkpoint's
         tokenizer enables the adaLN camera modulation (TripoSR feeds a fixed
         camera). Ask the user before downloading (~1.7 GB) or writing a
-        Python oracle.
-  - [ ] T4. Backbone: factor the BasicTransformerBlock (self-attn + cross-attn
+        Python oracle. Notes from T4: `TTripoSRConfig` exists (tokenizer,
+        backbone and post_processor sizes; add the image tokenizer and decoder
+        fields here); `LoadTripoSRBackbone` takes a `TNNetSafeTensorsReader`,
+        so a `TNNetTorchBinReader` plugs in unchanged. Check against the
+        checkpoint: no attn*.to_q/k/v.bias (attention_bias false),
+        ff.net.0.proj.weight is [8192, 1024] (GEGLU), and the DINO token count
+        is 1025 at 512 px (CLS kept); the image tokens are DINO's
+        last_hidden_state, (1025, 1, 768), fed as backbone input 0.
+  - [X] T4. Backbone: factor the BasicTransformerBlock (self-attn + cross-attn
         + GEGLU FFN) out of AddSDTransformer2D into a shared builder routine,
         then build Transformer1D over the 3 x 32 x 32 learned tokens
         (GroupNorm, proj_in, 16 blocks, proj_out) and the 2x2 stride-2
         post-processor; verify the triplane layout against
         TNNetDeconvolution's output (planes must not mix).
+        Landed: `AddSDBasicTransformerBlock` / `LoadSDBasicTransformerBlock`
+        (public, with the TSDBasicBlockLayers records) now build and load
+        every SD UNet block; tiny SD UNet structure and weights are
+        byte-identical before and after (SaveStructureToString /
+        SaveDataToString CRC32 on 4 fixtures). `TTripoSRConfig`,
+        `TripoSRDefaultConfig`, `ValidateTripoSRConfig`, `AddTripoSRBackbone`
+        (learned tokens = TNNetLearnedPositionalEmbedding over a zero input,
+        GroupNorm eps 1e-6, proj_in, N shared blocks cross-attending the
+        image tokens, proj_out, + tokens, reshape to (Wp, 3*Hp, C),
+        TNNetDeconvolutionLinear kernel 2 stride 2), `BuildTripoSRBackbone`
+        and `LoadTripoSRBackbone` (tokenizer.embeddings [3, C, Hp, Wp]
+        transposed to "(Np Hp Wp)" token rows, backbone.*,
+        post_processor.upsample.*). Tests: TestTripoSRBackbonePicoShapes
+        (also (32, 96, 1024) -> (64, 192, 40) on TNNetDeconvolution),
+        TestTripoSRPostProcessorPlaneIndependence (perturbing plane k
+        changes exactly output rows [2k*Hp, 2(k+1)*Hp)),
+        TestTripoSRBackboneLoadHandParity (synthetic checkpoint, zeroed
+        to_out / ff.net.2 so the blocks are identity, hand-computed output).
+        No real-checkpoint parity yet (T3 + oracle). RAM, estimated not
+        measured: the full backbone is ~330M FP32 parameters (~1.3 GB), and
+        every per-head attention layer keeps its score matrix (3072 x 3072
+        self, 3072 x 1025 cross: ~9.6 GB + ~3.2 GB over 16 blocks), so T6
+        needs a fused/shared attention path or int8 before a full-size run.
   - [ ] T5. NeRF decoder + density sweep: the per-point MLP after
         TNNetTriplaneSample (pointwise convs, SiLU, density bias/activation,
         RGB sigmoid), queried over the marching grid in chunks so

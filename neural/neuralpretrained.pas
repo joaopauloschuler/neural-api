@@ -18682,6 +18682,85 @@ function BuildGRUFromSafeTensors(const FileName, Prefix: string;
   InputSize, Hidden, NumLayers, SeqLen: integer;
   Bidirectional: boolean): TNNet;
 
+type
+  // One diffusers Attention over the cross states (bias-free q/k/v, biased out).
+  TSDCrossAttnLayers = record
+    Q, K, V, Out: TNNetLayer;
+    // IP-Adapter to_k_ip / to_v_ip; nil without image tokens.
+    KIP, VIP: TNNetLayer;
+  end;
+  // One GLIGEN GatedSelfAttentionDense; Linear is nil when the block has none.
+  TSDGLIGENFuserLayers = record
+    Linear, LN1, LN2, AttnGate, FfProj, FfOut, FfGate: TNNetLayer;
+    Attn: TSDCrossAttnLayers;
+  end;
+  // One BasicTransformerBlock's layer refs (attn1 / cross-attn / GEGLU FF).
+  // Self_QKV is nil when attn1 is a cross-attention (only_cross_attention).
+  TSDBasicBlockLayers = record
+    LN1, LN2, LN3: TNNetLayer;
+    Self_QKV, Self_Out: TNNetLayer;
+    Attn1Cross, Cross: TSDCrossAttnLayers;
+    Fuser: TSDGLIGENFuserLayers;
+    FfProj, FfOut: TNNetLayer;
+  end;
+
+// One diffusers BasicTransformerBlock over Tokens (N,1,Channels): pre-norm attn1, attn2 over
+// CrossStates, GEGLU FF, each + residual. Optional IP-Adapter tokens and GLIGEN objects.
+function AddSDBasicTransformerBlock(NN: TNNet; Tokens, CrossStates: TNNetLayer;
+  Channels, Heads: integer; OnlyCrossAttention, pTrainable: boolean;
+  out Refs: TSDBasicBlockLayers; IPKeyTokens: TNNetLayer = nil;
+  IPValueTokens: TNNetLayer = nil; GLIGENObjects: TNNetLayer = nil): TNNetLayer;
+// Loads one BasicTransformerBlock's norm1-3, attn1, attn2 (k/v from CrossDim) and
+// GEGLU ff tensors under BlockPrefix ('...transformer_blocks.N.').
+procedure LoadSDBasicTransformerBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TSDBasicBlockLayers; const BlockPrefix: string;
+  Channels, CrossDim: integer);
+
+const
+  // TripoSR triplane count: XY, XZ, YZ planes stacked along Y.
+  csTripoSRPlaneCount = 3;
+
+type
+  // TripoSR config.yaml sizes for the tokenizer, backbone and post_processor.
+  TTripoSRConfig = record
+    PlaneSize: integer;          // tokenizer.plane_size (32)
+    TokenChannels: integer;      // tokenizer.num_channels = backbone.in_channels (1024)
+    NumHeads: integer;           // backbone.num_attention_heads (16)
+    HeadDim: integer;            // backbone.attention_head_dim (64)
+    NumLayers: integer;          // backbone.num_layers (16)
+    CrossAttentionDim: integer;  // backbone.cross_attention_dim (768, DINO width)
+    NormNumGroups: integer;      // backbone.norm_num_groups (32)
+    ImageTokenCount: integer;    // image tokenizer tokens incl. CLS (1025 at 512 px)
+    TriplaneChannels: integer;   // post_processor.out_channels (40)
+  end;
+
+  // Layer refs of AddTripoSRBackbone; LoadTripoSRBackbone fills them.
+  TTripoSRBackboneLayers = record
+    // tokenizer.embeddings: a TNNetLearnedPositionalEmbedding over a zero input.
+    Tokens: TNNetLayer;
+    GN, ProjIn, ProjOut: TNNetLayer;
+    Blocks: array of TSDBasicBlockLayers;
+    // post_processor.upsample: TNNetDeconvolutionLinear, kernel 2, stride 2.
+    Upsample: TNNetLayer;
+  end;
+
+// stabilityai/TripoSR config.yaml values.
+function TripoSRDefaultConfig(): TTripoSRConfig;
+// Raises unless the sizes are consistent (heads, groups, planes >= 2).
+procedure ValidateTripoSRConfig(const Config: TTripoSRConfig);
+// Learned triplane tokens -> Transformer1D (cross-attending ImageTokens) -> per-plane
+// ConvTranspose2d; returns the (2*PlaneSize, 6*PlaneSize, TriplaneChannels) triplane.
+function AddTripoSRBackbone(NN: TNNet; const Config: TTripoSRConfig;
+  ImageTokens: TNNetLayer; pTrainable: boolean;
+  out Refs: TTripoSRBackboneLayers): TNNetLayer;
+// A net whose input 0 is the (ImageTokenCount, 1, CrossAttentionDim) image tokens and
+// whose last layer is the AddTripoSRBackbone triplane. Caller owns the net.
+function BuildTripoSRBackbone(const Config: TTripoSRConfig; pTrainable: boolean;
+  out Refs: TTripoSRBackboneLayers): TNNet;
+// Loads tokenizer.embeddings, backbone.* and post_processor.upsample.* into Refs.
+procedure LoadTripoSRBackbone(Reader: TNNetSafeTensorsReader;
+  const Refs: TTripoSRBackboneLayers; const Config: TTripoSRConfig);
+
 // NeuralAllowFusedAttention (the global fused-attention A/B toggle) lives in
 // neuralnetwork, next to TNNet.AddGQAAttentionFromSources which reads it, and
 // reaches this unit through the uses clause above.
@@ -79575,26 +79654,6 @@ type
   TSDResnetLayers = record
     GN1, Conv1, TimeProj, GN2, Conv2, Shortcut: TNNetLayer;
   end;
-  // One diffusers Attention over the text states (bias-free q/k/v, biased out).
-  TSDCrossAttnLayers = record
-    Q, K, V, Out: TNNetLayer;
-    // IP-Adapter to_k_ip / to_v_ip; nil without image tokens.
-    KIP, VIP: TNNetLayer;
-  end;
-  // One GLIGEN GatedSelfAttentionDense; Linear is nil when the block has none.
-  TSDGLIGENFuserLayers = record
-    Linear, LN1, LN2, AttnGate, FfProj, FfOut, FfGate: TNNetLayer;
-    Attn: TSDCrossAttnLayers;
-  end;
-  // One BasicTransformerBlock's layer refs (attn1 / cross-attn / GEGLU FF).
-  // Self_QKV is nil when attn1 is a cross-attention (only_cross_attention).
-  TSDBasicBlockLayers = record
-    LN1, LN2, LN3: TNNetLayer;
-    Self_QKV, Self_Out: TNNetLayer;
-    Attn1Cross, Cross: TSDCrossAttnLayers;
-    Fuser: TSDGLIGENFuserLayers;
-    FfProj, FfOut: TNNetLayer;
-  end;
   // One Transformer2DModel: GN + proj_in/out + a STACK of BasicTransformerBlocks
   // (transformer_layers_per_block, SDXL stacks >1; SD1.x uses exactly 1).
   TSDAttnLayers = record
@@ -79698,34 +79757,17 @@ begin
       Prefix + 'conv_shortcut.bias', OutCh, InCh, 1);
 end;
 
-// One diffusers Transformer2DModel: GroupNorm(eps 1e-6) -> proj_in ->
-// flatten (H,W,C)->(H*W,1,C) -> transformer_layers_per_block pre-norm
-// BasicTransformerBlocks (each: self-attn, text cross-attn over TextStates,
-// GEGLU FFN) -> reshape -> proj_out -> + residual(input). Self-attn is built
-// per-head exactly like the VAE mid-attention but with token LayerNorm;
-// cross-attn uses per-head TNNetCrossAttention over the projected text states
-// (the landed two-source recipe). OnlyCrossAttention makes attn1 a second
-// cross-attention over TextStates (diffusers only_cross_attention).
-// IPKeyTokens / IPValueTokens (IP-Adapter image tokens; the value ones carry
-// the scale) add per-head attention over to_k_ip / to_v_ip to the attn2 one.
-// GLIGENObjects (GLIGEN object tokens) adds a fuser after every attn1.
-//
-// proj_in/proj_out are built as 1x1 TNNetConvolutionLinear regardless of
-// Config.UseLinearProjection: an nn.Linear over the channel axis and a 1x1 conv
-// are the SAME per-token map -- only the stored tensor shape differs ([O,I] vs
-// [O,I,1,1]), which is purely a loader concern (see LoadSDTransformer2D).
-// Coded by Claude (AI).
-procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
-  TextStates, Input: TNNetLayer; Channels, Depth, Heads: integer;
-  OnlyCrossAttention, pTrainable: boolean; out Refs: TSDAttnLayers;
-  IPKeyTokens: TNNetLayer = nil; IPValueTokens: TNNetLayer = nil;
-  GLIGENObjects: TNNetLayer = nil);
+// One diffusers BasicTransformerBlock over Tokens (N,1,Channels): pre-norm attn1, attn2 over
+// CrossStates, GEGLU FF, each + residual. Optional IP-Adapter tokens and GLIGEN objects.
+function AddSDBasicTransformerBlock(NN: TNNet; Tokens, CrossStates: TNNetLayer;
+  Channels, Heads: integer; OnlyCrossAttention, pTrainable: boolean;
+  out Refs: TSDBasicBlockLayers; IPKeyTokens: TNNetLayer = nil;
+  IPValueTokens: TNNetLayer = nil; GLIGENObjects: TNNetLayer = nil): TNNetLayer;
 var
-  ResidualIn, Tokens, X1, X2, X3, Attn1Out, CrossOut: TNNetLayer;
+  X1, X2, Attn1Out, CrossOut: TNNetLayer;
   HeadOutputs, IPHeadOutputs: array of TNNetLayer;
   QChannels: array of integer;
-  H, W, HeadDim, Inner, HeadsM1, HeadDimM1, blk: integer;
-  DepthM1: integer;
+  HeadDim, Inner, HeadsM1, HeadDimM1: integer;
 
   // diffusers Attention of QueryIn over KVSource, plus the IP-Adapter image
   // tokens when KeyTokens is set; returns to_out.0.
@@ -79824,97 +79866,112 @@ var
   end;
 
 begin
-  ResidualIn := Input;
-  H := ResidualIn.Output.SizeY;
-  W := ResidualIn.Output.SizeX;
   if Heads < 1 then Heads := 1;
   HeadDim := Channels div Heads;
   HeadsM1 := Heads - 1;
   HeadDimM1 := HeadDim - 1;
   Inner := 4 * Channels;
+  SetLength(HeadOutputs, Heads);
+  SetLength(IPHeadOutputs, Heads);
+  SetLength(QChannels, HeadDim);
+
+  // ---- attn1 (pre-norm): self-attention, or cross-attention ----
+  Refs.LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), Tokens);
+  Refs.Self_QKV := nil;
+  Refs.Self_Out := nil;
+  Refs.Attn1Cross := Default(TSDCrossAttnLayers);
+  if OnlyCrossAttention then
+    Attn1Out := AddTextAttention(Refs.LN1, CrossStates, nil, nil,
+      Refs.Attn1Cross)
+  else
+  begin
+    Refs.Self_QKV := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(3 * Channels, {SuppressBias=}1).SetTrainable(pTrainable) );
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false);
+    Refs.Self_Out := NN.GetLastLayer();
+    Attn1Out := Refs.Self_Out;
+  end;
+  X1 := NN.AddLayer( TNNetSum.Create([Attn1Out, Tokens]) );
+  Refs.Fuser := Default(TSDGLIGENFuserLayers);
+  if GLIGENObjects <> nil then
+    X1 := AddGLIGENFuser(X1, Refs.Fuser);
+
+  // ---- cross-attention (pre-norm; K|V from CrossStates) ----
+  Refs.LN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X1);
+  CrossOut := AddTextAttention(Refs.LN2, CrossStates,
+    IPKeyTokens, IPValueTokens, Refs.Cross);
+  X2 := NN.AddLayer( TNNetSum.Create([CrossOut, X1]) );
+
+  // ---- GEGLU feed-forward (pre-norm) ----
+  Refs.LN3 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X2);
+  AddGEGLUFeedForward(Refs.FfProj, Refs.FfOut);
+  Result := NN.AddLayer( TNNetSum.Create([Refs.FfOut, X2]) );
+  SetLength(HeadOutputs, 0);
+  SetLength(IPHeadOutputs, 0);
+  SetLength(QChannels, 0);
+end;
+
+// One diffusers Transformer2DModel: GroupNorm(eps 1e-6) -> proj_in -> (H*W,1,C) tokens ->
+// Depth AddSDBasicTransformerBlock over TextStates -> proj_out -> + Input. Coded by Claude (AI).
+procedure AddSDTransformer2D(NN: TNNet; const Config: TSDUNetConfig;
+  TextStates, Input: TNNetLayer; Channels, Depth, Heads: integer;
+  OnlyCrossAttention, pTrainable: boolean; out Refs: TSDAttnLayers;
+  IPKeyTokens: TNNetLayer = nil; IPValueTokens: TNNetLayer = nil;
+  GLIGENObjects: TNNetLayer = nil);
+var
+  ResidualIn, Tokens: TNNetLayer;
+  H, W, blk, DepthM1: integer;
+begin
+  ResidualIn := Input;
+  H := ResidualIn.Output.SizeY;
+  W := ResidualIn.Output.SizeX;
   Refs.GN := NN.AddLayerAfter( CreateGroupNorm(Config.NormNumGroups,
     SDUNET_TR_EPS), Input );
+  // A 1x1 conv is the same per-token map as nn.Linear (use_linear_projection);
+  // only the stored tensor shape differs, which LoadSDTransformer2D handles.
   Refs.ProjIn := NN.AddLayer(
     TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
   // flatten the spatial grid row-major to (H*W,1,C) tokens.
   NN.AddLayer( TNNetReshape.Create(H * W, 1, Channels) );
   Tokens := NN.GetLastLayer();
-  SetLength(HeadOutputs, Heads);
-  SetLength(IPHeadOutputs, Heads);
-  SetLength(QChannels, HeadDim);
   if Depth < 1 then Depth := 1;
   SetLength(Refs.Blocks, Depth);
-
   DepthM1 := Depth - 1;
   for blk := 0 to DepthM1 do
-  begin
-    // ---- attn1 (pre-norm): self-attention, or text cross-attention ----
-    Refs.Blocks[blk].LN1 := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), Tokens);
-    Refs.Blocks[blk].Self_QKV := nil;
-    Refs.Blocks[blk].Self_Out := nil;
-    Refs.Blocks[blk].Attn1Cross := Default(TSDCrossAttnLayers);
-    if OnlyCrossAttention then
-      Attn1Out := AddTextAttention(Refs.Blocks[blk].LN1, TextStates, nil, nil,
-        Refs.Blocks[blk].Attn1Cross)
-    else
-    begin
-      Refs.Blocks[blk].Self_QKV := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(3 * Channels, {SuppressBias=}1).SetTrainable(pTrainable) );
-      NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false);
-      Refs.Blocks[blk].Self_Out := NN.GetLastLayer();
-      Attn1Out := Refs.Blocks[blk].Self_Out;
-    end;
-    X1 := NN.AddLayer( TNNetSum.Create([Attn1Out, Tokens]) );
-    Refs.Blocks[blk].Fuser := Default(TSDGLIGENFuserLayers);
-    if GLIGENObjects <> nil then
-      X1 := AddGLIGENFuser(X1, Refs.Blocks[blk].Fuser);
-
-    // ---- cross-attention (pre-norm; K|V from text states) ----
-    Refs.Blocks[blk].LN2 := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X1);
-    CrossOut := AddTextAttention(Refs.Blocks[blk].LN2, TextStates,
-      IPKeyTokens, IPValueTokens, Refs.Blocks[blk].Cross);
-    X2 := NN.AddLayer( TNNetSum.Create([CrossOut, X1]) );
-
-    // ---- GEGLU feed-forward (pre-norm) ----
-    Refs.Blocks[blk].LN3 := NN.AddLayerAfter(
-      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable), X2);
-    AddGEGLUFeedForward(Refs.Blocks[blk].FfProj, Refs.Blocks[blk].FfOut);
-    X3 := NN.AddLayer( TNNetSum.Create([Refs.Blocks[blk].FfOut, X2]) );
-    // the next block (if any) consumes this block's token output.
-    Tokens := X3;
-  end;
+    Tokens := AddSDBasicTransformerBlock(NN, Tokens, TextStates, Channels,
+      Heads, OnlyCrossAttention, pTrainable, Refs.Blocks[blk], IPKeyTokens,
+      IPValueTokens, GLIGENObjects);
 
   // ---- fold tokens back to (W,H,C), proj_out, + residual ----
   NN.AddLayerAfter( TNNetReshape.Create(W, H, Channels), Tokens );
   Refs.ProjOut := NN.AddLayer(
     TNNetConvolutionLinear.Create(Channels, 1, 0, 1, 0).SetTrainable(pTrainable) );
   NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualIn]) );
-  SetLength(HeadOutputs, 0);
-  SetLength(IPHeadOutputs, 0);
-  SetLength(QChannels, 0);
 end;
 
-procedure LoadSDTransformer2D(Reader: TNNetSafeTensorsReader;
-  const Refs: TSDAttnLayers; const Prefix: string;
-  Channels: integer; const Config: TSDUNetConfig);
+// Loads one BasicTransformerBlock's norm1-3, attn1, attn2 (k/v from CrossDim) and
+// GEGLU ff tensors under BlockPrefix ('...transformer_blocks.N.').
+procedure LoadSDBasicTransformerBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TSDBasicBlockLayers; const BlockPrefix: string;
+  Channels, CrossDim: integer);
 var
-  d, Inner, blk: integer;
-  P, TB: string;
-  BlocksM1: integer;
+  d, Inner: integer;
+  TB: string;
 
-  // to_q over the image (d->d), to_k/to_v over the text (cross->d), all
-  // bias-free; to_out.0 biased.
+  // to_q over the tokens (d->d), to_k/to_v over the cross states (CrossDim->d),
+  // all bias-free; to_out.0 biased.
   procedure LoadTextAttention(const AttnRefs: TSDCrossAttnLayers;
     const AttnPrefix: string);
   begin
     LoadLlamaLinearWeights(Reader, AttnRefs.Q, AttnPrefix + 'to_q.weight',
       d, d, 0, -1, 0, '');
     LoadLlamaLinearWeights(Reader, AttnRefs.K, AttnPrefix + 'to_k.weight',
-      Config.CrossAttentionDim, d, 0, -1, 0, '');
+      CrossDim, d, 0, -1, 0, '');
     LoadLlamaLinearWeights(Reader, AttnRefs.V, AttnPrefix + 'to_v.weight',
-      Config.CrossAttentionDim, d, 0, -1, 0, '');
+      CrossDim, d, 0, -1, 0, '');
     LoadLlamaLinearWeights(Reader, AttnRefs.Out, AttnPrefix + 'to_out.0.weight',
       d, d, 0, -1, 0, AttnPrefix + 'to_out.0.bias');
   end;
@@ -79922,6 +79979,43 @@ var
 begin
   d := Channels;
   Inner := 4 * Channels;
+  TB := BlockPrefix;
+  // norms (token LayerNorm gain/bias).
+  LoadLayerNormWeights(Reader, Refs.LN1, TB + 'norm1.weight', TB + 'norm1.bias', d);
+  LoadLayerNormWeights(Reader, Refs.LN2, TB + 'norm2.weight', TB + 'norm2.bias', d);
+  LoadLayerNormWeights(Reader, Refs.LN3, TB + 'norm3.weight', TB + 'norm3.bias', d);
+  // self-attention: q/k/v bias-free -> fused Q|K|V slab; to_out.0 biased.
+  if Refs.Self_QKV = nil then
+    LoadTextAttention(Refs.Attn1Cross, TB + 'attn1.')
+  else
+  begin
+    LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_q.weight',
+      d, d, 0, 3 * d, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_k.weight',
+      d, d, d, 3 * d, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Self_QKV, TB + 'attn1.to_v.weight',
+      d, d, 2 * d, 3 * d, 0, '');
+    LoadLlamaLinearWeights(Reader, Refs.Self_Out, TB + 'attn1.to_out.0.weight',
+      d, d, 0, -1, 0, TB + 'attn1.to_out.0.bias');
+  end;
+  LoadTextAttention(Refs.Cross, TB + 'attn2.');
+  // GEGLU ff: net.0.proj (d -> 2*inner) biased; net.2 (inner -> d) biased.
+  // TNNetGEGLUErf consumes [hidden|gate] in the same chunk(2) order.
+  LoadLlamaLinearWeights(Reader, Refs.FfProj, TB + 'ff.net.0.proj.weight',
+    d, 2 * Inner, 0, -1, 0, TB + 'ff.net.0.proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.FfOut, TB + 'ff.net.2.weight',
+    Inner, d, 0, -1, 0, TB + 'ff.net.2.bias');
+end;
+
+procedure LoadSDTransformer2D(Reader: TNNetSafeTensorsReader;
+  const Refs: TSDAttnLayers; const Prefix: string;
+  Channels: integer; const Config: TSDUNetConfig);
+var
+  d, blk: integer;
+  P: string;
+  BlocksM1: integer;
+begin
+  d := Channels;
   P := Prefix;
   LoadVaeGroupNorm(Reader, Refs.GN, P + 'norm', d, SDUNET_TR_EPS);
   // proj_in / proj_out. With use_linear_projection (SD2.x / SDXL) the tensors are
@@ -79946,34 +80040,9 @@ begin
   // each stacked BasicTransformerBlock loads its own weight set.
   BlocksM1 := Length(Refs.Blocks) - 1;
   for blk := 0 to BlocksM1 do
-  begin
-    TB := P + 'transformer_blocks.' + IntToStr(blk) + '.';
-    // norms (token LayerNorm gain/bias).
-    LoadLayerNormWeights(Reader, Refs.Blocks[blk].LN1, TB + 'norm1.weight', TB + 'norm1.bias', d);
-    LoadLayerNormWeights(Reader, Refs.Blocks[blk].LN2, TB + 'norm2.weight', TB + 'norm2.bias', d);
-    LoadLayerNormWeights(Reader, Refs.Blocks[blk].LN3, TB + 'norm3.weight', TB + 'norm3.bias', d);
-    // self-attention: q/k/v bias-free -> fused Q|K|V slab; to_out.0 biased.
-    if Refs.Blocks[blk].Self_QKV = nil then
-      LoadTextAttention(Refs.Blocks[blk].Attn1Cross, TB + 'attn1.')
-    else
-    begin
-      LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_QKV, TB + 'attn1.to_q.weight',
-        d, d, 0, 3 * d, 0, '');
-      LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_QKV, TB + 'attn1.to_k.weight',
-        d, d, d, 3 * d, 0, '');
-      LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_QKV, TB + 'attn1.to_v.weight',
-        d, d, 2 * d, 3 * d, 0, '');
-      LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].Self_Out, TB + 'attn1.to_out.0.weight',
-        d, d, 0, -1, 0, TB + 'attn1.to_out.0.bias');
-    end;
-    LoadTextAttention(Refs.Blocks[blk].Cross, TB + 'attn2.');
-    // GEGLU ff: net.0.proj (d -> 2*inner) biased; net.2 (inner -> d) biased.
-    // TNNetGEGLUErf consumes [hidden|gate] in the same chunk(2) order.
-    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].FfProj, TB + 'ff.net.0.proj.weight',
-      d, 2 * Inner, 0, -1, 0, TB + 'ff.net.0.proj.bias');
-    LoadLlamaLinearWeights(Reader, Refs.Blocks[blk].FfOut, TB + 'ff.net.2.weight',
-      Inner, d, 0, -1, 0, TB + 'ff.net.2.bias');
-  end;
+    LoadSDBasicTransformerBlock(Reader, Refs.Blocks[blk],
+      P + 'transformer_blocks.' + IntToStr(blk) + '.', d,
+      Config.CrossAttentionDim);
 end;
 
 // The GLIGEN fuser.* tensors of every block of Refs; a gate holds
@@ -125372,6 +125441,167 @@ begin
   finally
     PixelValues.Free;
   end;
+end;
+
+const
+  csTripoSRNormEps = 0.000001;   // Transformer1D GroupNorm eps
+  csTripoSRUpsampleKernel = 2;   // TriplaneUpsampleNetwork kernel = stride
+
+function TripoSRDefaultConfig(): TTripoSRConfig;
+begin
+  Result.PlaneSize := 32;
+  Result.TokenChannels := 1024;
+  Result.NumHeads := 16;
+  Result.HeadDim := 64;
+  Result.NumLayers := 16;
+  Result.CrossAttentionDim := 768;
+  Result.NormNumGroups := 32;
+  // facebook/dino-vitb16 at 512 px: 32 x 32 patches + CLS.
+  Result.ImageTokenCount := 1025;
+  Result.TriplaneChannels := 40;
+end;
+
+procedure ValidateTripoSRConfig(const Config: TTripoSRConfig);
+begin
+  if Config.PlaneSize < csTripoSRUpsampleKernel then
+    ImportError('TripoSR: PlaneSize ' + IntToStr(Config.PlaneSize) +
+      ' is below the upsample kernel ' + IntToStr(csTripoSRUpsampleKernel) + '.');
+  if (Config.NumHeads < 1) or (Config.HeadDim < 1) or (Config.NumLayers < 1) or
+     (Config.CrossAttentionDim < 1) or (Config.ImageTokenCount < 1) or
+     (Config.TriplaneChannels < 1) or (Config.TokenChannels < 1) then
+    ImportError('TripoSR: every size in the config must be positive.');
+  if (Config.NormNumGroups < 1) or
+     ((Config.TokenChannels mod Config.NormNumGroups) <> 0) then
+    ImportError('TripoSR: TokenChannels ' + IntToStr(Config.TokenChannels) +
+      ' is not a multiple of NormNumGroups ' + IntToStr(Config.NormNumGroups) + '.');
+end;
+
+function AddTripoSRBackbone(NN: TNNet; const Config: TTripoSRConfig;
+  ImageTokens: TNNetLayer; pTrainable: boolean;
+  out Refs: TTripoSRBackboneLayers): TNNetLayer;
+var
+  TokenCount, Inner, BlockPos, MaxBlockPos: integer;
+  ZeroTokens, Tokens: TNNetLayer;
+begin
+  ValidateTripoSRConfig(Config);
+  TokenCount := csTripoSRPlaneCount * Config.PlaneSize * Config.PlaneSize;
+  Inner := Config.NumHeads * Config.HeadDim;
+  // Token (k*Hp + y)*Wp + x is plane k, row y, column x: the "(Np Hp Wp)" order of
+  // Triplane1DTokenizer, so the (N,1,C) tokens reshape to (Wp, 3*Hp, C) in place.
+  ZeroTokens := NN.AddLayerAfter(
+    TNNetInput.Create(TokenCount, 1, Config.TokenChannels), 0);
+  ZeroTokens.Output.Fill(0);
+  Refs.Tokens := NN.AddLayerAfter(TNNetLearnedPositionalEmbedding.Create(
+    TokenCount).SetTrainable(pTrainable), ZeroTokens);
+  Refs.GN := NN.AddLayer(CreateGroupNorm(Config.NormNumGroups, csTripoSRNormEps));
+  Refs.ProjIn := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Inner).SetTrainable(pTrainable));
+  // Assumed config.yaml defaults: attention_bias false, activation_fn geglu,
+  // norm_type layer_norm, no only_cross / double_self attention.
+  Tokens := Refs.ProjIn;
+  SetLength(Refs.Blocks, Config.NumLayers);
+  MaxBlockPos := Config.NumLayers - 1;
+  for BlockPos := 0 to MaxBlockPos do
+    Tokens := AddSDBasicTransformerBlock(NN, Tokens, ImageTokens, Inner,
+      Config.NumHeads, {OnlyCrossAttention=}false, pTrainable,
+      Refs.Blocks[BlockPos]);
+  Refs.ProjOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+    Config.TokenChannels).SetTrainable(pTrainable), Tokens);
+  NN.AddLayer(TNNetSum.Create([Refs.ProjOut, Refs.Tokens]));
+  NN.AddLayer(TNNetReshape.Create(Config.PlaneSize,
+    csTripoSRPlaneCount * Config.PlaneSize, Config.TokenChannels));
+  // kernel = stride: each texel owns its 2x2 output block, so planes never mix.
+  Refs.Upsample := NN.AddLayer(TNNetDeconvolutionLinear.Create(
+    Config.TriplaneChannels, csTripoSRUpsampleKernel,
+    {pStride=}csTripoSRUpsampleKernel, {pPadding=}0).SetTrainable(pTrainable));
+  Result := Refs.Upsample;
+end;
+
+function BuildTripoSRBackbone(const Config: TTripoSRConfig; pTrainable: boolean;
+  out Refs: TTripoSRBackboneLayers): TNNet;
+var
+  ImageTokens: TNNetLayer;
+begin
+  Result := TNNet.Create();
+  try
+    ImageTokens := Result.AddLayer(TNNetInput.Create(Config.ImageTokenCount, 1,
+      Config.CrossAttentionDim));
+    AddTripoSRBackbone(Result, Config, ImageTokens, pTrainable, Refs);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+// tokenizer.embeddings [3, C, Hp, Wp] -> the Refs.Tokens table, row (k*Hp + y)*Wp + x.
+procedure LoadTripoSRTriplaneTokens(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Config: TTripoSRConfig);
+const
+  csName = 'tokenizer.embeddings';
+var
+  Embeddings, Table: TNNetVolume;
+  PlanePos, ChannelPos, TexelPos, SrcPos, DstPos: integer;
+  MaxPlanePos, MaxChannelPos, MaxTexelPos, Channels, PlaneTexels: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  Channels := Config.TokenChannels;
+  PlaneTexels := Config.PlaneSize * Config.PlaneSize;
+  if (not Reader.HasTensor(csName)) or (Reader.DimCount(csName) <> 4) or
+     (Reader.DimSize(csName, 0) <> csTripoSRPlaneCount) or
+     (Reader.DimSize(csName, 1) <> Channels) or
+     (Reader.DimSize(csName, 2) <> Config.PlaneSize) or
+     (Reader.DimSize(csName, 3) <> Config.PlaneSize) then
+    ImportError('TripoSR import: "' + csName + '" must have shape [3, ' +
+      IntToStr(Channels) + ', ' + IntToStr(Config.PlaneSize) + ', ' +
+      IntToStr(Config.PlaneSize) + '].');
+  Table := Layer.FArrNeurons[0].Weights;
+  Embeddings := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(csName, Embeddings);
+    MaxPlanePos := csTripoSRPlaneCount - 1;
+    MaxChannelPos := Channels - 1;
+    MaxTexelPos := PlaneTexels - 1;
+    SrcPos := 0;
+    for PlanePos := 0 to MaxPlanePos do
+      for ChannelPos := 0 to MaxChannelPos do
+      begin
+        DstPos := PlanePos * PlaneTexels * Channels + ChannelPos;
+        for TexelPos := 0 to MaxTexelPos do
+        begin
+          Table.FData[DstPos] := Embeddings.FData[SrcPos];
+          Inc(SrcPos);
+          Inc(DstPos, Channels);
+        end;
+      end;
+    Layer.FlushWeightCache();
+  finally
+    Embeddings.Free;
+  end;
+end;
+
+procedure LoadTripoSRBackbone(Reader: TNNetSafeTensorsReader;
+  const Refs: TTripoSRBackboneLayers; const Config: TTripoSRConfig);
+const
+  csBackbone = 'backbone.';
+var
+  Inner, BlockPos, MaxBlockPos: integer;
+begin
+  Inner := Config.NumHeads * Config.HeadDim;
+  LoadTripoSRTriplaneTokens(Reader, Refs.Tokens, Config);
+  LoadVaeGroupNorm(Reader, Refs.GN, csBackbone + 'norm', Config.TokenChannels,
+    csTripoSRNormEps);
+  LoadLlamaLinearWeights(Reader, Refs.ProjIn, csBackbone + 'proj_in.weight',
+    Config.TokenChannels, Inner, 0, -1, 0, csBackbone + 'proj_in.bias');
+  MaxBlockPos := High(Refs.Blocks);
+  for BlockPos := 0 to MaxBlockPos do
+    LoadSDBasicTransformerBlock(Reader, Refs.Blocks[BlockPos],
+      csBackbone + 'transformer_blocks.' + IntToStr(BlockPos) + '.', Inner,
+      Config.CrossAttentionDim);
+  LoadLlamaLinearWeights(Reader, Refs.ProjOut, csBackbone + 'proj_out.weight',
+    Inner, Config.TokenChannels, 0, -1, 0, csBackbone + 'proj_out.bias');
+  LoadConvTranspose2DFoldBN(Reader, Refs.Upsample,
+    'post_processor.upsample.weight', 'post_processor.upsample.bias',
+    Config.TokenChannels, Config.TriplaneChannels, csTripoSRUpsampleKernel);
 end;
 
 {$IFDEF OpenCL}
