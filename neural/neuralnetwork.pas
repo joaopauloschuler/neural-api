@@ -19082,6 +19082,34 @@ type
     property NumExperts: integer read FNumExperts;
   end;
 
+  {$IFDEF OpenCL}
+  TNNetDeformableConv = class;
+
+  // OpenCL forward helper for TNNetDeformableConv (cai_deformable_im2col): builds
+  // the bilinear-sampled patch matrix its main GEMM reads. Coded by Claude (AI).
+  TNNetDeformableConvCL = class(TNNetKernelCL)
+  private
+    FBufPatch: cl_mem;
+    FCapPatch: csize_t;
+    // Upload buffers for host-only sources: input, offsets, mask.
+    FBufSource: array[0..2] of cl_mem;
+    FCapSource: array[0..2] of csize_t;
+  public
+    constructor Create(NN: TNNet);
+    destructor Destroy(); override;
+    // The upload buffer of source slot SourcePos (0 input, 1 offsets, 2 mask),
+    // grown for Source; nothing is written.
+    function SourceUploadBuffer(SourcePos: integer; Source: TNNetVolume): cl_mem;
+    // Fills PatchBuffer with Layer's patch matrix [pos][tap][ci] read from the
+    // input, offset and mask buffers (BufMask unused without a mask).
+    procedure BuildPatch(Layer: TNNetDeformableConv; BufInput, BufOffsets,
+      BufMask: cl_mem);
+    function PatchBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    function BufferBytes(): int64; override;
+  end;
+  {$ENDIF}
+
   /// DEFORMABLE CONVOLUTION (Dai et al. 2017, "Deformable Convolutional
   /// Networks", arXiv:1703.06211) -- a convolution whose KxK sampling grid is
   /// shifted by LEARNABLE, per-output-location AND per-tap 2-D offsets, so the
@@ -19199,12 +19227,21 @@ type
     FBwScol, FBwDSpx, FBwDSpy: TNNetVolume; // length FInDepth scratch columns
     FdOffMap: TNNetVolume;     // backprop scratch: dL/d(offset map) (OutX,OutY,FOffOut)
     {$IFDEF OpenCL}
-    // Scratch operands for the device im2col GEMM (interleaved weights, gathered
-    // per-position bilinear patches, result). The bilinear GATHER stays on the
-    // CPU (FGemmPatch); only the dense patch x weight contraction goes to the
-    // device, exactly mirroring the EnCodec/HiFiGAN conv-offload path.
+    // Main GEMM operands: interleaved weights (both OpenCL paths), and the
+    // host-gathered patch matrix and result of the training forward.
     FGemmWInter, FGemmPatch, FGemmRes: TNNetVolume;
+    // Inference forward: cai_deformable_im2col builds the patch matrix and, in
+    // the self-offset mode, FOffsetDotCL runs the offset head as an implicit conv.
+    FDeformableCL: TNNetDeformableConvCL;
+    FOffsetDotCL: TDotProductSharedKernel;
+    // Repacks mW into FGemmWInter when the weights changed; True if it did.
+    function RefreshGemmWeightsCL(): boolean;
+    // Inference only: offset head, gather and GEMM in OpenCL, sources bound
+    // when resident, output left resident.
+    function WillGatherOnOpenCL(): boolean;
     procedure ComputeOpenCL();
+    // Training forward: CPU offset head and gather, OpenCL GEMM, host output.
+    procedure ComputeHostGatherOpenCL();
     {$ENDIF}
     function SampleBilinear(PrevOut: TNNetVolume; px, py: TNeuralFloat;
       ci: integer): TNeuralFloat;
@@ -19242,6 +19279,10 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLBufferBytes(): int64; override;
+    // FStruct[7] is not the Winograd flag here; the output keeps its own buffer.
+    function CanShareOpenCLOutput(): boolean; override;
     {$ENDIF}
     property InDepth: integer read FInDepth;
     property OutDepth: integer read FOutDepth;
@@ -104288,6 +104329,128 @@ begin
   end;
 end;
 
+{$IFDEF OpenCL}
+{ TNNetDeformableConvCL }
+
+constructor TNNetDeformableConvCL.Create(NN: TNNet);
+begin
+  inherited Create(NN, 'cai_deformable_im2col');
+end;
+
+destructor TNNetDeformableConvCL.Destroy();
+var
+  SourcePos: integer;
+begin
+  if Assigned(FBufPatch) then clReleaseMemObject(FBufPatch);
+  for SourcePos := Low(FBufSource) to High(FBufSource) do
+    if Assigned(FBufSource[SourcePos]) then clReleaseMemObject(FBufSource[SourcePos]);
+  inherited Destroy();
+end;
+
+function TNNetDeformableConvCL.SourceUploadBuffer(SourcePos: integer;
+  Source: TNNetVolume): cl_mem;
+begin
+  Result := FKernel.EnsureBuffer(FBufSource[SourcePos], FCapSource[SourcePos],
+    CL_MEM_READ_WRITE, csize_t(Source.Size) * csNeuralFloatSize);
+end;
+
+procedure TNNetDeformableConvCL.BuildPatch(Layer: TNNetDeformableConv;
+  BufInput, BufOffsets, BufMask: cl_mem);
+var
+  k: cl_kernel;
+  PatchCount, OutSizeX, InSizeX, InSizeY, InDepth, FeatureSizeX, TapCount,
+    Stride, Padding, DilationX, DilationY, GroupDepth, OffsetDepth,
+    OffsetGroupStride, OffsetDxFirst, MaskMode, MaskDepth, MaskFirst,
+    MaskGroupStride: longint;
+  Input: TNNetVolume;
+begin
+  k := FKernel.Kernel;
+  Input := Layer.FPrevLayer.FOutput;
+  OutSizeX := Layer.FOutputSizeX;
+  InSizeX := Input.SizeX;
+  InSizeY := Input.SizeY;
+  InDepth := Layer.FInDepth;
+  FeatureSizeX := Layer.FFeatureSizeX;
+  TapCount := Layer.FNumTaps;
+  Stride := Layer.FStride;
+  Padding := Layer.FPadding;
+  DilationX := Layer.FDilationX;
+  DilationY := Layer.FDilationY;
+  GroupDepth := Layer.FGroupDepth;
+  PatchCount := Layer.FOutputSizeX * Layer.FOutputSizeY * TapCount * InDepth;
+  if Layer.FHasOffsetSource then
+  begin
+    // torchvision order: channel g*2*KK + 2*tap = dy, +1 = dx; mask g*KK + tap.
+    OffsetDepth := 2 * Layer.FGroupCount * TapCount;
+    OffsetGroupStride := 2 * TapCount;
+    OffsetDxFirst := 0;
+    if Layer.FHasMaskSource then MaskMode := 1 else MaskMode := 0;
+    MaskDepth := Layer.FGroupCount * TapCount;
+    MaskFirst := 0;
+    MaskGroupStride := TapCount;
+  end
+  else
+  begin
+    // Offset head output: channel 2*tap = dx, +1 = dy; the DCNv2 modulation
+    // logits follow at 2*KK + tap and go through a sigmoid.
+    OffsetDepth := Layer.FOffOut;
+    OffsetGroupStride := 0;
+    OffsetDxFirst := 1;
+    if Layer.FModulated <> 0 then MaskMode := 2 else MaskMode := 0;
+    MaskDepth := Layer.FOffOut;
+    MaskFirst := 2 * TapCount;
+    MaskGroupStride := 0;
+    BufMask := BufOffsets;
+  end;
+  if not Assigned(BufMask) then BufMask := BufOffsets;
+  FKernel.EnsureBuffer(FBufPatch, FCapPatch, CL_MEM_READ_WRITE,
+    csize_t(PatchCount) * csNeuralFloatSize);
+  clSetKernelArg(k, 0, csLongintSize, @PatchCount);
+  clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
+  clSetKernelArg(k, 2, csLongintSize, @InSizeX);
+  clSetKernelArg(k, 3, csLongintSize, @InSizeY);
+  clSetKernelArg(k, 4, csLongintSize, @InDepth);
+  clSetKernelArg(k, 5, csLongintSize, @FeatureSizeX);
+  clSetKernelArg(k, 6, csLongintSize, @TapCount);
+  clSetKernelArg(k, 7, csLongintSize, @Stride);
+  clSetKernelArg(k, 8, csLongintSize, @Padding);
+  clSetKernelArg(k, 9, csLongintSize, @DilationX);
+  clSetKernelArg(k, 10, csLongintSize, @DilationY);
+  clSetKernelArg(k, 11, csLongintSize, @GroupDepth);
+  clSetKernelArg(k, 12, csLongintSize, @OffsetDepth);
+  clSetKernelArg(k, 13, csLongintSize, @OffsetGroupStride);
+  clSetKernelArg(k, 14, csLongintSize, @OffsetDxFirst);
+  clSetKernelArg(k, 15, csLongintSize, @MaskMode);
+  clSetKernelArg(k, 16, csLongintSize, @MaskDepth);
+  clSetKernelArg(k, 17, csLongintSize, @MaskFirst);
+  clSetKernelArg(k, 18, csLongintSize, @MaskGroupStride);
+  clSetKernelArg(k, 19, csCLMemSize, @BufInput);
+  clSetKernelArg(k, 20, csCLMemSize, @BufOffsets);
+  clSetKernelArg(k, 21, csCLMemSize, @BufMask);
+  clSetKernelArg(k, 22, csCLMemSize, @FBufPatch);
+  FKernel.RunKernel(k, PatchCount);
+end;
+
+function TNNetDeformableConvCL.PatchBuffer(): cl_mem;
+begin
+  Result := FBufPatch;
+end;
+
+function TNNetDeformableConvCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetDeformableConvCL.BufferBytes(): int64;
+var
+  SourcePos: integer;
+begin
+  Result := int64(FCapPatch);
+  for SourcePos := Low(FCapSource) to High(FCapSource) do
+    Result := Result + int64(FCapSource[SourcePos]);
+end;
+{$ENDIF}
+
 { TNNetDeformableConv }
 
 constructor TNNetDeformableConv.Create(pNumFeatures, pFeatureSize,
@@ -104417,6 +104580,8 @@ begin
   FGemmWInter.Free;
   FGemmPatch.Free;
   FGemmRes.Free;
+  FreeAndNil(FDeformableCL);
+  FreeDotProductCL(FOffsetDotCL);
   {$ENDIF}
   inherited Destroy();
 end;
@@ -104689,19 +104854,25 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
-  if FHasOffsetSource then FOffsetLayer.ForceOutputOnRAM();
-  if FHasMaskSource then FMaskLayer.ForceOutputOnRAM();
-  // Offload the dense main-conv im2col GEMM to the device when OpenCL is armed
-  // and the contraction is large enough to amortise the upload/dispatch. The
-  // offset head and the bilinear GATHER stay on the CPU (see ComputeOpenCL);
-  // below the work threshold (or when OpenCL is off) the whole conv runs on the
-  // CPU - byte-identical to the gate-OFF path.
-  if WillOpenCL() then
+  // Runs BEFORE the source downloads below because those are what it avoids.
+  if WillGatherOnOpenCL() then
   begin
     Inc(FForwardGPUCnt);
     ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if FHasOffsetSource then FOffsetLayer.ForceOutputOnRAM();
+  if FHasMaskSource then FMaskLayer.ForceOutputOnRAM();
+  MarkOutputWrittenOnRAM();
+  // Training forward: the offset head and the bilinear gather stay on the CPU
+  // (the backward reads FOffMap) and only the main GEMM runs in OpenCL.
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeHostGatherOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end
@@ -104825,12 +104996,11 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetDeformableConv.EnableOpenCL(DotProductKernel: TNeuralKernel);
+var
+  PositionCount, PatchSize: integer;
 begin
-  // Deliberately do NOT chain through TNNetConvolutionBase.EnableOpenCL: that
-  // path concats/interleaves a per-feature-neuron weight bank and arms the
-  // standard conv GEMM, which is meaningless for our custom 4-neuron layout.
-  // We only need the bare TNNetLayer arming (FHasOpenCL + the shared kernel) and
-  // our own scratch buffers; the offload runs through ComputeOpenCL.
+  // Not chained: TNNetConvolutionBase.EnableOpenCL concatenates and interleaves a
+  // per-neuron weight bank, which this 4-neuron layout does not have.
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
@@ -104840,42 +105010,196 @@ begin
   if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
   if not Assigned(FGemmPatch)  then FGemmPatch  := TNNetVolume.Create();
   if not Assigned(FGemmRes)    then FGemmRes    := TNNetVolume.Create();
+  PositionCount := FOutputSizeX * FOutputSizeY;
+  PatchSize := FNumTaps * FInDepth;
+  if (not Assigned(FNN)) or (PositionCount = 0) or (PatchSize = 0) then exit;
+  if not Assigned(FDeformableCL) then
+    FDeformableCL := TNNetDeformableConvCL.Create(FNN);
+  // PrepareForCompute releases the result buffer a resident output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FGemmWInter.ReSize(FOutDepth * PatchSize, 1, 1);
+  FDotCL.PrepareForCompute(FGemmWInter, PositionCount, PatchSize);
+  if not FHasOffsetSource then
+  begin
+    // The offset head is a plain conv: oW is already the implicit-conv A layout
+    // [((fy*FeatSizeX+fx)*InDepth+ci)*FOffOut + oc].
+    if not Assigned(FOffsetDotCL) then
+    begin
+      FOffsetDotCL := NewDotProductCL(GetDotProductKernel());
+      FOffsetDotCL.HideMessages();
+    end;
+    FOffsetDotCL.PrepareForCompute(FArrNeurons[2].FWeights, PositionCount,
+      PatchSize);
+    FOffsetDotCL.PrepareImplicitConv();
+  end;
+  FAfterWeightUpdateHasBeenCalled := true;
+end;
+
+procedure TNNetDeformableConv.DisableOpenCL();
+begin
+  // FDotCL owns the buffer a resident output lives in.
+  ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FreeAndNil(FDeformableCL);
+  FreeDotProductCL(FOffsetDotCL);
+  inherited DisableOpenCL();
+end;
+
+function TNNetDeformableConv.OpenCLBufferBytes(): int64;
+begin
+  Result := inherited OpenCLBufferBytes();
+  if Assigned(FDeformableCL) then Result := Result + FDeformableCL.BufferBytes();
+  if Assigned(FOffsetDotCL) then Result := Result + FOffsetDotCL.BufferBytes();
+end;
+
+function TNNetDeformableConv.CanShareOpenCLOutput(): boolean;
+begin
+  Result := false;
+end;
+
+function TNNetDeformableConv.WillGatherOnOpenCL(): boolean;
+begin
+  Result := Assigned(FDeformableCL) and Assigned(FDotCL) and FHasOpenCL and
+    (not FIsTrainable) and Assigned(FPrevLayer) and
+    (FGemmWInter.Size = FOutDepth * FNumTaps * FInDepth) and
+    // cai_deformable_im2col indexes the patch matrix with int.
+    (Int64(FOutputSizeX) * FOutputSizeY * FNumTaps * FInDepth <= High(longint)) and
+    (FHasOffsetSource or
+      (Assigned(FOffsetDotCL) and FOffsetDotCL.ImplicitConvReady)) and
+    (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCL() or
+      (FHasOffsetSource and FOffsetLayer.OutputBindableOnOpenCL()) or
+      (FHasMaskSource and FMaskLayer.OutputBindableOnOpenCL()));
 end;
 
 function TNNetDeformableConv.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FDotCL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL);
+  Result := WillGatherOnOpenCL() or
+    (Assigned(FDotCL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL));
 end;
 
-// Device im2col GEMM for the deformable MAIN conv. The offset head and the
-// per-tap bilinear GATHER (+ DCNv2 modulation) stay on the CPU: only the dense
-// patch x weight contraction goes to the device. The CPU ComputeCPU is the
-// fallback whenever OpenCL is off or below the work threshold.
-//
-// Output GEMM:  Out[co][t] = Bias[co] + sum_i mW[i*OutDepth+co] * Patch_t[i]
-//   N rows    = FOutDepth (output channels)
-//   T columns = NumPos    = OutputSizeX*OutputSizeY (one per output position)
-//   Size      = FNumTaps*FInDepth (contraction = sampled receptive field)
-// With one weight group mW is ALREADY stored [(tap*InDepth+ci)*OutDepth + co]
-// = [i*N + co], the kernel's interleaved A layout, so the copy is a verbatim
-// move; weight groups expand it block-diagonally. Patch_t[i] = SampleBilinear(...)*modM is gathered on the CPU into the
-// kernel's contiguous B layout [t*Size + i]. The kernel returns
-// Res[t*N + co], read back with the bias add (matching ComputeCPU exactly).
+// The GEMM's A operand is [i*OutDepth + co], i = tap*InDepth + ci. With one
+// weight group that is mW verbatim; weight groups expand it block-diagonally.
+function TNNetDeformableConv.RefreshGemmWeightsCL(): boolean;
+var
+  tap, ci, MaxTapPos, MaxWeightGroupPos, MaxWeightGroupCIPos, WeightGroup: integer;
+  srcRow, dstRow, coOfs, PatchSize: integer;
+  mW: TNNetVolume;
+begin
+  Result := FAfterWeightUpdateHasBeenCalled;
+  if not Result then exit;
+  mW := FArrNeurons[0].FWeights;
+  PatchSize := FNumTaps * FInDepth;
+  FGemmWInter.ReSize(FOutDepth * PatchSize, 1, 1);
+  if FWeightGroups = 1 then
+    // Verbatim contiguous weight copy (rule #13).
+    Move(mW.FData[0], FGemmWInter.FData[0], FOutDepth * PatchSize * csNeuralFloatSize)
+  else
+  begin
+    // Each (tap, ci) row holds its group's contiguous co run and zeros elsewhere.
+    FGemmWInter.Fill(0);
+    MaxTapPos := FNumTaps - 1;
+    MaxWeightGroupPos := FWeightGroups - 1;
+    MaxWeightGroupCIPos := FWeightGroupDepth - 1;
+    dstRow := 0;
+    for tap := 0 to MaxTapPos do
+      for WeightGroup := 0 to MaxWeightGroupPos do
+      begin
+        srcRow := tap * FWeightGroupDepth * FOutDepth;
+        coOfs := WeightGroup * FWeightGroupOutDepth;
+        for ci := 0 to MaxWeightGroupCIPos do
+        begin
+          Move(mW.FData[srcRow + coOfs], FGemmWInter.FData[dstRow + coOfs],
+            FWeightGroupOutDepth * csNeuralFloatSize);
+          Inc(srcRow, FOutDepth);
+          Inc(dstRow, FOutDepth);
+        end;
+      end;
+  end;
+end;
+
+// Offset head (self-offset mode, implicit conv) -> cai_deformable_im2col ->
+// patch x weight GEMM with the bias, all in OpenCL; the result stays in
+// FDotCL.ResultBuffer, which is the [ox,oy,co] output layout.
 procedure TNNetDeformableConv.ComputeOpenCL();
+var
+  GemmKernel, GatherKernel: TNeuralKernel;
+  InputBuffer, OffsetBuffer, MaskBuffer: cl_mem;
+  WeightsUpdated: boolean;
+  Bias: TNNetVolume;
+
+  procedure WaitIfAnotherQueue(Producer, Consumer: TNeuralKernel);
+  begin
+    if Producer.Commands <> Consumer.Commands then Producer.Finish();
+  end;
+
+  // pReadByGemm: the offset head also reads this source on the GEMM queue.
+  function BindOrUploadSource(Source: TNNetLayer; SourcePos: integer;
+    pReadByGemm: boolean): cl_mem;
+  var
+    UploadBuffer: cl_mem;
+  begin
+    UploadBuffer := nil;
+    if Source.OutputBindableOnOpenCL() then
+    begin
+      if pReadByGemm then Source.OpenCLWaitOutputIfAnotherQueue(GemmKernel);
+    end
+    else
+      UploadBuffer := FDeformableCL.SourceUploadBuffer(SourcePos, Source.FOutput);
+    Result := BindOrUploadOpenCLOperand(Source, GatherKernel, UploadBuffer);
+  end;
+
+begin
+  GemmKernel := FDotCL.DotProductKernel;
+  GatherKernel := FDeformableCL.OutputKernel();
+  // The previous forward's GEMM may still read the patch matrix rebuilt below.
+  WaitIfAnotherQueue(GemmKernel, GatherKernel);
+  WeightsUpdated := RefreshGemmWeightsCL();
+  InputBuffer := BindOrUploadSource(FPrevLayer, 0, not FHasOffsetSource);
+  MaskBuffer := nil;
+  if FHasOffsetSource then
+  begin
+    OffsetBuffer := BindOrUploadSource(FOffsetLayer, 1, false);
+    if FHasMaskSource then MaskBuffer := BindOrUploadSource(FMaskLayer, 2, false);
+  end
+  else
+  begin
+    FOffsetDotCL.ComputeImplicitConv(FArrNeurons[2].FWeights, FPrevLayer.FOutput,
+      FOutputSizeX, FFeatureSizeX * FInDepth, FStride, FPadding, FPadding,
+      FDilationX, FDilationY, csActNone, {NewVAs}WeightsUpdated,
+      FArrNeurons[3].FWeights, {NewVBias}WeightsUpdated, {NewSrc}false,
+      InputBuffer);
+    OffsetBuffer := FOffsetDotCL.ResultBuffer;
+    WaitIfAnotherQueue(GemmKernel, GatherKernel);
+  end;
+  FDeformableCL.BuildPatch(Self, InputBuffer, OffsetBuffer, MaskBuffer);
+  WaitIfAnotherQueue(GatherKernel, GemmKernel);
+  if FStruct[4] = 0 then Bias := FArrNeurons[1].FWeights else Bias := nil;
+  FDotCL.Compute(FGemmWInter, nil, csActNone, {NewVAs}WeightsUpdated,
+    {NewVBs}false, Bias, {NewVBias}WeightsUpdated, FDeformableCL.PatchBuffer());
+  FAfterWeightUpdateHasBeenCalled := false;
+  // No read back: the result stays in OpenCL memory until a host reader calls
+  // ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+
+// Output GEMM:  Out[co][t] = Bias[co] + sum_i A[i*OutDepth+co] * Patch_t[i]
+// with Patch_t[i] (i = tap*InDepth+ci) gathered on the CPU into the kernel's
+// contiguous B layout [t*Size + i]; read back as Res[t*OutDepth + co].
+procedure TNNetDeformableConv.ComputeHostGatherOpenCL();
 var
   ox, oy, co, fx, fy, ci, tap, t: integer;
   MaxOY, MaxOX, MaxOffOut, MaxFY, MaxFX, MaxCI, MaxCO: integer;
   NumPos, Sz, oc: integer;
   prevX0, prevY0: integer;
-  MaxTapPos, MaxWeightGroupPos, MaxWeightGroupCIPos, WeightGroup: integer;
-  srcRow, dstRow, coOfs: integer;
-  PrevOut, mW, mB, oW, oB: TNNetVolume;
+  PrevOut, mB, oW, oB: TNNetVolume;
   offv: TNeuralFloat;
   baseOut, offBase, maskBase, tSz, patchOfs, resBase: integer;
+  WeightsUpdated: boolean;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  FPrevLayer.ForceOutputOnRAM();
   PrevOut := FPrevLayer.FOutput;
-  mW := FArrNeurons[0].FWeights;
   mB := FArrNeurons[1].FWeights;
   oW := FArrNeurons[2].FWeights;
   oB := FArrNeurons[3].FWeights;
@@ -104889,13 +105213,9 @@ begin
   MaxCO := FOutDepth - 1;
   NumPos := FOutputSizeX * FOutputSizeY;
   Sz := FNumTaps * FInDepth;
-  MaxTapPos := FNumTaps - 1;
-  MaxWeightGroupPos := FWeightGroups - 1;
-  MaxWeightGroupCIPos := FWeightGroupDepth - 1;
 
   // 1. Offset head: ordinary conv (same kernel/pad/stride) -> 2*KK offset maps.
-  //    Identical to ComputeCPU step 1 (stays on the CPU; absent with an
-  //    external offset source).
+  //    Identical to ComputeCPU step 1 (absent with an external offset source).
   for oy := 0 to MaxOY do
   for ox := 0 to MaxOX do
     for oc := 0 to MaxOffOut do
@@ -104919,38 +105239,8 @@ begin
       FOffMap[ox, oy, oc] := offv;
     end;
 
-  // 2. Interleaved weights A[i*OutDepth + co] = mW (verbatim - already that
-  //    layout). Repacked and re-uploaded only when the weights changed
-  //    (FAfterWeightUpdateHasBeenCalled); otherwise the resident device copy is
-  //    reused (NewVAs=false below). The offset-head weights (oW/oB) feed the CPU
-  //    step above and are never uploaded.
-  if FAfterWeightUpdateHasBeenCalled then
-  begin
-    FGemmWInter.ReSize(FOutDepth * Sz, 1, 1);
-    if FWeightGroups = 1 then
-      // Verbatim contiguous weight copy (rule #13).
-      Move(mW.FData[0], FGemmWInter.FData[0], FOutDepth * Sz * csNeuralFloatSize)
-    else
-    begin
-      // Weight groups: block-diagonal dense A, each (tap, ci) row holding its
-      // group's contiguous co run and zeros elsewhere.
-      FGemmWInter.Fill(0);
-      dstRow := 0;
-      for tap := 0 to MaxTapPos do
-        for WeightGroup := 0 to MaxWeightGroupPos do
-        begin
-          srcRow := tap * FWeightGroupDepth * FOutDepth;
-          coOfs := WeightGroup * FWeightGroupOutDepth;
-          for ci := 0 to MaxWeightGroupCIPos do
-          begin
-            Move(mW.FData[srcRow + coOfs], FGemmWInter.FData[dstRow + coOfs],
-              FWeightGroupOutDepth * csNeuralFloatSize);
-            Inc(srcRow, FOutDepth);
-            Inc(dstRow, FOutDepth);
-          end;
-        end;
-    end;
-  end;
+  // 2. Interleaved weights, re-uploaded only when they changed (NewVAs below).
+  WeightsUpdated := RefreshGemmWeightsCL();
 
   // 3. Gather the bilinear-sampled (+modulated) patch for every output position
   //    into the kernel's contiguous B layout [t*Sz + i], i = tap*InDepth+ci.
@@ -104977,7 +105267,7 @@ begin
   FGemmRes.ReSize(NumPos * FOutDepth, 1, 1);
   FDotCL.ReallocateBuffersIfRequired(FGemmWInter, FGemmPatch, Sz);
   FDotCL.Compute(FGemmWInter, FGemmPatch, {ActFN}0,
-    {NewVAs}FAfterWeightUpdateHasBeenCalled, {NewVBs}true);
+    {NewVAs}WeightsUpdated, {NewVBs}true);
   FDotCL.FinishAndLoadResult(FGemmRes, 0);
   FAfterWeightUpdateHasBeenCalled := false;
 

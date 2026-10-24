@@ -4817,6 +4817,86 @@ __kernel void cai_ms_deformable_attn
   for (int c = 0; c < ChannelCount; c++) Out[c] = acc[c];
 }
 
+// TNNetDeformableConv forward im2col: FPatch[(pos * FTapCount + tap) * FInDepth
+// + ci] = the zero-padded bilinear sample of input channel ci for tap
+// (fx, fy) of output position pos, shifted by its offset group's (dx, dy) and
+// scaled by its mask. Offsets of group g sit at pos * FOffsetDepth + g *
+// FOffsetGroupStride + 2 * tap, (dx, dy) when FOffsetDxFirst != 0, else (dy, dx).
+// FMaskMode: 0 none, 1 FMask as given, 2 sigmoid(FMask), read at pos *
+// FMaskDepth + FMaskFirst + g * FMaskGroupStride + tap. One work-item per
+// patch element. Coded by Claude (AI).
+__kernel void cai_deformable_im2col
+(
+  const int FPatchCount,
+  const int FOutSizeX,
+  const int FInSizeX,
+  const int FInSizeY,
+  const int FInDepth,
+  const int FFeatureSizeX,
+  const int FTapCount,
+  const int FStride,
+  const int FPadding,
+  const int FDilationX,
+  const int FDilationY,
+  const int FGroupDepth,
+  const int FOffsetDepth,
+  const int FOffsetGroupStride,
+  const int FOffsetDxFirst,
+  const int FMaskMode,
+  const int FMaskDepth,
+  const int FMaskFirst,
+  const int FMaskGroupStride,
+  __global const float* FSrc,
+  __global const float* FOffsets,
+  __global const float* FMask,
+  __global float* FPatch
+)
+{
+  const int id = get_global_id(0);
+  if (id >= FPatchCount) return;
+  const int cell = id / FInDepth;
+  const int ci = id - cell * FInDepth;
+  const int pos = cell / FTapCount;
+  const int tap = cell - pos * FTapCount;
+  const int oy = pos / FOutSizeX;
+  const int ox = pos - oy * FOutSizeX;
+  const int fy = tap / FFeatureSizeX;
+  const int fx = tap - fy * FFeatureSizeX;
+  const int group = ci / FGroupDepth;
+  const int offPos = pos * FOffsetDepth + group * FOffsetGroupStride + 2 * tap;
+  const float first = FOffsets[offPos];
+  const float second = FOffsets[offPos + 1];
+  const float dx = FOffsetDxFirst ? first : second;
+  const float dy = FOffsetDxFirst ? second : first;
+  const float px = (float)(ox * FStride + fx * FDilationX - FPadding) + dx;
+  const float py = (float)(oy * FStride + fy * FDilationY - FPadding) + dy;
+  const float x0f = floor(px);
+  const float y0f = floor(py);
+  const int x0 = (int)x0f;
+  const int y0 = (int)y0f;
+  const int x1 = x0 + 1;
+  const int y1 = y0 + 1;
+  const float wx = px - x0f;
+  const float wy = py - y0f;
+  const int inX0 = (x0 >= 0) && (x0 < FInSizeX);
+  const int inX1 = (x1 >= 0) && (x1 < FInSizeX);
+  const int inY0 = (y0 >= 0) && (y0 < FInSizeY);
+  const int inY1 = (y1 >= 0) && (y1 < FInSizeY);
+  float v = 0.0f;
+  // Same corner order as NeuralBilinearGatherColumn.
+  if (inX0 && inY0) v += (1.0f - wx) * (1.0f - wy) * FSrc[(y0 * FInSizeX + x0) * FInDepth + ci];
+  if (inX1 && inY0) v += wx * (1.0f - wy) * FSrc[(y0 * FInSizeX + x1) * FInDepth + ci];
+  if (inX0 && inY1) v += (1.0f - wx) * wy * FSrc[(y1 * FInSizeX + x0) * FInDepth + ci];
+  if (inX1 && inY1) v += wx * wy * FSrc[(y1 * FInSizeX + x1) * FInDepth + ci];
+  if (FMaskMode != 0)
+  {
+    float m = FMask[pos * FMaskDepth + FMaskFirst + group * FMaskGroupStride + tap];
+    if (FMaskMode == 2) m = 1.0f / (1.0f + exp(-m));
+    v *= m;
+  }
+  FPatch[id] = v;
+} // end of kernel
+
 // CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
 // source element (pos, FChannelIdx[d]), so one kernel covers both a contiguous
 // channel run and the arbitrary channel list of TNNetSplitChannelEvery. A

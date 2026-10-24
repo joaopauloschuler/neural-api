@@ -73,6 +73,18 @@ rather than acted on.
 
 ## Bugs
 
+- [ ] Latent trap (not changed, awaits user decision): `TNNetDeformableConv`
+      packs has-mask (bit 0), Dilation-1 and WeightGroups-1 into `FStruct[7]`,
+      but the inherited `TNNetConvolution.WinogradEligible` reads
+      `FStruct[7] = 1` as "Winograd on", so a 3x3 / stride 1 / dilation 1
+      deformable layer with a mask source looks Winograd-eligible to inherited
+      code. Inherited consumers: `ChunkEligible`, `ShouldOpenCLIm2Col`,
+      `ShouldOpenCLImplicitConv`, `ComputeOpenCL` and `CanShareOpenCLOutput`;
+      the deformable layer overrides only the last (to false). Check whether
+      the inherited `ChunkEligible` can route a deformable layer into the
+      plain conv chunk path at all. Options: override `WinogradEligible` (and
+      `ChunkEligible`) to false in `TNNetDeformableConv`, or move the packed
+      field to a free slot.
 - [ ] Possible trap (not changed, awaits user decision): `TVolume.Copy`
       (neural/neuralvolume.pas) calls `ReSize` only when `Size` differs,
       so copying a 2048x512x1 volume into a 1024x1024x1 one keeps the
@@ -2292,9 +2304,15 @@ rather than acted on.
       - [X] torchvision parity fixture: tools/deform_conv2d_tiny_fixture.py
             writes tests/fixtures/deform_conv2d_tiny.safetensors (7243293e);
             it now also covers dilation 2 and 2 weight groups.
-      - [ ] OpenCL bilinear gather: only the patch x weight GEMM runs on the
-            device; the per-tap gather (both modes) runs on the CPU and the
-            sources are downloaded each forward.
+      - [X] OpenCL bilinear gather: the inference forward builds the patch
+            matrix with cai_deformable_im2col straight from the bound input,
+            offset and mask buffers (self-offset mode: the offset head runs as
+            an implicit conv first), feeds the existing GEMM and keeps its
+            output resident. Covered by TestDeformableConvOpenCLParity,
+            TestDeformableConvExternalOpenCLParity and
+            TestDeformableConvOpenCLResidency (sentinel check).
+      - [ ] The trainable OpenCL forward still gathers on the CPU (the CPU
+            backward reads FOffMap) and downloads its sources.
       - [ ] Not supported yet: OpenCL backward. Dilation > 1 and weight
             groups (deform_conv2d `groups` > 1) work in both modes, CPU forward
             and backward; the OpenCL forward runs weight groups as a

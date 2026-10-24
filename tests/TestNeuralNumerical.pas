@@ -462,6 +462,7 @@ type
     procedure TestDeformableConvExternalSerializationRoundTrip;
     procedure TestDeformableConvDilatedGroupedSerializationRoundTrip;
     procedure TestDeformableConvExternalOpenCLParity;
+    procedure TestDeformableConvOpenCLResidency;
     procedure TestGroupConvP4OpenCLParity;
     // OpenCL per-output-pixel bilinear-gather forward offload parity (vs CPU)
     // for the bilinear resampler layers.
@@ -71203,69 +71204,92 @@ begin
   RunDeformableConvGatherParity(Self, true);
 end;
 
+// Self-offset mode, CPU vs OpenCL. Case 0 is trainable (CPU gather, OpenCL GEMM);
+// the inference cases run cai_deformable_im2col and keep the output resident.
 procedure TTestNeuralNumerical.TestDeformableConvOpenCLParity;
 {$IFDEF OpenCL}
+const
+  // Modulated, dilation, weight groups, stride, offset-bias scale (12 sends
+  // taps outside the image), trainable.
+  csCases: array[0..4, 0..5] of integer = (
+    (0, 1, 1, 1, 1, 1),
+    (0, 1, 1, 1, 1, 0),
+    (1, 1, 1, 1, 1, 0),
+    (1, 2, 2, 2, 1, 0),
+    (0, 1, 1, 1, 12, 0));
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
   DC: TNNetDeformableConv;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i, InSize: integer;
+  i, InSize, CaseIdx, Dilation, IsTrainable: integer;
   Diff, MaxDiff: TNeuralFloat;
+  CaseMsg: string;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  RandSeed := 424242;
-  NN := TNNet.Create();
-  Input := TNNetVolume.Create(8, 8, 4);
-  OutCPU := TNNetVolume.Create();
-  try
-    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
-    // 6 output features, 3x3, pad1, stride1 -> contraction 3*3*4=36, 64 positions,
-    // 6 out-ch: 13824 MACs main conv (we force MinWork 0 so it still offloads).
-    DC := TNNetDeformableConv.Create(6, 3, 1, 1, 0);
-    NN.AddLayer(DC);
-    // Content-driven fractional offsets so the bilinear sampler is exercised.
-    for i := 0 to DC.Neurons[3].Weights.Size - 1 do
-      DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.013 * i;
-    for i := 0 to DC.Neurons[2].Weights.Size - 1 do
-      DC.Neurons[2].Weights.Raw[i] := 0.015 * Sin(i * 0.7);
-    InSize := Input.Size;
-    for i := 0 to InSize - 1 do
-      Input.Raw[i] := 0.07 * i - 0.4;
-
-    // CPU forward.
-    NN.Compute(Input);
-    OutCPU.Copy(NN.GetLastLayer.Output);
-
-    // Device forward (force every position onto the GEMM kernel).
-    NN.ForceOpenCL(True);
-    NN.EnableOpenCL(PlatformId, DeviceId);
+  for CaseIdx := Low(csCases) to High(csCases) do
+  begin
+    RandSeed := 424242;
+    Dilation := csCases[CaseIdx, 1];
+    IsTrainable := csCases[CaseIdx, 5];
+    CaseMsg := 'self-offset DeformableConv case ' + IntToStr(CaseIdx);
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 8, 4);
+    OutCPU := TNNetVolume.Create();
     try
+      NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+      // 6 output features, 3x3, padding = dilation.
+      DC := TNNetDeformableConv.Create(6, 3, Dilation, csCases[CaseIdx, 3], 0,
+        csCases[CaseIdx, 0], Dilation, csCases[CaseIdx, 2]);
+      if IsTrainable = 0 then DC.SetTrainable(False, False);
+      NN.AddLayer(DC);
+      // Content-driven fractional offsets so the bilinear sampler is exercised.
+      for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+        DC.Neurons[3].Weights.Raw[i] := (0.3 - 0.013 * i) * csCases[CaseIdx, 4];
+      for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+        DC.Neurons[2].Weights.Raw[i] := 0.015 * Sin(i * 0.7);
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.07 * i - 0.4;
+
       NN.Compute(Input);
-      // Second device forward with UNCHANGED weights: exercises the
-      // resident-weight reuse path (no re-upload). Coded by Claude (AI).
-      NN.Compute(Input);
-      MaxDiff := 0;
-      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
-      for i := 0 to OutCPU.Size - 1 do
-      begin
-        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
-        if Diff > MaxDiff then MaxDiff := Diff;
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        DC.ForwardGPUCnt := 0;
+        NN.Compute(Input);
+        // Second forward with UNCHANGED weights: the resident weights are reused.
+        NN.Compute(Input);
+        AssertEquals(CaseMsg + ' takes the OpenCL path', 2, DC.ForwardGPUCnt);
+        AssertEquals(CaseMsg + ' output stays in OpenCL memory only when inference',
+          IsTrainable = 0, DC.OutputBindableOnOpenCL());
+        DC.ForceOutputOnRAM();
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, DC.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - DC.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False); // restore per-layer verdict
       end;
+      WriteLn('  ', CaseMsg, ' OpenCL vs CPU max-abs-diff: ', MaxDiff:0:9);
+      AssertTrue(CaseMsg + ' CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+      AssertTrue(CaseMsg + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
     finally
-      NN.ForceOpenCL(False); // restore per-layer verdict
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
     end;
-    AssertTrue('DeformableConv OpenCL vs CPU parity: max |diff| = ' +
-      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
-  finally
-    OutCPU.Free;
-    Input.Free;
-    NN.Free;
   end;
 end;
 {$ELSE}
@@ -71697,34 +71721,51 @@ end;
 
 procedure TTestNeuralNumerical.TestDeformableConvExternalOpenCLParity;
 {$IFDEF OpenCL}
+const
+  // Offset groups, has-mask, padding, dilation, weight groups, stride,
+  // far offsets (+4.3 on every fourth channel), trainable. Cases 0-1 are
+  // trainable (CPU gather, OpenCL GEMM); the rest run cai_deformable_im2col.
+  csCases: array[0..6, 0..7] of integer = (
+    (2, 1, 1, 1, 1, 1, 0, 1),
+    (2, 1, 2, 2, 2, 1, 0, 1),
+    (1, 0, 1, 1, 1, 1, 0, 0),
+    (2, 1, 1, 1, 1, 1, 0, 0),
+    (2, 0, 1, 1, 1, 2, 0, 0),
+    (2, 1, 2, 2, 2, 1, 0, 0),
+    (1, 1, 1, 1, 1, 1, 1, 0));
 var
   NN: TNNet;
   ImgIn, OffIn, MaskIn: TNNetLayer;
   DC: TNNetDeformableConv;
-  OutCPU: TNNetVolume;
+  OutCPU, MaskVol: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i, CaseIdx: integer;
+  i, CaseIdx, IsTrainable: integer;
   Diff, MaxDiff: TNeuralFloat;
+  CaseMsg: string;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  // Case 0: dilation 1, one weight group; case 1: dilation 2, 2 weight groups.
-  for CaseIdx := 0 to 1 do
+  for CaseIdx := Low(csCases) to High(csCases) do
   begin
     RandSeed := 424242;
+    IsTrainable := csCases[CaseIdx, 7];
+    CaseMsg := 'external DeformableConv case ' + IntToStr(CaseIdx);
     NN := TNNet.Create();
     OutCPU := TNNetVolume.Create();
     try
-      if CaseIdx = 0 then
-        DC := BuildExternalDeformableNet(NN, 8, 7, 4, 6, 1, 2, true, ImgIn, OffIn, MaskIn)
-      else
-        DC := BuildExternalDeformableNet(NN, 8, 7, 4, 6, 1, 2, true, ImgIn, OffIn,
-          MaskIn, 2, 2, 2);
-      FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskIn.Output);
+      DC := BuildExternalDeformableNet(NN, 8, 7, 4, 6, csCases[CaseIdx, 5],
+        csCases[CaseIdx, 0], csCases[CaseIdx, 1] = 1, ImgIn, OffIn, MaskIn,
+        csCases[CaseIdx, 2], csCases[CaseIdx, 3], csCases[CaseIdx, 4]);
+      if IsTrainable = 0 then DC.SetTrainable(False, False);
+      if Assigned(MaskIn) then MaskVol := MaskIn.Output else MaskVol := nil;
+      FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskVol);
+      if csCases[CaseIdx, 6] = 1 then
+        for i := 0 to OffIn.Output.Size - 1 do
+          if i mod 4 = 0 then OffIn.Output.Raw[i] := OffIn.Output.Raw[i] + 4.3;
       NN.Compute(ImgIn.Output);
       OutCPU.Copy(DC.Output);
       NN.ForceOpenCL(True);
@@ -71732,8 +71773,10 @@ begin
       try
         DC.ForwardGPUCnt := 0;
         NN.Compute(ImgIn.Output);
-        AssertEquals('external DeformableConv took the OpenCL GEMM path', 1,
-          DC.ForwardGPUCnt);
+        NN.Compute(ImgIn.Output);
+        AssertEquals(CaseMsg + ' takes the OpenCL path', 2, DC.ForwardGPUCnt);
+        AssertEquals(CaseMsg + ' output stays in OpenCL memory only when inference',
+          IsTrainable = 0, DC.OutputBindableOnOpenCL());
         DC.ForceOutputOnRAM();
         MaxDiff := 0;
         AssertEquals('output size match', OutCPU.Size, DC.Output.Size);
@@ -71745,11 +71788,147 @@ begin
       finally
         NN.ForceOpenCL(False);
       end;
-      WriteLn('  external DeformableConv OpenCL vs CPU case ', CaseIdx,
-        ' max-abs-diff: ', MaxDiff:0:9);
-      AssertTrue('external DeformableConv OpenCL vs CPU parity case ' +
-        IntToStr(CaseIdx) + ': max |diff| = ' + FloatToStr(MaxDiff) +
-        ' must be < 1e-4', MaxDiff < 1e-4);
+      WriteLn('  ', CaseMsg, ' OpenCL vs CPU max-abs-diff: ', MaxDiff:0:9);
+      AssertTrue(CaseMsg + ' CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+      AssertTrue(CaseMsg + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Identity pointwise convolution after Source: a source whose output stays in
+// OpenCL memory and equals Source's values. Coded by Claude (AI).
+function AddResidentIdentitySource(NN: TNNet; Source: TNNetLayer): TNNetLayer;
+var
+  NeuronPos, Depth: integer;
+begin
+  Depth := Source.Output.Depth;
+  Result := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth).
+    SetTrainable(False, False), Source);
+  for NeuronPos := 0 to Result.Neurons.Count - 1 do
+  begin
+    Result.Neurons[NeuronPos].Weights.Fill(0);
+    Result.Neurons[NeuronPos].Weights.FData[NeuronPos] := 1;
+    Result.Neurons[NeuronPos].BiasWeight := 0;
+  end;
+  Result.FlushWeightCache();
+end;
+
+// Both modes behind resident sources: the inference forward binds the input,
+// offset and mask buffers (their host sentinels survive) and keeps its output
+// in OpenCL memory, with CPU parity.
+procedure TTestNeuralNumerical.TestDeformableConvOpenCLResidency;
+{$IFDEF OpenCL}
+const
+  csSourceSentinel = 12345.0;
+var
+  NN: TNNet;
+  ImgIn, OffIn, MaskIn, ImgSrc, OffSrc, MaskSrc: TNNetLayer;
+  DC: TNNetDeformableConv;
+  Sources: array of TNNetLayer;
+  OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, ModeIdx, SourcePos, Sentinels, SentinelTarget: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  ModeMsg: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Mode 0: self-offset (modulated, dilation 2, 2 weight groups); mode 1:
+  // external offsets and mask, 2 offset groups.
+  for ModeIdx := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    OutCPU := TNNetVolume.Create();
+    try
+      ImgIn := NN.AddLayer(TNNetInput.Create(8, 7, 4, 1));
+      if ModeIdx = 0 then
+      begin
+        ModeMsg := 'self-offset';
+        ImgSrc := AddResidentIdentitySource(NN, ImgIn);
+        DC := TNNetDeformableConv.Create(6, 3, 2, 1, 0, 1, 2, 2);
+        DC.SetTrainable(False, False);
+        NN.AddLayerAfter(DC, ImgSrc);
+        for i := 0 to DC.Neurons[3].Weights.Size - 1 do
+          DC.Neurons[3].Weights.Raw[i] := 0.3 - 0.013 * i;
+        for i := 0 to DC.Neurons[2].Weights.Size - 1 do
+          DC.Neurons[2].Weights.Raw[i] := 0.015 * Sin(i * 0.7);
+        for i := 0 to ImgIn.Output.Size - 1 do
+          ImgIn.Output.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+        SetLength(Sources, 1);
+        Sources[0] := ImgSrc;
+      end
+      else
+      begin
+        ModeMsg := 'external';
+        OffIn := NN.AddLayerAfter(TNNetInput.Create(8, 7, 2 * 2 * 9, 1), 0);
+        MaskIn := NN.AddLayerAfter(TNNetInput.Create(8, 7, 2 * 9, 1), 0);
+        ImgSrc := AddResidentIdentitySource(NN, ImgIn);
+        OffSrc := AddResidentIdentitySource(NN, OffIn);
+        MaskSrc := AddResidentIdentitySource(NN, MaskIn);
+        DC := TNNetDeformableConv.Create(6, 3, 1, 1, 0, OffSrc, MaskSrc, 2);
+        DC.SetTrainable(False, False);
+        NN.AddLayerAfter(DC, ImgSrc);
+        FillExternalDeformableSources(ImgIn.Output, OffIn.Output, MaskIn.Output);
+        SetLength(Sources, 3);
+        Sources[0] := ImgSrc;
+        Sources[1] := OffSrc;
+        Sources[2] := MaskSrc;
+      end;
+      NN.Compute(ImgIn.Output);
+      OutCPU.Copy(DC.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        DC.ForwardGPUCnt := 0;
+        NN.Compute(ImgIn.Output);
+        SentinelTarget := 0;
+        for SourcePos := 0 to High(Sources) do
+        begin
+          AssertTrue(ModeMsg + ' source ' + IntToStr(SourcePos) +
+            ' is resident', Sources[SourcePos].OutputBindableOnOpenCL());
+          Sources[SourcePos].Output.Fill(csSourceSentinel);
+          Inc(SentinelTarget, Sources[SourcePos].Output.Size);
+        end;
+        NN.Compute(ImgIn.Output);
+        Sentinels := 0;
+        for SourcePos := 0 to High(Sources) do
+          for i := 0 to Sources[SourcePos].Output.Size - 1 do
+            if Sources[SourcePos].Output.FData[i] = csSourceSentinel then
+              Inc(Sentinels);
+        AssertEquals(ModeMsg + ' takes the OpenCL path', 2, DC.ForwardGPUCnt);
+        AssertEquals(ModeMsg + ' resident sources are not downloaded',
+          SentinelTarget, Sentinels);
+        AssertTrue(ModeMsg + ' output stays in OpenCL memory',
+          DC.OutputBindableOnOpenCL());
+        DC.ForceOutputOnRAM();
+        MaxDiff := 0;
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - DC.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  ', ModeMsg, ' DeformableConv resident OpenCL vs CPU max-abs-diff: ',
+        MaxDiff:0:9, ' sentinels kept: ', Sentinels, '/', SentinelTarget);
+      AssertTrue(ModeMsg + ' CPU output is non-trivial', OutCPU.GetMaxAbs() > 1e-3);
+      AssertTrue(ModeMsg + ' OpenCL vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
     finally
       OutCPU.Free;
       NN.Free;
