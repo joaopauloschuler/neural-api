@@ -487,10 +487,10 @@ rather than acted on.
       prompt's token spans. Pico-fixture parity + an examples/GroundingDINODetect
       ("detect: a cat. a remote." -> boxes) demo.
 
-- [x] YOLO-World v2 importer: BuildYoloWorld[FromSafeTensors[Ex]] folds CLIP prompt
+- [ ] YOLO-World v2 importer follow-ups (BuildYoloWorld[FromSafeTensors[Ex]] LANDED: folds CLIP prompt
       embeddings into the C2fAttn attention + BNContrastiveHead convs of the shared
       YOLOv8 builder (TestYoloWorldParity, TestYoloWorldClipTextRoute);
-      examples/YoloDetect takes --prompts/--clip/--image.
+      examples/YoloDetect takes --prompts/--clip/--image):
   - [ ] Run a real yolov8s-worldv2 checkpoint + openai/clip-vit-base-patch32 on a
         photo and compare boxes/scores with ultralytics (only the random pico
         fixture is tested; the module semantics come from memory of the
@@ -1475,9 +1475,9 @@ rather than acted on.
       trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
       threads the per-step query/key positional-embedding additions through the
       asymmetric token<->image cross-attentions.
-- [x] SAM end-to-end processor: TSAMPredictor + SAMPreprocessImage /
+- [ ] SAM end-to-end processor follow-ups (TSAMPredictor LANDED: SAMPreprocessImage /
       SAMScaleCoordinates / SAMPostprocessMasks match SamImageProcessorPil + SamModel
-      (TestSAMProcessorEndToEndParity); examples/SegmentAnything takes --image/--point/--box.
+      (TestSAMProcessorEndToEndParity); examples/SegmentAnything takes --image/--point/--box):
   - [ ] Run TSAMPredictor on a real facebook/sam-vit-base checkpoint + photo
         (only the random pico fixture is tested).
   - [ ] transformers 5.x defaults SamImageProcessor to the torchvision backend
@@ -1639,11 +1639,6 @@ rather than acted on.
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states. Further gaps (audit 2026-10-02), which together mean
       the repo has NO usable video generator today:
-  - [x] Full AutoencoderKLCogVideoX decoder: BuildCogVideoXVaeDecoder[FromPath] +
-        DecodeCogVideoXVae now build the real diffusers decoder (causal Conv3D
-        convs, SpatialNorm3D resnets, temporal/spatial up blocks, post_quant_conv,
-        scaling_factor) from composed leaves, parity < 1e-4 vs diffusers decode in
-        TestCogVideoXVaeDecoderParity, wired into examples/TextToVideo --vae.
   - [ ] VAE follow-up: frame-batched decode with the diffusers conv cache
         (num_latent_frames_batch_size = 2; each CogVideoXCausalConv3d carries the
         last 2 input frames of the previous batch, and SpatialNorm3D resizes zq per
@@ -2574,13 +2569,10 @@ overrides `Compute` with no device branch silently loses its parent's kernel
 
 Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
 
-- [ ] GPU-box checks for two a20 device paths, unmeasured on the dev box:
-      (a) `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` (d7c177dd, direct O(N^2)
+- [ ] GPU-box check for an a20 device path, unmeasured on the dev box:
+      `TNNetRealFFT2D` / `TNNetInverseRealFFT2D` (d7c177dd, direct O(N^2)
       DFT per line) inside examples/LaMaInpaint at 512x512: FFT share of the
-      generator forward, and whether the whole generator stays resident;
-      (b) CogVideoX VAE decode: superseded, the cc4432cc decode tail is gone;
-      the full decoder's OpenCL timing is the "VAE follow-up: OpenCL / speed"
-      item under the CogVideoX entry.
+      generator forward, and whether the whole generator stays resident.
 - [ ] GPU-box check: `cai_sdpa_flash` gained a uniform score-bias branch
       (13282df0) that the decode path also runs. Measure decode tok/s on a
       Qwen checkpoint before/after; if it costs anything, split the biased
