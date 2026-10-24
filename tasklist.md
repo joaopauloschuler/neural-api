@@ -2537,7 +2537,10 @@ rather than acted on.
             (it must stay safe with the parallel layer scheduler), and
             `CanShareHostOutput` overrides on `TNNetBilinearUpsample`,
             `TNNetLeakyReLU` and `TNNetTokenLayerNorm`. A 640 x 480 run fits
-            the dev box only after this.
+            the dev box only after this. The im2col part is the same
+            library-wide question as "Decision for the user: inference-time
+            release of the convolution im2col matrix" below; it now blocks
+            big-lama 512x512, EfficientLoFTR 640x480 and RT-DETR 640x640.
       - [ ] Real-checkpoint run at 640 x 480 on a real image pair, user-tested,
             with the transformers comparison (the 256 x 192 check used
             docs/park.jpg and a crop of it).
@@ -2894,7 +2897,9 @@ cannot pay for its own transfer.
       matrix (`FInputPrepared`). Every CPU, int8, Winograd or explicit-OpenCL
       convolution keeps it after the forward in both memory modes (the FP32
       inference implicit-GEMM OpenCL path, `ShouldOpenCLImplicitConv`, has none); for big-lama at 512x512 that is ~6.7 GB of the ~8.6 GB
-      estimate. Options: free/share it when the net is not trainable, or tile the
+      estimate (EfficientLoFTR at 640x480 needs ~6.9 GB for the same reason,
+      and RT-DETR r18vd peaks at 1.86 GB at 640x640).
+      Options: free/share it when the net is not trainable, or tile the
       im2col along Y. Library-wide; propose and wait for approval before coding.
 
 - [ ] Faithful stacked-bidirectional torch import (`LoadTorchGRUInto`), GRU half
