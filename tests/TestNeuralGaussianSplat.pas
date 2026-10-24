@@ -33,6 +33,12 @@ type
     // A quaternion turns an x-elongated Gaussian onto y and onto the diagonal.
     procedure TestQuaternionRotatedAnisotropicGaussian;
     procedure TestLookAtCamera;
+    // Seven clustered Gaussians and three far outliers: the target stays in the cluster.
+    procedure TestRobustCentreIgnoresOutliers;
+    // Opacity weights the median; Gaussians below MinOpacity do not vote.
+    procedure TestRobustCentreOpacityWeighting;
+    // Camera rays meeting at a point, skew rays, parallel rays and rays pointing away.
+    procedure TestNearestPointToRays;
     // TGaussianSplatRasterizerCL matches the CPU rasterizer on a random degree-3
     // scene from two cameras, and renders an empty scene as background.
     procedure TestOpenCLMatchesCPU;
@@ -414,6 +420,102 @@ begin
   AssertEquals('camera x', 5, X, 1e-6);
 end;
 
+
+procedure TTestNeuralGaussianSplat.TestRobustCentreIgnoresOutliers;
+var
+  Scene: TGaussianSplatScene;
+  ClusterPos, OutlierPos: integer;
+  CentreX, CentreY, CentreZ, MedianDistance: TNeuralFloat;
+begin
+  Scene := TGaussianSplatScene.Create;
+  try
+    Scene.Resize(10, 0);
+    // Cluster k = -3..3 at (1 + 0.1k, 2 + 0.1k, 3 - 0.1k); outliers at (100, 100, -100).
+    for ClusterPos := 0 to 6 do
+      Scene.SetGaussian(ClusterPos, 1 + 0.1 * (ClusterPos - 3), 2 + 0.1 * (ClusterPos - 3),
+        3 - 0.1 * (ClusterPos - 3), 0.1, 0.1, 0.1, 1, 0, 0, 0, 1, 0.5, 0.5, 0.5);
+    for OutlierPos := 7 to 9 do
+      Scene.SetGaussian(OutlierPos, 100, 100, -100, 0.1, 0.1, 0.1, 1, 0, 0, 0, 1, 0.5, 0.5, 0.5);
+    Scene.ComputeRobustCentre(0.1, CentreX, CentreY, CentreZ, MedianDistance);
+    // Total weight 10: the 5th sorted value reaches half. x, y: 0.7..1.3 then 100s;
+    // z: three -100s then 2.7, 2.8. The centroid x would be (7 + 300) / 10 = 30.7.
+    AssertEquals('centre x', 1.1, CentreX, 1e-5);
+    AssertEquals('centre y', 2.1, CentreY, 1e-5);
+    AssertEquals('centre z', 2.8, CentreZ, 1e-5);
+    // Cluster offsets 0.1 (k-1, k-1, 2-k): squared lengths 0.01 x {57, 34, 17, 6, 1, 2, 9};
+    // sorted 1, 2, 6, 9, 17 -> the 5th is 17.
+    AssertEquals('median distance', 0.1 * Sqrt(17), MedianDistance, 1e-5);
+  finally
+    Scene.Free;
+  end;
+end;
+
+procedure TTestNeuralGaussianSplat.TestRobustCentreOpacityWeighting;
+var
+  Scene: TGaussianSplatScene;
+  GaussianPos: integer;
+  CentreX, CentreY, CentreZ, MedianDistance: TNeuralFloat;
+begin
+  Scene := TGaussianSplatScene.Create;
+  try
+    // x = 0 and 1 at opacity 0.2, x = 5 at 0.9, twenty x = -50 at 0.05.
+    Scene.Resize(23, 0);
+    Scene.SetGaussian(0, 0, 0, 0, 0.1, 0.1, 0.1, 1, 0, 0, 0, 0.2, 0.5, 0.5, 0.5);
+    Scene.SetGaussian(1, 1, 0, 0, 0.1, 0.1, 0.1, 1, 0, 0, 0, 0.2, 0.5, 0.5, 0.5);
+    Scene.SetGaussian(2, 5, 0, 0, 0.1, 0.1, 0.1, 1, 0, 0, 0, 0.9, 0.5, 0.5, 0.5);
+    for GaussianPos := 3 to 22 do
+      Scene.SetGaussian(GaussianPos, -50, 0, 0, 0.1, 0.1, 0.1, 1, 0, 0, 0, 0.05, 0.5, 0.5, 0.5);
+    // MinOpacity 0.1 keeps 0, 1, 5 with weights 0.2, 0.2, 0.9: half of 1.3 is first
+    // reached at 5, where the unweighted median would be 1.
+    Scene.ComputeRobustCentre(0.1, CentreX, CentreY, CentreZ, MedianDistance);
+    AssertEquals('weighted x', 5, CentreX, 1e-6);
+    AssertEquals('weighted y', 0, CentreY, 1e-6);
+    // Distances 5, 4, 0 with weights 0.2, 0.2, 0.9: the 0 alone outweighs half.
+    AssertEquals('weighted distance', 0, MedianDistance, 1e-5);
+    // MinOpacity 0: the -50s weigh 1.0 of 2.3; half (1.15) is reached at x = 0.
+    Scene.ComputeRobustCentre(0, CentreX, CentreY, CentreZ, MedianDistance);
+    AssertEquals('all voting x', 0, CentreX, 1e-6);
+    // No Gaussian reaches MinOpacity 2, so all of them vote again.
+    Scene.ComputeRobustCentre(2, CentreX, CentreY, CentreZ, MedianDistance);
+    AssertEquals('fallback x', 0, CentreX, 1e-6);
+  finally
+    Scene.Free;
+  end;
+end;
+
+procedure TTestNeuralGaussianSplat.TestNearestPointToRays;
+const
+  // Four cameras 5 units from (1, 2, 3) along +x, +y, +z, -x look at it; the
+  // last direction is not unit length.
+  MeetingOrigins: array[0..11] of TNeuralFloat = (6, 2, 3, 1, 7, 3, 1, 2, 8, -4, 2, 3);
+  MeetingDirections: array[0..11] of TNeuralFloat = (-1, 0, 0, 0, -1, 0, 0, 0, -1, 2, 0, 0);
+  // The x axis and the line x = 0, z = 2 along y: nearest point (0, 0, 1).
+  SkewOrigins: array[0..5] of TNeuralFloat = (-3, 0, 0, 0, -3, 2);
+  SkewDirections: array[0..5] of TNeuralFloat = (1, 0, 0, 0, 1, 0);
+  ParallelOrigins: array[0..5] of TNeuralFloat = (0, 0, 0, 1, 0, 0);
+  ParallelDirections: array[0..5] of TNeuralFloat = (0, 0, 1, 0, 0, 1);
+  // Lines meeting at the origin, both rays starting 5 units past it.
+  AwayOrigins: array[0..5] of TNeuralFloat = (5, 0, 0, 0, 5, 0);
+  AwayDirections: array[0..5] of TNeuralFloat = (1, 0, 0, 0, 1, 0);
+var
+  X, Y, Z: TNeuralFloat;
+begin
+  AssertTrue('meeting rays', GaussianSplatNearestPointToRays(MeetingOrigins,
+    MeetingDirections, 4, X, Y, Z));
+  AssertEquals('meeting x', 1, X, 1e-5);
+  AssertEquals('meeting y', 2, Y, 1e-5);
+  AssertEquals('meeting z', 3, Z, 1e-5);
+  AssertTrue('skew rays', GaussianSplatNearestPointToRays(SkewOrigins, SkewDirections, 2, X, Y, Z));
+  AssertEquals('skew x', 0, X, 1e-5);
+  AssertEquals('skew y', 0, Y, 1e-5);
+  AssertEquals('skew z', 1, Z, 1e-5);
+  AssertFalse('parallel rays', GaussianSplatNearestPointToRays(ParallelOrigins,
+    ParallelDirections, 2, X, Y, Z));
+  AssertFalse('rays pointing away', GaussianSplatNearestPointToRays(AwayOrigins,
+    AwayDirections, 2, X, Y, Z));
+  AssertFalse('one ray', GaussianSplatNearestPointToRays(MeetingOrigins,
+    MeetingDirections, 1, X, Y, Z));
+end;
 
 procedure TTestNeuralGaussianSplat.TestOpenCLMatchesCPU;
 {$IFDEF OpenCL}

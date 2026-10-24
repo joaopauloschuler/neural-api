@@ -1955,6 +1955,10 @@ type
   // no heap allocation, ties in unspecified order.
   procedure QuickSortOrderByDist(var Order: array of integer;
     const Dist: array of TNeuralFloat; iLo, iHi: Integer);
+  // Lower weighted median of Values[0..Count-1]: the smallest value whose cumulative
+  // Weight reaches half the total (plain lower median when the total is 0); Order: Count scratch.
+  function NeuralWeightedMedian(const Values, Weights: array of TNeuralFloat;
+    var Order: array of integer; Count: integer): TNeuralFloat;
 
   { NeuralGreedyNMS runs greedy, score-sorted, class-aware Non-Max-Suppression
     over Count boxes. Boxes are passed as four parallel flat arrays in corner
@@ -6925,6 +6929,41 @@ begin
   until Lo > Hi;
   if Hi > iLo then QuickSortOrderByDist(Order, Dist, iLo, Hi);
   if Lo < iHi then QuickSortOrderByDist(Order, Dist, Lo, iHi);
+end;
+
+function NeuralWeightedMedian(const Values, Weights: array of TNeuralFloat;
+  var Order: array of integer; Count: integer): TNeuralFloat;
+var
+  OrderPos, MaxOrderPos: integer;
+  TotalWeight, HalfWeight, CumulativeWeight: TNeuralFloat;
+begin
+  Result := 0;
+  if Count <= 0 then Exit;
+  MaxOrderPos := Count - 1;
+  TotalWeight := 0;
+  for OrderPos := 0 to MaxOrderPos do
+  begin
+    Order[OrderPos] := OrderPos;
+    TotalWeight := TotalWeight + Weights[OrderPos];
+  end;
+  if Count > 1 then QuickSortOrderByDist(Order, Values, 0, MaxOrderPos);
+  if TotalWeight <= 0 then
+  begin
+    Result := Values[Order[MaxOrderPos div 2]];
+    Exit;
+  end;
+  HalfWeight := 0.5 * TotalWeight;
+  CumulativeWeight := 0;
+  for OrderPos := 0 to MaxOrderPos do
+  begin
+    CumulativeWeight := CumulativeWeight + Weights[Order[OrderPos]];
+    if CumulativeWeight >= HalfWeight then
+    begin
+      Result := Values[Order[OrderPos]];
+      Exit;
+    end;
+  end;
+  Result := Values[Order[MaxOrderPos]];
 end;
 
 // Hoare-partition quickselect over the index array: permutes Order[0..Count-1]

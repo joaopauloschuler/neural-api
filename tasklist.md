@@ -1967,10 +1967,16 @@ rather than acted on.
         - [ ] Device-side sort + binning (radix sort on (tile, depth) keys,
               then per-tile ranges) so a frame needs no host round-trip; time
               it against the host BinTiles on a real 1-6 M Gaussian scene first.
-        - [ ] GaussianSplatView orbit target: the centroid of all means is
+        - [X] GaussianSplatView orbit target: the centroid of all means is
               pulled off the object by far background Gaussians on real scenes;
               use an opacity-weighted median (or the cameras.json look-at
-              centre) as the default target.
+              centre) as the default target. Done: TGaussianSplatScene.
+              ComputeRobustCentre (per-axis opacity-weighted median of the
+              means with opacity >= 0.1, plus the weighted median distance,
+              which replaces the RMS spread in the default radius) and
+              GaussianSplatNearestPointToRays (least-squares point nearest to
+              every cameras.json view axis; the median is the fallback).
+              Not yet checked on a real scene (see the item above).
 
 - [X] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT

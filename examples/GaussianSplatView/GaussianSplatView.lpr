@@ -2,7 +2,7 @@ program GaussianSplatView;
 (*
 GaussianSplatView: renders a trained 3D Gaussian Splatting scene (Kerbl et
 al., SIGGRAPH 2023, arXiv:2308.04079) from a camera orbiting the scene
-centroid. TGaussianSplatScene (neuralgaussiansplat.pas) loads the INRIA
+centre. TGaussianSplatScene (neuralgaussiansplat.pas) loads the INRIA
 point_cloud.ply and TGaussianSplatRasterizer renders each view with the
 reference tile rasterizer; --gpu runs the preprocess and blend kernels of
 TGaussianSplatRasterizerCL in OpenCL.
@@ -30,9 +30,11 @@ const
   csDemoGaussianCount = 600;
   csDemoSHDegree = 3;
   csGifDelayCentiseconds = 8;
-  // Without --radius and --cameras the orbit radius is this many RMS distances
-  // of the Gaussians from their centroid.
-  csOrbitRadiusPerSpread = 3;
+  // Without --radius and --cameras the orbit radius is this many median distances
+  // of the Gaussians from the orbit target.
+  csOrbitRadiusPerMedianDistance = 3;
+  // Gaussians below this opacity do not vote for the orbit target.
+  csTargetMinOpacity = 0.1;
 
 type
   TGaussianSplatViewOptions = record
@@ -50,11 +52,12 @@ begin
   WriteLn('         [--fov DEG] [--cameras cameras.json] [--radius R] [--gpu] [--out DIR]');
   WriteLn('  --ply FILE      INRIA 3DGS point_cloud.ply');
   WriteLn('  --demo          render a random scene of ', csDemoGaussianCount, ' Gaussians instead');
-  WriteLn('  --orbit N       frames in one orbit around the scene centroid (default 36)');
+  WriteLn('  --orbit N       frames in one orbit around the orbit target (default 36)');
   WriteLn('  --size WxH      image size (default 320x240)');
   WriteLn('  --fov DEG       horizontal field of view (default 60)');
   WriteLn('  --cameras FILE  INRIA cameras.json: camera 0 gives the focal lengths,');
-  WriteLn('                  the up axis and the orbit start');
+  WriteLn('                  the up axis and the orbit start; the orbit target is');
+  WriteLn('                  the point nearest to all camera view axes');
   WriteLn('  --radius R      orbit radius in scene units');
   WriteLn('  --gpu           preprocess and blend in OpenCL');
   WriteLn('  --out DIR       output folder (default gaussian_splat_frames)');
@@ -125,37 +128,17 @@ begin
     raise Exception.Create('--fov must be in (0, 180)');
 end;
 
-// Centroid of the Gaussian means and their RMS distance from it.
-procedure ComputeSceneCentroid(Scene: TGaussianSplatScene; out Centroid: TVector3;
-  out Spread: TNeuralFloat);
-var
-  GaussianPos, MaxGaussianPos, AxisPos: integer;
-  Sums: array[0..2] of double;
-  SquaredSum: double;
-begin
-  Sums[0] := 0; Sums[1] := 0; Sums[2] := 0;
-  MaxGaussianPos := Scene.Count - 1;
-  for GaussianPos := 0 to MaxGaussianPos do
-    for AxisPos := 0 to 2 do
-      Sums[AxisPos] := Sums[AxisPos] + Scene.Positions[3 * GaussianPos + AxisPos];
-  for AxisPos := 0 to 2 do Centroid[AxisPos] := Sums[AxisPos] / Max(1, Scene.Count);
-  SquaredSum := 0;
-  for GaussianPos := 0 to MaxGaussianPos do
-    for AxisPos := 0 to 2 do
-      SquaredSum := SquaredSum + Sqr(Scene.Positions[3 * GaussianPos + AxisPos] - Centroid[AxisPos]);
-  Spread := Sqrt(SquaredSum / Max(1, Scene.Count));
-end;
-
-// Reads camera 0 of an INRIA cameras.json: focal lengths scaled to the output
-// size, the camera centre as Eye and minus the camera y axis as Up.
-procedure LoadInriaCamera(const FileName: string; var Camera: TGaussianSplatCamera;
-  out Eye, Up: TVector3);
+// Reads an INRIA cameras.json: camera 0 gives the focal lengths scaled to the output
+// size, Eye and Up (minus its y axis); every camera adds its centre and z axis to the rays.
+procedure LoadInriaCameras(const FileName: string; var Camera: TGaussianSplatCamera;
+  out Eye, Up: TVector3; out RayOrigins, RayDirections: TNeuralFloatDynArr;
+  out RayCount: integer);
 var
   FileStream: TFileStream;
   Root: TJSONData;
   Entry: TJSONObject;
   Position, Rotation: TJSONArray;
-  AxisPos: integer;
+  AxisPos, CameraPos, MaxCameraPos: integer;
 begin
   FileStream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
   try
@@ -166,11 +149,26 @@ begin
   try
     if (not (Root is TJSONArray)) or (TJSONArray(Root).Count = 0) then
       raise Exception.Create(FileName + ' is not a non-empty JSON array of cameras');
+    RayCount := TJSONArray(Root).Count;
+    SetLength(RayOrigins, 3 * RayCount);
+    SetLength(RayDirections, 3 * RayCount);
+    MaxCameraPos := RayCount - 1;
+    // "rotation" is camera-to-world: its columns are the camera axes in world space.
+    for CameraPos := 0 to MaxCameraPos do
+    begin
+      Entry := TJSONArray(Root).Objects[CameraPos];
+      Position := Entry.Arrays['position'];
+      Rotation := Entry.Arrays['rotation'];
+      for AxisPos := 0 to 2 do
+      begin
+        RayOrigins[3 * CameraPos + AxisPos] := Position.Floats[AxisPos];
+        RayDirections[3 * CameraPos + AxisPos] := Rotation.Arrays[AxisPos].Floats[2];
+      end;
+    end;
     Entry := TJSONArray(Root).Objects[0];
     Camera.FocalX := Entry.Floats['fx'] * Camera.Width / Entry.Integers['width'];
     Camera.FocalY := Entry.Floats['fy'] * Camera.Height / Entry.Integers['height'];
     Position := Entry.Arrays['position'];
-    // "rotation" is camera-to-world: its columns are the camera axes in world space.
     Rotation := Entry.Arrays['rotation'];
     for AxisPos := 0 to 2 do
     begin
@@ -249,8 +247,11 @@ var
   Camera: TGaussianSplatCamera;
   Rendered, Frame: TNNetVolume;
   GifWriter: TNNetAnimatedGIFWriter;
-  Centroid, Eye, Up, Offset, Rotated: TVector3;
-  Spread, OffsetLength, UpLength: TNeuralFloat;
+  Target, RayTarget, Eye, Up, Offset, Rotated: TVector3;
+  MedianDistance, OffsetLength, UpLength: TNeuralFloat;
+  RayOrigins, RayDirections: TNeuralFloatDynArr;
+  RayCount: integer;
+  TargetSource: string;
   StartTime, FrameSeconds, TotalSeconds: double;
   FramePos, MaxFramePos, AxisPos: integer;
   Where, FrameFile, GifFile: string;
@@ -275,25 +276,36 @@ begin
         Format(', loaded in %.2f s', [(Now() - StartTime) * 86400]));
     end;
     if Scene.Count = 0 then raise Exception.Create('the scene has no Gaussians');
-    ComputeSceneCentroid(Scene, Centroid, Spread);
+    Scene.ComputeRobustCentre(csTargetMinOpacity, Target[0], Target[1], Target[2],
+      MedianDistance);
+    TargetSource := 'opacity-weighted median of the means';
     InitGaussianSplatCamera(Camera, Opt.Width, Opt.Height, DegToRad(Opt.FovDegrees));
     // COLMAP axes put image +y down, so world -y is the default up axis.
     Up[0] := 0; Up[1] := -1; Up[2] := 0;
-    Eye[0] := Centroid[0]; Eye[1] := Centroid[1];
-    Eye[2] := Centroid[2] - csOrbitRadiusPerSpread * Spread;
-    if Opt.CamerasFile <> '' then LoadInriaCamera(Opt.CamerasFile, Camera, Eye, Up);
+    Eye[0] := Target[0]; Eye[1] := Target[1];
+    Eye[2] := Target[2] - csOrbitRadiusPerMedianDistance * MedianDistance;
+    if Opt.CamerasFile <> '' then
+    begin
+      LoadInriaCameras(Opt.CamerasFile, Camera, Eye, Up, RayOrigins, RayDirections, RayCount);
+      if GaussianSplatNearestPointToRays(RayOrigins, RayDirections, RayCount,
+        RayTarget[0], RayTarget[1], RayTarget[2]) then
+      begin
+        Target := RayTarget;
+        TargetSource := Format('point nearest to the view axes of %d cameras', [RayCount]);
+      end;
+    end;
     UpLength := Sqrt(Sqr(Up[0]) + Sqr(Up[1]) + Sqr(Up[2]));
     for AxisPos := 0 to 2 do
     begin
       Up[AxisPos] := Up[AxisPos] / UpLength;
-      Offset[AxisPos] := Eye[AxisPos] - Centroid[AxisPos];
+      Offset[AxisPos] := Eye[AxisPos] - Target[AxisPos];
     end;
     OffsetLength := Sqrt(Sqr(Offset[0]) + Sqr(Offset[1]) + Sqr(Offset[2]));
     if (Opt.OrbitRadius > 0) and (OffsetLength > 0) then
       for AxisPos := 0 to 2 do
         Offset[AxisPos] := Offset[AxisPos] * Opt.OrbitRadius / OffsetLength;
-    WriteLn(Format('Centroid (%.3f, %.3f, %.3f), spread %.3f, orbit radius %.3f',
-      [Centroid[0], Centroid[1], Centroid[2], Spread,
+    WriteLn(Format('Orbit target (%.3f, %.3f, %.3f) = %s; median distance %.3f, orbit radius %.3f',
+      [Target[0], Target[1], Target[2], TargetSource, MedianDistance,
       Sqrt(Sqr(Offset[0]) + Sqr(Offset[1]) + Sqr(Offset[2]))]));
     Rasterizer := CreateRasterizer(Opt, Where);
     WriteLn('Rendering ', Opt.FrameCount, ' frames of ', Opt.Width, 'x', Opt.Height,
@@ -307,9 +319,9 @@ begin
     for FramePos := 0 to MaxFramePos do
     begin
       RotateAboutAxis(Offset, Up, 2 * Pi * FramePos / Opt.FrameCount, Rotated);
-      SetGaussianSplatCameraLookAt(Camera, Centroid[0] + Rotated[0],
-        Centroid[1] + Rotated[1], Centroid[2] + Rotated[2],
-        Centroid[0], Centroid[1], Centroid[2], Up[0], Up[1], Up[2]);
+      SetGaussianSplatCameraLookAt(Camera, Target[0] + Rotated[0],
+        Target[1] + Rotated[1], Target[2] + Rotated[2],
+        Target[0], Target[1], Target[2], Up[0], Up[1], Up[2]);
       StartTime := Now();
       Rasterizer.Render(Scene, Camera, 0, 0, 0, Rendered);
       FrameSeconds := (Now() - StartTime) * 86400;

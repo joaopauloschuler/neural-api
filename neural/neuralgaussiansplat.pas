@@ -71,6 +71,10 @@ type
     // View-dependent SH colour seen from the camera centre, + 0.5, clamped at 0.
     procedure ComputeColor(Index: integer; CameraX, CameraY, CameraZ: TNeuralFloat;
       var RGB: array of TNeuralFloat);
+    // Per-axis opacity-weighted median of the means with Opacity >= MinOpacity (all when
+    // none qualify) and the opacity-weighted median distance of those means from it.
+    procedure ComputeRobustCentre(MinOpacity: TNeuralFloat;
+      out CentreX, CentreY, CentreZ, MedianDistance: TNeuralFloat);
   end;
 
   // Preprocess fills the per-Gaussian arrays, BinTiles the depth-sorted per-tile
@@ -148,6 +152,10 @@ type
     EyeX, EyeY, EyeZ, TargetX, TargetY, TargetZ, UpX, UpY, UpZ: TNeuralFloat);
   procedure GetGaussianSplatCameraPosition(const Camera: TGaussianSplatCamera;
     out X, Y, Z: TNeuralFloat);
+  // Least-squares point nearest to RayCount rays (Origins, Directions: 3 per ray); False
+  // when the rays are near-parallel or the point lies behind at least half of them.
+  function GaussianSplatNearestPointToRays(const Origins, Directions: array of TNeuralFloat;
+    RayCount: integer; out X, Y, Z: TNeuralFloat): boolean;
 
 implementation
 
@@ -230,6 +238,60 @@ begin
     Y := -(WorldToView[1] * WorldToView[3] + WorldToView[5] * WorldToView[7] + WorldToView[9] * WorldToView[11]);
     Z := -(WorldToView[2] * WorldToView[3] + WorldToView[6] * WorldToView[7] + WorldToView[10] * WorldToView[11]);
   end;
+end;
+
+function GaussianSplatNearestPointToRays(const Origins, Directions: array of TNeuralFloat;
+  RayCount: integer; out X, Y, Z: TNeuralFloat): boolean;
+const
+  // det(sum of I - d d^T) over RayCount^3: 2 orthogonal rays give 0.25, parallel rays 0.
+  MinRelativeDeterminant = 1e-4;
+var
+  Normal: array[0..8] of TNeuralFloat;
+  Rhs: array[0..2] of TNeuralFloat;
+  Direction: array[0..2] of TNeuralFloat;
+  RayPos, MaxRayPos, RowPos, ColPos, InFrontCount: integer;
+  InvLength, Projector, Determinant, Along: TNeuralFloat;
+begin
+  Result := False;
+  X := 0; Y := 0; Z := 0;
+  if RayCount < 2 then Exit;
+  FillChar(Normal, SizeOf(Normal), 0);
+  FillChar(Rhs, SizeOf(Rhs), 0);
+  MaxRayPos := RayCount - 1;
+  // Normal equations: sum (I - d d^T) p = sum (I - d d^T) o.
+  for RayPos := 0 to MaxRayPos do
+  begin
+    InvLength := Sqrt(Sqr(Directions[3 * RayPos]) + Sqr(Directions[3 * RayPos + 1]) +
+      Sqr(Directions[3 * RayPos + 2]));
+    if InvLength = 0 then Exit;
+    InvLength := 1 / InvLength;
+    for RowPos := 0 to 2 do Direction[RowPos] := Directions[3 * RayPos + RowPos] * InvLength;
+    for RowPos := 0 to 2 do
+      for ColPos := 0 to 2 do
+      begin
+        Projector := -Direction[RowPos] * Direction[ColPos];
+        if RowPos = ColPos then Projector := Projector + 1;
+        Normal[3 * RowPos + ColPos] := Normal[3 * RowPos + ColPos] + Projector;
+        Rhs[RowPos] := Rhs[RowPos] + Projector * Origins[3 * RayPos + ColPos];
+      end;
+  end;
+  Determinant :=
+    Normal[0] * (Normal[4] * Normal[8] - Normal[5] * Normal[7]) -
+    Normal[1] * (Normal[3] * Normal[8] - Normal[5] * Normal[6]) +
+    Normal[2] * (Normal[3] * Normal[7] - Normal[4] * Normal[6]);
+  if Determinant < MinRelativeDeterminant * RayCount * RayCount * RayCount then Exit;
+  if not NeuralLinearSolve(Normal, Rhs, 3, 1) then Exit;
+  InFrontCount := 0;
+  for RayPos := 0 to MaxRayPos do
+  begin
+    Along := (Rhs[0] - Origins[3 * RayPos]) * Directions[3 * RayPos] +
+      (Rhs[1] - Origins[3 * RayPos + 1]) * Directions[3 * RayPos + 1] +
+      (Rhs[2] - Origins[3 * RayPos + 2]) * Directions[3 * RayPos + 2];
+    if Along > 0 then Inc(InFrontCount);
+  end;
+  if 2 * InFrontCount <= RayCount then Exit;
+  X := Rhs[0]; Y := Rhs[1]; Z := Rhs[2];
+  Result := True;
 end;
 
 { TGaussianSplatScene }
@@ -571,6 +633,53 @@ begin
     if Sum < 0 then Sum := 0;
     RGB[ChannelPos] := Sum;
   end;
+end;
+
+procedure TGaussianSplatScene.ComputeRobustCentre(MinOpacity: TNeuralFloat;
+  out CentreX, CentreY, CentreZ, MedianDistance: TNeuralFloat);
+var
+  Selected, Order: TNeuralIntegerArray;
+  Values, Weights: TNeuralFloatDynArr;
+  Centre: array[0..2] of TNeuralFloat;
+  GaussianPos, MaxGaussianPos, SelectedCount, SelectedPos, MaxSelectedPos, AxisPos,
+    PositionBase: integer;
+begin
+  CentreX := 0; CentreY := 0; CentreZ := 0; MedianDistance := 0;
+  if Count <= 0 then Exit;
+  SetLength(Selected, Count);
+  MaxGaussianPos := Count - 1;
+  SelectedCount := 0;
+  for GaussianPos := 0 to MaxGaussianPos do
+    if Opacities[GaussianPos] >= MinOpacity then
+    begin
+      Selected[SelectedCount] := GaussianPos;
+      Inc(SelectedCount);
+    end;
+  if SelectedCount = 0 then
+  begin
+    for GaussianPos := 0 to MaxGaussianPos do Selected[GaussianPos] := GaussianPos;
+    SelectedCount := Count;
+  end;
+  MaxSelectedPos := SelectedCount - 1;
+  SetLength(Order, SelectedCount);
+  SetLength(Values, SelectedCount);
+  SetLength(Weights, SelectedCount);
+  for SelectedPos := 0 to MaxSelectedPos do
+    Weights[SelectedPos] := Opacities[Selected[SelectedPos]];
+  for AxisPos := 0 to 2 do
+  begin
+    for SelectedPos := 0 to MaxSelectedPos do
+      Values[SelectedPos] := Positions[3 * Selected[SelectedPos] + AxisPos];
+    Centre[AxisPos] := NeuralWeightedMedian(Values, Weights, Order, SelectedCount);
+  end;
+  for SelectedPos := 0 to MaxSelectedPos do
+  begin
+    PositionBase := 3 * Selected[SelectedPos];
+    Values[SelectedPos] := Sqrt(Sqr(Positions[PositionBase] - Centre[0]) +
+      Sqr(Positions[PositionBase + 1] - Centre[1]) + Sqr(Positions[PositionBase + 2] - Centre[2]));
+  end;
+  MedianDistance := NeuralWeightedMedian(Values, Weights, Order, SelectedCount);
+  CentreX := Centre[0]; CentreY := Centre[1]; CentreZ := Centre[2];
 end;
 
 { TGaussianSplatRasterizer }

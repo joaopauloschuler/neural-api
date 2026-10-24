@@ -3,7 +3,7 @@
 Renders a trained 3D Gaussian Splatting scene (Kerbl et al., SIGGRAPH 2023,
 [*3D Gaussian Splatting for Real-Time Radiance Field
 Rendering*](https://arxiv.org/abs/2308.04079)) from a camera that orbits the
-scene centroid, and writes the views as PNG frames and one animated GIF.
+scene centre, and writes the views as PNG frames and one animated GIF.
 
 **Status: coded, not yet run on a real INRIA scene.** The rasterizer is tested
 on hand-derived cases (`TestNeuralGaussianSplat`), the OpenCL rasterizer
@@ -16,7 +16,7 @@ the example runs end to end with `--demo` on the CPU and on PoCL. No trained
 ```
 point_cloud.ply (INRIA layout)
   -> TGaussianSplatScene.LoadFromPLY     sigmoid opacity, exp scale, unit quaternion, SH 0-3
-  -> per orbit frame: SetGaussianSplatCameraLookAt(eye on the orbit, centroid)
+  -> per orbit frame: SetGaussianSplatCameraLookAt(eye on the orbit, orbit target)
   -> TGaussianSplatRasterizer.Render
        Preprocess   per Gaussian: 2D conic, 3-sigma radius, SH colour, depth, tile rect
        BinTiles     one depth sort, then per 16x16 tile lists, nearest first
@@ -33,12 +33,24 @@ downloads the radii, depths and tile rects, `BinTiles` builds the per-tile
 lists, and `TGaussianSplatRasterizerCL.Blend` uploads them. The means, conics
 and colours stay in OpenCL memory, and the scene is uploaded once.
 
-The orbit turns about the up axis through the centroid of the Gaussian means.
-Without `--cameras` the up axis is world -y (COLMAP axes: image +y is down),
-and the orbit starts on the -z side of the centroid at 3 times the RMS
-distance of the means from the centroid (`--radius` overrides it). Real scenes
-often have far background Gaussians that pull the centroid and the RMS
-distance away from the object, so `--radius` and `--cameras` matter there.
+The orbit turns about the up axis through the orbit target. Real scenes have
+far background Gaussians that would pull a plain centroid off the object, so
+the target is robust to them:
+
+- Without `--cameras`, `TGaussianSplatScene.ComputeRobustCentre` takes the
+  per-axis median of the Gaussian means, each weighted by its opacity;
+  Gaussians with opacity below 0.1 do not vote. The up axis is world -y
+  (COLMAP axes: image +y is down), and the orbit starts on the -z side of the
+  target at 3 times the opacity-weighted median distance of the means from
+  the target.
+- With `--cameras`, `GaussianSplatNearestPointToRays` takes the least-squares
+  point nearest to the view axes of all cameras in `cameras.json`: the point
+  the capture cameras look at. When the axes are near-parallel or the point
+  lies behind at least half of the cameras (a forward-facing capture), the
+  weighted median above stays the target. The orbit starts at camera 0, so
+  the radius is its distance from the target.
+
+`--radius` overrides the radius in both cases.
 
 ## Run
 
@@ -55,7 +67,7 @@ distance away from the object, so `--radius` and `--cameras` matter there.
 | `--orbit N` | frames in one full orbit | 36 |
 | `--size WxH` | image size in pixels | 320x240 |
 | `--fov DEG` | horizontal field of view, square pixels | 60 |
-| `--cameras FILE` | INRIA `cameras.json`: camera 0 gives `fx`/`fy` (scaled to `--size`), the up axis (minus its y axis) and the orbit start (its position); the camera still looks at the centroid | off |
+| `--cameras FILE` | INRIA `cameras.json`: camera 0 gives `fx`/`fy` (scaled to `--size`), the up axis (minus its y axis) and the orbit start (its position); all cameras give the orbit target (see above) | off |
 | `--radius R` | orbit radius in scene units | see above |
 | `--gpu` | preprocess and blend in OpenCL (first platform, first device) | off |
 | `--out DIR` | output folder | `gaussian_splat_frames` |
