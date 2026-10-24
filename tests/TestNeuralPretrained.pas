@@ -1682,6 +1682,11 @@ type
     // top-K gather on OpenCL, parity with the oracle, residency counts printed.
     procedure TestRtDetrOpenCL;
     procedure TestRtDetrRejectsInputSize;
+    // RT-DETRv2 (rt_detr_v2, decoder_offset_scale 0.7): config reading and pico
+    // parity with bilinear and discrete decoder_method, CPU and forced OpenCL.
+    procedure TestRtDetrV2ConfigFromJSONFile;
+    procedure TestRtDetrV2Parity;
+    procedure TestRtDetrV2OpenCL;
     // HGNetV2 (the D-FINE backbone): config reading and the stem + stage
     // outputs against transformers, without (tiny_dfine) and with
     // (tiny_dfine_perlevel) the learnable affine blocks; also forced OpenCL.
@@ -59126,7 +59131,10 @@ begin
   AssertEquals('queries', 10, Config.NumQueries);
   AssertEquals('decoder layers', 2, Config.DecoderLayers);
   AssertEquals('levels', 3, Config.NumFeatureLevels);
-  AssertEquals('points', 3, Config.DecoderPoints);
+  AssertEquals('points per level', 3, Length(Config.DecoderPointsPerLevel));
+  AssertEquals('points', 3, Config.DecoderPointsPerLevel[1]);
+  AssertEquals('rt_detr offset scale', 0.5, Config.DecoderOffsetScale, 1e-6);
+  AssertFalse('rt_detr bilinear', Config.DecoderDiscreteSampling);
   AssertEquals('labels', 5, Config.NumLabels);
   AssertEquals('class name', 'LABEL_3', Config.ClassNames[3]);
   AssertEquals('input width', 64, Config.ImageWidth);
@@ -59306,6 +59314,7 @@ var
   NN: TNNet;
   IO: TNNetSafeTensorsReader;
   Image: TNNetVolume;
+  LayerPos, MaxLayerPos: integer;
   {$IFDEF OpenCL}
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -59319,6 +59328,12 @@ begin
     NN := BuildRtDetrFromSafeTensors(ATest.FixturePath(Name + '.safetensors'), Config,
       {pTrainable=}false, ATest.FixturePath(Name + '_config.json'), Image.SizeX,
       Image.SizeY);
+    MaxLayerPos := NN.CountLayers() - 1;
+    for LayerPos := 0 to MaxLayerPos do
+      if NN.Layers[LayerPos] is TNNetMultiScaleDeformableAttention then
+        ATest.AssertEquals(Name + ' layer ' + IntToStr(LayerPos) + ' sampling',
+          Config.DecoderDiscreteSampling,
+          TNNetMultiScaleDeformableAttention(NN.Layers[LayerPos]).IsDiscreteSampling);
     {$IFDEF OpenCL}
     if OnOpenCL then
     begin
@@ -59364,6 +59379,38 @@ end;
 procedure TTestNeuralPretrained.TestRtDetrR50Parity;
 begin
   RunRtDetrParity(Self, 'tiny_rtdetr_r50', {OnOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrV2ConfigFromJSONFile;
+var
+  Config: TRtDetrConfig;
+begin
+  Config := ReadRtDetrConfigFromJSONFile(FixturePath('tiny_rtdetr_v2_config.json'),
+    64, 64);
+  AssertEquals('model_type', 'rt_detr_v2', Config.ModelType);
+  AssertEquals('points', 3, Config.DecoderPointsPerLevel[2]);
+  AssertEquals('offset scale', 0.7, Config.DecoderOffsetScale, 1e-6);
+  AssertFalse('default decoder_method', Config.DecoderDiscreteSampling);
+  AssertTrue('ToString', Pos('rt_detr_v2', RtDetrConfigToString(Config)) > 0);
+  Config := ReadRtDetrConfigFromJSONFile(
+    FixturePath('tiny_rtdetr_v2_discrete_config.json'), 64, 64);
+  AssertTrue('decoder_method discrete', Config.DecoderDiscreteSampling);
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrV2Parity;
+begin
+  RunRtDetrParity(Self, 'tiny_rtdetr_v2', {OnOpenCL=}false);
+  RunRtDetrParity(Self, 'tiny_rtdetr_v2_discrete', {OnOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestRtDetrV2OpenCL;
+begin
+  {$IFDEF OpenCL}
+  RunRtDetrParity(Self, 'tiny_rtdetr_v2', {OnOpenCL=}true);
+  RunRtDetrParity(Self, 'tiny_rtdetr_v2_discrete', {OnOpenCL=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 procedure TTestNeuralPretrained.TestRtDetrRejectsInputSize;
@@ -59520,9 +59567,9 @@ begin
   AssertEquals('depth_mult', 0.34, Config.DepthMult, 1e-6);
   AssertEquals('backbone stages', 4, Length(Config.Backbone.StageInChannels));
   AssertEquals('input channels', 3, Config.Detector.NumChannels);
-  AssertEquals('points per level', 3, Length(Config.DecoderPointsPerLevel));
-  AssertEquals('equal points', 3, Config.DecoderPointsPerLevel[2]);
-  AssertEquals('offset scale', 0.5, Config.DecoderOffsetScale, 1e-6);
+  AssertEquals('points per level', 3, Length(Config.Detector.DecoderPointsPerLevel));
+  AssertEquals('equal points', 3, Config.Detector.DecoderPointsPerLevel[2]);
+  AssertEquals('offset scale', 0.5, Config.Detector.DecoderOffsetScale, 1e-6);
   AssertEquals('bins', 8, Config.MaxNumBins);
   AssertEquals('eval_idx -1 = last layer', 1, Config.EvalIdx);
   AssertEquals('reg_scale', 4.0, Config.RegScale, 1e-6);
@@ -59535,7 +59582,7 @@ begin
   AssertTrue('decoder_method discrete', Config.Detector.DecoderDiscreteSampling);
   Config := ReadDFineConfigFromJSONFile(
     FixturePath('tiny_dfine_perlevel_config.json'), 64, 64);
-  AssertEquals('per-level points', 6, Config.DecoderPointsPerLevel[1]);
+  AssertEquals('per-level points', 6, Config.Detector.DecoderPointsPerLevel[1]);
   AssertEquals('eval_idx', 1, Config.EvalIdx);
   AssertEquals('decoder layers', 3, Config.Detector.DecoderLayers);
 end;

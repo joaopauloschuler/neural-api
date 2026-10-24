@@ -25,7 +25,7 @@ Coded by Claude (AI).
 //     backbone + transformer encoder-decoder + learned object queries; decoded
 //     with DecodeDetrDetections (softmax, drop the "no-object" slot, threshold).
 //   * RT-DETR with --rtdetr (BuildRtDetrFromSafeTensors, PekingU/rtdetr_r18vd ..
-//     r101vd): a ResNet-vd backbone + the hybrid encoder (AIFI + CSP FPN/PAN) +
+//     r101vd, and the RT-DETRv2 PekingU/rtdetr_v2_*): a ResNet-vd backbone + the hybrid encoder (AIFI + CSP FPN/PAN) +
 //     top-K query selection + a multi-scale deformable-attention decoder with
 //     iterative box refinement; decoded with DecodeRtDetrDetections (sigmoid
 //     scores, top-K over query x class, threshold, no NMS).

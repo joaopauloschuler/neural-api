@@ -6,7 +6,9 @@ The demo for the three DETR-family object-detection importers in
 - **DETR** (`BuildDetrFromSafeTensors`, `facebook/detr-resnet-50`), the default
   mode;
 - **RT-DETR** (`BuildRtDetrFromSafeTensors`, `PekingU/rtdetr_r18vd` ..
-  `rtdetr_r101vd`), with `--rtdetr`;
+  `rtdetr_r101vd`) and **RT-DETRv2** (the same entry point, model_type
+  `rt_detr_v2`, `PekingU/rtdetr_v2_r18vd` .. `rtdetr_v2_r101vd`), with
+  `--rtdetr`;
 - **D-FINE** (`BuildDFineFromSafeTensors`, `ustc-community/dfine-nano-coco` ..
   `dfine-xlarge-coco` and the `-obj365` / `-obj2coco` variants), with
   `--dfine`.
@@ -36,6 +38,11 @@ box to pixel `xyxy`. The example writes `object_detection.ppm`.
   (`TNNetTopKGatherTokens`) seed the decoder;
 - a decoder of self-attention + **multi-scale deformable cross-attention**
   (`TNNetMultiScaleDeformableAttention`) with **iterative box refinement**.
+
+**RT-DETRv2** changes only the decoder's deformable cross-attention: the
+sampling offsets are scaled by `decoder_offset_scale` (RT-DETR fixes it at 0.5),
+and `decoder_method` `"discrete"` reads the nearest feature-map cell instead of
+the bilinear sample. `ReadRtDetrConfigFromJSONFile` reads both fields.
 
 `DecodeRtDetrDetections` ports transformers `post_process_object_detection`:
 sigmoid of every (query, class) logit, the `num_queries` best pairs, score above
@@ -73,6 +80,7 @@ $B                                          # DETR, committed pico fixture
 $B model.safetensors config.json [threshold]
 $B --rtdetr                                 # RT-DETR, committed pico fixture
 $B --rtdetr --image photo.jpg rtdetr_r18vd/model.safetensors [config.json] [threshold]
+$B --rtdetr --image photo.jpg rtdetr_v2_r18vd/model.safetensors   # RT-DETRv2
 $B --dfine                                  # D-FINE, committed pico fixture
 $B --dfine --image photo.jpg dfine-nano-coco/model.safetensors [config.json] [threshold]
 ```
@@ -116,6 +124,10 @@ about 1.9 GB of RAM at 640 x 640.
   a bottleneck (r50vd layout, 4 feature levels) pico model
   (`TestRtDetrParity`, `TestRtDetrR50Parity`; generator
   `tools/make_pico_rtdetr_fixture.py`).
+- RT-DETRv2 parity: logits, boxes and post-processed detections < 1e-4 vs
+  transformers float64 on two pico models with `decoder_offset_scale` 0.7, one
+  with bilinear and one with discrete sampling (`TestRtDetrV2Parity`,
+  `TestRtDetrV2OpenCL`).
 - D-FINE parity: logits, boxes and post-processed detections < 1e-4 vs
   transformers float64 on two pico models, one with the same number of
   sampling points on every level and one with per-level counts `[3, 6, 3]`,
@@ -123,9 +135,13 @@ about 1.9 GB of RAM at 640 x 640.
   (`TestDFineParity`, `TestDFineOpenCL`).
 - RT-DETR status: planned (coded); not yet run by the user with a real
   checkpoint. The example output above is an agent run of `PekingU/rtdetr_r18vd`.
+- RT-DETRv2 status: planned (coded); no real `PekingU/rtdetr_v2_*` checkpoint
+  has been run yet, by the user or by an agent.
 - D-FINE status: planned (coded); the `ustc-community/dfine-*` checkpoints have
-  not been run yet, by the user or by an agent. Only `decoder_method`
-  `"default"` is supported (`"discrete"` is rejected at load).
+  not been run yet, by the user or by an agent. Both `decoder_method` values
+  (`"default"` and `"discrete"`) are supported.
+- DEIMv2 (transformers model_type `deimv2`) is not supported: its decoder uses
+  RMSNorm and a SwiGLU FFN and its encoder differs from D-FINE's.
 - Pure CPU, < 1 s on the fixtures.
 
 Coded by Claude (AI).

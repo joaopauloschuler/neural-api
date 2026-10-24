@@ -1874,7 +1874,9 @@ rather than acted on.
       ReadRtDetrConfigFromJSONFile, DecodeRtDetrDetections,
       TNNetMultiScaleDeformableAttention, TNNetTopKGatherTokens,
       TNNetInverseSigmoid, ObjectDetection --rtdetr; OpenCL forward included;
-      agent run of PekingU/rtdetr_r18vd matched transformers):
+      agent run of PekingU/rtdetr_r18vd matched transformers; the same entry
+      points load RT-DETRv2, model_type rt_detr_v2, TestRtDetrV2Parity /
+      TestRtDetrV2OpenCL on pico fixtures):
         - [ ] User run of a real checkpoint (r18vd and r50vd/r101vd; only r18vd
               was run, by the agent).
         - [ ] RAM: r18vd at 640 x 640 peaks at 1.86 GB RSS with
@@ -1889,12 +1891,9 @@ rather than acted on.
               decoder computes only the last layer's class head).
         - [ ] Unsupported config options raise: normalize_before = true,
               learn_initial_query = true, use_timm_backbone.
-        - [ ] RT-DETRv2 importer (model_type rt_detr_v2): per-level point
-              counts and discrete sampling (decoder_method "discrete") exist
-              in TNNetMultiScaleDeformableAttention; ReadRtDetrDetectorFields
-              reads decoder_method into DecoderDiscreteSampling and
-              TRtDetrNetBuilder.AddDeformableAttention applies it, so the new
-              code is the config reader and the v2 decoder wiring.
+        - [ ] Agent or user check on a real PekingU/rtdetr_v2_r18vd checkpoint
+              (640 x 640 under the 2 GB cap): same detections as transformers.
+              Not run on the dev box.
 
 - [ ] D-FINE importer follow-ups (BuildDFineFromSafeTensors[Ex], model_type
       "d_fine": BuildHGNetV2Backbone, BuildDFineEncoder on the shared
@@ -1903,10 +1902,24 @@ rather than acted on.
         - [ ] Agent or user check on a real ustc-community/dfine-* checkpoint
               (dfine-nano-coco at 640 x 640 under the 2 GB cap): same
               detections as transformers. Not run on the dev box.
-        - [ ] DEIM detector (same HGNetV2 + D-FINE decoder, different
-              training): check whether its checkpoints load through
-              BuildDFineFromSafeTensors unchanged; if so, list them in
-              examples/ObjectDetection/README.md as planned (coded).
+        - [ ] DEIM (v1) detector: the architecture is D-FINE's, but
+              transformers 5.17 has no "deim" model_type and the official
+              weights are original-repo .pth files. Check (with internet)
+              whether any Hub checkpoint ships as model_type "d_fine"
+              safetensors; if so, run it through BuildDFineFromSafeTensors and
+              list it in examples/ObjectDetection/README.md as planned (coded).
+              Otherwise a .pth -> d_fine key converter is the gap.
+        - [ ] DEIMv2 importer (model_type "deimv2", Intellindust/DEIMv2_*;
+              Deimv2Config extends DFineConfig): decoder layers use RMSNorm
+              instead of LayerNorm, a SwiGLU FFN (gate/up/down, decoder_ffn_dim
+              / 2) and an RMSNorm in the gateway (use_gateway = false adds an
+              encoder_attn RMSNorm instead); the hybrid encoder fuses by sum
+              (encoder_fuse_op) with RepNCSPELAN5 blocks
+              (encoder_has_trailing_conv); encoder_type "lite" (Atto/Femto/
+              Pico) is a separate LiteEncoder; the DINOv3 variants add a
+              DINOv3 backbone (Deimv2DINOv3ConvEncoder) with a
+              SpatialTuningAdapter;
+              share_bbox_head. Start with the HGNetV2 N variant.
         - Inference only; training (FDR/GO-LSD distillation losses) is out of
           scope.
 

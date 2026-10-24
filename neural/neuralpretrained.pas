@@ -16984,12 +16984,13 @@ function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
 
 // ===========================================================================
 // RT-DETR real-time object-detection import (HF model_type "rt_detr",
-// PekingU/rtdetr_r18vd .. rtdetr_r101vd). A ResNet-vd backbone (deep 3-conv
-// stem, average-pool shortcut downsample), the efficient hybrid encoder (AIFI
-// self-attention on the top map + an FPN/PAN of CSP-RepVGG blocks), top-K
-// query selection from the encoder proposals, and a decoder of multi-scale
-// deformable cross-attention (TNNetMultiScaleDeformableAttention) with
-// iterative box refinement. Inference only: no denoising queries.
+// PekingU/rtdetr_r18vd .. rtdetr_r101vd, and "rt_detr_v2", PekingU/rtdetr_v2_*,
+// whose decoder adds decoder_offset_scale and decoder_method). A ResNet-vd
+// backbone (deep 3-conv stem, average-pool shortcut downsample), the efficient
+// hybrid encoder (AIFI self-attention on the top map + an FPN/PAN of
+// CSP-RepVGG blocks), top-K query selection from the encoder proposals, and a
+// decoder of multi-scale deformable cross-attention
+// (TNNetMultiScaleDeformableAttention) with iterative box refinement. Inference only: no denoising queries.
 // ===========================================================================
 type
   TRtDetrConfig = record
@@ -17015,7 +17016,9 @@ type
     // decoder
     DModel, NumQueries, DecoderLayers, DecoderHeads, DecoderFFNDim: integer;
     DecoderInChannels: array of integer;
-    NumFeatureLevels, DecoderPoints: integer;
+    NumFeatureLevels: integer;
+    DecoderPointsPerLevel: TNeuralIntegerArray; // decoder_n_points, one per level
+    DecoderOffsetScale: TNeuralFloat;      // decoder_offset_scale (rt_detr: 0.5)
     DecoderDiscreteSampling: boolean;      // decoder_method = "discrete"
     DecoderActivation: string;
     NumLabels: integer;
@@ -17023,11 +17026,11 @@ type
     LayerNormEps, BatchNormEps: TNeuralFloat;
     // input
     ImageWidth, ImageHeight: integer;      // net input (multiple of 32)
-    ModelType: string;                     // 'rt_detr'
+    ModelType: string;                     // 'rt_detr', 'rt_detr_v2' or 'd_fine'
   end;
 
-// Reads a HF RT-DETR config.json; missing backbone_config fields take the
-// RTDetrResNetConfig defaults (r50vd). The net input is ImageWidth x ImageHeight.
+// Reads a HF RT-DETR or RT-DETRv2 config.json; missing backbone_config fields take
+// the RTDetrResNetConfig defaults (r50vd). The net input is ImageWidth x ImageHeight.
 function ReadRtDetrConfigFromJSONFile(const FileName: string;
   ImageWidth: integer = 640; ImageHeight: integer = 640): TRtDetrConfig;
 
@@ -17095,13 +17098,10 @@ function BuildHGNetV2Backbone(NN: TNNet; Reader: TNNetSafeTensorsReader;
 // ---------------------------------------------------------------------------
 type
   TDFineConfig = record
-    // The fields D-FINE shares with RT-DETR; the Backbone* fields are unused
-    // and DecoderPoints is 0 (see DecoderPointsPerLevel).
+    // The fields D-FINE shares with RT-DETR; the Backbone* fields are unused.
     Detector: TRtDetrConfig;
     Backbone: THGNetV2Config;              // backbone_config
     DepthMult: TNeuralFloat;               // depth_mult (CSP blocks per neck block)
-    DecoderPointsPerLevel: TNeuralIntegerArray; // decoder_n_points, one per level
-    DecoderOffsetScale: TNeuralFloat;      // decoder_offset_scale
     MaxNumBins, LqeHiddenDim, LqeLayers, TopProbValues: integer;
     EvalIdx: integer;                      // eval_idx, made non-negative
     RegScale, Up, LayerScale: TNeuralFloat;
@@ -96165,6 +96165,20 @@ begin
       StringReplace(OutFeatures.Strings[FeaturePos], 'stage', '', []), 0);
 end;
 
+// Values as comma-separated decimals, no brackets.
+function JoinIntegerArray(const Values: array of integer): string;
+var
+  ValuePos, MaxValuePos: integer;
+begin
+  Result := '';
+  MaxValuePos := High(Values);
+  for ValuePos := 0 to MaxValuePos do
+  begin
+    if ValuePos > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Values[ValuePos]);
+  end;
+end;
+
 // The JSON number FieldName of Obj; Default when it is missing or null.
 function ReadJSONFloatOrDefault(Obj: TJSONObject; const FieldName: string;
   Default: TNeuralFloat): TNeuralFloat;
@@ -96174,14 +96188,15 @@ begin
   else Result := Default;
 end;
 
-// The hybrid-encoder, decoder and label fields of an RT-DETR or D-FINE
-// config.json (not the backbone, not decoder_n_points); errors name ImporterName.
+// The hybrid-encoder, decoder and label fields of an RT-DETR, RT-DETRv2 or
+// D-FINE config.json (not the backbone); errors name ImporterName.
 procedure ReadRtDetrDetectorFields(Obj: TJSONObject; const ImporterName: string;
   var Config: TRtDetrConfig);
 var
   Field: TJSONData;
   Labels: TJSONObject;
-  LabelPos, MaxLabelPos, LabelId: integer;
+  Points: TJSONArray;
+  LabelPos, MaxLabelPos, LabelId, LevelPos, MaxLevelPos: integer;
   DecoderMethod: string;
 begin
   if Obj.Get('normalize_before', false) then
@@ -96214,6 +96229,26 @@ begin
   Config.DecoderInChannels := ReadJSONIntArray(Obj, 'decoder_in_channels',
     [256, 256, 256]);
   Config.NumFeatureLevels := Obj.Get('num_feature_levels', 3);
+  // decoder_n_points: one count for every level, or a list with one per level.
+  Config.DecoderPointsPerLevel := nil;
+  SetLength(Config.DecoderPointsPerLevel, Config.NumFeatureLevels);
+  MaxLevelPos := Config.NumFeatureLevels - 1;
+  Field := Obj.Find('decoder_n_points');
+  if Field is TJSONArray then
+  begin
+    Points := TJSONArray(Field);
+    if Points.Count <> Config.NumFeatureLevels then
+      ImportError(ImporterName + ' import: decoder_n_points lists ' +
+        IntToStr(Points.Count) + ' counts for ' +
+        IntToStr(Config.NumFeatureLevels) + ' feature levels.');
+    for LevelPos := 0 to MaxLevelPos do
+      Config.DecoderPointsPerLevel[LevelPos] := Points.Items[LevelPos].AsInteger;
+  end
+  else
+    for LevelPos := 0 to MaxLevelPos do
+      Config.DecoderPointsPerLevel[LevelPos] := Obj.Get('decoder_n_points', 4);
+  Config.DecoderOffsetScale := ReadJSONFloatOrDefault(Obj,
+    'decoder_offset_scale', 0.5);
   // RT-DETRv2 and D-FINE: "default" (bilinear) or "discrete" sampling.
   DecoderMethod := Obj.Get('decoder_method', 'default');
   if (DecoderMethod <> 'default') and (DecoderMethod <> 'discrete') then
@@ -96251,9 +96286,9 @@ begin
   Obj := LoadImportJSONObject(FileName, 'RT-DETR');
   try
     Result.ModelType := Obj.Get('model_type', 'rt_detr');
-    if Result.ModelType <> 'rt_detr' then
+    if (Result.ModelType <> 'rt_detr') and (Result.ModelType <> 'rt_detr_v2') then
       ImportError('RT-DETR import: config model_type is "' + Result.ModelType +
-        '", expected "rt_detr".');
+        '", expected "rt_detr" or "rt_detr_v2".');
     if Obj.Get('use_timm_backbone', false) then
       ImportError('RT-DETR import: use_timm_backbone is not supported.');
     // ---- backbone (RTDetrResNetConfig defaults = the r50vd layout) ----
@@ -96283,7 +96318,16 @@ begin
     if Length(Result.BackboneDepths) <> Length(Result.BackboneHiddenSizes) then
       ImportError('RT-DETR import: backbone hidden_sizes / depths length mismatch.');
     ReadRtDetrDetectorFields(Obj, 'RT-DETR', Result);
-    Result.DecoderPoints := Obj.Get('decoder_n_points', 4);
+    if Result.ModelType = 'rt_detr' then
+    begin
+      // RTDetrMultiscaleDeformableAttention has neither option.
+      Result.DecoderOffsetScale := 0.5;
+      Result.DecoderDiscreteSampling := false;
+    end
+    else if Obj.Get('decoder_n_levels', 3) <> Result.NumFeatureLevels then
+      ImportError('RT-DETR import: decoder_n_levels (' +
+        IntToStr(Obj.Get('decoder_n_levels', 3)) + ') must equal ' +
+        'num_feature_levels (' + IntToStr(Result.NumFeatureLevels) + ').');
     Result.ImageWidth := ImageWidth;
     Result.ImageHeight := ImageHeight;
   finally
@@ -96309,7 +96353,7 @@ begin
     Sizes := Sizes + IntToStr(Config.BackboneHiddenSizes[StagePos]);
     Depths := Depths + IntToStr(Config.BackboneDepths[StagePos]);
   end;
-  Result := 'rt_detr config: backbone ' +
+  Result := Config.ModelType + ' config: backbone ' +
     BoolToStr(Config.BackboneBottleneck, 'bottleneck', 'basic') +
     ' stages=[' + Sizes + '] depths=[' + Depths + ']' +
     ', encoder hidden=' + IntToStr(Config.EncoderHiddenDim) +
@@ -96318,7 +96362,9 @@ begin
     ', d_model=' + IntToStr(Config.DModel) +
     ', decoder=' + IntToStr(Config.DecoderLayers) + 'x' +
     IntToStr(Config.DecoderHeads) + 'h/' + IntToStr(Config.NumFeatureLevels) +
-    ' levels/' + IntToStr(Config.DecoderPoints) + ' points' +
+    ' levels points=[' + JoinIntegerArray(Config.DecoderPointsPerLevel) + ']' +
+    ' offset_scale=' + FloatToStr(Config.DecoderOffsetScale) +
+    BoolToStr(Config.DecoderDiscreteSampling, ' discrete', '') +
     ', queries=' + IntToStr(Config.NumQueries) +
     ', labels=' + IntToStr(Config.NumLabels) +
     ', input=' + IntToStr(Config.ImageWidth) + 'x' + IntToStr(Config.ImageHeight);
@@ -96418,17 +96464,12 @@ type
     // (queries, 1, 3 * SampleChannels) TNNetMultiScaleDeformableAttention input.
     function AddSamplingOffsetsAndLogits(Source: TNNetLayer;
       SampleChannels: integer; const AttnPrefix: string): TNNetLayer;
-    // TNNetMultiScaleDeformableAttention after OffsetsLogits with DiscreteSampling;
-    // LevelPoints holds one count per level.
+    // decoder heads x the decoder_n_points sum: AddSamplingOffsetsAndLogits' width.
+    function DecoderSampleChannels(): integer;
+    // TNNetMultiScaleDeformableAttention after OffsetsLogits with the config's
+    // heads, points per level, offset scale and DiscreteSampling.
     function AddDeformableAttention(OffsetsLogits, ValueSource,
-      ReferenceSource: TNNetLayer; Heads: integer;
-      const LevelPoints, LevelShapes: array of integer;
-      OffsetScale: TNeuralFloat): TNNetLayer; overload;
-    // Points samples on every level.
-    function AddDeformableAttention(OffsetsLogits, ValueSource,
-      ReferenceSource: TNNetLayer; Heads, Points: integer;
-      const LevelShapes: array of integer;
-      OffsetScale: TNeuralFloat): TNNetLayer; overload;
+      ReferenceSource: TNNetLayer; const LevelShapes: array of integer): TNNetLayer;
     // CSPRepLayer: conv3(RepVGG^BlockCount(conv1(x)) + conv2(x)); every RepVGG
     // block folds into one 3x3 conv; conv3 only when HiddenCh <> OutCh.
     function AddCSPRepLayer(Source: TNNetLayer; HiddenCh, OutCh,
@@ -96599,30 +96640,24 @@ begin
     AttnPrefix + 'attention_weights.bias');
 end;
 
-function TRtDetrNetBuilder.AddDeformableAttention(OffsetsLogits, ValueSource,
-  ReferenceSource: TNNetLayer; Heads: integer;
-  const LevelPoints, LevelShapes: array of integer;
-  OffsetScale: TNeuralFloat): TNNetLayer;
+function TRtDetrNetBuilder.DecoderSampleChannels(): integer;
+var
+  LevelPos, MaxLevelPos: integer;
 begin
-  Result := FNN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(Heads,
-    LevelPoints, LevelShapes, ValueSource, ReferenceSource, OffsetScale,
-    FDiscreteSampling).SetTrainable(FTrainable), OffsetsLogits);
+  Result := 0;
+  MaxLevelPos := High(FConfig.DecoderPointsPerLevel);
+  for LevelPos := 0 to MaxLevelPos do
+    Inc(Result, FConfig.DecoderPointsPerLevel[LevelPos]);
+  Result := Result * FConfig.DecoderHeads;
 end;
 
 function TRtDetrNetBuilder.AddDeformableAttention(OffsetsLogits, ValueSource,
-  ReferenceSource: TNNetLayer; Heads, Points: integer;
-  const LevelShapes: array of integer;
-  OffsetScale: TNeuralFloat): TNNetLayer;
-var
-  LevelPoints: TNeuralIntegerArray;
-  LevelPos, MaxLevelPos: integer;
+  ReferenceSource: TNNetLayer; const LevelShapes: array of integer): TNNetLayer;
 begin
-  LevelPoints := nil;
-  SetLength(LevelPoints, Max(Length(LevelShapes) div 2, 1));
-  MaxLevelPos := High(LevelPoints);
-  for LevelPos := 0 to MaxLevelPos do LevelPoints[LevelPos] := Points;
-  Result := AddDeformableAttention(OffsetsLogits, ValueSource, ReferenceSource,
-    Heads, LevelPoints, LevelShapes, OffsetScale);
+  Result := FNN.AddLayerAfter(TNNetMultiScaleDeformableAttention.Create(
+    FConfig.DecoderHeads, FConfig.DecoderPointsPerLevel, LevelShapes,
+    ValueSource, ReferenceSource, FConfig.DecoderOffsetScale,
+    FDiscreteSampling).SetTrainable(FTrainable), OffsetsLogits);
 end;
 
 function TRtDetrNetBuilder.AddCSPRepLayer(Source: TNNetLayer; HiddenCh, OutCh,
@@ -97045,8 +97080,7 @@ begin
     Reference := NN.AddLayerAfter(TNNetSigmoid.Create().SetTrainable(pTrainable),
       Reference);
     // ---- decoder with iterative box refinement ----
-    SampleChannels := Config.DecoderHeads * Config.NumFeatureLevels *
-      Config.DecoderPoints;
+    SampleChannels := Builder.DecoderSampleChannels();
     MaxLayerPos := Config.DecoderLayers - 1;
     for LayerPos := 0 to MaxLayerPos do
     begin
@@ -97064,7 +97098,7 @@ begin
       OffsetsLogits := Builder.AddSamplingOffsetsAndLogits(QueryKey,
         SampleChannels, Prefix + 'encoder_attn.');
       Attention := Builder.AddDeformableAttention(OffsetsLogits, Values,
-        Reference, Config.DecoderHeads, Config.DecoderPoints, LevelShapes, 0.5);
+        Reference, LevelShapes);
       Attention := Builder.AddLinear(Attention, DModel, DModel,
         Prefix + 'encoder_attn.output_proj');
       Attention := NN.AddLayer(TNNetSum.Create([Attention, AttentionNorm])
@@ -97423,8 +97457,6 @@ function ReadDFineConfigFromJSONFile(const FileName: string;
 var
   Obj, EmptyBackbone: TJSONObject;
   Field: TJSONData;
-  Points: TJSONArray;
-  LevelPos, MaxLevelPos: integer;
 begin
   Obj := LoadImportJSONObject(FileName, 'D-FINE');
   try
@@ -97458,30 +97490,9 @@ begin
     Result.Detector.DownsampleInBottleneck := false;
     Result.Detector.BackboneActivation := Result.Backbone.Activation;
     Result.Detector.NumChannels := Result.Backbone.NumChannels;
-    Result.Detector.DecoderPoints := 0;
     Result.Detector.ImageWidth := ImageWidth;
     Result.Detector.ImageHeight := ImageHeight;
-    // decoder_n_points: one count for every level, or a list with one per level.
-    Result.DecoderPointsPerLevel := nil;
-    SetLength(Result.DecoderPointsPerLevel, Result.Detector.NumFeatureLevels);
-    MaxLevelPos := Result.Detector.NumFeatureLevels - 1;
-    Field := Obj.Find('decoder_n_points');
-    if Field is TJSONArray then
-    begin
-      Points := TJSONArray(Field);
-      if Points.Count <> Result.Detector.NumFeatureLevels then
-        ImportError('D-FINE import: decoder_n_points lists ' +
-          IntToStr(Points.Count) + ' counts for ' +
-          IntToStr(Result.Detector.NumFeatureLevels) + ' feature levels.');
-      for LevelPos := 0 to MaxLevelPos do
-        Result.DecoderPointsPerLevel[LevelPos] := Points.Items[LevelPos].AsInteger;
-    end
-    else
-      for LevelPos := 0 to MaxLevelPos do
-        Result.DecoderPointsPerLevel[LevelPos] := Obj.Get('decoder_n_points', 4);
     Result.DepthMult := ReadJSONFloatOrDefault(Obj, 'depth_mult', 1.0);
-    Result.DecoderOffsetScale := ReadJSONFloatOrDefault(Obj,
-      'decoder_offset_scale', 0.5);
     Result.MaxNumBins := Obj.Get('max_num_bins', 32);
     Result.LqeHiddenDim := Obj.Get('lqe_hidden_dim', 64);
     Result.LqeLayers := Obj.Get('lqe_layers', 2);
@@ -97515,31 +97526,18 @@ begin
 end;
 
 function DFineConfigToString(const Config: TDFineConfig): string;
-
-  function JoinIntegers(const Values: TNeuralIntegerArray): string;
-  var
-    ValuePos, MaxValuePos: integer;
-  begin
-    Result := '';
-    MaxValuePos := High(Values);
-    for ValuePos := 0 to MaxValuePos do
-    begin
-      if ValuePos > 0 then Result := Result + ',';
-      Result := Result + IntToStr(Values[ValuePos]);
-    end;
-  end;
-
 begin
   Result := 'd_fine config: backbone hgnet_v2 stages=[' +
-    JoinIntegers(Config.Backbone.StageOutChannels) + '] blocks=[' +
-    JoinIntegers(Config.Backbone.StageNumBlocks) + ']' +
+    JoinIntegerArray(Config.Backbone.StageOutChannels) + '] blocks=[' +
+    JoinIntegerArray(Config.Backbone.StageNumBlocks) + ']' +
     ', encoder hidden=' + IntToStr(Config.Detector.EncoderHiddenDim) +
     ' depth_mult=' + FloatToStr(Config.DepthMult) +
     ', d_model=' + IntToStr(Config.Detector.DModel) +
     ', decoder=' + IntToStr(Config.Detector.DecoderLayers) + 'x' +
     IntToStr(Config.Detector.DecoderHeads) + 'h points=[' +
-    JoinIntegers(Config.DecoderPointsPerLevel) + '] eval_idx=' +
+    JoinIntegerArray(Config.Detector.DecoderPointsPerLevel) + '] eval_idx=' +
     IntToStr(Config.EvalIdx) + ' bins=' + IntToStr(Config.MaxNumBins) +
+    ' offset_scale=' + FloatToStr(Config.Detector.DecoderOffsetScale) +
     BoolToStr(Config.Detector.DecoderDiscreteSampling, ' discrete', '') +
     ', queries=' + IntToStr(Config.Detector.NumQueries) +
     ', labels=' + IntToStr(Config.Detector.NumLabels) +
@@ -97853,7 +97851,7 @@ var
   Hidden, PreviousHidden, Box, QueryPosition, QueryKey, AttentionNorm: TNNetLayer;
   CrossInput, OffsetsLogits, Attention, Corners, PreviousCorners: TNNetLayer;
   Probabilities, InitialBox, BoxScale, BoxCentre, HeadInput, Logits: TNNetLayer;
-  LayerPos, MaxLayerPos, LevelPos, MaxLevelPos, SampleChannels: integer;
+  LayerPos, MaxLayerPos, SampleChannels: integer;
   DModel, BinCount: integer;
   Prefix, EvalName: string;
 begin
@@ -97868,11 +97866,7 @@ begin
     ImportError('D-FINE import: lqe_layers must be >= 1.');
   if Abs(FDFineConfig.RegScale) = 0 then
     ImportError('D-FINE import: reg_scale must not be 0.');
-  MaxLevelPos := High(FDFineConfig.DecoderPointsPerLevel);
-  SampleChannels := 0;
-  for LevelPos := 0 to MaxLevelPos do
-    Inc(SampleChannels, FDFineConfig.DecoderPointsPerLevel[LevelPos]);
-  SampleChannels := SampleChannels * FConfig.DecoderHeads;
+  SampleChannels := DecoderSampleChannels();
   Hidden := Encoder.Target;
   Box := FNN.AddLayerAfter(TNNetSigmoid.Create().SetTrainable(FTrainable),
     Encoder.ReferenceLogits);
@@ -97900,8 +97894,7 @@ begin
       Prefix + 'encoder_attn.');
     // D-FINE samples the decoder memory itself: no value_proj, no output_proj.
     Attention := AddDeformableAttention(OffsetsLogits, Encoder.SourceFlat, Box,
-      FConfig.DecoderHeads, FDFineConfig.DecoderPointsPerLevel,
-      Encoder.LevelShapes, FDFineConfig.DecoderOffsetScale);
+      Encoder.LevelShapes);
     Hidden := AddGate(AttentionNorm, Attention, Prefix + 'gateway.');
     Hidden := AddFeedForward(Hidden, DModel, FConfig.DecoderFFNDim,
       FConfig.DecoderActivation, Prefix);
