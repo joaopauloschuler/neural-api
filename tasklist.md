@@ -1594,13 +1594,22 @@ rather than acted on.
         resize against `DBNetPrepareInput` on a large downscale (the pico case only
         downscales 120x90 -> 85x64), and docTR's padding removal against
         `DecodeDBNetTextBoxes`'s pixel mapping.
-  - [ ] examples/DocumentOCR (.lpr + .lpi + README.md, cthreads first): image in ->
-        `BuildDBNetFromSafeTensors` + `DetectDBNetTextBoxes` -> sort into reading order
-        (top-to-bottom, then left-to-right) -> crop + resize each line -> existing
-        TrOCR (`microsoft/trocr-small-printed`) -> text out, plus `--boxes out.png`
-        drawing the boxes with the existing drawing helpers. Pico fixtures
-        (tests/fixtures/tiny_dbnet_*) make it run offline; `--gpu` and `--int8`
-        follow the other vision examples.
+  - [X] examples/DocumentOCR (.lpr + .lpi + README.md, cthreads first): image in ->
+        `BuildDBNetFromSafeTensors` + `DetectDBNetTextBoxes` ->
+        `SortDBNetTextBoxesInReadingOrder` (lines by box centre vs the line's mean
+        bottom, then left to right) -> `TranscribeTrOCRImageRegion` (crop,
+        `ClipPreprocessImage` with the preprocessor_config.json or
+        `DefaultTrOCRImageProcessorConfig`, `DecodeTrOCRGreedy`) -> text, plus
+        `--boxes out.png` (`DrawRectangleOutline`, now also used by ObjectTracking and
+        PoseEstimation). The TrOCR decoder now holds the whole position table, so a
+        DecSeqLen=1 build decodes with the KV cache (DecodeSeq2SeqForcedPrefixCached).
+        `--smoke` runs the pico fixtures offline; `--gpu` / `--int8` as the other vision
+        examples. Tests: TestDBNetReadingOrder, TestTrOCRCachedDecodeAndRegion,
+        TestDrawRectangleOutline. CODED, not supported: still open is a real run
+        (docTR db_mobilenet_v3_large + microsoft/trocr-small-printed on a scanned page
+        and a photo), checking that the trocr-small sentencepiece.bpe.model (fairseq id
+        layout) decodes correctly through `--tokenizer` or that a tokenizer.json is
+        available, and measuring TrOCR (trained on lines) on docTR's word boxes.
   - [ ] Rotated boxes (docTR assume_straight_pages=False): min-area rectangle of each
         component's contour + polygon unclip; `DecodeDBNetTextBoxes` is
         axis-aligned only. Also not ported: cv2.findContours RETR_EXTERNAL drops a

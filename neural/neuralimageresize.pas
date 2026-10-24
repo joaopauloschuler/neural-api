@@ -160,6 +160,11 @@ procedure FillCircleCV2(Image: TNNetVolume; CenterX, CenterY, Radius: integer;
 procedure FillRectangleCV2(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
   const Color: array of TNeuralFloat);
 
+// The outline of the (X1, Y1)-(X2, Y2) rectangle (corners in any order, both
+// inclusive, clipped), Thickness pixels wide inwards.
+procedure DrawRectangleOutline(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat; Thickness: integer = 1);
+
 const
   // DrawBitmapText glyph size in font pixels; glyphs sit 1 font pixel apart.
   csBitmapFontGlyphWidth = 5;
@@ -1317,6 +1322,31 @@ procedure FillRectangleCV2(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
 begin
   CheckDrawColor(Image, Color, 'FillRectangleCV2');
   FillRectangleUnchecked(Image, X1, Y1, X2, Y2, Color);
+end;
+
+procedure DrawRectangleOutline(Image: TNNetVolume; X1, Y1, X2, Y2: integer;
+  const Color: array of TNeuralFloat; Thickness: integer);
+var
+  Left, Top, Right, Bottom, MaxRingPos, RingPos: integer;
+begin
+  CheckDrawColor(Image, Color, 'DrawRectangleOutline');
+  Left := Min(X1, X2);
+  Right := Max(X1, X2);
+  Top := Min(Y1, Y2);
+  Bottom := Max(Y1, Y2);
+  MaxRingPos := Thickness - 1;
+  for RingPos := 0 to MaxRingPos do
+  begin
+    if (Left > Right) or (Top > Bottom) then exit;
+    FillRectangleUnchecked(Image, Left, Top, Right, Top, Color);
+    FillRectangleUnchecked(Image, Left, Bottom, Right, Bottom, Color);
+    FillRectangleUnchecked(Image, Left, Top, Left, Bottom, Color);
+    FillRectangleUnchecked(Image, Right, Top, Right, Bottom, Color);
+    Inc(Left);
+    Inc(Top);
+    Dec(Right);
+    Dec(Bottom);
+  end;
 end;
 
 const

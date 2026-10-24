@@ -120,6 +120,7 @@ examples/InstanceSegmentation/*.ppu
 __pycache__/
 *.pyc
 examples/ColorizePhoto/*.png
+examples/DocumentOCR/*.png
 examples/FaceRestoration/*.png
 examples/BackgroundRemoval/*.png
 examples/ImageMatting/*.png

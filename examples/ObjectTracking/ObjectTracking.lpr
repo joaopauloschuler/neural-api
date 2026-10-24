@@ -305,14 +305,7 @@ begin
     Y1 := Round(EnsureRange(Tracks[TrackPos].Y1, -1, Image.SizeY));
     X2 := Round(EnsureRange(Tracks[TrackPos].X2, -1, Image.SizeX));
     Y2 := Round(EnsureRange(Tracks[TrackPos].Y2, -1, Image.SizeY));
-    DrawLineCV2(Image, X1, Y1, X2, Y1, BoxColor);
-    DrawLineCV2(Image, X1, Y2, X2, Y2, BoxColor);
-    DrawLineCV2(Image, X1, Y1, X1, Y2, BoxColor);
-    DrawLineCV2(Image, X2, Y1, X2, Y2, BoxColor);
-    DrawLineCV2(Image, X1 + 1, Y1 + 1, X2 - 1, Y1 + 1, BoxColor);
-    DrawLineCV2(Image, X1 + 1, Y2 - 1, X2 - 1, Y2 - 1, BoxColor);
-    DrawLineCV2(Image, X1 + 1, Y1 + 1, X1 + 1, Y2 - 1, BoxColor);
-    DrawLineCV2(Image, X2 - 1, Y1 + 1, X2 - 1, Y2 - 1, BoxColor);
+    DrawRectangleOutline(Image, X1, Y1, X2, Y2, BoxColor, {Thickness=}2);
     // The tag sits above the box, or inside it when the box touches the top.
     TagTop := Y1 - TagHeight;
     if TagTop < 0 then TagTop := Y1;

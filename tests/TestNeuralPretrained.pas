@@ -1348,6 +1348,9 @@ type
     procedure TestBlipCaptionGreedy;
     procedure TestTrOCRConfigFromJSONFile;
     procedure TestTrOCRParity;
+    // A DecSeqLen=1 TrOCR decoder (KV cache) emits the full-prefix ids, and
+    // TranscribeTrOCRImageRegion equals crop + preprocess + DecodeTrOCRGreedy.
+    procedure TestTrOCRCachedDecodeAndRegion;
     procedure TestFlorence2LocationTokens;
     procedure TestFlorence2Parity;
     procedure TestFlorence2PositionTableShape;
@@ -1706,6 +1709,8 @@ type
     procedure TestDBNetMobileNetV3LargeParity;
     procedure TestDBNetResNet50Parity;
     procedure TestDBNetDecodeSyntheticMap;
+    // SortDBNetTextBoxesInReadingOrder: two lines of shuffled word boxes.
+    procedure TestDBNetReadingOrder;
     // FaceAlignmentMatrix + AlignWarpFace + PasteFaceIntoImage against a numpy
     // port of facexlib (float warp, cv2 4.10 erode / GaussianBlur / Lanczos4).
     procedure TestFacePasteMatchesFacexlibOracle;
@@ -43966,6 +43971,67 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestTrOCRCachedDecodeAndRegion;
+var
+  EncoderNet, FullDecoder, CachedEncoder, CachedDecoder: TNNet;
+  Config: TTrOCRConfig;
+  Processor: TClipImageProcessorConfig;
+  Image, Region, PixelValues: TNNetVolume;
+  FullIds, CachedIds, RegionIds: TNeuralIntegerArray;
+  X, Y, Channel, IdPos: integer;
+begin
+  BuildTrOCRFromSafeTensors(FixturePath('tiny_trocr.safetensors'),
+    EncoderNet, FullDecoder, Config, {DecSeqLen=}20, {pTrainable=}false,
+    FixturePath('tiny_trocr_config.json'));
+  BuildTrOCRFromSafeTensors(FixturePath('tiny_trocr.safetensors'),
+    CachedEncoder, CachedDecoder, Config, {DecSeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_trocr_config.json'));
+  Image := TNNetVolume.Create(40, 20, 3);
+  Region := TNNetVolume.Create;
+  PixelValues := TNNetVolume.Create;
+  try
+    for Channel := 0 to 2 do
+      for Y := 0 to 19 do
+        for X := 0 to 39 do
+          Image[X, Y, Channel] := (X * 37 + Y * 91 + Channel * 53) mod 256;
+    Processor := DefaultTrOCRImageProcessorConfig(Config);
+    Region.CopyCropping(Image, 5, 3, 24, 12);
+    ClipPreprocessImage(Region, PixelValues, Processor);
+    AssertEquals('pixel values width', Config.ImageSize, PixelValues.SizeX);
+    FullIds := DecodeTrOCRGreedy(EncoderNet, FullDecoder, PixelValues, Config, 18);
+    CachedIds := DecodeTrOCRGreedy(CachedEncoder, CachedDecoder, PixelValues,
+      Config, 18);
+    AssertTrue('more than one id decoded', Length(FullIds) > 1);
+    AssertEquals('cached id count', Length(FullIds), Length(CachedIds));
+    for IdPos := 0 to High(FullIds) do
+      AssertEquals('cached id ' + IntToStr(IdPos), FullIds[IdPos],
+        CachedIds[IdPos]);
+    RegionIds := TranscribeTrOCRImageRegion(CachedEncoder, CachedDecoder,
+      Config, Processor, Image, 5, 3, 24, 12, 18);
+    AssertEquals('region id count', Length(FullIds), Length(RegionIds));
+    for IdPos := 0 to High(FullIds) do
+      AssertEquals('region id ' + IntToStr(IdPos), FullIds[IdPos],
+        RegionIds[IdPos]);
+    // A region past the image border is clipped instead of read out of bounds.
+    RegionIds := TranscribeTrOCRImageRegion(CachedEncoder, CachedDecoder,
+      Config, Processor, Image, 30, -4, 50, 50, 18);
+    AssertTrue('clipped region decodes', Length(RegionIds) > 0);
+    Image.Fill(255);
+    Region.CopyCropping(Image, 0, 0, 7, 3);
+    ClipPreprocessImage(Region, PixelValues, Processor);
+    AssertEquals('white maps to 1', 1, PixelValues.GetMin(), 1e-6);
+    AssertEquals('white maps to 1 (max)', 1, PixelValues.GetMax(), 1e-6);
+  finally
+    PixelValues.Free;
+    Region.Free;
+    Image.Free;
+    EncoderNet.Free;
+    FullDecoder.Free;
+    CachedEncoder.Free;
+    CachedDecoder.Free;
+  end;
+end;
+
 // Florence-2 location-token (de)quantization: a normalized coordinate <->
 // a <loc_> token id round-trip (the "spatial outputs as text" idea), checked
 // against the reference bins the fixture generator emits.
@@ -60900,6 +60966,48 @@ begin
   finally
     ProbMap.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestDBNetReadingOrder;
+
+  function MakeBox(X1, Y1, X2, Y2: TNeuralFloat): TDBNetTextBox;
+  begin
+    Result.X1 := X1;
+    Result.Y1 := Y1;
+    Result.X2 := X2;
+    Result.Y2 := Y2;
+    Result.Score := X1;
+    Result.ClassId := 0;
+  end;
+
+const
+  csExpectedLeft: array[0..4] of TNeuralFloat = (5, 50, 90, 10, 70);
+  csExpectedLine: array[0..4] of integer = (0, 0, 0, 1, 1);
+var
+  Boxes: TDBNetTextBoxArray;
+  LineIds: TNeuralIntegerArray;
+  BoxPos: integer;
+begin
+  SetLength(Boxes, 5);
+  Boxes[0] := MakeBox(70, 42, 100, 58);
+  Boxes[1] := MakeBox(50, 10, 80, 30);
+  Boxes[2] := MakeBox(10, 40, 60, 60);
+  Boxes[3] := MakeBox(90, 8, 120, 34);   // the tallest box of line 0
+  Boxes[4] := MakeBox(5, 12, 40, 28);
+  SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
+  AssertEquals('line id count', 5, Length(LineIds));
+  for BoxPos := 0 to 4 do
+  begin
+    AssertEquals('box ' + IntToStr(BoxPos) + ' left', csExpectedLeft[BoxPos],
+      Boxes[BoxPos].X1, 0);
+    AssertEquals('box ' + IntToStr(BoxPos) + ' line', csExpectedLine[BoxPos],
+      LineIds[BoxPos]);
+    AssertEquals('box ' + IntToStr(BoxPos) + ' kept its fields',
+      Boxes[BoxPos].X1, Boxes[BoxPos].Score, 0);
+  end;
+  SetLength(Boxes, 0);
+  SortDBNetTextBoxesInReadingOrder(Boxes, LineIds);
+  AssertEquals('no boxes, no lines', 0, Length(LineIds));
 end;
 
 // A FastSAM-x config with only widths/depths derives the ultralytics head widths.

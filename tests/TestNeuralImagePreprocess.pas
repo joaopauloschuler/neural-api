@@ -148,6 +148,8 @@ type
     // Text and FillRectangleCV2 across or far past the image border are
     // clipped pixel-exactly without exceptions; a wrong Color length raises.
     procedure TestBitmapTextClipsAtBorder;
+    // DrawRectangleOutline: swapped corners, a 2 px ring inwards, border clipping.
+    procedure TestDrawRectangleOutline;
   end;
 
 implementation
@@ -2116,6 +2118,33 @@ begin
   end;
 end;
 
+procedure TTestNeuralImagePreprocess.TestDrawRectangleOutline;
+var
+  Image: TNNetVolume;
+begin
+  Image := TNNetVolume.Create(8, 6, 1);
+  try
+    Image.Fill(0);
+    DrawRectangleOutline(Image, 6, 4, 1, 1, [1]);
+    // 6 x 4 outline: 2 * 6 + 2 * 2 pixels.
+    AssertEquals('1 px ring', 16, Image.GetSum(), 0);
+    AssertEquals('corner', 1, Image[1, 1, 0], 0);
+    AssertEquals('inside', 0, Image[3, 2, 0], 0);
+    Image.Fill(0);
+    DrawRectangleOutline(Image, 0, 0, 7, 5, [1], 2);
+    // Rings 8 x 6 and 6 x 4: 24 + 16 pixels, the 4 x 2 centre stays empty.
+    AssertEquals('2 px ring', 40, Image.GetSum(), 0);
+    AssertEquals('second ring', 1, Image[1, 1, 0], 0);
+    AssertEquals('centre', 0, Image[2, 2, 0], 0);
+    Image.Fill(0);
+    DrawRectangleOutline(Image, -3, 2, 20, 30, [1]);
+    // Only the top edge (row 2) is inside the image.
+    AssertEquals('clipped to the top edge', 8, Image.GetSum(), 0);
+    AssertEquals('row 2', 1, Image[7, 2, 0], 0);
+  finally
+    Image.Free;
+  end;
+end;
 
 initialization
   RegisterTest(TTestNeuralImagePreprocess);

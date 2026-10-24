@@ -171,10 +171,7 @@ begin
     Y1 := Round(Poses[PersonPos].Y1);
     X2 := Round(Poses[PersonPos].X2);
     Y2 := Round(Poses[PersonPos].Y2);
-    DrawLineCV2(Image, X1, Y1, X2, Y1, csBoxColor);
-    DrawLineCV2(Image, X1, Y2, X2, Y2, csBoxColor);
-    DrawLineCV2(Image, X1, Y1, X1, Y2, csBoxColor);
-    DrawLineCV2(Image, X2, Y1, X2, Y2, csBoxColor);
+    DrawRectangleOutline(Image, X1, Y1, X2, Y2, csBoxColor);
     BoxLabel := Format('person %.2f', [Poses[PersonPos].BoxScore]);
     TagTop := Y1 - TagHeight;
     if TagTop < 0 then TagTop := Y1;

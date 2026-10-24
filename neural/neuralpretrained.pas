@@ -8410,11 +8410,8 @@ procedure BuildTrOCRFromSafeTensors(const FileName: string;
 procedure RunTrOCRLogits(EncoderNet, DecoderNet: TNNet;
   PixelValues, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
 
-// Autoregressive greedy transcription: computes the image features once, then
-// runs the standard argmax decode loop from Config.DecoderStartTokenId,
-// stopping at the EOS token or after MaxNewTokens (or when DecSeqLen is
-// exhausted). Returns the GENERATED ids (the start token excluded; the emitted
-// EOS is included). PixelValues is the EncoderNet input volume.
+// Greedy ids after Config.DecoderStartTokenId (EOS included, <= MaxNewTokens) for the
+// EncoderNet input PixelValues; a DecoderNet built with DecSeqLen=1 decodes with the KV cache.
 function DecodeTrOCRGreedy(EncoderNet, DecoderNet: TNNet;
   PixelValues: TNNetVolume; const Config: TTrOCRConfig;
   MaxNewTokens: integer): TNeuralIntegerArray;
@@ -17624,6 +17621,23 @@ function DecodeDBNetTextBoxes(ProbMap: TNNetVolume; const Config: TDBNetConfig;
 function DetectDBNetTextBoxes(NN: TNNet; const Config: TDBNetConfig;
   Image: TNNetVolume; ProbMap: TNNetVolume = nil): TDBNetTextBoxArray;
 
+// Reorders Boxes by text line from the top, left to right inside a line; LineIds[i]
+// (from 0) is the line of Boxes[i]; a box joins a line while its centre is above its mean bottom.
+procedure SortDBNetTextBoxesInReadingOrder(var Boxes: TDBNetTextBoxArray;
+  out LineIds: TNeuralIntegerArray);
+
+// TrOCR's ViTImageProcessor for a missing preprocessor_config.json: an ImageSize
+// square bilinear resize, rescale 1/255, mean = std = 0.5, no crop.
+function DefaultTrOCRImageProcessorConfig(
+  const Config: TTrOCRConfig): TClipImageProcessorConfig;
+
+// DecodeTrOCRGreedy ids of the Left, Top, Width x Height pixel region of Image
+// (RGB 0..255, clipped to the image) after the Processor resize + normalize.
+function TranscribeTrOCRImageRegion(EncoderNet, DecoderNet: TNNet;
+  const Config: TTrOCRConfig; const Processor: TClipImageProcessorConfig;
+  Image: TNNetVolume; Left, Top, Width, Height,
+  MaxNewTokens: integer): TNeuralIntegerArray;
+
 type
   // One person: the xyxy detector box in photo pixels, its score and the joints.
   TPoseKeypoints = record
@@ -18146,7 +18160,8 @@ var
 implementation
 
 uses
-  RegExpr; // diffusers' re.search over the UNet module names (SDUNetPAGLayerIndices)
+  RegExpr, // diffusers' re.search over the UNet module names (SDUNetPAGLayerIndices)
+  neuraldecode; // DecodeSeq2SeqForcedPrefixCached (TrOCR KV-cache decode)
 
 procedure ImportError(const Msg: string);
 begin
@@ -67064,8 +67079,9 @@ begin
         TNNetInput.Create(NumTokens, 1, Config.DModel, 1), 0);
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
         Config.VocabSize, Config.DModel, {EncodeZero=}1).SetTrainable(pTrainable), DecTokenInput);
-      DecPos := Dec.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(SeqLen).SetTrainable(pTrainable) );
+      // The whole position table, so a DecSeqLen=1 net can stream (KV cache).
+      DecPos := Dec.AddLayer( TNNetLearnedPositionalEmbedding.Create(
+        Config.MaxPositions).SetTrainable(pTrainable) );
       DecEmbLN := Dec.AddLayer(
         TNNetTokenLayerNorm.Create(Config.DecLayerNormEps).SetTrainable(pTrainable) );
       if not pTrainable then Dec.SetTrainable();
@@ -67125,11 +67141,10 @@ begin
           ImportError('TrOCR import: embed_positions must have ' +
             IntToStr((Config.MaxPositions + TrOCRPosOffset) * Config.DModel) +
             ' elements, got ' + IntToStr(Tmp.Size) + '.');
-        // The window is rows TrOCRPosOffset..TrOCRPosOffset+SeqLen-1 of the
-        // source table, contiguous at the same DModel stride as the target.
+        // Rows TrOCRPosOffset.. of the source table, at the target's stride.
         Move(Tmp.FData[TrOCRPosOffset * Config.DModel],
           DecPos.FArrNeurons[0].Weights.FData[0],
-          SeqLen * Config.DModel * csNeuralFloatSize);
+          Config.MaxPositions * Config.DModel * csNeuralFloatSize);
         DecPos.FlushWeightCache();
         Consumed.Add('decoder.model.decoder.embed_positions.weight');
       finally
@@ -67227,8 +67242,16 @@ begin
   if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
     ImportError('DecodeTrOCRGreedy: encoder/decoder image-states size ' +
       'mismatch.');
-  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
   DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  if DecSeqLen = 1 then
+  begin
+    // Position MaxPositions - 1 is the last one the table holds.
+    Result := DecodeSeq2SeqForcedPrefixCached(DecoderNet,
+      EncoderNet.GetLastLayer().Output, [Config.DecoderStartTokenId],
+      Config.EosTokenId, Min(MaxNewTokens, Config.MaxPositions - 1));
+    exit;
+  end;
+  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
   Logits := DecoderNet.GetLastLayer().Output;
   DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
   try
@@ -119927,6 +119950,108 @@ begin
   finally
     if Output <> ProbMap then Output.Free;
     NetInput.Free;
+  end;
+end;
+
+procedure SortDBNetTextBoxesInReadingOrder(var Boxes: TDBNetTextBoxArray;
+  out LineIds: TNeuralIntegerArray);
+var
+  Moving: TDBNetTextBox;
+  BoxPos, InsertPos, MaxBoxPos, LineStart, LineCount, LineId: integer;
+  MovingKey, LineBottomSum, CentreY: TNeuralFloat;
+begin
+  MaxBoxPos := High(Boxes);
+  SetLength(LineIds, MaxBoxPos + 1);
+  // Insertion sort by centre Y (Y1 + Y2 orders the same as the centre).
+  for BoxPos := 1 to MaxBoxPos do
+  begin
+    Moving := Boxes[BoxPos];
+    MovingKey := Moving.Y1 + Moving.Y2;
+    InsertPos := BoxPos;
+    while (InsertPos > 0) and
+      (Boxes[InsertPos - 1].Y1 + Boxes[InsertPos - 1].Y2 > MovingKey) do
+    begin
+      Boxes[InsertPos] := Boxes[InsertPos - 1];
+      Dec(InsertPos);
+    end;
+    Boxes[InsertPos] := Moving;
+  end;
+  // Centres only grow, so a box leaves the line once its centre passes the
+  // mean bottom of the boxes the line holds.
+  LineId := -1;
+  LineStart := 0;
+  LineCount := 0;
+  LineBottomSum := 0;
+  for BoxPos := 0 to MaxBoxPos do
+  begin
+    CentreY := (Boxes[BoxPos].Y1 + Boxes[BoxPos].Y2) * 0.5;
+    if (LineCount = 0) or (CentreY > LineBottomSum / LineCount) then
+    begin
+      Inc(LineId);
+      LineStart := BoxPos;
+      LineCount := 0;
+      LineBottomSum := 0;
+    end;
+    Inc(LineCount);
+    LineBottomSum := LineBottomSum + Boxes[BoxPos].Y2;
+    LineIds[BoxPos] := LineId;
+    // Insertion sort of the current line by left edge.
+    Moving := Boxes[BoxPos];
+    InsertPos := BoxPos;
+    while (InsertPos > LineStart) and (Boxes[InsertPos - 1].X1 > Moving.X1) do
+    begin
+      Boxes[InsertPos] := Boxes[InsertPos - 1];
+      Dec(InsertPos);
+    end;
+    Boxes[InsertPos] := Moving;
+  end;
+end;
+
+function DefaultTrOCRImageProcessorConfig(
+  const Config: TTrOCRConfig): TClipImageProcessorConfig;
+var
+  Channel: integer;
+begin
+  Result.ShortestEdge := Config.ImageSize;
+  Result.ResizeKeepsAspect := false;
+  Result.ResizeHeight := Config.ImageSize;
+  Result.ResizeWidth := Config.ImageSize;
+  Result.CropHeight := Config.ImageSize;
+  Result.CropWidth := Config.ImageSize;
+  Result.DoResize := true;
+  Result.DoCenterCrop := false;
+  Result.DoRescale := true;
+  Result.DoNormalize := true;
+  Result.RescaleFactor := 1 / 255;
+  for Channel := 0 to 2 do
+  begin
+    Result.Mean[Channel] := 0.5;
+    Result.Std[Channel] := 0.5;
+  end;
+  Result.Resample := irfBilinear;
+end;
+
+function TranscribeTrOCRImageRegion(EncoderNet, DecoderNet: TNNet;
+  const Config: TTrOCRConfig; const Processor: TClipImageProcessorConfig;
+  Image: TNNetVolume; Left, Top, Width, Height,
+  MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  Region, PixelValues: TNNetVolume;
+begin
+  Left := EnsureRange(Left, 0, Image.SizeX - 1);
+  Top := EnsureRange(Top, 0, Image.SizeY - 1);
+  Width := EnsureRange(Width, 1, Image.SizeX - Left);
+  Height := EnsureRange(Height, 1, Image.SizeY - Top);
+  Region := TNNetVolume.Create;
+  PixelValues := TNNetVolume.Create;
+  try
+    Region.CopyCropping(Image, Left, Top, Width, Height);
+    ClipPreprocessImage(Region, PixelValues, Processor);
+    Result := DecodeTrOCRGreedy(EncoderNet, DecoderNet, PixelValues, Config,
+      MaxNewTokens);
+  finally
+    PixelValues.Free;
+    Region.Free;
   end;
 end;
 
