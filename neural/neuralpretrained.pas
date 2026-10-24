@@ -14837,26 +14837,59 @@ function BuildCogVideoXFromSafeTensors(const FileName: string;
 // block type or activation the decoder does not build.
 function ReadCogVideoXVaeConfig(const FileName: string): TCogVideoXVaeConfig;
 
-// Frames the decoder emits for LatentFrames latent frames (whole-clip decode).
+// Frames the decoder emits for LatentFrames latent frames (the batched decode
+// emits as many as a whole-clip one).
 function CogVideoXVaeOutputFrames(const Config: TCogVideoXVaeConfig;
   LatentFrames: integer): integer;
 
-// Builds the AutoencoderKLCogVideoX decoder (post_quant_conv .. conv_out) for a
-// whole (LatentFrames, LatentH, LatentW) clip from Reader (caller owns Reader).
-function BuildCogVideoXVaeDecoder(Reader: TNNetSafeTensorsReader;
-  const Config: TCogVideoXVaeConfig; LatentFrames, LatentH,
-  LatentW: integer): TNNet;
+type
+  // The causal convs (time kernel > 1) of one decoder net, in build order: the
+  // layer holding each padded input and, in a cached-pad net, its cache input.
+  TCogVideoXVaeCausalConvs = record
+    PadLayers, CacheInputs: array of TNNetLayer;
+    // Depth channels of the last 2 padded frames: diffusers' conv_cache.
+    CacheChannels: array of TNeuralIntegerArray;
+  end;
 
-// VaePath is a diffusers vae folder (config.json + diffusion_pytorch_model)
-// or a .safetensors file with a sibling config.json.
-function BuildCogVideoXVaeDecoderFromPath(const VaePath: string;
-  out Config: TCogVideoXVaeConfig; LatentFrames, LatentH,
-  LatentW: integer): TNNet;
-
-// Decodes the scaled latent (flat (t,h,w,c), the denoiser's layout) into
-// Frames = (W, H*FrameCount, OutChannels): frame f holds rows [f*H, (f+1)*H).
-procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXVaeConfig;
-  Latent: TNNetVolume; Frames: TNNetVolume);
+  // diffusers AutoencoderKLCogVideoX._decode: 2 latent frames per batch (the
+  // first batch also takes an odd clip's extra frame), every causal conv
+  // padded with the last 2 input frames of the batch before. Each net holds
+  // one batch, so RAM follows the batch size, not the clip. Coded by Claude (AI).
+  TCogVideoXVaeDecoder = class(TObject)
+  private
+    FConfig: TCogVideoXVaeConfig;
+    FLatentFrames, FLatentH, FLatentW, FFirstBatchFrames: integer;
+    // FFirstNet (frame-0 repeat pad) owns the weights and decodes the first
+    // batch; FNextNet (cached pad) borrows them; nil for a one-batch clip.
+    FFirstNet, FNextNet: TNNet;
+    FFirstConvs, FNextConvs: TCogVideoXVaeCausalConvs;
+    FPackedLatent: TNNetVolume;
+    procedure BuildNets(Reader: TNNetSafeTensorsReader);
+    // Runs Net on latent frames [FirstFrame, FirstFrame + its batch) and
+    // writes its output frames into Frames from output frame OutFrame on.
+    procedure DecodeBatch(Net: TNNet; Latent: TNNetVolume;
+      FirstFrame: integer; Frames: TNNetVolume; var OutFrame: integer);
+    function GetBatchCount(): integer;
+    function GetOutputFrames(): integer;
+  public
+    // VaePath is a diffusers vae folder (config.json + diffusion_pytorch_model)
+    // or a .safetensors file with a sibling config.json.
+    constructor Create(const VaePath: string; LatentFrames, LatentH,
+      LatentW: integer);
+    // Loads the decoder (post_quant_conv .. conv_out) from Reader (caller owns it).
+    constructor CreateFromReader(Reader: TNNetSafeTensorsReader;
+      const Config: TCogVideoXVaeConfig; LatentFrames, LatentH, LatentW: integer);
+    destructor Destroy(); override;
+    // Decodes the scaled latent (flat (t,h,w,c), the denoiser's layout) into
+    // Frames = (W, H*OutputFrames, OutChannels), frame f at rows [f*H, f*H+H).
+    procedure Decode(Latent, Frames: TNNetVolume);
+    property Config: TCogVideoXVaeConfig read FConfig;
+    property LatentFrames: integer read FLatentFrames;
+    property OutputFrames: integer read GetOutputFrames;
+    property BatchCount: integer read GetBatchCount;
+    property FirstNet: TNNet read FFirstNet;
+    property NextNet: TNNet read FNextNet;
+  end;
 
 // Returns the CogVideoX denoiser's timestep input (the (1,1,1) scalar, the
 // SECOND TNNetInput) and T5 text-states input (the THIRD TNNetInput).
@@ -115183,9 +115216,12 @@ begin
   end;
 end;
 
-function BuildCogVideoXVaeDecoder(Reader: TNNetSafeTensorsReader;
-  const Config: TCogVideoXVaeConfig; LatentFrames, LatentH,
-  LatentW: integer): TNNet;
+// One decoder net for a BatchFrames-latent-frame batch; Reader = nil borrows
+// WeightOwner's weights. CachedPad: causal pads take cache inputs, not frame 0.
+function BuildCogVideoXVaeBatchNet(Reader: TNNetSafeTensorsReader;
+  WeightOwner: TNNet; const Config: TCogVideoXVaeConfig; BatchFrames, LatentH,
+  LatentW: integer; CachedPad: boolean;
+  out CausalConvs: TCogVideoXVaeCausalConvs): TNNet;
 var
   NN: TNNet;
   LoadedNames: TStringList;
@@ -115197,30 +115233,67 @@ var
   UpPrefix, TensorName: string;
   DecoderChannels: TNeuralIntegerArray;
 
-  // A diffusers Conv3d (KT > 1: CogVideoXCausalConv3d, time padded by
-  // repeating frame 0) or, with a 4-D weight, a per-frame Conv2d.
+  // Records a causal conv's padded input (PadCount + FrameCount frames) and
+  // the channels of its last PadCount frames.
+  procedure AddCausalPad(PadLayer, CacheInput: TNNetLayer;
+    PadCount, Channels: integer);
+  var
+    CacheFrames: TNeuralIntegerArray;
+    FramePos, MaxFramePos, ConvPos: integer;
+  begin
+    CacheFrames := nil;
+    SetLength(CacheFrames, PadCount);
+    MaxFramePos := PadCount - 1;
+    for FramePos := 0 to MaxFramePos do
+      CacheFrames[FramePos] := FrameCount + FramePos;
+    ConvPos := Length(CausalConvs.PadLayers);
+    SetLength(CausalConvs.PadLayers, ConvPos + 1);
+    SetLength(CausalConvs.CacheInputs, ConvPos + 1);
+    SetLength(CausalConvs.CacheChannels, ConvPos + 1);
+    CausalConvs.PadLayers[ConvPos] := PadLayer;
+    CausalConvs.CacheInputs[ConvPos] := CacheInput;
+    CausalConvs.CacheChannels[ConvPos] :=
+      CogVideoXFrameGatherChannels(CacheFrames, Channels);
+  end;
+
+  // A diffusers Conv3d (KT > 1: CogVideoXCausalConv3d, time padded by the
+  // cache input or by repeating frame 0) or, with a 4-D weight, a per-frame Conv2d.
   function AddConv(Source: TNNetLayer; const Prefix: string;
     pOutCh, pInCh, KT, K: integer): TNNetLayer;
   var
     PadFrames: TNeuralIntegerArray;
+    CacheInput: TNNetLayer;
     FramePos, MaxFramePos, PadCount: integer;
   begin
     if KT > 1 then
     begin
       PadCount := KT - 1;
-      PadFrames := nil;
-      SetLength(PadFrames, PadCount + FrameCount);
-      MaxFramePos := PadCount + FrameCount - 1;
-      for FramePos := 0 to MaxFramePos do
-        PadFrames[FramePos] := Max(FramePos - PadCount, 0);
-      Source := NN.AddLayerAfter(TNNetGatherChannels.Create(
-        CogVideoXFrameGatherChannels(PadFrames, pInCh)).SetTrainable(false),
-        Source);
+      CacheInput := nil;
+      if CachedPad then
+      begin
+        CacheInput := NN.AddLayer(TNNetInput.Create(FrameW, FrameH,
+          PadCount * pInCh).SetTrainable(false));
+        Source := NN.AddLayer(TNNetDeepConcat.Create([CacheInput, Source]).
+          SetTrainable(false));
+      end
+      else
+      begin
+        PadFrames := nil;
+        SetLength(PadFrames, PadCount + FrameCount);
+        MaxFramePos := PadCount + FrameCount - 1;
+        for FramePos := 0 to MaxFramePos do
+          PadFrames[FramePos] := Max(FramePos - PadCount, 0);
+        Source := NN.AddLayerAfter(TNNetGatherChannels.Create(
+          CogVideoXFrameGatherChannels(PadFrames, pInCh)).SetTrainable(false),
+          Source);
+      end;
+      AddCausalPad(Source, CacheInput, PadCount, pInCh);
     end;
     Result := NN.AddLayerAfter(TNNetConvolution3D.Create(pOutCh, KT, K,
       (K - 1) div 2, 1, pInCh).SetTrainable(false), Source);
-    LoadTorchConv3D(Reader, Result, Prefix + 'weight', Prefix + 'bias',
-      pOutCh, pInCh, KT, K, csCogVideoXVaeImporter);
+    if Reader <> nil then
+      LoadTorchConv3D(Reader, Result, Prefix + 'weight', Prefix + 'bias',
+        pOutCh, pInCh, KT, K, csCogVideoXVaeImporter);
     LoadedNames.Add(Prefix + 'weight');
     LoadedNames.Add(Prefix + 'bias');
   end;
@@ -115237,17 +115310,17 @@ var
     SourceFrame := nil;
     SetLength(SourceFrame, FrameCount);
     MaxFramePos := FrameCount - 1;
-    IsIdentity := FrameCount = LatentFrames;
+    IsIdentity := FrameCount = BatchFrames;
     for FramePos := 0 to MaxFramePos do
     begin
       if (FrameCount > 1) and Odd(FrameCount) then
       begin
         // z_first -> frame 0, z_rest -> the remaining frames.
         if FramePos = 0 then SourceFrame[FramePos] := 0
-        else SourceFrame[FramePos] := 1 + ((FramePos - 1) * (LatentFrames - 1))
+        else SourceFrame[FramePos] := 1 + ((FramePos - 1) * (BatchFrames - 1))
           div (FrameCount - 1);
       end
-      else SourceFrame[FramePos] := (FramePos * LatentFrames) div FrameCount;
+      else SourceFrame[FramePos] := (FramePos * BatchFrames) div FrameCount;
       IsIdentity := IsIdentity and (SourceFrame[FramePos] = FramePos);
     end;
     if not IsIdentity then
@@ -115272,8 +115345,9 @@ var
       Channels).SetTrainable(false), Source);
     Normed := NN.AddLayer(CreateGroupNorm(Config.NormNumGroups,
       csCogVideoXSpatialNormEps).SetTrainable(false));
-    LoadVaeGroupNorm(Reader, Normed, Prefix + 'norm_layer', Channels,
-      csCogVideoXSpatialNormEps);
+    if Reader <> nil then
+      LoadVaeGroupNorm(Reader, Normed, Prefix + 'norm_layer', Channels,
+        csCogVideoXSpatialNormEps);
     LoadedNames.Add(Prefix + 'norm_layer.weight');
     LoadedNames.Add(Prefix + 'norm_layer.bias');
     Normed := NN.AddLayer(TNNetReshape.Create(FrameW, FrameH,
@@ -115340,9 +115414,9 @@ var
   end;
 
 begin
-  if (LatentFrames < 1) or (LatentH < 1) or (LatentW < 1) then
+  if (BatchFrames < 1) or (LatentH < 1) or (LatentW < 1) then
     ImportError(csCogVideoXVaeImporter + ': empty latent clip ' +
-      IntToStr(LatentFrames) + 'x' + IntToStr(LatentH) + 'x' +
+      IntToStr(BatchFrames) + 'x' + IntToStr(LatentH) + 'x' +
       IntToStr(LatentW) + '.');
   LevelCount := Length(Config.BlockOutChannels);
   // The decoder walks block_out_channels in reverse.
@@ -115352,17 +115426,19 @@ begin
   for UpPos := 0 to MaxUpPos do
     DecoderChannels[UpPos] := Config.BlockOutChannels[MaxUpPos - UpPos];
   TemporalLevels := CogVideoXVaeTemporalLevels(Config);
-  FrameCount := LatentFrames;
+  FrameCount := BatchFrames;
   FrameH := LatentH;
   FrameW := LatentW;
+  CausalConvs := Default(TCogVideoXVaeCausalConvs);
   NN := TNNet.Create();
+  NN.BuildWeightOwner := WeightOwner;
   LoadedNames := TStringList.Create;
   LoadedNames.Sorted := true;
   LoadedNames.Duplicates := dupIgnore;
   try
     // Frame-packed latent: (W, H, T*C), frame t at depth [t*C, t*C + C).
     Zq := NN.AddLayer(TNNetInput.Create(LatentW, LatentH,
-      LatentFrames * Config.LatentChannels).SetTrainable(false));
+      BatchFrames * Config.LatentChannels).SetTrainable(false));
     if Config.UsePostQuantConv then
       Zq := AddConv(Zq, 'post_quant_conv.', Config.LatentChannels,
         Config.LatentChannels, 1, 1);
@@ -115390,7 +115466,13 @@ begin
     NN.AddLayer(TNNetSiLU.Create().SetTrainable(false));
     AddConv(NN.GetLastLayer(), 'decoder.conv_out.conv.', Config.OutChannels,
       OutCh, 3, 3);
-    MaxTensorPos := Reader.Count - 1;
+    if NN.UnlinkedBuildWeightOwnerLayerCount() > 0 then
+      ImportError(csCogVideoXVaeImporter + ': internal error - the batch ' +
+        'net left ' + IntToStr(NN.UnlinkedBuildWeightOwnerLayerCount()) +
+        ' weight layers of its owner unborrowed.');
+    NN.BuildWeightOwner := nil;
+    if Reader <> nil then MaxTensorPos := Reader.Count - 1
+    else MaxTensorPos := -1;
     for TensorPos := 0 to MaxTensorPos do
     begin
       TensorName := Reader.TensorName(TensorPos);
@@ -115409,13 +115491,39 @@ begin
   Result := NN;
 end;
 
-function BuildCogVideoXVaeDecoderFromPath(const VaePath: string;
-  out Config: TCogVideoXVaeConfig; LatentFrames, LatentH,
-  LatentW: integer): TNNet;
+const
+  // diffusers AutoencoderKLCogVideoX.num_latent_frames_batch_size.
+  csCogVideoXVaeFrameBatch = 2;
+
+// Feeds every causal conv of Target the cache diffusers keeps from Source's
+// last forward: the last 2 frames of its padded input.
+procedure CopyCogVideoXVaeConvCaches(const Source,
+  Target: TCogVideoXVaeCausalConvs);
+var
+  ConvPos, MaxConvPos: integer;
+  CacheInput: TNNetLayer;
+begin
+  MaxConvPos := High(Target.CacheInputs);
+  for ConvPos := 0 to MaxConvPos do
+  begin
+    CacheInput := Target.CacheInputs[ConvPos];
+    Source.PadLayers[ConvPos].ForceOutputOnRAM();
+    CacheInput.ForceOutputOnRAM();
+    CacheInput.Output.CopyChannels(Source.PadLayers[ConvPos].Output,
+      Source.CacheChannels[ConvPos]);
+    CacheInput.MarkOutputWrittenOnRAM();
+  end;
+end;
+
+{ TCogVideoXVaeDecoder }
+
+constructor TCogVideoXVaeDecoder.Create(const VaePath: string; LatentFrames,
+  LatentH, LatentW: integer);
 var
   Folder, WeightsFile: string;
   Reader: TNNetSafeTensorsReader;
 begin
+  inherited Create();
   if DirectoryExists(VaePath) then
   begin
     Folder := IncludeTrailingPathDelimiter(VaePath);
@@ -115427,68 +115535,103 @@ begin
     Folder := ExtractFilePath(VaePath);
     WeightsFile := VaePath;
   end;
-  Config := ReadCogVideoXVaeConfig(Folder + 'config.json');
+  FConfig := ReadCogVideoXVaeConfig(Folder + 'config.json');
+  FLatentFrames := LatentFrames;
+  FLatentH := LatentH;
+  FLatentW := LatentW;
   Reader := CreatePretrainedTensorReader(WeightsFile);
   try
-    Result := BuildCogVideoXVaeDecoder(Reader, Config, LatentFrames, LatentH,
-      LatentW);
+    BuildNets(Reader);
   finally
     Reader.Free;
   end;
 end;
 
-procedure DecodeCogVideoXVae(VaeNet: TNNet; const Config: TCogVideoXVaeConfig;
-  Latent: TNNetVolume; Frames: TNNetVolume);
+constructor TCogVideoXVaeDecoder.CreateFromReader(
+  Reader: TNNetSafeTensorsReader; const Config: TCogVideoXVaeConfig;
+  LatentFrames, LatentH, LatentW: integer);
+begin
+  inherited Create();
+  FConfig := Config;
+  FLatentFrames := LatentFrames;
+  FLatentH := LatentH;
+  FLatentW := LatentW;
+  BuildNets(Reader);
+end;
+
+destructor TCogVideoXVaeDecoder.Destroy();
+begin
+  // The borrower goes before the weight owner.
+  FNextNet.Free;
+  FFirstNet.Free;
+  FPackedLatent.Free;
+  inherited Destroy();
+end;
+
+procedure TCogVideoXVaeDecoder.BuildNets(Reader: TNNetSafeTensorsReader);
+begin
+  FFirstBatchFrames := Min(FLatentFrames,
+    csCogVideoXVaeFrameBatch + FLatentFrames mod csCogVideoXVaeFrameBatch);
+  FPackedLatent := TNNetVolume.Create();
+  FFirstNet := BuildCogVideoXVaeBatchNet(Reader, nil, FConfig,
+    FFirstBatchFrames, FLatentH, FLatentW, {CachedPad=}false, FFirstConvs);
+  if GetBatchCount() > 1 then
+    FNextNet := BuildCogVideoXVaeBatchNet(nil, FFirstNet, FConfig,
+      csCogVideoXVaeFrameBatch, FLatentH, FLatentW, {CachedPad=}true,
+      FNextConvs);
+end;
+
+function TCogVideoXVaeDecoder.GetBatchCount(): integer;
+begin
+  Result := Max(FLatentFrames div csCogVideoXVaeFrameBatch, 1);
+end;
+
+function TCogVideoXVaeDecoder.GetOutputFrames(): integer;
+begin
+  Result := CogVideoXVaeOutputFrames(FConfig, FLatentFrames);
+end;
+
+procedure TCogVideoXVaeDecoder.DecodeBatch(Net: TNNet; Latent: TNNetVolume;
+  FirstFrame: integer; Frames: TNNetVolume; var OutFrame: integer);
 var
-  LatentW, LatentH, LatentFrames, LatentCh, OutW, OutH, OutFrames, OutCh: integer;
+  BatchFrames, LatentCh, OutW, OutH, OutFrames, OutCh: integer;
   FramePos, MaxFramePos, PixelPos, MaxPixelPos: integer;
   SrcPos, DstPos, LatentBytes, OutBytes, PixelStride: integer;
-  PackedLatent, Decoded: TNNetVolume;
+  Decoded: TNNetVolume;
 begin
-  LatentW := VaeNet.Layers[0].Output.SizeX;
-  LatentH := VaeNet.Layers[0].Output.SizeY;
-  LatentCh := Config.LatentChannels;
-  LatentFrames := VaeNet.Layers[0].Output.Depth div LatentCh;
-  if Latent.Size <> LatentW * LatentH * LatentFrames * LatentCh then
-    ImportError('DecodeCogVideoXVae: latent has ' + IntToStr(Latent.Size) +
-      ' values, the VAE net takes ' + IntToStr(LatentW * LatentH *
-      LatentFrames * LatentCh) + '.');
+  LatentCh := FConfig.LatentChannels;
+  BatchFrames := Net.Layers[0].Output.Depth div LatentCh;
   // (t, h, w, c) -> frame-packed ((h*W + w)*T + t)*C + c: each (t, pixel) is a
   // contiguous C-float run in both layouts.
-  MaxFramePos := LatentFrames - 1;
-  MaxPixelPos := LatentW * LatentH - 1;
+  FPackedLatent.ReSize(FLatentW, FLatentH, BatchFrames * LatentCh);
+  MaxFramePos := BatchFrames - 1;
+  MaxPixelPos := FLatentW * FLatentH - 1;
   LatentBytes := LatentCh * csNeuralFloatSize;
-  PixelStride := LatentFrames * LatentCh;
-  PackedLatent := TNNetVolume.Create(LatentW, LatentH, LatentFrames * LatentCh);
-  try
-    SrcPos := 0;
-    for FramePos := 0 to MaxFramePos do
+  PixelStride := BatchFrames * LatentCh;
+  SrcPos := FirstFrame * FLatentW * FLatentH * LatentCh;
+  for FramePos := 0 to MaxFramePos do
+  begin
+    DstPos := FramePos * LatentCh;
+    for PixelPos := 0 to MaxPixelPos do
     begin
-      DstPos := FramePos * LatentCh;
-      for PixelPos := 0 to MaxPixelPos do
-      begin
-        Move(Latent.FData[SrcPos], PackedLatent.FData[DstPos], LatentBytes);
-        Inc(SrcPos, LatentCh);
-        Inc(DstPos, PixelStride);
-      end;
+      Move(Latent.FData[SrcPos], FPackedLatent.FData[DstPos], LatentBytes);
+      Inc(SrcPos, LatentCh);
+      Inc(DstPos, PixelStride);
     end;
-    PackedLatent.Mul(1 / Config.ScalingFactor);
-    VaeNet.Compute(PackedLatent);
-  finally
-    PackedLatent.Free;
   end;
-  Decoded := VaeNet.GetLastLayer().Output;
+  FPackedLatent.Mul(1 / FConfig.ScalingFactor);
+  Net.Compute(FPackedLatent);
+  Decoded := Net.GetLastLayer().Output;
   OutW := Decoded.SizeX;
   OutH := Decoded.SizeY;
-  OutCh := Config.OutChannels;
+  OutCh := FConfig.OutChannels;
   OutFrames := Decoded.Depth div OutCh;
   // Frame-packed output -> frames stacked along Y, frame f at rows [f*H, f*H+H).
-  Frames.ReSize(OutW, OutH * OutFrames, OutCh);
   MaxFramePos := OutFrames - 1;
   MaxPixelPos := OutW * OutH - 1;
   OutBytes := OutCh * csNeuralFloatSize;
   PixelStride := OutFrames * OutCh;
-  DstPos := 0;
+  DstPos := OutFrame * OutW * OutH * OutCh;
   for FramePos := 0 to MaxFramePos do
   begin
     SrcPos := FramePos * OutCh;
@@ -115498,6 +115641,33 @@ begin
       Inc(SrcPos, PixelStride);
       Inc(DstPos, OutCh);
     end;
+  end;
+  Inc(OutFrame, OutFrames);
+end;
+
+procedure TCogVideoXVaeDecoder.Decode(Latent, Frames: TNNetVolume);
+var
+  LatentSize, BatchPos, MaxBatchPos, FirstFrame, OutFrame: integer;
+  LastOutput: TNNetVolume;
+begin
+  LatentSize := FLatentW * FLatentH * FLatentFrames * FConfig.LatentChannels;
+  if Latent.Size <> LatentSize then
+    ImportError('TCogVideoXVaeDecoder.Decode: latent has ' +
+      IntToStr(Latent.Size) + ' values, the decoder takes ' +
+      IntToStr(LatentSize) + '.');
+  LastOutput := FFirstNet.GetLastLayer().Output;
+  Frames.ReSize(LastOutput.SizeX, LastOutput.SizeY * GetOutputFrames(),
+    FConfig.OutChannels);
+  OutFrame := 0;
+  DecodeBatch(FFirstNet, Latent, 0, Frames, OutFrame);
+  FirstFrame := FFirstBatchFrames;
+  MaxBatchPos := GetBatchCount() - 1;
+  for BatchPos := 1 to MaxBatchPos do
+  begin
+    if BatchPos = 1 then CopyCogVideoXVaeConvCaches(FFirstConvs, FNextConvs)
+    else CopyCogVideoXVaeConvCaches(FNextConvs, FNextConvs);
+    DecodeBatch(FNextNet, Latent, FirstFrame, Frames, OutFrame);
+    Inc(FirstFrame, csCogVideoXVaeFrameBatch);
   end;
 end;
 

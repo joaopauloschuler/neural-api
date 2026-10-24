@@ -75,7 +75,11 @@ Two parity targets are written, each asserted < 1e-4 by the Pascal test:
       (4 up blocks, 2 of them temporal, 3 latent frames, no post_quant_conv)
       and a 2-block one with post_quant_conv over 2 latent frames (diffusers
       sizes post_quant_conv by out_channels, so it needs out == latent).
-      With <= 3 latent frames diffusers decodes the whole clip in one batch.
+      With <= 3 latent frames diffusers decodes the whole clip in one batch;
+      the "vae_batched" cases (4, 5 and 7 latent frames) go through its
+      frame-batched _decode (2 latent frames per batch, the odd one in the
+      first, each causal conv carrying the last 2 input frames of the batch
+      before it).
 
 The fixture writes RAW diffusers-style tensor names; the Pascal importer reads
 exactly these.
@@ -326,6 +330,41 @@ VAE_CASES = [
     ("tiny_cogvideox_vae", (4, 4, 8, 8), 4, 3, False, 1.15258426, 3, 2, 3),
     ("tiny_cogvideox_vae_pq", (4, 4), 2, CIN, True, 0.7, 2, 2, 3),
 ]
+# Clips longer than 3 latent frames, decoded by diffusers' frame-batched
+# _decode (2 latent frames per batch plus the conv cache) on the VAEs above:
+# (folder, latent frames, latent H, latent W).
+VAE_BATCHED_CASES = [
+    ("tiny_cogvideox_vae", 5, 1, 2),
+    ("tiny_cogvideox_vae_pq", 4, 2, 3),
+    ("tiny_cogvideox_vae_pq", 7, 2, 3),
+]
+
+
+def vae_io_case(vae, folder, scaling, lt, lh, lw):
+    import torch
+    # float32-representable latent, so Pascal reads the same input.
+    latent = torch.randn(1, CIN, lt, lh, lw).float().double()
+    with torch.no_grad():
+        decoded = vae.decode(latent / scaling).sample  # (1, C, T, H, W)
+        if lt > vae.num_latent_frames_batch_size + 1:
+            z = latent / scaling
+            if vae.post_quant_conv is not None:
+                z = vae.post_quant_conv(z)
+            whole, _ = vae.decoder(z)
+            print(f"  {folder}: batched vs whole-clip decode max |diff| = "
+                  f"{(decoded - whole).abs().max().item():.3g}")
+    print(f"  {folder}: latent {lt}x{lh}x{lw} -> decoded "
+          f"{tuple(decoded.shape[2:])} x {decoded.shape[1]}")
+    # Both stored as flat (t, h, w, c), the denoiser's token-major layout.
+    return {
+        "folder": folder,
+        "latent_frames": lt, "latent_height": lh, "latent_width": lw,
+        "latent": latent[0].permute(1, 2, 3, 0).reshape(-1).tolist(),
+        "frames": decoded.shape[2], "height": decoded.shape[3],
+        "width": decoded.shape[4], "channels": decoded.shape[1],
+        "decoded": [float("%.9g" % v) for v in
+                    decoded[0].permute(1, 2, 3, 0).reshape(-1).tolist()],
+    }
 
 
 def write_vae_fixtures(fixtures):
@@ -333,6 +372,7 @@ def write_vae_fixtures(fixtures):
     from diffusers import AutoencoderKLCogVideoX
     torch.manual_seed(20261023)
     io_cases = []
+    vaes = {}
     for (folder, blocks, ratio, out_ch, post_quant, scaling, lt, lh, lw) in VAE_CASES:
         vae = AutoencoderKLCogVideoX(
             in_channels=3, out_channels=out_ch, latent_channels=CIN,
@@ -350,24 +390,14 @@ def write_vae_fixtures(fixtures):
                     param.copy_(0.2 * torch.randn_like(param))
         vae.save_pretrained(os.path.join(fixtures, folder))
         vae = vae.double().eval()
-        # float32-representable latent, so Pascal reads the same input.
-        latent = torch.randn(1, CIN, lt, lh, lw).float().double()
-        with torch.no_grad():
-            decoded = vae.decode(latent / scaling).sample  # (1, C, T, H, W)
-        # Both stored as flat (t, h, w, c), the denoiser's token-major layout.
-        io_cases.append({
-            "folder": folder,
-            "latent_frames": lt, "latent_height": lh, "latent_width": lw,
-            "latent": latent[0].permute(1, 2, 3, 0).reshape(-1).tolist(),
-            "frames": decoded.shape[2], "height": decoded.shape[3],
-            "width": decoded.shape[4], "channels": decoded.shape[1],
-            "decoded": [float("%.9g" % v) for v in
-                        decoded[0].permute(1, 2, 3, 0).reshape(-1).tolist()],
-        })
-        print(f"  {folder}: latent {lt}x{lh}x{lw} -> decoded "
-              f"{tuple(decoded.shape[2:])} x {decoded.shape[1]}")
+        vaes[folder] = (vae, scaling)
+        io_cases.append(vae_io_case(vae, folder, scaling, lt, lh, lw))
+    batched_cases = []
+    for (folder, lt, lh, lw) in VAE_BATCHED_CASES:
+        vae, scaling = vaes[folder]
+        batched_cases.append(vae_io_case(vae, folder, scaling, lt, lh, lw))
     with open(os.path.join(fixtures, "tiny_cogvideox_vae_io.json"), "w") as f:
-        json.dump({"vae": io_cases}, f)
+        json.dump({"vae": io_cases, "vae_batched": batched_cases}, f)
 
 
 # ---------------- write ----------------

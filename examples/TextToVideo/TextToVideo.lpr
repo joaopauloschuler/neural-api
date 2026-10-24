@@ -12,10 +12,10 @@ a frozen SD UNet):
        tokens
     -> multi-step DDIM / DPM-Solver++ reverse loop (TNNetDiffusionScheduler)
     -> sampled (NumFrames, GridH, GridW, in_channels) video latent
-    -> AutoencoderKLCogVideoX decoder (BuildCogVideoXVaeDecoderFromPath +
-       DecodeCogVideoXVae): causal 3D convs, SpatialNorm3D resnets and up
-       blocks that upsample space 2x per block and time 2x on the first
-       log2(temporal_compression_ratio) blocks
+    -> AutoencoderKLCogVideoX decoder (TCogVideoXVaeDecoder, 2 latent frames
+       per batch with the diffusers conv cache): causal 3D convs, SpatialNorm3D
+       resnets and up blocks that upsample space 2x per block and time 2x on
+       the first log2(temporal_compression_ratio) blocks
     -> per-frame RGB -> a sequence of P6 PPM files (frame_00.ppm, frame_01.ppm,
        ...) or PNG files, and optionally one looping animated GIF
        (TNNetAnimatedGIFWriter, neuralgif.pas).
@@ -159,9 +159,9 @@ begin
 end;
 
 var
-  Net, VaeNet: TNNet;
+  Net: TNNet;
+  VaeDecoder: TCogVideoXVaeDecoder;
   Cfg: TCogVideoXConfig;
-  VaeCfg: TCogVideoXVaeConfig;
   Sampler: TCogVideoXSampler;
   FirstBlockCacheThreshold: TNeuralFloat;
   SkippedBefore: integer;
@@ -217,12 +217,12 @@ begin
 
   RandSeed := 424242;
   Net := BuildCogVideoXFromSafeTensors(ST, Cfg, {pTrainable=}false, CfgPath);
-  VaeNet := BuildCogVideoXVaeDecoderFromPath(VaePath, VaeCfg, Cfg.NumFrames,
+  VaeDecoder := TCogVideoXVaeDecoder.Create(VaePath, Cfg.NumFrames,
     Cfg.GridHeight, Cfg.GridWidth);
-  if VaeCfg.LatentChannels <> Cfg.InChannels then
+  if VaeDecoder.Config.LatentChannels <> Cfg.InChannels then
   begin
-    WriteLn('The VAE takes ', VaeCfg.LatentChannels, ' latent channels; the ',
-      'denoiser makes ', Cfg.InChannels, '.');
+    WriteLn('The VAE takes ', VaeDecoder.Config.LatentChannels,
+      ' latent channels; the denoiser makes ', Cfg.InChannels, '.');
     Halt(1);
   end;
   Sampler := TCogVideoXSampler.Create(Net, Cfg);
@@ -282,10 +282,10 @@ begin
 
     // VAE decode: the latent is already flat (t, h, w, c); the frames come
     // back stacked along Y.
-    DecodeCogVideoXVae(VaeNet, VaeCfg, Latent, Decoded);
+    VaeDecoder.Decode(Latent, Decoded);
     DecodedOk := AllFinite(Decoded);
     FrameW := Decoded.SizeX;
-    FrameCount := CogVideoXVaeOutputFrames(VaeCfg, Cfg.NumFrames);
+    FrameCount := VaeDecoder.OutputFrames;
     FrameH := Decoded.SizeY div FrameCount;
     FrameFloats := FrameW * FrameH * Decoded.Depth;
     WriteLn('Decoded video ', FrameCount, ' frames of ', FrameW, 'x', FrameH,
@@ -328,7 +328,7 @@ begin
     Latent.Free;
     Scheduler.Free;
     Sampler.Free;
-    VaeNet.Free;
+    VaeDecoder.Free;
     Net.Free;
   end;
 end.

@@ -1630,7 +1630,7 @@ rather than acted on.
       a cheaper no-UNet route to video is bolting the same temporal block onto the
       landed PixArt DiT.
 - [ ] CogVideoX text-to-VIDEO DiT real-checkpoint follow-up
-      (BuildCogVideoXFromSafeTensors[Ex] + TCogVideoXConfig + DecodeCogVideoXVae +
+      (BuildCogVideoXFromSafeTensors[Ex] + TCogVideoXConfig + TCogVideoXVaeDecoder +
       examples/TextToVideo LANDED, reusing TNNetMRotaryEmbedding 3D RoPE +
       TNNetConvolution3D causal VAE, no new leaf; pico parity TestCogVideoXParity
       < 1e-4): real-checkpoint parity (THUDM/CogVideoX-2b) vs a sliced real checkpoint
@@ -1639,15 +1639,17 @@ rather than acted on.
       T5 encoder over a tokenized prompt feeding BuildT5FromSafeTensors instead of the
       synthetic text states. Further gaps (audit 2026-10-02), which together mean
       the repo has NO usable video generator today:
-  - [ ] VAE follow-up: frame-batched decode with the diffusers conv cache
-        (num_latent_frames_batch_size = 2; each CogVideoXCausalConv3d carries the
-        last 2 input frames of the previous batch, and SpatialNorm3D resizes zq per
-        batch). The whole-clip DecodeCogVideoXVae equals diffusers only for <= 3
-        latent frames; a real 13-latent-frame clip needs the batched path to match
-        (and to fit in RAM).
+  - [X] VAE follow-up: frame-batched decode with the diffusers conv cache
+        (num_latent_frames_batch_size = 2). DONE: TCogVideoXVaeDecoder replaces
+        BuildCogVideoXVaeDecoder*/DecodeCogVideoXVae; a first-batch net (frame-0
+        pad, owns the weights) and a 2-frame cached-pad net (TNNetInput cache +
+        TNNetDeepConcat per causal conv, BuildWeightOwner) hold one batch each;
+        TestCogVideoXVaeBatchedDecodeParity (4/5/7 latent frames) < 1e-4. Left:
+        the nets do not use ShareHostOutputsByLiveness (it would recycle the pad
+        layers the cache copy reads after Compute).
   - [ ] VAE follow-up: spatial tiling (diffusers tiled_decode, tile_sample_min
         240x360, overlap 1/6 x 1/5 with blend_v/blend_h) for 480x720 output.
-  - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (BuildCogVideoXVaeDecoderFromPath
+  - [ ] VAE follow-up: real THUDM/CogVideoX-2b vae run (TCogVideoXVaeDecoder.Create
         on the downloaded vae folder, a 2-3 latent-frame low-res slice against
         diffusers decode) once the chunked path makes it fit; check the encoder
         tensors are ignored and no decoder tensor is left over.

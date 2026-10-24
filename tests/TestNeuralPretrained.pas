@@ -62,6 +62,10 @@ type
     // The latents after every step (SDCaptureEveryStep).
     FSDStepLatents: TNNetVolumeList;
     function FixturePath(const FileName: string): string;
+    // Decodes every case of tiny_cogvideox_vae_io.json's CasesKey array with
+    // TCogVideoXVaeDecoder; each must match diffusers < 1e-4.
+    procedure CheckCogVideoXVaeCases(const CasesKey: string;
+      CaseCount, BatchCountSum: integer);
     // tiny_sd15_pipeline_io.json, parsed raw (its prompts hold UTF-8).
     function LoadSD15PipelineOracle(): TJSONData;
     function LoadSD15Fixture(const FileName: string): TJSONData;
@@ -1609,6 +1613,8 @@ type
     procedure TestCogVideoXParity;
     // Pico AutoencoderKLCogVideoX decoders vs diffusers vae.decode (float64).
     procedure TestCogVideoXVaeDecoderParity;
+    // 4/5/7-latent-frame clips vs diffusers' frame-batched _decode (conv cache).
+    procedure TestCogVideoXVaeBatchedDecodeParity;
     // TCogVideoXSampler's First-Block Cache vs plain loops on a 3-block copy
     // of the pico checkpoint: threshold 0 bit-identical, skips as a reference.
     procedure TestCogVideoXFirstBlockCacheReference;
@@ -56802,47 +56808,50 @@ begin
   end;
 end;
 
-procedure TTestNeuralPretrained.TestCogVideoXVaeDecoderParity;
+procedure TTestNeuralPretrained.CheckCogVideoXVaeCases(const CasesKey: string;
+  CaseCount, BatchCountSum: integer);
 var
-  VaeNN: TNNet;
-  VaeConfig: TCogVideoXVaeConfig;
+  Decoder: TCogVideoXVaeDecoder;
   Latent, Frames: TNNetVolume;
   RefRoot: TJSONData;
   RefJson: TStringList;
   VaeArr, LatArr, DecArr: TJSONArray;
   CaseObj: TJSONObject;
-  CasePos, ValuePos, LatentFrames, OutFrames, OutH: integer;
+  CasePos, ValuePos, OutFrames, OutH, BatchCountTotal: integer;
   Diff, MaxDiff: double;
 begin
   RefJson := TStringList.Create;
   Latent := TNNetVolume.Create;
   Frames := TNNetVolume.Create;
   RefRoot := nil;
-  VaeNN := nil;
+  Decoder := nil;
   try
     RefJson.LoadFromFile(FixturePath('tiny_cogvideox_vae_io.json'));
     RefRoot := GetJSON(RefJson.Text);
-    VaeArr := TJSONArray(TJSONObject(RefRoot).Find('vae'));
-    AssertTrue('vae cases present', (VaeArr <> nil) and (VaeArr.Count = 2));
+    VaeArr := TJSONArray(TJSONObject(RefRoot).Find(CasesKey));
+    AssertTrue(CasesKey + ' cases present', (VaeArr <> nil) and
+      (VaeArr.Count = CaseCount));
+    BatchCountTotal := 0;
     for CasePos := 0 to VaeArr.Count - 1 do
     begin
       CaseObj := TJSONObject(VaeArr.Items[CasePos]);
-      LatentFrames := CaseObj.Get('latent_frames', 0);
       OutFrames := CaseObj.Get('frames', 0);
       OutH := CaseObj.Get('height', 0);
-      FreeAndNil(VaeNN);
-      VaeNN := BuildCogVideoXVaeDecoderFromPath(
+      FreeAndNil(Decoder);
+      Decoder := TCogVideoXVaeDecoder.Create(
         ExtractFilePath(FixturePath(CaseObj.Get('folder', '') +
-          DirectorySeparator + 'config.json')), VaeConfig, LatentFrames,
+          DirectorySeparator + 'config.json')), CaseObj.Get('latent_frames', 0),
         CaseObj.Get('latent_height', 0), CaseObj.Get('latent_width', 0));
-      AssertEquals('output frame count', OutFrames,
-        CogVideoXVaeOutputFrames(VaeConfig, LatentFrames));
+      AssertEquals('output frame count', OutFrames, Decoder.OutputFrames);
+      AssertEquals('next-batch net iff more than one batch',
+        Decoder.BatchCount > 1, Decoder.NextNet <> nil);
+      Inc(BatchCountTotal, Decoder.BatchCount);
       LatArr := TJSONArray(CaseObj.Find('latent'));
       DecArr := TJSONArray(CaseObj.Find('decoded'));
       Latent.ReSize(LatArr.Count, 1, 1);
       for ValuePos := 0 to LatArr.Count - 1 do
         Latent.FData[ValuePos] := LatArr.Items[ValuePos].AsFloat;
-      DecodeCogVideoXVae(VaeNN, VaeConfig, Latent, Frames);
+      Decoder.Decode(Latent, Frames);
       AssertEquals('decoded width', CaseObj.Get('width', 0), Frames.SizeX);
       AssertEquals('decoded rows', OutH * OutFrames, Frames.SizeY);
       AssertEquals('decoded channels', CaseObj.Get('channels', 0), Frames.Depth);
@@ -56854,16 +56863,32 @@ begin
         Diff := Abs(Frames.FData[ValuePos] - DecArr.Items[ValuePos].AsFloat);
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
+      WriteLn('  CogVideoX VAE ', CasesKey, ' ', CaseObj.Get('folder', ''), ' ',
+        CaseObj.Get('latent_frames', 0), ' latent frames: max |diff| = ',
+        FloatToStr(MaxDiff));
       AssertTrue(CaseObj.Get('folder', '') + ': max |diff| = ' +
         FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
     end;
+    AssertEquals(CasesKey + ' batches decoded', BatchCountSum, BatchCountTotal);
   finally
-    VaeNN.Free;
+    Decoder.Free;
     RefRoot.Free;
     Frames.Free;
     Latent.Free;
     RefJson.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXVaeDecoderParity;
+begin
+  // 3 and 2 latent frames: one batch each.
+  CheckCogVideoXVaeCases('vae', 2, 2);
+end;
+
+procedure TTestNeuralPretrained.TestCogVideoXVaeBatchedDecodeParity;
+begin
+  // 5 = 3 + 2, 4 = 2 + 2 and 7 = 3 + 2 + 2 latent frames.
+  CheckCogVideoXVaeCases('vae_batched', 3, 7);
 end;
 
 procedure TTestNeuralPretrained.TestCogVideoXFirstBlockCacheReference;

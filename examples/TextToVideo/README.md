@@ -13,8 +13,8 @@ caller-supplied T5 text states  (a real T5 tower is a follow-up)
      token sequence with expert adaLN-Zero modulation + 3D RoPE
   -> multi-step DDIM / DPM-Solver++ reverse loop (TNNetDiffusionScheduler)
   -> sampled (NumFrames, GridH, GridW, in_channels) video latent
-  -> AutoencoderKLCogVideoX decoder (BuildCogVideoXVaeDecoderFromPath +
-     DecodeCogVideoXVae): conv_in -> mid block -> up blocks -> norm_out ->
+  -> AutoencoderKLCogVideoX decoder (TCogVideoXVaeDecoder, 2 latent frames
+     per batch with the diffusers conv cache): conv_in -> mid block -> up blocks -> norm_out ->
      SiLU -> conv_out, every conv a causal 3D conv and every norm a
      SpatialNorm3D on the latent; space doubles per up block, time doubles on
      the first log2(temporal_compression_ratio) blocks (frame 0 kept single)
@@ -33,11 +33,15 @@ in `TestCogVideoXVaeDecoderParity`.
 
 - **`BuildCogVideoXFromSafeTensors`** + **`CogVideoXConditioning`** — the flat-DiT
   denoiser and its per-step timestep/text conditioning (`TCogVideoXConfig`).
-- **`BuildCogVideoXVaeDecoderFromPath`** + **`DecodeCogVideoXVae`** — the
-  diffusers `AutoencoderKLCogVideoX` decoder (`TCogVideoXVaeConfig`, read from
-  `vae/config.json`). It decodes the whole clip in one forward. diffusers
-  decodes 2 latent frames at a time with a conv cache; for 3 latent frames or
-  fewer the two are the same. The two genuinely-new CogVideoX primitives (3D
+- **`TCogVideoXVaeDecoder`** — the diffusers `AutoencoderKLCogVideoX` decoder
+  (`TCogVideoXVaeConfig`, read from `vae/config.json`). Like diffusers'
+  `_decode`, it decodes 2 latent frames per batch (the first batch also takes
+  the extra frame of an odd clip), and every causal conv is padded with the last
+  2 input frames of the batch before (the diffusers conv cache). One net decodes
+  the first batch and owns the weights; a second net, which borrows them,
+  decodes every later batch. Parity < 1e-4 against diffusers on 2-7 latent
+  frames (`TestCogVideoXVaeDecoderParity`,
+  `TestCogVideoXVaeBatchedDecodeParity`). The two genuinely-new CogVideoX primitives (3D
   causal conv via `TNNetConvolution3D` after a frame-0 repeat in
   `TNNetGatherChannels`, 3D RoPE via `TNNetMRotaryEmbedding`) are reused landed
   leaves.
@@ -114,9 +118,10 @@ option. The step is `TCogVideoXSampler.PredictNoise` and the cache
 - **Fixture (default):** `tests/fixtures/tiny_cogvideox.*` (denoiser) and
   `tests/fixtures/tiny_cogvideox_vae/` (VAE, 2 latent frames of 2x2 decode to
   8 frames of 16x16) — fully self-contained, no network access.
-- **Memory:** the decoder holds the whole clip at full resolution. The pico
-  fixture needs a few MB; a real 49-frame 480x720 clip does not fit in RAM
-  without the chunked / tiled decode that is still a follow-up.
+- **Memory:** the decoder holds one batch (2-3 latent frames, 8-9 output
+  frames) at full resolution, not the whole clip. The pico fixture needs a few
+  MB. A real 480x720 batch still keeps every layer's activation of 8 frames, so
+  a real checkpoint needs the spatial tiling that is still a follow-up.
 - **Text states:** deterministic synthetic values stand in for a real T5 tower.
 - **Output:** writes `frame_<ii>.ppm` (P6, or `.png` with `--png`) for each
   decoded frame, the `--gif` file when asked, and prints the config, the
