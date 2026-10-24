@@ -2879,14 +2879,6 @@ Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
         reads. Time a CAI self-attention model on the GPU box; if the
         contraction shows up at long sequences, tile A and B rows through
         local memory.
-- [X] `TNNetSpectralConv2D` FNO mode: `Create(OutDepth, ModesX, ModesY, True)`
-      (`FStruct[3]`) is torch's `SpectralConv2d` (two Y corners, irfft2), CPU +
-      OpenCL, with `ImportTorchFNOWeights`; the default stays the one-corner,
-      real-part-of-IFFT variant. Checked against a naive Double rfft2/irfft2.
-      `TNNetSpectralConv1D` has the same mode: `Create(OutDepth, Modes, True)`
-      (`FStruct[1]`) is torch's `SpectralConv1d` (rfft, `:modes` mix, irfft),
-      CPU only (the 1-D layer has no OpenCL path), checked against a naive
-      Double rfft/irfft. Still open: no safetensors FNO checkpoint loader.
 
 The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
 `TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and
@@ -3044,6 +3036,9 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `TNNetTitansMemory` (token-shift + per-token k/v/q projections + the neural
       memory leaf + residual/out-projection), the drop-in Memory-as-Context block,
       mirroring `AddGatedLinearAttention` / `AddRWKVTimeMix`.
+- [ ] FNO checkpoint loader: the FNO mode of `TNNetSpectralConv1D` /
+      `TNNetSpectralConv2D` and `ImportTorchFNOWeights` exist; no loader reads a
+      safetensors FNO checkpoint yet.
 - [ ] Segment-mask MHA-builder test: `AddMultiHeadSDPAConcat` /
       `AddMultiHeadSelfAttention` already take `SegmentSource` (avSDPA only), but
       no test passes one. Assert a packed two-doc MHA stack matches the
@@ -3115,16 +3110,17 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       inputs, mirroring the HardTanh/SoftCapping pattern.
 - [ ] TNNetDigital forward-equality test — pin threshold and output for
       three inputs straddling it (non-differentiable, so forward-only).
-- [ ] TNNetMaxPoolWithPosition correctness check — the auxiliary "position
+- [ ] TNNetMaxPoolWithPosition round-trip check — the auxiliary "position
       channels" should round-trip through TNNetDeMaxPool to exactly
-      reconstruct the upsample pattern.
+      reconstruct the upsample pattern (`TestMaxPoolWithPositionNonTrainable`
+      already checks the logged positions themselves).
 - [ ] Gradient-flow regression test — train a 12-layer ReLU MLP one epoch
       with and without a single TNNetLayerNorm/RMSNorm at the midpoint;
       assert per-layer gradient norms with the norm layer are uniformly
       bounded above the no-norm case.
 - [ ] TNNetDotProducts numerical-gradient test — standalone class still
       ships; its input-gradient path (both branches A and B) is only
-      forward-tested (`TestDotProductNumerical`).
+      forward-tested (`TestDotProductNumerical`, `TestDotProductsOpenCLParity`).
 - [ ] TNNetLocalConnect / TNNetDeLocalConnect input + weight gradient tests.
 - [ ] Kink-region test parametric helper: with Clamp / HardShrink /
       SoftShrink / Threshold / ShiftedReLU / HardTanh all in tree, the
@@ -3150,11 +3146,12 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] LiSHT / BentIdentity gradient-magnitude sanity at large |x| — both
       grow unboundedly, finite-difference eps must scale with input
       magnitude.
-- [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer raises the
-      documented error when SizeY > 1.
+- [ ] Shape-edge test for TNNetTokenShift: assert SetPrevLayer reports the
+      documented error through `FErrorProc` when SizeY > 1 (it does not raise).
 - [ ] Two-layer TokenShift composition test (catches subtle double-pass
       bugs in the t-1 / t+1 input-gradient scatter).
-- [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
+- [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test (the guard reports
+      through `FErrorProc`, it does not raise).
 - [ ] Audit TNNetSigmoid and TNNetHardSigmoid for negative-x / positive-x
       symmetric-stability (same question as SoftPlus).
 - [ ] TNNetPointwiseSoftMax: now that the exact Jacobian lives in
