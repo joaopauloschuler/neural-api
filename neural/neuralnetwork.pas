@@ -17864,6 +17864,30 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// True Global Mean Pooling: parameter-free per-channel arithmetic mean
+  // over EVERY (x,y) position. Output shape is 1 x 1 x Depth.
+  //
+  // IMPORTANT -- difference vs the sibling TNNetAvgChannel: this layer is
+  // EXACT on rectangular inputs (SizeX <> SizeY) and on 1D streams shaped
+  // (SeqLen,1,Depth): each output cell is sum(cells) / (SizeX*SizeY).
+  // TNNetAvgChannel instead inherits a square FPoolSize x FPoolSize pooling
+  // window from TNNetAvgPool and divides by FPoolSize*FPoolSize regardless
+  // of the actual input shape, so on a (SeqLen,1,Depth) volume it returns
+  // sum/SeqLen^2 instead of sum/SeqLen -- a known legacy simplification
+  // (see the notes in tools/make_pico_ecapa_fixture.py and tasklist.md)
+  // whose numeric semantics are pinned by the ECAPA / VAR text-cond parity
+  // fixtures, and which is therefore intentionally left untouched. Use THIS
+  // layer whenever a true mean over non-square inputs is required; the
+  // backward pass broadcasts the incoming gradient divided by the same
+  // SizeX*SizeY cell count to every input position. Never routed to OpenCL
+  // (the device avg-pool kernel only serves the exact TNNetAvgPool class).
+  // Coded by Claude (AI).
+  TNNetMeanChannel = class(TNNetGlobalSumPool)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Adaptive average pooling: produces a fixed target output size
   // (OutX, OutY) regardless of the input spatial size, like PyTorch's
   // AdaptiveAvgPool2d. Depth is unchanged. For output index o along an
@@ -83152,6 +83176,49 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetMeanChannel }
+procedure TNNetMeanChannel.Compute();
+begin
+  // TNNetGlobalSumPool's forward is an exact SUM over every (x,y) position
+  // per depth; scaling it by the true cell count yields the exact arithmetic
+  // mean -- including rectangular (SizeX <> SizeY) and (SeqLen,1,Depth) 1D
+  // shapes, where TNNetAvgChannel's square-window division would under-scale
+  // the average (and the gradient) by a factor of SizeY.
+  inherited Compute();
+  FOutput.Divi(FPrevLayer.Output.SizeX * FPrevLayer.Output.SizeY);
+end;
+
+procedure TNNetMeanChannel.Backpropagate();
+var
+  StartTime: double;
+  X, Y, MaxX, MaxY, Depth: integer;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    Depth := FOutput.Depth;
+    MaxX := PrevErr.SizeX - 1;
+    MaxY := PrevErr.SizeY - 1;
+    // The mean's Jacobian is a uniform 1/N broadcast: pre-scale the
+    // (1,1,Depth) gradient by 1/(SizeX*SizeY) ONCE -- after the
+    // departing-branches guard, so branching nets never scale twice -- then
+    // reuse the base contiguous per-pixel scatter (AVX vector adds).
+    FOutputError.Divi(FPrevLayer.Output.SizeX * FPrevLayer.Output.SizeY);
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+        TNNetVolume.Add(PrevErr.GetRawPtr(X, Y), FOutputError.DataPtr, Depth);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetAdaptiveAvgPool }
 
 constructor TNNetAdaptiveAvgPool.Create(pSize: integer);
@@ -132371,6 +132438,7 @@ begin
       'TNNetAdaptiveMaxPool':       Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]);
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
+      'TNNetMeanChannel':           Result := TNNetMeanChannel.Create();
       'TNNetMaskedMean':            Result := TNNetMaskedMean.Create();
       'TNNetMaskedMax':             Result := TNNetMaskedMax.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
@@ -132820,6 +132888,7 @@ begin
       if S[0] = 'TNNetAdaptiveMaxPool' then Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]) else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else
+      if S[0] = 'TNNetMeanChannel' then Result := TNNetMeanChannel.Create() else
       if S[0] = 'TNNetMaskedMean' then Result := TNNetMaskedMean.Create() else
       if S[0] = 'TNNetMaskedMax' then Result := TNNetMaskedMax.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
