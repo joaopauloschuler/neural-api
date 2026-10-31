@@ -1,0 +1,13 @@
+{
+  "state": "Hi, when you have time, could you tell me how to change my avatar picture? No rush.",
+  "questions": {
+    "urgent": {
+      "type": "noul",
+      "instructions": "Is this ticket urgent?",
+      "criteria": {
+        "true": "money is at stake or the customer is blocked",
+        "false": "the request can wait for the normal queue"
+      }
+    }
+  }
+}

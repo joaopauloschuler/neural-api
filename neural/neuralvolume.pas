@@ -1777,6 +1777,11 @@ type
     numerical instability in forward/backward passes. }
   procedure AssertFinite(V: TNNetVolume; const Where: string);
 
+  // True when FileName is a Git LFS pointer text (a clone made without "git lfs pull").
+  function IsGitLfsPointerFile(const FileName: string): boolean;
+  // Raises ErrorClass naming FileName when FileName is a Git LFS pointer file.
+  procedure RaiseIfGitLfsPointer(const FileName: string; ErrorClass: ExceptClass);
+
   { RowSoftMax replaces Row in place with the numerically-stable softmax over
     all Row.Size elements (subtract the row max, exponentiate, divide by the
     sum). This is post-network host math over a flat logits/score row; it is
@@ -5128,6 +5133,40 @@ begin
         '): non-finite value at index ' + IntToStr(I) +
         ': Inf (' + FloatToStr(Val) + ')');
   end;
+end;
+
+function IsGitLfsPointerFile(const FileName: string): boolean;
+const
+  csGitLfsPointerSignature = 'version https://git-lfs.github.com/spec/v1';
+  // The Git LFS specification caps a pointer file below 1024 bytes.
+  csMaxGitLfsPointerSize = 1024;
+var
+  Stream: TFileStream;
+  Head: string;
+begin
+  Result := false;
+  if not FileExists(FileName) then exit;
+  try
+    Stream := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+  except
+    exit;
+  end;
+  try
+    if (Stream.Size < Length(csGitLfsPointerSignature)) or
+      (Stream.Size >= csMaxGitLfsPointerSize) then exit;
+    SetLength(Head, Length(csGitLfsPointerSignature));
+    Stream.ReadBuffer(Head[1], Length(Head));
+    Result := Head = csGitLfsPointerSignature;
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure RaiseIfGitLfsPointer(const FileName: string; ErrorClass: ExceptClass);
+begin
+  if IsGitLfsPointerFile(FileName) then
+    raise ErrorClass.Create(FileName + ' is a Git LFS pointer file, not the' +
+      ' real file; run "git lfs install" and "git lfs pull" in the repository');
 end;
 
 procedure RowSoftMax(Row: TNNetVolume);

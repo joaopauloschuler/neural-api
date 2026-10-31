@@ -1,0 +1,38 @@
+{
+  "state": {
+    "applicant": {
+      "name": "A. Rivera",
+      "years_experience": 6,
+      "skills": ["Pascal", "SQL", "Linux administration"]
+    },
+    "job": {
+      "title": "Backend developer",
+      "requirements": ["5+ years of experience", "SQL", "a compiled language"],
+      "location": {"city": "Porto", "remote": true}
+    }
+  },
+  "questions": {
+    "fit": {
+      "type": "choice",
+      "instructions": {
+        "task": "Classify how well the applicant fits the job.",
+        "consider": ["the listed requirements", "the years of experience"]
+      },
+      "criteria": {
+        "strong": {"meaning": "meets every requirement"},
+        "partial": {"meaning": "meets some requirements"},
+        "weak": {"meaning": "meets few or none"}
+      }
+    },
+    "seniority": {
+      "type": "score",
+      "instructions": "Which seniority level matches the applicant?",
+      "criteria": ["junior", "mid-level", "senior"]
+    },
+    "interview": {
+      "type": "noul",
+      "instructions": "Should the applicant be invited to an interview?",
+      "criteria": {"true": "worth an interview", "false": "reject now"}
+    }
+  }
+}

@@ -28,7 +28,20 @@ Endpoints (all responses application/json):
        Plain text completion: the prompt is encoded WITHOUT any chat
        template and the model continues it (the --format raw path, but
        available in every mode). Also honors "stream":true.
-  GET  /v1/models             lists the single loaded model.
+  POST /v1/systemone          TypeSafe/Jev typed decision request (a state plus
+       typed questions in, option probabilities out; no text generated).
+       The server scores it with AnyJev L0 (neural/neuralanyjev.pas) on the
+       loaded chat model; --decision-level/-prior/-max-rotations tune it.
+       --decision-adapter DIR scores it instead with a Kev or Open-Jev
+       checkpoint (neural/neuraldecisionheads.pas) whose LoRA is merged into
+       the model directory (its base); the chat endpoints then answer 501.
+       The request's "model" is optional and ignored: the response's
+       "model" always names the scorer that answered.
+       Errors use the FastAPI {"detail": ...} body: 422 on validation and on
+       a request the scorer cannot answer (e.g. a label that is not one
+       token), 501 when no decision scorer is active, 500 when it fails.
+  GET  /v1/models             lists the loaded model (and the decision
+       scorer's model when one is active).
 
 STREAMING: with "stream":true the reply is sent as Server-Sent Events -
 one "data: {chunk JSON}" frame per decoded token (chat.completion.chunk
@@ -63,6 +76,9 @@ requests are handled strictly one at a time on the accept loop, which IS
 the serialization. The KV-cache prefix reuse still pays off: consecutive
 requests of a growing conversation share their prompt prefix, so only the
 new tail is prefilled (TTFT stays roughly flat as the conversation grows).
+A /v1/systemone request runs on the same loop, so it never interleaves with
+a chat request; TChatEngine.PrefillDecisionPrefix saves the live
+conversation (to a conversation slot) before it scores.
 
 --selftest runs the offline request-parsing/overlay unit checks (no model
 needed) and exits.
@@ -92,8 +108,9 @@ uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
-  Classes, SysUtils, DateUtils, fpjson, jsonparser, fphttpserver,
-  neuralvolume, neuralchat, neuralchatengine;
+  Classes, SysUtils, DateUtils, Math, fpjson, jsonparser, fphttpserver,
+  neuralvolume, neuralchat, neuralchatengine, neuralpretrained, neuraldecision,
+  neuralanyjev, neuraldecisionheads;
 
 const
   // Conversation slots when --kv-slots is not given: alternating clients
@@ -119,6 +136,15 @@ type
     property Connection;
   end;
 
+  // The --decision-* flags: which scorer answers /v1/systemone and how.
+  TDecisionServerOptions = record
+    Level: TAnyJevLevel;
+    Prior: TAnyJevPrior;
+    MaxRotations: integer;      // 0 = every cyclic shift of a choice
+    AdapterDir: string;         // --decision-adapter; '' = AnyJev L0
+    Temperature: double;        // --decision-temperature; 0 = the checkpoint's
+  end;
+
 procedure PrintUsage();
 begin
   WriteLn('Usage: ChatServer <model-dir> [options]');
@@ -133,6 +159,9 @@ begin
   WriteLn('max_tokens override the launch defaults per request; absent fields fall');
   WriteLn('back to them. "stream":true streams SSE chunks (one per token) the way');
   WriteLn('the OpenAI client libraries expect; "n">1 is rejected.');
+  WriteLn('POST /v1/systemone answers TypeSafe/Jev typed decision requests (no text');
+  WriteLn('generated) with the AnyJev L0 readout on the loaded chat model, or with');
+  WriteLn('a Kev / Open-Jev checkpoint given by --decision-adapter.');
   WriteLn;
   WriteLn('Server options:');
   WriteLn('  --host ADDR           listen address (default 127.0.0.1, loopback only)');
@@ -140,6 +169,17 @@ begin
   WriteLn('  --kv-slots N          conversation slots, see below (default ',
     csChatServerDefaultKVSlots, ' here;');
   WriteLn('                        --kv-slots 0 turns them off)');
+  WriteLn('  --decision-level L    /v1/systemone readout: l0 (default; every option');
+  WriteLn('                        rotation, prior-corrected) or raw (one prompt)');
+  WriteLn('  --decision-prior P    l0 label prior: content_free (default) or none');
+  WriteLn('  --decision-max-rotations N  cap on the cyclic shifts of a choice');
+  WriteLn('                        question (default 0 = one per option)');
+  WriteLn('  --decision-adapter DIR  score /v1/systemone with the Kev or Open-Jev');
+  WriteLn('                        checkpoint in DIR (LoRA merged into <model-dir>,');
+  WriteLn('                        the base it was trained on); the chat endpoints');
+  WriteLn('                        then answer 501. Not with the three flags above.');
+  WriteLn('  --decision-temperature T  override the checkpoint''s calibration');
+  WriteLn('                        temperature (1 = raw head scores)');
   WriteLn;
   PrintChatOptionsHelp();
 end;
@@ -398,6 +438,9 @@ type
     Engine: TChatEngine;
     ModelName: string;          // reported in responses: the model dir's name
     RequestCount: integer;      // completion ids + console log lines
+    DecisionScorer: TDecisionScorer;  // owned; nil = /v1/systemone answers 501
+    // Non-empty = decision-only: the chat endpoints answer 501 with this reason.
+    DecisionOnlyReason: string;
     procedure NoticeOut(const S: string);
     procedure HandleRequest(Sender: TObject;
       var ARequest: TFPHTTPConnectionRequest;
@@ -420,6 +463,9 @@ type
     procedure HandleCompletions(Req: TJSONObject;
       var AResponse: TFPHTTPConnectionResponse);
     procedure HandleModels(var AResponse: TFPHTTPConnectionResponse);
+    function DecisionResponse(const Body: string; out Code: integer): string;
+    procedure HandleDecision(const Body: string;
+      var AResponse: TFPHTTPConnectionResponse);
     function UsageObject(): TJSONObject;
     function StreamChunkFrame(const ContentDelta: string; WithRole: boolean;
       const FinishReason: string): string;
@@ -826,16 +872,85 @@ end;
 
 procedure TServerApp.HandleModels(var AResponse: TFPHTTPConnectionResponse);
 var
-  Model: TJSONObject;
+  Models: TJSONArray;
+
+  procedure AddModel(const Id: string);
+  begin
+    Models.Add(TJSONObject.Create([
+      'id', Id,
+      'object', 'model',
+      'created', DateTimeToUnix(Now, false),
+      'owned_by', 'neural-api']));
+  end;
+
 begin
-  Model := TJSONObject.Create([
-    'id', ModelName,
-    'object', 'model',
-    'created', DateTimeToUnix(Now, false),
-    'owned_by', 'neural-api']);
-  SendJSON(AResponse, 200, TJSONObject.Create([
-    'object', 'list',
-    'data', TJSONArray.Create([Model])]));
+  Models := TJSONArray.Create();
+  if DecisionOnlyReason = '' then AddModel(ModelName);
+  if Assigned(DecisionScorer) and
+    ((DecisionOnlyReason <> '') or (DecisionScorer.ModelName <> ModelName)) then
+    AddModel(DecisionScorer.ModelName);
+  SendJSON(AResponse, 200, TJSONObject.Create(['object', 'list', 'data', Models]));
+end;
+
+// The /v1/systemone reply to a raw request body. The raw string goes to
+// ParseDecisionRequest: only it sees option names over fpjson's 255-byte keys.
+function TServerApp.DecisionResponse(const Body: string;
+  out Code: integer): string;
+var
+  Request: TDecisionRequest;
+  Errors: TDecisionErrorDetails;
+  Answers: TDecisionAnswers;
+  InputTokens, OutputTokens: integer;
+begin
+  if DecisionScorer = nil then
+  begin
+    Code := 501;
+    Exit(DecisionErrorMessageToJSON('no decision scorer is active on this' +
+      ' server, so POST /v1/systemone cannot answer'));
+  end;
+  if not ParseDecisionRequest(Body, Request, Errors) then
+  begin
+    Code := 422;
+    Exit(DecisionErrorsToJSON(Errors));
+  end;
+  try
+    DecisionScorer.Score(Request, Answers, InputTokens, OutputTokens);
+    Result := DecisionResponseToJSON(Request, DecisionScorer.ModelName, Answers,
+      InputTokens, OutputTokens);
+    Code := 200;
+  except
+    on E: EDecisionUnsupported do
+    begin
+      Code := 422;
+      Result := DecisionErrorMessageToJSON(E.Message);
+    end;
+    on E: Exception do
+    begin
+      Code := 500;
+      Result := DecisionErrorMessageToJSON(E.Message);
+      WriteLn('[systemone scorer failed] ', E.ClassName, ': ', E.Message);
+    end;
+  end;
+end;
+
+procedure TServerApp.HandleDecision(const Body: string;
+  var AResponse: TFPHTTPConnectionResponse);
+var
+  Code: integer;
+  TStart: QWord;
+begin
+  TStart := GetTickCount64();
+  AResponse.Content := DecisionResponse(Body, Code);
+  AResponse.Code := Code;
+  AResponse.ContentType := 'application/json';
+  if Code = 200 then
+  begin
+    Inc(RequestCount);
+    WriteLn(Format('[systemone %d] %.1fs', [RequestCount,
+      (GetTickCount64() - TStart) / 1000]));
+  end
+  else
+    WriteLn('[error ', Code, '] ', AResponse.Content);
 end;
 
 procedure TServerApp.HandleRequest(Sender: TObject;
@@ -853,9 +968,20 @@ begin
       HandleModels(AResponse);
       exit;
     end;
+    if (ARequest.Method = 'POST') and (Path = '/v1/systemone') then
+    begin
+      HandleDecision(ARequest.Content, AResponse);
+      exit;
+    end;
     if (ARequest.Method = 'POST') and
       ((Path = '/v1/chat/completions') or (Path = '/v1/completions')) then
     begin
+      if DecisionOnlyReason <> '' then
+      begin
+        SendError(AResponse, 501, DecisionOnlyReason +
+          ', so this server only answers POST /v1/systemone');
+        exit;
+      end;
       Root := nil;
       try
         try
@@ -888,7 +1014,7 @@ begin
     end;
     SendError(AResponse, 404, 'no such endpoint: ' + ARequest.Method + ' ' +
       Path + ' (POST /v1/chat/completions, POST /v1/completions,' +
-      ' GET /v1/models)');
+      ' POST /v1/systemone, GET /v1/models)');
   except
     // Nothing may escape into the accept loop: any unexpected failure
     // becomes a 500 and the server keeps serving.
@@ -897,17 +1023,231 @@ begin
   end;
 end;
 
-// Parses the command line and applies the server's own defaults; false +
-// Opt.ErrorMsg on a bad argument.
-function ParseServerArgs(Args: TStringList; var Opt: TChatOptions): boolean;
+function DecisionLevelText(const DecisionOpt: TDecisionServerOptions): string;
 begin
-  Result := ParseArgs(Args, Opt);
+  if DecisionOpt.Level = ajlRaw then Exit('raw');
+  Result := 'L0';
+  if DecisionOpt.Prior = ajpContentFree then Result := Result + ', content-free prior'
+  else Result := Result + ', no prior';
+  if DecisionOpt.MaxRotations > 0 then
+    Result := Result + Format(', at most %d rotations', [DecisionOpt.MaxRotations]);
+end;
+
+// Parses the command line and applies the server's own defaults; false +
+// Opt.ErrorMsg on a bad argument. ParseArgs never sees the --decision-* flags.
+function ParseServerArgs(Args: TStringList; var Opt: TChatOptions;
+  out DecisionOpt: TDecisionServerOptions): boolean;
+var
+  ChatArgs: TStringList;
+  ArgPos, ValueCode: integer;
+  Arg, DecisionError, AnyJevFlag: string;
+
+  // Applies one --decision-* flag; returns the error ('' = parsed).
+  function ApplyDecisionFlag(const Flag, Value: string): string;
+  begin
+    Result := '';
+    if Value = '' then Result := Flag + ' needs a value'
+    else if Flag = '--decision-adapter' then DecisionOpt.AdapterDir := Value
+    else if Flag = '--decision-temperature' then
+    begin
+      Val(Value, DecisionOpt.Temperature, ValueCode); // '.' decimal separator
+      if (ValueCode <> 0) or not (DecisionOpt.Temperature > 0) or
+        IsInfinite(DecisionOpt.Temperature) then
+        Result := '--decision-temperature: not a positive number: ' + Value;
+    end
+    else if Flag = '--decision-level' then
+    begin
+      if Value = 'l0' then DecisionOpt.Level := ajlL0
+      else if Value = 'raw' then DecisionOpt.Level := ajlRaw
+      else Result := '--decision-level: l0 or raw, not ' + Value;
+    end
+    else if Flag = '--decision-prior' then
+    begin
+      if Value = 'content_free' then DecisionOpt.Prior := ajpContentFree
+      else if Value = 'none' then DecisionOpt.Prior := ajpNone
+      else Result := '--decision-prior: content_free or none, not ' + Value;
+    end
+    else if not (TryStrToInt(Value, DecisionOpt.MaxRotations) and
+      (DecisionOpt.MaxRotations >= 0)) then
+      Result := '--decision-max-rotations: not a count: ' + Value;
+  end;
+
+begin
+  DecisionOpt.Level := ajlL0;
+  DecisionOpt.Prior := ajpContentFree;
+  DecisionOpt.MaxRotations := 0;
+  DecisionOpt.AdapterDir := '';
+  DecisionOpt.Temperature := 0;
+  DecisionError := '';
+  AnyJevFlag := '';
+  ChatArgs := TStringList.Create();
+  try
+    ArgPos := 0;
+    while ArgPos < Args.Count do
+    begin
+      Arg := Args[ArgPos];
+      if (Arg = '--decision-level') or (Arg = '--decision-prior') or
+        (Arg = '--decision-max-rotations') or (Arg = '--decision-adapter') or
+        (Arg = '--decision-temperature') then
+      begin
+        if (AnyJevFlag = '') and (Arg <> '--decision-adapter') and
+          (Arg <> '--decision-temperature') then
+          AnyJevFlag := Arg;
+        Inc(ArgPos);
+        // The first bad flag is the one reported.
+        if DecisionError = '' then
+        begin
+          if ArgPos < Args.Count then
+            DecisionError := ApplyDecisionFlag(Arg, Args[ArgPos])
+          else
+            DecisionError := ApplyDecisionFlag(Arg, '');
+        end;
+      end
+      else ChatArgs.Add(Arg);
+      Inc(ArgPos);
+    end;
+    Result := ParseArgs(ChatArgs, Opt);
+  finally
+    ChatArgs.Free;
+  end;
   Opt.DefaultKVSlots := csChatServerDefaultKVSlots;
+  if DecisionError = '' then
+  begin
+    if (DecisionOpt.AdapterDir <> '') and (AnyJevFlag <> '') then
+      DecisionError := AnyJevFlag + ' tunes the AnyJev L0 readout, which' +
+        ' --decision-adapter replaces: drop one of the two'
+    else if (DecisionOpt.AdapterDir = '') and (DecisionOpt.Temperature > 0) then
+      DecisionError := '--decision-temperature needs --decision-adapter (the' +
+        ' AnyJev L0 readout has no temperature)';
+  end;
+  if Result and (DecisionError <> '') then
+  begin
+    Opt.ErrorMsg := DecisionError;
+    Result := false;
+  end;
+end;
+
+// True when both name the same directory.
+function SameDirectory(const DirA, DirB: string): boolean;
+begin
+  Result := ExcludeTrailingPathDelimiter(ExpandFileName(DirA)) =
+    ExcludeTrailingPathDelimiter(ExpandFileName(DirB));
+end;
+
+// Detects the --decision-adapter layout, prints the base it records, checks the
+// head against <model-dir>/config.json, sets Opt.LoRAAdapterDir and Opt.OmitLMHead.
+function PrepareDecisionAdapter(var Opt: TChatOptions; const AdapterDir: string;
+  out Info: TDecisionAdapterInfo; out ErrorMsg: string): boolean;
+var
+  BaseConfig: TLlamaConfig;
+  BaseHiddenSize: integer;
+  RecordedBase: string;
+begin
+  Result := false;
+  ErrorMsg := '';
+  // A full-weight checkpoint is its own model: nothing is merged into a base.
+  if (DetectDecisionAdapterLayout(AdapterDir) = dalKevFullWeights) and
+    not SameDirectory(Opt.ModelDir, AdapterDir) then
+  begin
+    ErrorMsg := AdapterDir + ' is a Kev full-weight checkpoint (its own' +
+      ' config.json and model*.safetensors, as kev-27b): pass that directory' +
+      ' as <model-dir> too, not ' + Opt.ModelDir;
+    exit;
+  end;
+  try
+    Info := ReadDecisionAdapterInfo(AdapterDir);
+  except
+    on E: Exception do
+    begin
+      ErrorMsg := E.Message;
+      exit;
+    end;
+  end;
+  RecordedBase := Info.BaseModelId;
+  if RecordedBase = '' then RecordedBase := '(not recorded)';
+  if Info.BaseRevision <> '' then
+    RecordedBase := RecordedBase + ' at revision ' + Info.BaseRevision;
+  if Info.Layout = dalKevFullWeights then
+    WriteLn('[decision checkpoint ', AdapterDir, ': Kev full weights, fine-tuned' +
+      ' from ', RecordedBase, '; nothing to merge]')
+  else
+    WriteLn('[decision adapter ', AdapterDir, ': trained on ', RecordedBase,
+      '; <model-dir> ', Opt.ModelDir, ' must hold that checkpoint]');
+  BaseHiddenSize := 0;
+  try
+    BaseConfig := ReadLlamaConfigFromJSONFile(IncludeTrailingPathDelimiter(
+      Opt.ModelDir) + 'config.json');
+    BaseHiddenSize := BaseConfig.HiddenSize;
+  except
+    // An unreadable config is reported by LoadModel; nothing to compare here.
+  end;
+  if (BaseHiddenSize > 0) and (Info.HeadInputSize > 0) and
+    (BaseHiddenSize <> Info.HeadInputSize) then
+  begin
+    ErrorMsg := Format('the decision head in %s reads hidden states of size %d,' +
+      ' but %s has hidden_size %d: <model-dir> is not the base the adapter was' +
+      ' trained on (%s)', [Info.CheckpointDir, Info.HeadInputSize, Opt.ModelDir,
+      BaseHiddenSize, RecordedBase]);
+    exit;
+  end;
+  Opt.LoRAAdapterDir := Info.LoRAAdapterDir;
+  // Both heads read the final hidden states, never the logits.
+  Opt.OmitLMHead := true;
+  Result := true;
+end;
+
+// The reason the chat endpoints give in decision-only mode.
+function DecisionOnlyReasonText(const Info: TDecisionAdapterInfo;
+  const AdapterDir: string): string;
+begin
+  Result := 'the server was launched with --decision-adapter ' + AdapterDir;
+  if Info.LoRAAdapterDir <> '' then
+    Result := Result + ': its LoRA adapter is merged into the base weights,' +
+      ' which are tuned for decision scoring, not for text'
+  else if Info.Layout = dalKevFullWeights then
+    Result := Result + ': its full weights are fine-tuned for decision' +
+      ' scoring, not for text';
+  if Info.Layout = dalKevLoRA then
+    Result := Result + ' (and Kev bases are pretrained -Base models with no' +
+      ' chat tuning)';
+  Result := Result + '; the model is loaded without its LM head';
 end;
 
 // ---------------------------------------------------------------------------
 // --selftest: offline unit checks (no model files needed).
 // ---------------------------------------------------------------------------
+type
+  // --selftest scorer: question k gets FixedProbabilities[k]; raises FailMessage
+  // (UnsupportedMessage, LabelTokenMessage as their exception classes) when set.
+  TFixedDecisionScorer = class(TDecisionScorer)
+  public
+    FixedProbabilities: array of TDecisionProbabilities;
+    FailMessage, UnsupportedMessage, LabelTokenMessage: string;
+    procedure Score(const Request: TDecisionRequest;
+      out Answers: TDecisionAnswers;
+      out InputTokens, OutputTokens: integer); override;
+  end;
+
+procedure TFixedDecisionScorer.Score(const Request: TDecisionRequest;
+  out Answers: TDecisionAnswers; out InputTokens, OutputTokens: integer);
+var
+  QuestionPos, MaxQuestionPos: integer;
+begin
+  if FailMessage <> '' then raise Exception.Create(FailMessage);
+  if UnsupportedMessage <> '' then
+    raise EDecisionUnsupported.Create(UnsupportedMessage);
+  if LabelTokenMessage <> '' then
+    raise EAnyJevLabelTokenError.Create(LabelTokenMessage);
+  Answers := nil;
+  SetLength(Answers, Length(Request.Questions));
+  MaxQuestionPos := High(Request.Questions);
+  for QuestionPos := 0 to MaxQuestionPos do
+    Answers[QuestionPos] := DecisionAnswerFromProbabilities(
+      Request.Questions[QuestionPos].Kind, FixedProbabilities[QuestionPos]);
+  InputTokens := 11;
+  OutputTokens := 3;
+end;
+
 procedure SelfTest();
 var
   Failures: integer;
@@ -934,28 +1274,226 @@ var
     end;
   end;
 
+  // Runs one request through TServerApp.HandleRequest; returns the body.
+  function Serve(App: TServerApp; const Method, URI, Body: string;
+    out Code: integer): string;
+  var
+    Request: TFPHTTPConnectionRequest;
+    Response: TFPHTTPConnectionResponse;
+  begin
+    Request := TFPHTTPConnectionRequest.Create();
+    Response := TFPHTTPConnectionResponse.Create(Request);
+    try
+      Request.Method := Method;
+      Request.URI := URI;
+      Request.Content := Body;
+      App.HandleRequest(nil, Request, Response);
+      Code := Response.Code;
+      Result := Trim(Response.Content);
+    finally
+      Response.Free;
+      Request.Free;
+    end;
+  end;
+
+var
+  CreatedPaths: TStringList;   // files and directories, removed in reverse
+
+  procedure EnsureDir(const Dir: string);
+  begin
+    if DirectoryExists(Dir) then exit;
+    EnsureDir(ExtractFileDir(Dir));
+    CreateDir(Dir);
+    CreatedPaths.Add(Dir);
+  end;
+
+  // Creates the empty files Names (relative to Dir; '/' separates subdirectories).
+  procedure CreateFiles(const Dir: string; const Names: array of string);
+  var
+    NamePos: integer;
+    FileName: string;
+    Handle: THandle;
+  begin
+    EnsureDir(Dir);
+    for NamePos := 0 to High(Names) do
+    begin
+      FileName := IncludeTrailingPathDelimiter(Dir) +
+        StringReplace(Names[NamePos], '/', DirectorySeparator, [rfReplaceAll]);
+      EnsureDir(ExtractFileDir(FileName));
+      Handle := FileCreate(FileName);
+      FileClose(Handle);
+      CreatedPaths.Add(FileName);
+    end;
+  end;
+
+  procedure RemoveCreatedPaths();
+  var
+    PathPos: integer;
+  begin
+    for PathPos := CreatedPaths.Count - 1 downto 0 do
+      if DirectoryExists(CreatedPaths[PathPos]) then RemoveDir(CreatedPaths[PathPos])
+      else DeleteFile(CreatedPaths[PathPos]);
+    CreatedPaths.Clear;
+  end;
+
 var
   Base, GenOpt, ServerOpt: TChatOptions;
+  DecisionOpt: TDecisionServerOptions;
+  AdapterInfo: TDecisionAdapterInfo;
+  LayoutRoot: string;
   Req: TJSONObject;
   Msgs: TChatMessages;
   ErrMsg: string;
   IgnoredStop, Stream, IncludeUsage: boolean;
   ServerArgs: TStringList;
+  App: TServerApp;
+  Scorer: TFixedDecisionScorer;
+  Code: integer;
+  Reply, DecisionBody: string;
 begin
   Failures := 0;
   // Conversation slots: on by default here, an explicit --kv-slots wins.
   ServerArgs := TStringList.Create();
   try
     ServerArgs.Add('model');
-    Check(ParseServerArgs(ServerArgs, ServerOpt) and
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
       (ServerOpt.KVSlots < 0) and
       (ServerOpt.DefaultKVSlots = csChatServerDefaultKVSlots),
       'no --kv-slots: the server default applies');
+    Check((DecisionOpt.Level = ajlL0) and (DecisionOpt.Prior = ajpContentFree) and
+      (DecisionOpt.MaxRotations = 0),
+      'no --decision-* flags: AnyJev L0, content-free prior, every rotation');
     ServerArgs.Add('--kv-slots'); ServerArgs.Add('0');
-    Check(ParseServerArgs(ServerArgs, ServerOpt) and (ServerOpt.KVSlots = 0),
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and (ServerOpt.KVSlots = 0),
       '--kv-slots 0 turns the slots off');
+    ServerArgs.Add('--decision-level'); ServerArgs.Add('raw');
+    ServerArgs.Add('--decision-prior'); ServerArgs.Add('none');
+    ServerArgs.Add('--decision-max-rotations'); ServerArgs.Add('2');
+    ServerArgs.Add('--fp32');
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (DecisionOpt.Level = ajlRaw) and (DecisionOpt.Prior = ajpNone) and
+      (DecisionOpt.MaxRotations = 2) and (ServerOpt.WeightMode = cwmFP32) and
+      (ServerOpt.KVSlots = 0) and (ServerOpt.ModelDir = 'model'),
+      '--decision-* flags parse beside the chat flags');
+    ServerArgs.Add('--decision-level'); ServerArgs.Add('l2');
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-level', ServerOpt.ErrorMsg) = 1),
+      'an unknown --decision-level is an error naming the flag');
+    ServerArgs.Clear;
+    ServerArgs.Add('model');
+    ServerArgs.Add('--decision-max-rotations');
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (ServerOpt.ErrorMsg = '--decision-max-rotations needs a value'),
+      '--decision-max-rotations without a value is an error');
+    ServerArgs.Clear;
+    ServerArgs.AddStrings(['model', '--decision-adapter', 'kev-0.8b',
+      '--decision-temperature', '1.5', '--fp32']);
+    Check(ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (DecisionOpt.AdapterDir = 'kev-0.8b') and
+      (Abs(DecisionOpt.Temperature - 1.5) < 1e-12) and
+      (ServerOpt.WeightMode = cwmFP32) and (ServerOpt.ModelDir = 'model'),
+      '--decision-adapter and --decision-temperature parse beside the chat flags');
+    ServerArgs.AddStrings(['--decision-prior', 'none']);
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-prior tunes the AnyJev', ServerOpt.ErrorMsg) = 1),
+      '--decision-prior with --decision-adapter is refused naming the flag');
+    ServerArgs.Clear;
+    ServerArgs.AddStrings(['model', '--decision-level', 'raw',
+      '--decision-adapter', 'kev-0.8b']);
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-level tunes the AnyJev', ServerOpt.ErrorMsg) = 1),
+      '--decision-level before --decision-adapter is refused too');
+    ServerArgs.Clear;
+    ServerArgs.AddStrings(['model', '--decision-adapter', 'a',
+      '--decision-max-rotations', '2']);
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-max-rotations tunes', ServerOpt.ErrorMsg) = 1),
+      '--decision-max-rotations with --decision-adapter is refused');
+    ServerArgs.Clear;
+    ServerArgs.AddStrings(['model', '--decision-temperature', '2']);
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-temperature needs --decision-adapter', ServerOpt.ErrorMsg) = 1),
+      '--decision-temperature without --decision-adapter is refused');
+    ServerArgs.Clear;
+    ServerArgs.AddStrings(['model', '--decision-adapter', 'a',
+      '--decision-temperature', '-1']);
+    Check(not ParseServerArgs(ServerArgs, ServerOpt, DecisionOpt) and
+      (Pos('--decision-temperature: not a positive number', ServerOpt.ErrorMsg) = 1),
+      'a non-positive --decision-temperature is refused');
   finally
     ServerArgs.Free;
+  end;
+
+  // --decision-adapter layouts on empty placeholder files.
+  CreatedPaths := TStringList.Create();
+  LayoutRoot := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    Format('chatserver-selftest-%d', [GetProcessID()]);
+  try
+    CreateFiles(LayoutRoot + DirectorySeparator + 'kev-0.8b',
+      ['head.pt', 'adapter_config.json', 'adapter_model.safetensors', 'tokenizer.json']);
+    CreateFiles(LayoutRoot + DirectorySeparator + 'kev-27b',
+      ['head.pt', 'config.json', 'model-00001-of-00011.safetensors']);
+    CreateFiles(LayoutRoot + DirectorySeparator + 'Open-Jev-2B',
+      ['package/checkpoint/head.pt', 'package/checkpoint/temperature.json',
+      'package/checkpoint/model.json', 'package/checkpoint/adapter/adapter_config.json']);
+    CreateFiles(LayoutRoot + DirectorySeparator + 'openjev-flat',
+      ['head.pt', 'temperature.json']);
+    CreateFiles(LayoutRoot + DirectorySeparator + 'no-weights',
+      ['head.pt', 'adapter_config.json']);
+    CreateFiles(LayoutRoot + DirectorySeparator + 'empty', []);
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'kev-0.8b') =
+      dalKevLoRA, 'head.pt + adapter_config.json + adapter weights is a Kev LoRA');
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'kev-27b') =
+      dalKevFullWeights, 'head.pt + config.json + model shards is Kev full weights');
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'Open-Jev-2B') =
+      dalOpenJev, 'an Open-Jev repo root (package/checkpoint) is Open-Jev');
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'Open-Jev-2B' +
+      DirectorySeparator + 'package' + DirectorySeparator + 'checkpoint') = dalOpenJev,
+      'an Open-Jev checkpoint directory itself is Open-Jev');
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'openjev-flat') =
+      dalOpenJev, 'head.pt + temperature.json is Open-Jev');
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'no-weights') =
+      dalUnknown, 'an adapter_config.json without adapter weights is not a layout');
+    Check(DetectDecisionAdapterLayout(LayoutRoot + DirectorySeparator + 'empty') =
+      dalUnknown, 'an empty directory is not a layout');
+    Check(DecisionAdapterModelName(LayoutRoot + DirectorySeparator + 'kev-0.8b' +
+      DirectorySeparator) = 'kev-0.8b', 'a Kev model is named after its directory');
+    Check(DecisionAdapterModelName(LayoutRoot + DirectorySeparator + 'Open-Jev-2B' +
+      DirectorySeparator + 'package' + DirectorySeparator + 'checkpoint') =
+      'Open-Jev-2B', 'an Open-Jev package/checkpoint is named after the repo root');
+    ServerOpt := DefaultChatOptions();
+    ServerOpt.ModelDir := LayoutRoot + DirectorySeparator + 'empty';
+    Check(not PrepareDecisionAdapter(ServerOpt, LayoutRoot + DirectorySeparator +
+      'kev-27b', AdapterInfo, ErrMsg) and (Pos('Kev full-weight', ErrMsg) > 0) and
+      (Pos('as <model-dir> too', ErrMsg) > 0) and not ServerOpt.OmitLMHead,
+      'a Kev full-weight checkpoint with another <model-dir> is refused');
+    ServerOpt.ModelDir := LayoutRoot + DirectorySeparator + 'kev-27b' +
+      DirectorySeparator;
+    Check(not PrepareDecisionAdapter(ServerOpt, LayoutRoot + DirectorySeparator +
+      'kev-27b', AdapterInfo, ErrMsg) and (Pos('as <model-dir> too', ErrMsg) = 0),
+      'a Kev full-weight checkpoint as <model-dir> passes the directory check' +
+      ' (the empty placeholder head.pt then fails to parse)');
+    AdapterInfo.Layout := dalKevFullWeights;
+    AdapterInfo.LoRAAdapterDir := '';
+    ErrMsg := DecisionOnlyReasonText(AdapterInfo, 'kev-27b');
+    Check((Pos('full weights are fine-tuned', ErrMsg) > 0) and
+      (Pos('without its LM head', ErrMsg) > 0),
+      'the Kev full-weight decision-only reason names the weights and the LM head');
+    ServerOpt := DefaultChatOptions();
+    ServerOpt.ModelDir := LayoutRoot + DirectorySeparator + 'empty';
+    Check(not PrepareDecisionAdapter(ServerOpt, LayoutRoot + DirectorySeparator +
+      'empty', AdapterInfo, ErrMsg) and (Pos('not a decision checkpoint', ErrMsg) > 0) and
+      (Pos('adapter_config.json', ErrMsg) > 0) and (Pos('temperature.json', ErrMsg) > 0),
+      'an unknown layout is refused naming the expected files');
+    AdapterInfo.Layout := dalKevLoRA;
+    AdapterInfo.LoRAAdapterDir := 'kev-0.8b';
+    ErrMsg := DecisionOnlyReasonText(AdapterInfo, 'kev-0.8b');
+    Check((Pos('--decision-adapter kev-0.8b', ErrMsg) > 0) and
+      (Pos('LoRA adapter is merged', ErrMsg) > 0) and (Pos('-Base', ErrMsg) > 0),
+      'the Kev decision-only reason names the flag, the merge and the -Base model');
+  finally
+    RemoveCreatedPaths();
+    CreatedPaths.Free;
   end;
   Base := DefaultChatOptions();
   Base.Temperature := 0.7;
@@ -1229,6 +1767,90 @@ begin
     Req.Free;
   end;
 
+  // POST /v1/systemone through HandleRequest (Engine stays nil: no route here may touch it).
+  DecisionBody := '{"model":"fixed-test","state":"s","questions":{' +
+    '"pick":{"type":"choice","instructions":"which?",' +
+    '"criteria":{"a":"first","b":null}},' +
+    '"level":{"type":"score","criteria":["low","mid","high"]},' +
+    '"yes":{"type":"noul"}}}';
+  App := TServerApp.Create();
+  try
+    App.ModelName := 'chat-test';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 501) and (Pos('"detail":', Reply) = 2) and
+      (Pos('no decision scorer', Reply) > 0),
+      'systemone without a scorer answers 501 {"detail": reason}');
+    Scorer := TFixedDecisionScorer.Create('fixed-test');
+    App.DecisionScorer := Scorer;
+    SetLength(Scorer.FixedProbabilities, 3);
+    Scorer.FixedProbabilities[0] := [0.75, 0.25];
+    Scorer.FixedProbabilities[1] := [0, 0.57, 0.43];
+    Scorer.FixedProbabilities[2] := [0.2, 0.8];
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 200) and (Reply = '{"model":"fixed-test","answers":{' +
+      '"pick":{"type":"choice","choice":"a","probabilities":{"a":0.75,' +
+      '"b":0.25},"confidence":0.5},"level":{"type":"score","score":1.43,' +
+      '"legend":{"0":"low","1":"mid","2":"high"},"probabilities":{"0":0.0,' +
+      '"1":0.57,"2":0.43},"confidence":0.355},"yes":{"type":"noul",' +
+      '"noul":0.8}},"usage":{"input_tokens":11,"output_tokens":3}}'),
+      'systemone with a fixed scorer returns the exact response JSON');
+    Reply := Serve(App, 'POST', '/v1/systemone',
+      StringReplace(DecisionBody, '"fixed-test"', '"other"', []), Code);
+    Check((Code = 200) and (Pos('{"model":"fixed-test"', Reply) = 1),
+      'systemone answers any model name with the loaded scorer''s name');
+    Reply := Serve(App, 'POST', '/v1/systemone',
+      StringReplace(DecisionBody, '"model":"fixed-test",', '', []), Code);
+    Check((Code = 200) and (Pos('{"model":"fixed-test"', Reply) = 1),
+      'systemone answers a request without a model');
+    Reply := Serve(App, 'POST', '/v1/systemone', '{"model":"fixed-test",' +
+      '"questions":{"q":{"type":"box"}}}', Code);
+    Check((Code = 422) and (Pos('{"detail":[{"loc":["body",', Reply) = 1),
+      'systemone answers a malformed request with the 422 detail list');
+    Reply := Serve(App, 'POST', '/v1/systemone', '{not json', Code);
+    Check((Code = 422) and (Pos('json_invalid', Reply) > 0),
+      'systemone answers invalid JSON with a 422 json_invalid detail');
+    Scorer.FailMessage := 'scorer exploded';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 500) and (Reply = '{"detail":"scorer exploded"}'),
+      'a scorer exception answers 500 {"detail": message}');
+    Scorer.FailMessage := '';
+    Scorer.UnsupportedMessage := 'too many options';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 422) and (Reply = '{"detail":"too many options"}'),
+      'a request the scorer cannot answer is a 422 {"detail": message}');
+    Scorer.UnsupportedMessage := '';
+    Scorer.LabelTokenMessage := 'label "Yes" is not a single token';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check((Code = 422) and
+      (Reply = '{"detail":"label \"Yes\" is not a single token"}'),
+      'an AnyJev label that is not one token is a 422 {"detail": message}');
+    Scorer.LabelTokenMessage := '';
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check(Code = 200, 'systemone answers again after a scorer exception');
+    Reply := Serve(App, 'GET', '/v1/models', '', Code);
+    Check((Code = 200) and (Pos('"chat-test"', Reply) > 0) and
+      (Pos('"fixed-test"', Reply) > 0),
+      '/v1/models lists the chat model and the decision scorer model');
+    App.DecisionOnlyReason := 'the server was launched with --decision-adapter';
+    Reply := Serve(App, 'POST', '/v1/chat/completions',
+      '{"messages":[{"role":"user","content":"hi"}]}', Code);
+    Check((Code = 501) and (Pos('--decision-adapter', Reply) > 0) and
+      (Pos('"error"', Reply) > 0),
+      'decision-only mode answers chat completions with 501 naming the reason');
+    Reply := Serve(App, 'POST', '/v1/completions', '{"prompt":"hi"}', Code);
+    Check((Code = 501) and (Pos('--decision-adapter', Reply) > 0),
+      'decision-only mode answers completions with 501 naming the reason');
+    Reply := Serve(App, 'POST', '/v1/systemone', DecisionBody, Code);
+    Check(Code = 200, 'decision-only mode still answers systemone');
+    Reply := Serve(App, 'GET', '/v1/models', '', Code);
+    Check((Code = 200) and (Pos('"chat-test"', Reply) = 0) and
+      (Pos('"fixed-test"', Reply) > 0),
+      'decision-only /v1/models lists only the decision scorer model');
+  finally
+    App.DecisionScorer.Free;
+    App.Free;
+  end;
+
   if Failures = 0 then WriteLn('SELFTEST OK')
   else
   begin
@@ -1242,15 +1864,18 @@ end;
 // ---------------------------------------------------------------------------
 var
   Opt: TChatOptions;
+  DecisionOpt: TDecisionServerOptions;
+  AdapterInfo: TDecisionAdapterInfo;
+  HeadScorer: TDecisionHeadScorer;
   Args: TStringList;
   App: TServerApp;
   Server: TChatHTTPServer;
   Cnt: integer;
-  ErrorMsg: string;
+  ErrorMsg, ScorerText: string;
 begin
   Args := TStringList.Create();
   for Cnt := 1 to ParamCount do Args.Add(ParamStr(Cnt));
-  if not ParseServerArgs(Args, Opt) then
+  if not ParseServerArgs(Args, Opt, DecisionOpt) then
   begin
     WriteLn('Error: ', Opt.ErrorMsg);
     WriteLn;
@@ -1270,21 +1895,85 @@ begin
     if Opt.ModelDir = '' then Halt(1);
     Halt(0);
   end;
+  // A load error is one stderr line and exit code 1, never an unhandled exception.
+  try
+    if (DecisionOpt.AdapterDir = '') and
+      (DetectDecisionAdapterLayout(Opt.ModelDir) = dalKevFullWeights) then
+    begin
+      WriteLn(StdErr, 'Error: ', Opt.ModelDir, ' is a Kev full-weight decision checkpoint' +
+        ' (no LM head, nothing to chat with): add --decision-adapter ', Opt.ModelDir);
+      Halt(1);
+    end;
+    if (DecisionOpt.AdapterDir <> '') and
+      not PrepareDecisionAdapter(Opt, DecisionOpt.AdapterDir, AdapterInfo, ErrorMsg) then
+    begin
+      WriteLn(StdErr, 'Error: --decision-adapter: ', ErrorMsg);
+      Halt(1);
+    end;
 
-  App := TServerApp.Create();
-  App.Engine := TChatEngine.Create();
-  App.Engine.OnNotice := @App.NoticeOut; // load progress + notices to console
-  App.RequestCount := 0;
-  if not App.Engine.LoadModel(Opt, ErrorMsg) then
-  begin
-    WriteLn(ErrorMsg);
-    App.Engine.Free;
-    App.Free;
-    Halt(1);
+    App := TServerApp.Create();
+    App.Engine := TChatEngine.Create();
+    App.Engine.OnNotice := @App.NoticeOut; // load progress + notices to console
+    App.RequestCount := 0;
+    if not App.Engine.LoadModel(Opt, ErrorMsg) then
+    begin
+      WriteLn(StdErr, 'Error: ', ErrorMsg);
+      App.Engine.Free;
+      App.Free;
+      Halt(1);
+    end;
+    App.ModelName :=
+      ExtractFileName(ExcludeTrailingPathDelimiter(App.Engine.Opt.ModelDir));
+    if App.ModelName = '' then App.ModelName := App.Engine.ModelType;
+    if DecisionOpt.AdapterDir = '' then
+    begin
+      // The decision model name is the chat model name, so /v1/models lists one id.
+      App.DecisionScorer := TAnyJevL0Scorer.Create(App.Engine, App.ModelName,
+        DecisionOpt.Level, DecisionOpt.Prior, DecisionOpt.MaxRotations);
+      ScorerText := 'AnyJev ' + DecisionLevelText(DecisionOpt) +
+        ' readout on the chat model';
+    end
+    else
+    begin
+      try
+        if AdapterInfo.Layout = dalOpenJev then
+        begin
+          HeadScorer := TOpenJevScorer.Create(App.Engine,
+            DecisionAdapterModelName(DecisionOpt.AdapterDir), AdapterInfo.CheckpointDir);
+          ScorerText := 'Open-Jev candidate head';
+        end
+        else
+        begin
+          HeadScorer := TKevScorer.Create(App.Engine,
+            DecisionAdapterModelName(DecisionOpt.AdapterDir),
+            AdapterInfo.CheckpointDir + csOpenJevHeadFile);
+          ScorerText := 'Kev pointer head';
+        end;
+      except
+        on E: Exception do
+        begin
+          WriteLn(StdErr, 'Error: --decision-adapter: ', E.Message);
+          App.Engine.Free;
+          App.Free;
+          Halt(1);
+        end;
+      end;
+      App.DecisionScorer := HeadScorer;
+      if DecisionOpt.Temperature > 0 then HeadScorer.Temperature := DecisionOpt.Temperature;
+      ScorerText := Format('%s from %s, temperature %.6g (checkpoint %.6g)',
+        [ScorerText, DecisionOpt.AdapterDir, HeadScorer.Temperature,
+        HeadScorer.HeadTemperature]);
+      App.DecisionOnlyReason := DecisionOnlyReasonText(AdapterInfo,
+        DecisionOpt.AdapterDir);
+      App.ModelName := HeadScorer.ModelName;
+    end;
+  except
+    on E: Exception do
+    begin
+      WriteLn(StdErr, 'Error: ', E.Message);
+      Halt(1);
+    end;
   end;
-  App.ModelName :=
-    ExtractFileName(ExcludeTrailingPathDelimiter(App.Engine.Opt.ModelDir));
-  if App.ModelName = '' then App.ModelName := App.Engine.ModelType;
 
   Server := TChatHTTPServer.Create(nil);
   try
@@ -1293,12 +1982,20 @@ begin
     Server.Threaded := false; // one request at a time on the accept loop:
                               // the engine's serialization guarantee
     Server.OnRequest := @App.HandleRequest;
-    WriteLn(Format('Serving %s on http://%s:%d/v1 (SSE streaming with' +
-      ' "stream":true; Ctrl+C stops)', [App.ModelName, App.Engine.Opt.Host,
-      App.Engine.Opt.Port]));
+    if App.DecisionOnlyReason = '' then
+      WriteLn(Format('Serving %s on http://%s:%d/v1 (SSE streaming with' +
+        ' "stream":true; Ctrl+C stops)', [App.ModelName, App.Engine.Opt.Host,
+        App.Engine.Opt.Port]))
+    else
+      WriteLn(Format('Serving decision model %s on http://%s:%d/v1, POST' +
+        ' /v1/systemone only (Ctrl+C stops)', [App.ModelName,
+        App.Engine.Opt.Host, App.Engine.Opt.Port]));
+    WriteLn(Format('POST /v1/systemone: %s (answers as "%s" whatever model' +
+      ' the request names)', [ScorerText, App.DecisionScorer.ModelName]));
     Server.Active := true; // blocks: the accept/serve loop
   finally
     Server.Free;
+    App.DecisionScorer.Free;
     App.Engine.Free;
     App.Free;
   end;

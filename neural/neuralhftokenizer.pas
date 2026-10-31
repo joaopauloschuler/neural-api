@@ -2112,6 +2112,7 @@ begin
     LoadSentencePieceModel(FileName);
     Exit;
   end;
+  RaiseIfGitLfsPointer(FileName, EHFTokenizerError);
   ClearState();
   DetectKeyMangling();
   FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
@@ -2708,6 +2709,7 @@ var
   end;
 
 begin
+  RaiseIfGitLfsPointer(FileName, EHFTokenizerError);
   ClearState();
   // NOTE: DetectKeyMangling() is intentionally NOT called -- the .model
   // reader handles raw bytes itself (no fpjson involved), so no key

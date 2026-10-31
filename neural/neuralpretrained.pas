@@ -13955,16 +13955,23 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // checkpoint again (see BuildLlamaFromSafeTensorsWithConfig). Only the
 // model types PretrainedModelTypeCanBorrowWeights accepts take it; every
 // other family raises EPretrainedImportError.
+// pLoRAAdapterDir: a HF PEFT LoRA adapter directory merged into the weights as
+// they load (TNNetLoRAMergeReader); Llama-builder model types only, and
+// unused with pWeightOwner (the owner's weights already carry the merge).
+// pOmitLMHead: the net ends at the final norm and outputs hidden states (no
+// vocab x hidden LM head; a tied embedding still loads); Llama-builder types
+// only. A twin borrowing from such a net must pass it too.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = '';
+  pOmitLMHead: boolean = false): TNNet;
 
 // True for the config.json model_type values BuildFromPretrained routes
 // through the Llama builder (llama, mistral, qwen2, qwen3, qwen3_moe,
-// qwen3_vl, qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2,
-// olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
-// twin can borrow an already-loaded net's weights (pWeightOwner).
+// qwen3_vl, qwen3_5, qwen3_5_text, qwen3_5_moe, gemma, gemma2, gemma3_text,
+// phi3, olmo2, olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) -
+// the families whose twin can borrow an already-loaded net's weights.
 function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 
 // ---------------------------------------------------------------------------
@@ -14012,6 +14019,67 @@ type
     Alpha: TNeuralFloat;
     Rank: integer;
     RankFound: boolean;
+    // target_modules when it is a list; TargetModulesIsList is false for a
+    // regex string or an absent field.
+    TargetModules: TStringArray;
+    TargetModulesIsList: boolean;
+    // rank_pattern / alpha_pattern in file order; keys are module-name
+    // suffixes (PEFT's first match wins).
+    RankPatternKeys: TStringArray;
+    RankPatternValues: array of integer;
+    AlphaPatternKeys: TStringArray;
+    AlphaPatternValues: TNeuralFloatDynArr;
+  end;
+
+  // One adapted base tensor of a TNNetLoRAMergeReader: W [OutDim, InDim]
+  // reads as W + Scale * B @ A, with A [Rank, InDim] and B [OutDim, Rank].
+  TPEFTLoRAMergeModule = record
+    AName, BName: string;
+    Rank, InDim, OutDim: integer;
+    Scale: TNeuralFloat;
+  end;
+
+  // A tensor reader over a base checkpoint with a HF PEFT LoRA adapter merged
+  // in, in HF tensor space: every base tensor the adapter targets reads as
+  // W + (lora_alpha / r) * B @ A in FP32, per whole-tensor or row-range load,
+  // so the importers' row permutations and int8/int4 quantization see the
+  // merged weights. Adapter key "base_model.model.<m>.lora_A.weight" targets
+  // the base tensor "<m>.weight", else "<text prefix><m>.weight" (the prefix
+  // of the checkpoint's embed_tokens.weight: "model.language_model.",
+  // "model." or ""). The other tensors pass through untouched. An entry's
+  // Shard field holds its index into FSourceNames (renames keep the link).
+  TNNetLoRAMergeReader = class(TNNetSafeTensorsReader)
+  private
+    FBase: TNNetSafeTensorsReader;     // owned
+    FAdapter: TNNetSafeTensorsReader;  // owned
+    FSourceNames: array of string;     // base tensor name per entry
+    FModuleOfSource: array of integer; // FModules index per entry, -1 = none
+    FModules: array of TPEFTLoRAMergeModule;
+    FCachedModule: integer;            // module whose A/B are in FA/FB
+    FA, FB, FDeltaRow: TNNetVolume;
+    function SourceOf(const pName: string): integer;
+    procedure LoadModuleFactors(ModuleIdx: integer);
+    // Adds Scale * (B @ A) of FModules[ModuleIdx] to Dest, which holds the
+    // flat elements FirstElement.. of the [OutDim, InDim] base tensor.
+    procedure AddDeltaToFlatRange(ModuleIdx: integer; Dest: TNNetVolume;
+      FirstElement: Int64);
+    function GetAdaptedTensorCount: integer;
+  public
+    // Takes ownership of pBase (also freed when Create raises). pAdapterDir
+    // holds adapter_config.json and adapter_model.safetensors (or .bin).
+    constructor Create(pBase: TNNetSafeTensorsReader;
+      const pAdapterDir: string);
+    destructor Destroy; override;
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+    function CanStreamTensorRows(const pName: string): boolean; override;
+    procedure LoadTensorRowsFlat(const pName: string;
+      FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); override;
+    function CanStreamTensorPackedQ4_0(const pName: string): boolean; override;
+    procedure LoadTensorPackedRowsQ4_0(const pName: string;
+      FirstRow, RowCount, RowSize: integer;
+      Dest: TNNetVolumeQuant4); override;
+    property AdaptedTensorCount: integer read GetAdaptedTensorCount;
   end;
 
 // Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
@@ -14024,8 +14092,8 @@ procedure LoadPlainLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   Scale: TNeuralFloat = 1.0);
 
-// Reads lora_alpha and r from a PEFT adapter_config.json. Missing fields
-// default to Alpha=Rank (scale 1.0) so a config-less adapter still loads.
+// Reads r, lora_alpha (default r), target_modules and rank/alpha_pattern from
+// adapter_config.json; raises on options (DoRA, rsLoRA, ...) beyond W + alpha/r B A.
 function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
 
 // Loads ONE wrapped module's LoRA pair from an already-open reader onto the
@@ -14201,6 +14269,14 @@ uses
 procedure ImportError(const Msg: string);
 begin
   raise EPretrainedImportError.Create(Msg);
+end;
+
+// Loads the text file FileName into JsonText; a Git LFS pointer file raises
+// EPretrainedImportError instead.
+procedure LoadImportJSONText(JsonText: TStrings; const FileName: string);
+begin
+  RaiseIfGitLfsPointer(FileName, EPretrainedImportError);
+  JsonText.LoadFromFile(FileName);
 end;
 
 function CreatePretrainedTensorReader(
@@ -15335,7 +15411,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -17046,21 +17122,82 @@ begin
 end;
 
 function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+const
+  // Options that add weights or change the merged math (W + alpha/r * B A).
+  UnsupportedOptions: array[0..13] of string = ('use_dora', 'use_rslora',
+    'use_qalora', 'use_bdlora', 'lora_bias', 'fan_in_fan_out',
+    'modules_to_save', 'trainable_token_indices', 'layer_replication',
+    'target_parameters', 'alora_invocation_tokens', 'arrow_config',
+    'kasa_config', 'monteclora_config');
 var
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
   Field: TJSONData;
+  OptionCnt, ItemCnt, MaxItemPos: integer;
+  InitText: string;
+
+  // True when the option is present with a value other than null, false,
+  // "" or an empty list/object.
+  function IsOptionSet(Value: TJSONData): boolean;
+  begin
+    if (Value = nil) or Value.IsNull then exit(false);
+    case Value.JSONType of
+      jtBoolean: Result := Value.AsBoolean;
+      jtString: Result := Value.AsString <> '';
+      jtArray, jtObject: Result := Value.Count > 0;
+    else
+      Result := true;
+    end;
+  end;
+
+  // Reads a rank_pattern / alpha_pattern object; keys must be plain dotted
+  // module-name suffixes (PEFT matches them as regexes).
+  procedure ReadPattern(const FieldName: string; out Keys: TStringArray;
+    out Values: TNeuralFloatDynArr);
+  var
+    PatternObj: TJSONObject;
+    KeyCnt, MaxKeyPos: integer;
+    Key: string;
+  begin
+    SetLength(Keys, 0);
+    SetLength(Values, 0);
+    Field := Obj.Find(FieldName);
+    if (Field = nil) or Field.IsNull then exit;
+    if not (Field is TJSONObject) then
+      ImportError('PEFT import: config "' + FieldName + '" must be an ' +
+        'object, got ' + Field.AsJSON + '.');
+    PatternObj := TJSONObject(Field);
+    SetLength(Keys, PatternObj.Count);
+    SetLength(Values, PatternObj.Count);
+    MaxKeyPos := PatternObj.Count - 1;
+    for KeyCnt := 0 to MaxKeyPos do
+    begin
+      Key := PatternObj.Names[KeyCnt];
+      if (Key = '') or (LastDelimiter('*+?[](){}|^$\', Key) > 0) then
+        ImportError('PEFT import: config "' + FieldName + '" key "' + Key +
+          '" is a regex - only plain module-name suffixes are supported.');
+      if not (PatternObj.Items[KeyCnt].JSONType = jtNumber) then
+        ImportError('PEFT import: config "' + FieldName + '" value for "' +
+          Key + '" must be a number.');
+      Keys[KeyCnt] := Key;
+      Values[KeyCnt] := PatternObj.Items[KeyCnt].AsFloat;
+    end;
+  end;
+
+var
+  PatternValues: TNeuralFloatDynArr;
+  MaxPatternPos, PatternCnt: integer;
 begin
+  Result := Default(TPEFTAdapterConfig);
   Result.Alpha := 1.0;
   Result.Rank := 1;
-  Result.RankFound := False;
   if not FileExists(FileName) then
     ImportError('PEFT import: adapter_config.json not found: ' + FileName);
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -17072,6 +17209,31 @@ begin
       ImportError('PEFT import: config "' + FileName +
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
+    if Obj.Get('peft_type', 'LORA') <> 'LORA' then
+      ImportError('PEFT import: config "' + FileName + '" has peft_type "' +
+        Obj.Get('peft_type', '') + '" - only LORA is supported.');
+    for OptionCnt := Low(UnsupportedOptions) to High(UnsupportedOptions) do
+      if IsOptionSet(Obj.Find(UnsupportedOptions[OptionCnt])) then
+        ImportError('PEFT import: config "' + FileName + '" sets "' +
+          UnsupportedOptions[OptionCnt] + '" = ' +
+          Obj.Find(UnsupportedOptions[OptionCnt]).AsJSON +
+          ' - not supported (the weights would not be base + ' +
+          '(lora_alpha/r) * B @ A).');
+    if Obj.Get('bias', 'none') <> 'none' then
+      ImportError('PEFT import: config "' + FileName + '" has bias "' +
+        Obj.Get('bias', '') + '" - only "none" is supported.');
+    // PiSSA / OLoRA / CorDA / LoftQ / LoRA-GA rewrite the base weights at
+    // initialization, so their adapters do not apply to the original base.
+    Field := Obj.Find('init_lora_weights');
+    if (Field <> nil) and (Field.JSONType = jtString) then
+    begin
+      InitText := Field.AsString;
+      if (InitText <> 'gaussian') and (InitText <> 'eva') and
+         (InitText <> 'orthogonal') then
+        ImportError('PEFT import: config "' + FileName +
+          '" has init_lora_weights "' + InitText + '" - only true, false, ' +
+          '"gaussian", "eva" and "orthogonal" leave the base weights intact.');
+    end;
     Field := Obj.Find('r');
     if (Field <> nil) and not Field.IsNull then
     begin
@@ -17083,10 +17245,56 @@ begin
     end;
     // lora_alpha defaults to r (PEFT scale 1.0) when absent.
     Result.Alpha := Obj.Get('lora_alpha', TNeuralFloat(Result.Rank));
+    Field := Obj.Find('target_modules');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      Result.TargetModulesIsList := true;
+      SetLength(Result.TargetModules, Field.Count);
+      MaxItemPos := Field.Count - 1;
+      for ItemCnt := 0 to MaxItemPos do
+        Result.TargetModules[ItemCnt] := Field.Items[ItemCnt].AsString;
+    end;
+    ReadPattern('rank_pattern', Result.RankPatternKeys, PatternValues);
+    SetLength(Result.RankPatternValues, Length(PatternValues));
+    MaxPatternPos := High(PatternValues);
+    for PatternCnt := 0 to MaxPatternPos do
+    begin
+      Result.RankPatternValues[PatternCnt] := Round(PatternValues[PatternCnt]);
+      if Result.RankPatternValues[PatternCnt] < 1 then
+        ImportError('PEFT import: config "rank_pattern" value for "' +
+          Result.RankPatternKeys[PatternCnt] + '" must be >= 1.');
+    end;
+    ReadPattern('alpha_pattern', Result.AlphaPatternKeys,
+      Result.AlphaPatternValues);
   finally
     Root.Free;
     JsonText.Free;
   end;
+end;
+
+// True when ModulePath is Suffix or ends with "." + Suffix (PEFT's module-name
+// match for target_modules lists and plain rank_pattern / alpha_pattern keys).
+function PEFTModuleNameMatches(const ModulePath, Suffix: string): boolean;
+var
+  PathLen, SuffixLen: integer;
+begin
+  PathLen := Length(ModulePath);
+  SuffixLen := Length(Suffix);
+  if PathLen = SuffixLen then exit(ModulePath = Suffix);
+  Result := (PathLen > SuffixLen) and
+    (ModulePath[PathLen - SuffixLen] = '.') and
+    (Copy(ModulePath, PathLen - SuffixLen + 1, SuffixLen) = Suffix);
+end;
+
+// Index of the first key ModulePath matches, -1 when none.
+function PEFTPatternIndex(const Keys: array of string;
+  const ModulePath: string): integer;
+var
+  KeyCnt: integer;
+begin
+  for KeyCnt := Low(Keys) to High(Keys) do
+    if PEFTModuleNameMatches(ModulePath, Keys[KeyCnt]) then exit(KeyCnt);
+  Result := -1;
 end;
 
 function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
@@ -17148,6 +17356,294 @@ begin
   // B: [d_out, Rank] -> B layer (d_out neurons, Rank weights), scaled.
   LoadPlainLinearWeights(Reader, BUp, BName, Rank, d_out, Scale);
   Result := Base;
+end;
+
+{ TNNetLoRAMergeReader }
+
+constructor TNNetLoRAMergeReader.Create(pBase: TNNetSafeTensorsReader;
+  const pAdapterDir: string);
+const
+  PEFTKeyPrefix = 'base_model.model.';
+  LoRAAMarker = '.lora_A.';
+var
+  Config: TPEFTAdapterConfig;
+  ConfigFile, AdapterFile, AdapterKey, ModulePath, WeightSuffix: string;
+  BName, BaseName, TextPrefix, DType: string;
+  PairedNames: TStringList;
+  Module: TPEFTLoRAMergeModule;
+  Alpha: TNeuralFloat;
+  SourceCnt, MaxSourcePos, AdapterCnt, MaxAdapterPos, MarkerPos: integer;
+  SourceIdx, PatternIdx, ExpectedRank, ModuleIdx: integer;
+
+  // "weight" or "<adapter name>.weight" (PEFT drops the name "default").
+  function IsLoRAWeightSuffix(const Suffix: string): boolean;
+  var
+    NamePart: string;
+  begin
+    if Suffix = 'weight' then exit(true);
+    NamePart := Copy(Suffix, 1, Length(Suffix) - Length('.weight'));
+    Result := (Length(Suffix) > Length('.weight')) and
+      (Copy(Suffix, Length(NamePart) + 1, MaxInt) = '.weight') and
+      (Pos('.', NamePart) = 0);
+  end;
+
+begin
+  inherited CreateBare;
+  FBase := pBase; // first: Destroy frees it when anything below raises
+  FCachedModule := -1;
+  FA := TNNetVolume.Create;
+  FB := TNNetVolume.Create;
+  FDeltaRow := TNNetVolume.Create;
+  FFileName := FBase.FileName;
+  ConfigFile := IncludeTrailingPathDelimiter(pAdapterDir) +
+    'adapter_config.json';
+  Config := ReadPEFTAdapterConfig(ConfigFile);
+  if not Config.RankFound then
+    ImportError('LoRA merge: ' + ConfigFile + ' has no "r".');
+  AdapterFile := IncludeTrailingPathDelimiter(pAdapterDir) +
+    'adapter_model.safetensors';
+  if not FileExists(AdapterFile) then
+    AdapterFile := IncludeTrailingPathDelimiter(pAdapterDir) +
+      'adapter_model.bin';
+  if not FileExists(AdapterFile) then
+    ImportError('LoRA merge: neither adapter_model.safetensors nor ' +
+      'adapter_model.bin found in ' + pAdapterDir + '.');
+  FAdapter := CreatePretrainedTensorReader(AdapterFile);
+  MaxSourcePos := FBase.Count - 1;
+  SetLength(FTensors, FBase.Count);
+  SetLength(FSourceNames, FBase.Count);
+  SetLength(FModuleOfSource, FBase.Count);
+  for SourceCnt := 0 to MaxSourcePos do
+  begin
+    FSourceNames[SourceCnt] := FBase.TensorName(SourceCnt);
+    FTensors[SourceCnt] := FBase.GetInfo(FSourceNames[SourceCnt]);
+    FTensors[SourceCnt].Shard := SourceCnt;
+    FModuleOfSource[SourceCnt] := -1;
+  end;
+  InvalidateTensorIndex;
+  // The text decoder's prefix, as the Llama importer detects it.
+  if FBase.HasTensor('model.language_model.embed_tokens.weight') then
+    TextPrefix := 'model.language_model.'
+  else if FBase.HasTensor('model.embed_tokens.weight') then
+    TextPrefix := 'model.'
+  else
+    TextPrefix := '';
+  PairedNames := TStringList.Create;
+  try
+    PairedNames.Sorted := true;
+    MaxAdapterPos := FAdapter.Count - 1;
+    for AdapterCnt := 0 to MaxAdapterPos do
+    begin
+      AdapterKey := FAdapter.TensorName(AdapterCnt);
+      MarkerPos := Pos(LoRAAMarker, AdapterKey);
+      if MarkerPos = 0 then continue; // paired below from its lora_A
+      WeightSuffix := Copy(AdapterKey, MarkerPos + Length(LoRAAMarker), MaxInt);
+      if not IsLoRAWeightSuffix(WeightSuffix) then continue;
+      ModulePath := Copy(AdapterKey, 1, MarkerPos - 1);
+      BName := ModulePath + '.lora_B.' + WeightSuffix;
+      if not FAdapter.HasTensor(BName) then
+        ImportError('LoRA merge: adapter tensor "' + AdapterKey +
+          '" has no matching "' + BName + '" in ' + AdapterFile + '.');
+      PairedNames.Add(AdapterKey);
+      PairedNames.Add(BName);
+      if Copy(ModulePath, 1, Length(PEFTKeyPrefix)) = PEFTKeyPrefix then
+        Delete(ModulePath, 1, Length(PEFTKeyPrefix));
+      if FBase.HasTensor(ModulePath + '.weight') then
+        BaseName := ModulePath + '.weight'
+      else if (TextPrefix <> '') and
+        FBase.HasTensor(TextPrefix + ModulePath + '.weight') then
+        BaseName := TextPrefix + ModulePath + '.weight'
+      else
+        ImportError('LoRA merge: adapter module "' + ModulePath +
+          '" matches no base tensor (tried "' + ModulePath + '.weight" and "' +
+          TextPrefix + ModulePath + '.weight") in ' + FFileName + '.');
+      if (Pos('visual.', BaseName) = 1) or (Pos('model.visual.', BaseName) = 1)
+        or (Pos('mtp.', BaseName) = 1) or (Pos('model.mtp.', BaseName) = 1) then
+        ImportError('LoRA merge: adapter module "' + ModulePath +
+          '" targets "' + BaseName + '", which the text importer skips.');
+      if Config.TargetModulesIsList and
+        (PEFTPatternIndex(Config.TargetModules, ModulePath) < 0) then
+        ImportError('LoRA merge: adapter module "' + ModulePath +
+          '" is not in the target_modules of ' + ConfigFile + '.');
+      DType := FBase.GetDType(BaseName);
+      if ((DType <> 'F32') and (DType <> 'F16') and (DType <> 'BF16')) or
+        (FBase.DimCount(BaseName) <> 2) then
+        ImportError('LoRA merge: base tensor "' + BaseName + '" (dtype ' +
+          DType + ', shape ' + FBase.ShapeAsString(BaseName) +
+          ') is not a dense F32/F16/BF16 matrix.');
+      Module.AName := AdapterKey;
+      Module.BName := BName;
+      Module.OutDim := integer(FBase.DimSize(BaseName, 0));
+      Module.InDim := integer(FBase.DimSize(BaseName, 1));
+      if (FAdapter.DimCount(AdapterKey) <> 2) or
+        (FAdapter.DimCount(BName) <> 2) or
+        (FAdapter.DimSize(AdapterKey, 1) <> Module.InDim) or
+        (FAdapter.DimSize(BName, 0) <> Module.OutDim) or
+        (FAdapter.DimSize(BName, 1) <> FAdapter.DimSize(AdapterKey, 0)) then
+        ImportError('LoRA merge: "' + AdapterKey + '" ' +
+          FAdapter.ShapeAsString(AdapterKey) + ' and "' + BName + '" ' +
+          FAdapter.ShapeAsString(BName) + ' do not fit base "' + BaseName +
+          '" ' + FBase.ShapeAsString(BaseName) +
+          ' (expected [r, in] and [out, r]).');
+      Module.Rank := integer(FAdapter.DimSize(AdapterKey, 0));
+      PatternIdx := PEFTPatternIndex(Config.RankPatternKeys, ModulePath);
+      if PatternIdx >= 0 then ExpectedRank := Config.RankPatternValues[PatternIdx]
+      else ExpectedRank := Config.Rank;
+      if Module.Rank <> ExpectedRank then
+        ImportError('LoRA merge: "' + AdapterKey + '" has rank ' +
+          IntToStr(Module.Rank) + ' but ' + ConfigFile + ' gives r = ' +
+          IntToStr(ExpectedRank) + ' for module "' + ModulePath + '".');
+      PatternIdx := PEFTPatternIndex(Config.AlphaPatternKeys, ModulePath);
+      if PatternIdx >= 0 then Alpha := Config.AlphaPatternValues[PatternIdx]
+      else Alpha := Config.Alpha;
+      Module.Scale := Alpha / Module.Rank;
+      SourceIdx := FindTensor(BaseName);
+      if FModuleOfSource[SourceIdx] >= 0 then
+        ImportError('LoRA merge: two adapter modules target "' + BaseName +
+          '" in ' + AdapterFile + '.');
+      ModuleIdx := Length(FModules);
+      SetLength(FModules, ModuleIdx + 1);
+      FModules[ModuleIdx] := Module;
+      FModuleOfSource[SourceIdx] := ModuleIdx;
+      FTensors[SourceIdx].DType := 'F32'; // served merged, in FP32
+    end;
+    for AdapterCnt := 0 to MaxAdapterPos do
+      if PairedNames.IndexOf(FAdapter.TensorName(AdapterCnt)) < 0 then
+        ImportError('LoRA merge: adapter tensor "' +
+          FAdapter.TensorName(AdapterCnt) + '" is not part of a ' +
+          'lora_A/lora_B weight pair - DoRA magnitudes, LoRA biases, ' +
+          'embedding LoRA, trainable tokens and modules_to_save are not ' +
+          'supported (' + AdapterFile + ').');
+  finally
+    PairedNames.Free;
+  end;
+  if Length(FModules) = 0 then
+    ImportError('LoRA merge: ' + AdapterFile + ' holds no LoRA weights.');
+end;
+
+destructor TNNetLoRAMergeReader.Destroy;
+begin
+  FDeltaRow.Free;
+  FB.Free;
+  FA.Free;
+  FAdapter.Free;
+  FBase.Free;
+  inherited Destroy;
+end;
+
+function TNNetLoRAMergeReader.GetAdaptedTensorCount: integer;
+begin
+  Result := Length(FModules);
+end;
+
+function TNNetLoRAMergeReader.SourceOf(const pName: string): integer;
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    raise ESafeTensorsError.CreateFmt('LoRA merge: tensor "%s" not found ' +
+      'in %s', [pName, FFileName]);
+  Result := FTensors[Idx].Shard;
+end;
+
+procedure TNNetLoRAMergeReader.LoadModuleFactors(ModuleIdx: integer);
+begin
+  if FCachedModule = ModuleIdx then exit;
+  FCachedModule := -1;
+  FAdapter.LoadTensorFlat(FModules[ModuleIdx].AName, FA);
+  FAdapter.LoadTensorFlat(FModules[ModuleIdx].BName, FB);
+  FDeltaRow.ReSize(FModules[ModuleIdx].InDim, 1, 1);
+  FCachedModule := ModuleIdx;
+end;
+
+procedure TNNetLoRAMergeReader.AddDeltaToFlatRange(ModuleIdx: integer;
+  Dest: TNNetVolume; FirstElement: Int64);
+var
+  InDim, Rank, MaxRankPos, RankPos, Row, Col, DestPos, SpanCount: integer;
+  ElemCount, BRowBase: integer;
+  Scale: TNeuralFloat;
+begin
+  LoadModuleFactors(ModuleIdx);
+  InDim := FModules[ModuleIdx].InDim;
+  Rank := FModules[ModuleIdx].Rank;
+  Scale := FModules[ModuleIdx].Scale;
+  MaxRankPos := Rank - 1;
+  ElemCount := Dest.Size;
+  Row := integer(FirstElement div InDim);
+  Col := integer(FirstElement mod InDim);
+  DestPos := 0;
+  while DestPos < ElemCount do
+  begin
+    SpanCount := InDim - Col;
+    if SpanCount > ElemCount - DestPos then SpanCount := ElemCount - DestPos;
+    // The unscaled B @ A row first, then W += Scale * row: one rounding of
+    // the delta into W, as PEFT's W + (B @ A) * scaling.
+    FDeltaRow.Fill(0);
+    BRowBase := Row * Rank;
+    for RankPos := 0 to MaxRankPos do
+      TNNetVolume.MulAdd(FDeltaRow.GetRawPtr(0), FA.GetRawPtr(RankPos * InDim),
+        FB.FData[BRowBase + RankPos], InDim);
+    TNNetVolume.MulAdd(Dest.GetRawPtr(DestPos), FDeltaRow.GetRawPtr(Col),
+      Scale, SpanCount);
+    Inc(DestPos, SpanCount);
+    Inc(Row);
+    Col := 0;
+  end;
+end;
+
+procedure TNNetLoRAMergeReader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  FBase.LoadTensorFlat(FSourceNames[SourceIdx], Dest);
+  if FModuleOfSource[SourceIdx] >= 0 then
+    AddDeltaToFlatRange(FModuleOfSource[SourceIdx], Dest, 0);
+end;
+
+function TNNetLoRAMergeReader.CanStreamTensorRows(
+  const pName: string): boolean;
+begin
+  Result := FBase.CanStreamTensorRows(FSourceNames[SourceOf(pName)]);
+end;
+
+procedure TNNetLoRAMergeReader.LoadTensorRowsFlat(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  FBase.LoadTensorRowsFlat(FSourceNames[SourceIdx], FirstRow, RowCount,
+    RowSize, Dest);
+  if FModuleOfSource[SourceIdx] >= 0 then
+    AddDeltaToFlatRange(FModuleOfSource[SourceIdx], Dest,
+      Int64(FirstRow) * RowSize);
+end;
+
+function TNNetLoRAMergeReader.CanStreamTensorPackedQ4_0(
+  const pName: string): boolean;
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  // Packed Q4_0 codes cannot take the delta; adapted tensors load as FP32.
+  Result := (FModuleOfSource[SourceIdx] < 0) and
+    FBase.CanStreamTensorPackedQ4_0(FSourceNames[SourceIdx]);
+end;
+
+procedure TNNetLoRAMergeReader.LoadTensorPackedRowsQ4_0(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolumeQuant4);
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  if FModuleOfSource[SourceIdx] >= 0 then
+    raise ESafeTensorsError.CreateFmt('LoRA merge: "%s" carries a LoRA ' +
+      'delta and has no packed Q4_0 form: %s', [pName, FFileName]);
+  FBase.LoadTensorPackedRowsQ4_0(FSourceNames[SourceIdx], FirstRow, RowCount,
+    RowSize, Dest);
 end;
 
 // Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
@@ -18262,13 +18758,15 @@ end;
 // (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
 // allocated, and no quantize sweep runs. A layer count or class mismatch
 // raises. pStopBeforeFinalNorm, pDeepStackInputs: see
-// BuildLlamaFromSafeTensorsWithConfig. Coded by Claude (AI).
+// BuildLlamaFromSafeTensorsWithConfig. pOmitLMHead: the net ends at the final
+// RMSNorm (hidden states out); lm_head is neither required nor loaded.
+// Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
   pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false;
-  pDeepStackInputs: integer = 0): TNNet;
+  pDeepStackInputs: integer = 0; pOmitLMHead: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -18475,7 +18973,7 @@ begin
             '], got ' +
             Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
         if (not Config.TieWordEmbeddings) and (not pStopBeforeFinalNorm) and
-           (not Reader.HasTensor(LMHeadName)) then
+           (not pOmitLMHead) and (not Reader.HasTensor(LMHeadName)) then
           ImportError('Llama import: config says tie_word_embeddings=false ' +
             'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
       end;
@@ -19002,13 +19500,17 @@ begin
       begin
         FinalNorm := NN.AddLayer(
           TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
-        LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
-        // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
-        // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
-        // (HF applies it to the logits before any sampling softmax).
-        if Config.FinalLogitSoftCap > 0 then
-          NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+        if pOmitLMHead then LMHead := nil
+        else
+        begin
+          LMHead := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+          // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
+          // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
+          // (HF applies it to the logits before any sampling softmax).
+          if Config.FinalLogitSoftCap > 0 then
+            NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+        end;
       end;
       if not pTrainable then NN.SetTrainable();
       if QuantizeSweeps then NN.QuantizeWeightsInt8();
@@ -22167,7 +22669,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -22604,7 +23106,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -23342,7 +23844,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -23809,7 +24311,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24255,7 +24757,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24619,7 +25121,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -25076,7 +25578,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -25671,7 +26173,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26255,7 +26757,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26960,7 +27462,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -27034,7 +27536,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -28522,7 +29024,7 @@ begin
   Root := nil;
   try
     try
-      JsonText.LoadFromFile(FileName);
+      LoadImportJSONText(JsonText, FileName);
       try
         Root := GetJSON(JsonText.Text);
       except
@@ -29281,7 +29783,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -29998,7 +30500,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -30682,7 +31184,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -31434,7 +31936,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -32072,7 +32574,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -33546,7 +34048,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -34057,7 +34559,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -34669,7 +35171,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -34973,7 +35475,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MusicGen import: config "' + FileName +
@@ -35069,7 +35571,7 @@ begin
   Root := nil;
   try
     try
-      JsonText.LoadFromFile(FileName);
+      LoadImportJSONText(JsonText, FileName);
       Root := GetJSON(JsonText.Text);
     except
       // Corrupt/unreadable JSON behaves the same as an absent file.
@@ -36217,7 +36719,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Parler-TTS import: config "' + FileName +
@@ -36923,7 +37425,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MusicGen Melody import: config "' + FileName +
@@ -37882,7 +38384,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Bark import: config root is not a JSON object.');
@@ -38368,7 +38870,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -38746,7 +39248,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -39108,7 +39610,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -40003,7 +40505,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -41191,7 +41693,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -41859,7 +42361,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42400,7 +42902,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42791,7 +43293,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -43061,7 +43563,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -44015,7 +44517,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('EnCodec import: config "' + FileName +
@@ -45678,7 +46180,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Mimi import: config "' + FileName + '" is not a JSON object.');
@@ -47261,7 +47763,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('DAC import: config "' + FileName + '" is not a JSON object.');
@@ -48250,7 +48752,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -49059,7 +49561,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -49854,7 +50356,7 @@ begin
   Root := nil;
   CfgRoot := nil;
   try
-    JsonText.LoadFromFile(VocabFile);
+    LoadImportJSONText(JsonText, VocabFile);
     // Parse WITHOUT joUTF8 so multibyte char keys (e.g. the en-dash in
     // mms-tts-eng) survive as raw UTF-8 bytes.
     try
@@ -49888,7 +50390,7 @@ begin
     begin
       if not FileExists(ConfigFile) then
         ImportError('VITS tokenizer: config file not found: ' + ConfigFile);
-      JsonText.LoadFromFile(ConfigFile);
+      LoadImportJSONText(JsonText, ConfigFile);
       try
         CfgRoot := HFParseJSONRaw(JsonText.Text);
       except
@@ -50831,7 +51333,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -51306,7 +51808,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     // The HF config.json escapes some vocab keys (̃); decode them to
     // raw UTF-8 and parse without joUTF8 so every key keeps its bytes.
     try
@@ -53739,7 +54241,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -54181,7 +54683,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -55334,7 +55836,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -55729,7 +56231,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -56331,7 +56833,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -56920,7 +57422,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -57639,7 +58141,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -58046,7 +58548,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -58607,7 +59109,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -60192,7 +60694,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61641,7 +62143,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61885,7 +62387,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -62032,7 +62534,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -62653,7 +63155,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63515,7 +64017,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63946,7 +64448,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -64270,7 +64772,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -64832,7 +65334,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -65237,7 +65739,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -65750,7 +66252,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -66227,7 +66729,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -66788,7 +67290,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67321,7 +67823,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67751,7 +68253,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -68043,7 +68545,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -68489,7 +68991,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -68945,7 +69447,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -69939,7 +70441,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -70381,7 +70883,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -71029,7 +71531,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -71653,7 +72155,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -72267,7 +72769,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
@@ -73575,7 +74077,7 @@ begin
     ImportError('SD UNet import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Result := ReadSDUNetConfigFromJSONText(JsonText.Text, FileName);
   finally
     JsonText.Free;
@@ -74822,7 +75324,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75313,7 +75815,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75696,7 +76198,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75953,7 +76455,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76136,7 +76638,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76691,7 +77193,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76945,7 +77447,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -77159,7 +77661,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -77472,7 +77974,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -77922,7 +78424,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78623,7 +79125,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -79034,7 +79536,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -79401,7 +79903,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -79740,7 +80242,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -80075,7 +80577,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('SAM mask decoder: config is not a JSON object.');
@@ -80963,7 +81465,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -81599,7 +82101,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -82183,7 +82685,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -82571,7 +83073,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -83402,7 +83904,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84290,7 +84792,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84861,7 +85363,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -85072,7 +85574,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -85460,7 +85962,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -85759,7 +86261,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -86186,7 +86688,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Qwen2-VL import: config root is not a JSON object.');
@@ -86503,7 +87005,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     Result.ImageTokenId := TJSONObject(Root).Get('image_token_id', -1);
     Result.VideoTokenId := TJSONObject(Root).Get('video_token_id', -1);
@@ -87118,7 +87620,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
@@ -87526,7 +88028,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError(csQwen3VLVisionImporter + ': "' + FileName +
@@ -89141,7 +89643,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(IndexFile);
+    LoadImportJSONText(JsonText, IndexFile);
     Root := GetJSON(JsonText.Text);
     PipelineClass := '';
     if Root is TJSONObject then
@@ -90105,7 +90607,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -90551,7 +91053,8 @@ begin
   Result := (ModelType = 'llama') or (ModelType = 'mistral') or
     (ModelType = 'qwen2') or (ModelType = 'qwen3') or
     (ModelType = 'qwen3_moe') or (ModelType = 'qwen3_vl') or
-    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
+    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_text') or
+    (ModelType = 'qwen3_5_moe') or
     (ModelType = 'gemma') or (ModelType = 'gemma2') or
     (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
     (ModelType = 'olmo2') or (ModelType = 'olmoe') or
@@ -90565,8 +91068,10 @@ end;
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = '';
+  pOmitLMHead: boolean = false): TNNet;
 var
+  LlamaReader: TNNetSafeTensorsReader;
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
   Root, ArchData: TJSONData;
@@ -90635,7 +91140,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(ConfigPath);
+    LoadImportJSONText(JsonText, ConfigPath);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -90685,6 +91190,15 @@ begin
       '" cannot borrow the weights of an already-loaded net - only the ' +
       'Llama-family builders can (PretrainedModelTypeCanBorrowWeights); ' +
       'build the second net without pWeightOwner.');
+  if (pLoRAAdapterDir <> '') and
+    (not PretrainedModelTypeCanBorrowWeights(ModelType)) then
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" cannot merge a LoRA adapter - only the Llama-family builders can ' +
+      '(PretrainedModelTypeCanBorrowWeights).');
+  if pOmitLMHead and (not PretrainedModelTypeCanBorrowWeights(ModelType)) then
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" cannot be built without its LM head - only the Llama-family ' +
+      'builders can (PretrainedModelTypeCanBorrowWeights).');
 
   // ---- dispatch ----
   if (ModelType = 'gpt2') and GPT2SeqCls then
@@ -90819,8 +91333,18 @@ begin
     // full attention) plus - for the MoE variant - the fused-expert +
     // gated-shared-expert sparse FFN; the vision tower and MTP head are
     // skipped (TEXT decoder only). See BuildQwen35FromSafeTensorsEx.
-    Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8, pWeightOwner)
+  begin
+    IgnoredLlamaConfig := ReadLlamaConfigFromJSONFile(ConfigPath);
+    // A borrowing build never opens the checkpoint.
+    if Assigned(pWeightOwner) then LlamaReader := nil
+    else if pLoRAAdapterDir <> '' then
+      LlamaReader := TNNetLoRAMergeReader.Create(
+        CreatePretrainedTensorReader(WeightsPath), pLoRAAdapterDir)
+    else LlamaReader := CreatePretrainedTensorReader(WeightsPath);
+    Result := BuildLlamaFromTensorReaderWithConfig(LlamaReader, WeightsPath,
+      IgnoredLlamaConfig, pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner,
+      {pStopBeforeFinalNorm=}false, {pDeepStackInputs=}0, pOmitLMHead);
+  end
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
           (ModelType = 'roberta') or (ModelType = 'xlm-roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1
@@ -91111,7 +91635,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('DiT import: ' + FileName + ' is not a JSON object.');
@@ -91570,7 +92094,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('VAR import: ' + FileName + ' is not a JSON object.');
@@ -92178,7 +92702,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('PixArt import: ' + FileName + ' is not a JSON object.');
@@ -92674,7 +93198,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MMDiT import: ' + FileName + ' is not a JSON object.');
@@ -92978,7 +93502,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -93491,7 +94015,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -93896,7 +94420,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('F5-TTS import: config "' + FileName + '" is not a JSON object.');

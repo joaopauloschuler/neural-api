@@ -46,6 +46,9 @@ Coded by Claude (AI).
 //     built PER CALL from the TChatOptions passed in, so a server can
 //     overlay per-request sampling parameters on the launch defaults at
 //     zero engine-level cost.
+//   - TChatEngine.PrefillDecisionPrefix / ScoreDecisionBranch: the decision
+//     scorers' primitives (one shared prefix fed once, then any number of
+//     branches scored from its state: last-id logits and final hidden states).
 //
 // KV-cache reuse across calls: each call diffs its prompt against the
 // token ids still resident in the cache, truncates the divergent tail and
@@ -68,6 +71,7 @@ Coded by Claude (AI).
 // Callers that serve concurrent clients must serialize calls into it.
 
 {$mode objfpc}{$H+}
+{$modeswitch nestedprocvars}
 
 interface
 
@@ -170,6 +174,10 @@ type
 
   TChatOptions = record
     ModelDir: string;
+    LoRAAdapterDir: string;      // HF PEFT LoRA adapter merged into the
+                                 // weights as they load ('' = none)
+    OmitLMHead: boolean;         // build ends at the final norm: hidden
+                                 // states only, no logits (decision heads)
     WeightMode: TChatWeightMode; // --fp32 / --int8 (default) / --int4
     LowMemory: boolean;          // true (default) = low-memory forward path
                                  // (drops the concatenated weight cache);
@@ -298,6 +306,10 @@ type
   // time, without a trailing newline (load progress, [bracketed] notices).
   TChatTextEvent = procedure(const S: string) of object;
   TChatNotifyEvent = procedure() of object;
+  // TChatEngine.FeedPrefillLadder's report after ASession fed the ids at
+  // FirstPos..FedPos-1; FirstPos = FedPos when the state just reached Session.
+  TPrefillFedEvent = procedure(ASession: TNNetStreamingDecoder;
+    FirstPos, FedPos: integer) is nested;
 
   { TChatEngine }
 
@@ -403,7 +415,8 @@ type
                                  // started (the (... of C cached))
     LastPrefillTokens: integer;  // prompt tokens the last call fed
     LastResumeRoute: TChatResumeRoute; // where the last call resumed from
-    LastPrefillWindows: integer; // whole windows the last call fed through
+    LastPrefillWindows: integer; // whole windows the last call (a reply or
+                                 // a decision prefix or branch) fed through
                                  // WindowSession (0 without --prefill-window)
     LastPrefillTailWindows: integer; // whole windows the last call fed
                                  // through TailSession (0 without a tail twin)
@@ -463,6 +476,13 @@ type
     function CountMessagePrefixTokens(const Msgs: TChatMessages;
       LastMessagePos: integer; const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions): integer;
+    // Decision scoring: feeds PrefixIds from an empty session and keeps their
+    // state for ScoreDecisionBranch. Afterwards CachedTokens = PrefixIds.
+    procedure PrefillDecisionPrefix(const PrefixIds: TNeuralIntegerArray);
+    // Feeds BranchIds (not empty) after the prefix: Logits = the last id's logits,
+    // Hidden row k = the final hidden state at HiddenPositions[k] (nil = skip).
+    procedure ScoreDecisionBranch(const BranchIds,
+      HiddenPositions: TNeuralIntegerArray; Logits, Hidden: TNNetVolume);
   private
     // Bytes of an unfinished UTF-8 sequence EmitToken is holding until the
     // token that completes it arrives (a codepoint can straddle two tokens).
@@ -515,6 +535,23 @@ type
     // Moves the live state from ActiveSession into Target (snapshot, restore)
     // and makes Target the active session. No-op when Target is active.
     procedure SwitchTo(Target: TNNetStreamingDecoder);
+    // The prefill ladder for TokenCount ids: window widths, whole-window
+    // counts, and the session that steps first.
+    function PlanPrefillLadder(TokenCount: integer; out WindowLen, WindowCount,
+      TailLen, TailCount: integer): TNNetStreamingDecoder;
+    // Feeds Tokens[FromPos..ToPos-1] (never padded, stopping at the LM-head
+    // input) down the ladder from ActiveSession's state; ends in Session.
+    procedure FeedPrefillLadder(const Tokens: TNeuralIntegerArray;
+      FromPos, ToPos: integer; InV: TNNetVolume; OnFed: TPrefillFedEvent;
+      out WindowsFed, TailWindowsFed: integer);
+    // Empties CachedTokens and the live points and resets every session, so
+    // the next call prefills in full: the cleanup after a failed call.
+    procedure ResetLiveState();
+  private
+    // The ids PrefillDecisionPrefix fed, and their recurrent state (owned;
+    // nil without recurrent layers or before the first prefix).
+    DecisionPrefixIds: TNeuralIntegerArray;
+    DecisionPrefixState: TNNetDecoderStateCheckpoint;
   end;
 
 function DefaultChatOptions(): TChatOptions;
@@ -746,6 +783,8 @@ end;
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
+  Result.LoRAAdapterDir := '';
+  Result.OmitLMHead := false;
   Result.WeightMode := cwmInt8; // less RAM, faster; --fp32 and --int4 opt out
   Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
@@ -1482,6 +1521,8 @@ begin
   KVSlotSaves := 0;
   LiveUserState := nil;
   ClearLivePoints();
+  SetLength(DecisionPrefixIds, 0);
+  DecisionPrefixState := nil;
   LastResumeRoute := crrNone;
   SeqLen := 0;
   VocabSize := 0;
@@ -1517,6 +1558,7 @@ destructor TChatEngine.Destroy();
 begin
   FreeCheckpoints(); // OpenCL slots in NN's context: free before the nets
   FreeKVSlots();
+  FreeAndNil(DecisionPrefixState);
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(WindowSession);
@@ -1942,6 +1984,101 @@ begin
   ActiveSession := Target;
 end;
 
+function TChatEngine.PlanPrefillLadder(TokenCount: integer; out WindowLen,
+  WindowCount, TailLen, TailCount: integer): TNNetStreamingDecoder;
+begin
+  WindowLen := 0;
+  WindowCount := 0;
+  TailLen := 0;
+  TailCount := 0;
+  if Assigned(WindowSession) then
+  begin
+    WindowLen := WindowIn.SizeX;
+    WindowCount := TokenCount div WindowLen;
+    if Assigned(TailSession) then
+    begin
+      TailLen := TailIn.SizeX;
+      TailCount := (TokenCount - WindowCount * WindowLen) div TailLen;
+    end;
+  end;
+  if WindowCount > 0 then Result := WindowSession
+  else if TailCount > 0 then Result := TailSession
+  else Result := Session;
+end;
+
+// Whole windows of WindowLen through WindowSession, whole windows of TailLen
+// of what is left through TailSession, then the fewer than TailLen ids left
+// one at a time through Session. SwitchTo carries the state between them.
+procedure TChatEngine.FeedPrefillLadder(const Tokens: TNeuralIntegerArray;
+  FromPos, ToPos: integer; InV: TNNetVolume; OnFed: TPrefillFedEvent;
+  out WindowsFed, TailWindowsFed: integer);
+var
+  WindowLen, WindowCount, TailLen, TailCount, FedPos: integer;
+  // Up to WindowCount whole windows from FedPos on through WSession (the
+  // active one). A window that would overflow the cache is never fed: the
+  // fused attention layer only prints on overflow and then scores past its
+  // buffers; what is left goes in smaller windows or single steps.
+  procedure FeedWindows(WSession: TNNetStreamingDecoder; WIn: TNNetVolume;
+    WindowCount: integer; var Fed: integer);
+  var
+    WLen, WindowPos, WindowRow, MaxRowPos: integer;
+  begin
+    WLen := WIn.SizeX;
+    {$IFDEF Debug}
+    Assert(WSession = ActiveSession,
+      'TChatEngine: windows fed to a session that does not hold the state');
+    Assert(WLen = WSession.Net.GetFirstLayer().Output.SizeX,
+      'TChatEngine: window volume width differs from the twin input width');
+    {$ENDIF}
+    MaxRowPos := WLen - 1;
+    for WindowPos := 0 to WindowCount - 1 do
+    begin
+      if FedPos + WLen > SeqLen then break;
+      for WindowRow := 0 to MaxRowPos do
+        WIn.FData[WindowRow] := Tokens[FedPos + WindowRow];
+      WSession.StepForwardToHidden(WIn, FedPos);
+      Inc(FedPos, WLen);
+      Inc(Fed);
+      if Assigned(OnFed) then OnFed(WSession, FedPos - WLen, FedPos);
+    end;
+  end;
+begin
+  WindowsFed := 0;
+  TailWindowsFed := 0;
+  SwitchTo(PlanPrefillLadder(ToPos - FromPos, WindowLen, WindowCount, TailLen,
+    TailCount));
+  FedPos := FromPos;
+  if WindowCount > 0 then
+    FeedWindows(WindowSession, WindowIn, WindowCount, WindowsFed);
+  // Whole windows of TailLen over what is left, so a window the width-N twin
+  // did not feed (the cache-room check) also falls to the tail twin.
+  if TailLen > 0 then TailCount := (ToPos - FedPos) div TailLen;
+  if TailCount > 0 then
+  begin
+    SwitchTo(TailSession);
+    FeedWindows(TailSession, TailIn, TailCount, TailWindowsFed);
+  end;
+  SwitchTo(Session);
+  if Assigned(OnFed) then OnFed(Session, FedPos, FedPos);
+  while FedPos < ToPos do
+  begin
+    InV.FData[0] := Tokens[FedPos];
+    Session.StepForwardToHidden(InV, FedPos);
+    Inc(FedPos);
+    if Assigned(OnFed) then OnFed(Session, FedPos - 1, FedPos);
+  end;
+end;
+
+procedure TChatEngine.ResetLiveState();
+begin
+  SetLength(CachedTokens, 0);
+  ClearLivePoints();
+  Session.Reset();
+  if Assigned(WindowSession) then WindowSession.Reset();
+  if Assigned(TailSession) then TailSession.Reset();
+  ActiveSession := Session;
+end;
+
 function TChatEngine.LoadModel(const AOpt: TChatOptions;
   out ErrorMsg: string): boolean;
 var
@@ -2188,8 +2325,15 @@ begin
       NeuralImportInt4FromRows := Opt.WeightMode = cwmInt4;
       NeuralImportInt4LayerCount := 0;
       NeuralImportInt4FromRowsLayerCount := 0;
+      if Opt.LoRAAdapterDir <> '' then
+        Notice('[LoRA adapter ' + Opt.LoRAAdapterDir + ' merged into the' +
+          ' weights as they load]');
+      if Opt.OmitLMHead then
+        Notice('[no LM head: the net ends at the final norm (hidden states' +
+          ' for a decision head; no logits, no chat)]');
       NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
-        {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+        {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
+        {pWeightOwner=}nil, Opt.LoRAAdapterDir, Opt.OmitLMHead);
       Int4DirectLayerCount := NeuralImportInt4LayerCount;
       Int4RowLayerCount := NeuralImportInt4FromRowsLayerCount;
       // --prefill-window: the width-N twin borrows NN's weights
@@ -2213,7 +2357,8 @@ begin
         NeuralImportInt4LayerCount := 0;
         NeuralImportInt4FromRowsLayerCount := 0;
         WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
-          {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+          {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
+          {pWeightOwner=}nil, Opt.LoRAAdapterDir, Opt.OmitLMHead);
       end;
     finally
       NeuralImportInt4FromQ4_0 := false;
@@ -2267,7 +2412,7 @@ begin
       LoadStart := GetTickCount64();
       WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
         {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
-        {pWeightOwner=}NN);
+        {pWeightOwner=}NN, '', Opt.OmitLMHead);
       WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
       LastIdx := WindowNN.GetLastLayerIdx();
       for Cnt := 0 to LastIdx do
@@ -2276,7 +2421,8 @@ begin
       begin
         TailNN := BuildFromPretrained(Opt.ModelDir,
           {pSeqLen=}Opt.PrefillTailWindow, {pTrainable=}false, '',
-          {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN);
+          {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN, '',
+          Opt.OmitLMHead);
         TailNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
         LastIdx := TailNN.GetLastLayerIdx();
         for Cnt := 0 to LastIdx do
@@ -2371,7 +2517,8 @@ begin
   end;
 
   SeqLen := Opt.CtxLen;
-  VocabSize := NN.GetLastLayer().Output.Depth;
+  if Opt.OmitLMHead then VocabSize := 0
+  else VocabSize := NN.GetLastLayer().Output.Depth;
   // int8 KV cache is armed at construction so the FP32 K/V buffers are never
   // allocated (a post-Create switch frees them, but the allocator arena may
   // keep the pages). Reset and cache-reuse truncation keep the int8 mode
@@ -2408,6 +2555,15 @@ begin
     Notice(Format('[--prefill-window %d: the twins hold %.1f MB of' +
       ' activations and caches in host memory besides the borrowed weights]',
       [Opt.PrefillWindow, TwinBytes / (1024 * 1024)]));
+  end;
+  // ContrastiveHiddenLayer would pick the layer before the final norm.
+  if Opt.OmitLMHead then
+  begin
+    Session.SetHiddenLayer(NN.GetLastLayer());
+    if Assigned(WindowSession) then
+      WindowSession.SetHiddenLayer(WindowNN.GetLastLayer());
+    if Assigned(TailSession) then
+      TailSession.SetHiddenLayer(TailNN.GetLastLayer());
   end;
   if Opt.KVInt8 then
     Notice('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ' +
@@ -2483,8 +2639,10 @@ begin
   end;
   SetLength(CandidateOrder, Length(Checkpoints) +
     Length(KVSlots) * (Ord(High(TConversationSlotPoint)) + 1));
-  Line := Format('Model: %s, %d params, vocab %d, context %d, chat format ',
-    [ModelType, NN.CountWeights(), VocabSize, SeqLen]);
+  if Opt.OmitLMHead then Line := 'no LM head'
+  else Line := 'vocab ' + IntToStr(VocabSize);
+  Line := Format('Model: %s, %d params, %s, context %d, chat format ',
+    [ModelType, NN.CountWeights(), Line, SeqLen]);
   if RawMode then Line := Line + 'raw (completion)'
   else Line := Line + ChatFormatName(ChatFormat);
   Notice(Line + ', ' + ChatWeightModeName(Opt.WeightMode) + ' weights.');
@@ -2699,6 +2857,146 @@ begin
   Result := true;
 end;
 
+// Decision scoring keeps the chat cache truthful: CachedTokens always lists
+// the ids Session holds, so a later chat call reuses what it can, and
+// ScoreDecisionBranch finds its prefix gone when a chat call replaced it.
+procedure TChatEngine.PrefillDecisionPrefix(
+  const PrefixIds: TNeuralIntegerArray);
+var
+  PrefixLen, WindowLen, WindowCount, TailLen, TailCount: integer;
+  InV: TNNetVolume;
+begin
+  if not Loaded then
+    raise Exception.Create('TChatEngine.PrefillDecisionPrefix before LoadModel');
+  PrefixLen := Length(PrefixIds);
+  if PrefixLen >= SeqLen then
+    raise Exception.CreateFmt('TChatEngine.PrefillDecisionPrefix: %d prefix' +
+      ' ids leave no room for a branch in the %d-token context',
+      [PrefixLen, SeqLen]);
+  InV := TNNetVolume.Create(1, 1, 1);
+  try
+    try
+      SaveLiveConversation(-1);
+      SetLength(CachedTokens, 0);
+      ClearLivePoints();
+      SetLength(DecisionPrefixIds, 0);
+      ActiveSession := PlanPrefillLadder(PrefixLen, WindowLen, WindowCount,
+        TailLen, TailCount);
+      ActiveSession.Reset();
+      FeedPrefillLadder(PrefixIds, 0, PrefixLen, InV, nil, LastPrefillWindows,
+        LastPrefillTailWindows);
+      if Session.SSMCount > 0 then
+      begin
+        if not Assigned(DecisionPrefixState) then
+          DecisionPrefixState := Session.NewStateCheckpoint();
+        Session.CaptureStateInto(DecisionPrefixState);
+      end;
+      DecisionPrefixIds := Copy(PrefixIds);
+      CachedTokens := Copy(PrefixIds);
+    except
+      ResetLiveState();
+      raise;
+    end;
+  finally
+    InV.Free;
+  end;
+end;
+
+procedure TChatEngine.ScoreDecisionBranch(const BranchIds,
+  HiddenPositions: TNeuralIntegerArray; Logits, Hidden: TNNetVolume);
+var
+  PrefixLen, BranchLen, LastPos, HiddenDepth, PositionPos: integer;
+  MaxHiddenPos, HiddenRowBytes: integer;
+  InV: TNNetVolume;
+  // Copies the requested hidden-state rows among the ids ASession fed at
+  // FirstPos..FedPos-1 (row r of its window holds position FirstPos + r).
+  procedure CopyHiddenRows(ASession: TNNetStreamingDecoder;
+    FirstPos, FedPos: integer);
+  var
+    HiddenOut: TNNetVolume;
+    RequestPos, FedRowPos: integer;
+  begin
+    HiddenOut := nil;
+    for RequestPos := 0 to MaxHiddenPos do
+    begin
+      FedRowPos := PrefixLen + HiddenPositions[RequestPos];
+      if (FedRowPos < FirstPos) or (FedRowPos >= FedPos) then continue;
+      if HiddenOut = nil then
+      begin
+        // Not the last layer: under OpenCL its output may be resident only.
+        ASession.HiddenLayer().ForceOutputOnRAM();
+        HiddenOut := ASession.HiddenState();
+      end;
+      Move(HiddenOut.FData[(FedRowPos - FirstPos) * HiddenDepth],
+        Hidden.FData[RequestPos * HiddenDepth], HiddenRowBytes);
+    end;
+  end;
+begin
+  if not Loaded then
+    raise Exception.Create('TChatEngine.ScoreDecisionBranch before LoadModel');
+  PrefixLen := Length(DecisionPrefixIds);
+  BranchLen := Length(BranchIds);
+  if BranchLen = 0 then
+    raise Exception.Create('TChatEngine.ScoreDecisionBranch: empty branch');
+  if Assigned(Logits) and Opt.OmitLMHead then
+    raise Exception.Create('TChatEngine.ScoreDecisionBranch: logits asked of' +
+      ' a model loaded without its LM head (TChatOptions.OmitLMHead)');
+  if PrefixLen + BranchLen > SeqLen then
+    raise Exception.CreateFmt('TChatEngine.ScoreDecisionBranch: %d prefix +' +
+      ' %d branch ids exceed the %d-token context',
+      [PrefixLen, BranchLen, SeqLen]);
+  if (Length(CachedTokens) < PrefixLen) or
+    (CommonPrefixLen(CachedTokens, DecisionPrefixIds) < PrefixLen) then
+    raise Exception.Create('TChatEngine.ScoreDecisionBranch: the decision' +
+      ' prefix is no longer cached; call PrefillDecisionPrefix again');
+  MaxHiddenPos := -1;
+  HiddenDepth := Session.HiddenState().Depth;
+  HiddenRowBytes := HiddenDepth * csNeuralFloatSize;
+  if Assigned(Hidden) then
+  begin
+    MaxHiddenPos := High(HiddenPositions);
+    for PositionPos := 0 to MaxHiddenPos do
+      if (HiddenPositions[PositionPos] < 0) or
+        (HiddenPositions[PositionPos] >= BranchLen) then
+        raise Exception.CreateFmt('TChatEngine.ScoreDecisionBranch: hidden' +
+          ' position %d outside the %d-id branch',
+          [HiddenPositions[PositionPos], BranchLen]);
+    Hidden.ReSize(Length(HiddenPositions), 1, HiddenDepth);
+  end;
+  LastPos := PrefixLen + BranchLen - 1;
+  InV := TNNetVolume.Create(1, 1, 1);
+  try
+    try
+      SaveLiveConversation(-1);
+      ClearLivePoints();
+      // The prefix state: its K/V rows (TruncateTo), and its recurrent state.
+      Session.TruncateTo(PrefixLen);
+      if PrefixLen = 0 then Session.Reset()
+      else if Assigned(DecisionPrefixState) then
+        Session.RestoreStateFrom(DecisionPrefixState);
+      // CachedTokens lists the branch before it is fed; a failure clears it.
+      SetLength(CachedTokens, LastPos + 1);
+      Move(BranchIds[0], CachedTokens[PrefixLen], BranchLen * csIntegerSize);
+      FeedPrefillLadder(CachedTokens, PrefixLen, LastPos, InV, @CopyHiddenRows,
+        LastPrefillWindows, LastPrefillTailWindows);
+      InV.FData[0] := BranchIds[BranchLen - 1];
+      if Assigned(Logits) then Session.StepForward(InV, LastPos)
+      else Session.StepForwardToHidden(InV, LastPos);
+      CopyHiddenRows(Session, LastPos, LastPos + 1);
+      if Assigned(Logits) then
+      begin
+        NN.GetLastLayer().ForceOutputOnRAM();
+        Logits.Copy(Session.Output());
+      end;
+    except
+      ResetLiveState();
+      raise;
+    end;
+  finally
+    InV.Free;
+  end;
+end;
+
 // ---------------------------------------------------------------------------
 // Generation: one assistant reply, streamed through OnToken as it decodes.
 // ---------------------------------------------------------------------------
@@ -2757,7 +3055,7 @@ var
   OneId: array[0..0] of integer;
   Incremental: boolean;
   InV, Output, Row: TNNetVolume;
-  Len, StepCnt, Cnt, NewToken: integer;
+  Len, StepCnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
   WindowLen, WindowCount: integer; // --prefill-window: the width-N twin
   TailLen, TailCount: integer;     // and its width-T tail twin
@@ -2876,40 +3174,23 @@ var
     Result := (FedPos = SystemCapturePos) or (FedPos = UserCapturePos) or
       (FedPos = AllButLastTwoCapturePos) or (FedPos = FirstHalfCapturePos);
   end;
-  // Up to WindowCount whole windows of Tokens from Cnt on through WSession
-  // (the active one), never padded. A window that would overflow the cache is
-  // never fed: the fused attention layer only prints on overflow and then
-  // scores past its buffers; the caller then feeds what is left in smaller
-  // windows or single steps. Fed counts the windows this call fed.
-  procedure FeedWindows(WSession: TNNetStreamingDecoder; WIn: TNNetVolume;
-    WindowCount: integer; var Fed: integer);
-  var
-    WLen, WindowPos, WindowRow, MaxRowPos: integer;
+  // The prefill ladder reached FedPos: a message boundary there is captured
+  // from Session, and from a twin when the twins' captures are legal.
+  procedure CaptureFedBoundary(ASession: TNNetStreamingDecoder;
+    FirstPos, FedPos: integer);
   begin
-    WLen := WIn.SizeX;
-    {$IFDEF Debug}
-    Assert(WSession = ActiveSession,
-      'TChatEngine: windows fed to a session that does not hold the state');
-    Assert(WLen = WSession.Net.GetFirstLayer().Output.SizeX,
-      'TChatEngine: window volume width differs from the twin input width');
-    {$ENDIF}
-    MaxRowPos := WLen - 1;
-    for WindowPos := 0 to WindowCount - 1 do
-    begin
-      if Cnt + WLen > SeqLen then break;
-      for WindowRow := 0 to MaxRowPos do
-        WIn.FData[WindowRow] := Tokens[Cnt + WindowRow];
-      WSession.StepForwardToHidden(WIn, Cnt);
-      Inc(Cnt, WLen);
-      Inc(Fed);
-      if IsBoundaryCapture(Cnt) and CheckpointOnTwins then
-        CaptureBoundary(WSession, Cnt);
-    end;
+    if IsBoundaryCapture(FedPos) and
+      ((ASession = Session) or CheckpointOnTwins) then
+      CaptureBoundary(ASession, FedPos);
   end;
 begin
   Result := '';
   if not Loaded then
     raise Exception.Create('TChatEngine.GenerateFromIds before LoadModel');
+  if Opt.OmitLMHead then
+    raise Exception.Create('TChatEngine.GenerateFromIds: the model was loaded' +
+      ' without its LM head (TChatOptions.OmitLMHead), so it has no logits' +
+      ' to generate from');
   Inc(CurrentTurn);
   ContextFull := false;
   LastPromptTokens := Length(PromptIds);
@@ -3109,23 +3390,8 @@ begin
     PrefillTokens := LenM2 + 1 - Reused;
     LastReusedTokens := Reused;
     LastPrefillTokens := PrefillTokens;
-    WindowCount := 0;
-    WindowLen := 0;
-    TailCount := 0;
-    TailLen := 0;
-    if Assigned(WindowSession) then
-    begin
-      WindowLen := WindowIn.SizeX;
-      WindowCount := PrefillTokens div WindowLen;
-      if Assigned(TailSession) then
-      begin
-        TailLen := TailIn.SizeX;
-        TailCount := (PrefillTokens - WindowCount * WindowLen) div TailLen;
-      end;
-    end;
-    if WindowCount > 0 then FirstSession := WindowSession
-    else if TailCount > 0 then FirstSession := TailSession
-    else FirstSession := Session;
+    FirstSession := PlanPrefillLadder(PrefillTokens, WindowLen, WindowCount,
+      TailLen, TailCount);
     if StateReuse then
     begin
       SystemCapturePos := MessageBoundaryCapturePosition(SystemPromptTokenCount,
@@ -3185,26 +3451,8 @@ begin
       ActiveSession := Session;
       SwitchTo(FirstSession);
     end;
-    Cnt := Reused;
-    if WindowCount > 0 then
-      FeedWindows(WindowSession, WindowIn, WindowCount, LastPrefillWindows);
-    // Whole windows of TailLen over what is left, so a window the width-N
-    // twin did not feed (the cache-room check) also falls to the tail twin.
-    if TailLen > 0 then TailCount := (LenM2 + 1 - Cnt) div TailLen;
-    if TailCount > 0 then
-    begin
-      SwitchTo(TailSession);
-      FeedWindows(TailSession, TailIn, TailCount, LastPrefillTailWindows);
-    end;
-    SwitchTo(Session);
-    if IsBoundaryCapture(Cnt) then CaptureBoundary(Session, Cnt);
-    while Cnt <= LenM2 do
-    begin
-      InV.FData[0] := Tokens[Cnt];
-      Session.StepForwardToHidden(InV, Cnt);
-      Inc(Cnt);
-      if IsBoundaryCapture(Cnt) then CaptureBoundary(Session, Cnt);
-    end;
+    FeedPrefillLadder(Tokens, Reused, LenM2 + 1, InV, @CaptureFedBoundary,
+      LastPrefillWindows, LastPrefillTailWindows);
     TPrefillEnd := GetTickCount64();
     // End-of-prompt checkpoint for the next call's resume: Session now holds
     // exactly PromptIds[0..Len-2], a prefix of what CachedTokens will list
@@ -3212,7 +3460,7 @@ begin
     // it. The time counts toward TTFT (--stats prefill excludes it).
     // PromptEnd checkpoints are not stored: they took store entries and were
     // never resumed under BPSA, which echoes the reply (ReplyEnd matches).
-    // if StateReuse then CaptureAt(Session, Cnt, cckPromptEnd);
+    // if StateReuse then CaptureAt(Session, LenM2 + 1, cckPromptEnd);
     SingleSteps := PrefillTokens - LastPrefillWindows * WindowLen -
       LastPrefillTailWindows * TailLen;
     // --profile: the prefill's own layer-class report, one table per net
@@ -3528,12 +3776,7 @@ begin
     Chain.Free; // owns the processors, which own the penalty
   end;
   except
-    SetLength(CachedTokens, 0);
-    ClearLivePoints();
-    Session.Reset();
-    if Assigned(WindowSession) then WindowSession.Reset();
-    if Assigned(TailSession) then TailSession.Reset();
-    ActiveSession := Session;
+    ResetLiveState();
     raise;
   end;
 end;
