@@ -65,6 +65,7 @@ type
     procedure TestIdentityLayer;
     procedure TestReshapeLayer;
     procedure TestDropoutLayer;
+    procedure TestDropoutInvertedScaling;
     procedure TestMultipleLayersNetwork;
     procedure TestNetworkClone;
     procedure TestLayerCount;
@@ -2401,6 +2402,64 @@ begin
     // During inference (non-training), dropout should pass values through
     // The output size should match input size
     AssertEquals('Dropout output size should be 10', 10, NN.GetLastLayer.Output.Size);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// zwj: regression for the inverted-dropout + exact-rate change: survivors
+// carry the 1/(1-Rate) scale (not the old quantized 1/Round(1/Rate)), and the
+// backward pass scales the gradient by the same factor through the mask.
+procedure TTestNeuralLayers.TestDropoutInvertedScaling;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  I: integer;
+  Kept: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1000, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1000, 1, 1, 1));
+    Layer := NN.AddLayer(TNNetDropout.Create(0.3));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    Kept := 0;
+    for I := 0 to Input.Size - 1 do
+    begin
+      if Layer.Output.Raw[I] > 0 then
+      begin
+        Inc(Kept);
+        // zwj: survivor value must be 1/keep = 1/0.7. The old quantized draw
+        // (drop 1/3) would have scaled survivors by 1.5 instead.
+        AssertEquals('Survivor value must be 1/keep',
+          1.0/0.7, Layer.Output.Raw[I], 0.0001);
+      end;
+    end;
+    // The exact 0.3 rate keeps ~70% of the cells; the old quantized draw kept
+    // ~66.7%. 0.05 slack is ~3.4 sigma at N=1000.
+    AssertTrue('Kept fraction close to 0.7',
+      Abs(Kept/Input.Size - 0.7) < 0.05);
+
+    // Backward: dx = dy * mask / keep.
+    Layer.OutputError.Fill(1.0);
+    NN.GetFirstLayer.OutputError.Fill(0);
+    Layer.IncDepartingBranchesCnt();
+    Layer.Backpropagate();
+    for I := 0 to Input.Size - 1 do
+    begin
+      if Layer.Output.Raw[I] > 0 then
+        AssertEquals('Grad scales by 1/keep at kept cells',
+          1.0/0.7, NN.GetFirstLayer.OutputError.Raw[I], 0.0001)
+      else
+        AssertEquals('Grad is zero at dropped cells',
+          0.0, NN.GetFirstLayer.OutputError.Raw[I], 0.0001);
+    end;
   finally
     NN.Free;
     Input.Free;

@@ -8579,10 +8579,29 @@ type
 
   /// Dropout layer. The input parameter is the dropout rate (rate of values
   // that are zeroed).
+  //
+  // zwj: training applies INVERTED dropout -- surviving cells are scaled by
+  // 1/(1-Rate) in the forward pass, and the incoming gradient is scaled by
+  // the same factor through the mask in the backward pass, so the expected
+  // activation magnitude at train time matches inference (where the layer is
+  // fully disabled via TNNet.EnableDropouts). The rate is used EXACTLY: the
+  // old Random(FRate)=0 draw quantized the drop probability to
+  // 1/Round(1/Rate) (Rate 0.3 became 1/3). The exact rate round-trips in
+  // FFloatSt[0]; FStruct[0] keeps the legacy Round(1/Rate) value so models
+  // saved before this change reload bit-compatibly (the registry rebuilds
+  // via Create(1/St[0], St[1])) -- such old saves carry FFloatSt[0]=0 and
+  // fall back to the quantized keep 1-1/FRate.
   TNNetDropout = class(TNNetAddNoiseBase)
     protected
       FRate: integer;
       FDropoutMask: TNNetVolume;
+      // zwj: exact-rate state. FKeepRate < 0 means "not resolved yet" so a
+      // layer that just came off the serialization path resolves its keep
+      // probability on first use (Create runs with the quantized registry
+      // rate BEFORE the saved FFloatSt payload is assigned on top of it).
+      FKeepRate: TNeuralFloat;
+      FInvKeep: TNeuralFloat;
+      procedure ResolveKeepRate();
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
@@ -102934,14 +102953,39 @@ begin
     FRate := Round(1/Rate);
     FStruct[0] := FRate;
     FEnabled := true;
+    // zwj: exact rate rides in FFloatSt[0] (serialized); FStruct[0] keeps the
+    // legacy quantized value so old saved models round-trip unchanged. The
+    // keep/scaling pair is resolved lazily on first use (see ResolveKeepRate)
+    // because the serialization path assigns the saved FFloatSt AFTER this
+    // constructor ran with the quantized registry rate.
+    FFloatSt[0] := Rate;
+    FKeepRate := -1;
+    FInvKeep := 0;
   end
   else
   begin
     FRate := -1;
     FStruct[0] := -1;
     FEnabled := false;
+    FKeepRate := 1;
+    FInvKeep := 1;
   end;
   FDropoutMask := TNNetVolume.Create();
+end;
+
+// zwj: resolve the keep probability and the inverted-dropout scale factor.
+// Exact path: keep = 1-FFloatSt[0]. Legacy fallback for layers saved before
+// the exact rate existed (FFloatSt[0]=0): keep = 1-1/FRate, i.e. the old
+// quantized drop probability 1/Round(1/Rate). Rate >= 1 degenerates to
+// drop-everything with a zero (not infinite) scale factor.
+procedure TNNetDropout.ResolveKeepRate();
+begin
+  if FFloatSt[0] > 0 then
+    FKeepRate := 1 - FFloatSt[0]
+  else
+    FKeepRate := 1 - 1/FRate;
+  if FKeepRate <= 0 then FKeepRate := 0;
+  if FKeepRate > 0 then FInvKeep := 1/FKeepRate else FInvKeep := 0;
 end;
 
 destructor TNNetDropout.Destroy();
@@ -102966,9 +103010,16 @@ begin
 
   if ( FEnabled and (FRate>0) ) then
   begin
+    // zwj: lazy resolve so layers rebuilt from serialization (quantized
+    // registry rate first, saved FFloatSt second) use the exact keep rate.
+    if FKeepRate < 0 then ResolveKeepRate();
     if FBatchUpdate and ({OneMaskPerbatch}FStruct[1]>0) then
     begin
       FOutput.Mul(FDropoutMask);
+      // zwj: inverted dropout -- scale the surviving cells by 1/keep so the
+      // expected activation magnitude matches inference (fixed factor, the
+      // PyTorch semantics; the mask's realized keep-rate may fluctuate).
+      FOutput.Mul(FInvKeep);
     end
     else
     begin
@@ -102976,12 +103027,16 @@ begin
       MaxOutput := FOutput.Size - 1;
       for CntOut := 0 to MaxOutput do
       begin
-        if (Random(FRate) = 0) then
+        // zwj: exact-rate draw on [0,1) replaces the quantized
+        // Random(FRate)=0 (drop probability 1/Round(1/Rate)).
+        if (Random() >= FKeepRate) then
         begin
           FOutput.FData[CntOut] := 0;
           FDropoutMask.FData[CntOut] := 0;
         end;
       end;
+      // zwj: inverted dropout scaling for the per-sample mask path too.
+      FOutput.Mul(FInvKeep);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -102995,7 +103050,15 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
-  if ( FEnabled and (FOutputError.Size = FOutput.Size) ) then FOutputError.Mul(FDropoutMask);
+  if ( FEnabled and (FOutputError.Size = FOutput.Size) ) then
+  begin
+    FOutputError.Mul(FDropoutMask);
+    // zwj: mirror the forward inverted scaling -- dx = dy * mask / keep, the
+    // exact Jacobian of y = x*mask/keep (mask kills dropped cells, the same
+    // factor the forward multiplied the survivors by).
+    if FKeepRate < 0 then ResolveKeepRate();
+    FOutputError.Mul(FInvKeep);
+  end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   BackpropagateNoTest();
 end;
@@ -103004,11 +103067,13 @@ procedure TNNetDropout.RefreshDropoutMask();
 var
   CntOut, MaxOutput: integer;
 begin
+  // zwj: lazy resolve (exact keep rate) + exact-rate draw, mirroring Compute.
+  if FKeepRate < 0 then ResolveKeepRate();
   FDropoutMask.Fill(1);
   MaxOutput := FDropoutMask.Size - 1;
   for CntOut := 0 to MaxOutput do
   begin
-    if (Random(FRate) = 0) then
+    if (Random() >= FKeepRate) then
     begin
       FDropoutMask.FData[CntOut] := 0;
     end;
