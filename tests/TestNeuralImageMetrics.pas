@@ -104,7 +104,7 @@ implementation
 
 function TTestNeuralImageMetrics.FixturePath: string;
 begin
-  Result := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim +
+  Result := 'fixtures' + PathDelim +
     'image_metrics_oracle.json';
 end;
 
@@ -909,7 +909,7 @@ var
   realSet, genSame, genNear, genFar: TNNetVolumeList;
   fidSelf, fidNear, fidFar: Double;
 begin
-  fixDir := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim;
+  fixDir := 'fixtures' + PathDelim;
   fixSafe := fixDir + cInceptionFixture;
   fixCfg  := fixDir + cInceptionConfig;
   if (not FileExists(fixSafe)) or (not FileExists(fixCfg)) then
