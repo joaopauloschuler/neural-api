@@ -305,6 +305,7 @@ function DecisionFloatToStr(V: double): string;
 var
   Precision, ExpPos, Exp10, DigitCount, PointPos: integer;
   Mantissa, Digits: string;
+  ExpText: shortstring;
   Parsed: double;
   ParsedWide: extended;
   Negative: boolean;
@@ -326,22 +327,21 @@ begin
     if Precision = 1 then
       Mantissa := OneDigitMantissa(V)
     else
-      Mantissa := FloatToStrF(V, ffExponent, Precision, 0, DecisionFormat);
+    begin
+      // Str and not FloatToStrF, which stops at 15 digits where Extended is
+      // Double (Win64). Width = sign + "E+ddd" + point + Precision digits.
+      Str(V:Precision + 7, ExpText);
+      Mantissa := Trim(ExpText);
+    end;
     // StrToFloat returns Extended: round to double (when in range) before comparing.
     ParsedWide := StrToFloat(Mantissa, DecisionFormat);
     if ParsedWide > MaxDouble then continue;
     Parsed := ParsedWide;
     if Parsed = V then break;
   end;
-  // Mantissa = "d.dddE+X", or "d.ddd" when the exponent is 0
+  // Mantissa = "d.dddE+X", or "dE+X" from OneDigitMantissa
   ExpPos := Pos('E', Mantissa);
-  if ExpPos = 0 then
-  begin
-    Exp10 := 0;
-    ExpPos := Length(Mantissa) + 1;
-  end
-  else
-    Exp10 := StrToInt(Copy(Mantissa, ExpPos + 1, Length(Mantissa)));
+  Exp10 := StrToInt(Copy(Mantissa, ExpPos + 1, Length(Mantissa)));
   Digits := StringReplace(Copy(Mantissa, 1, ExpPos - 1), '.', '', []);
   DigitCount := Length(Digits);
   while (DigitCount > 1) and (Digits[DigitCount] = '0') do Dec(DigitCount);
