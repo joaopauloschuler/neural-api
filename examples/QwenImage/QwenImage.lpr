@@ -75,7 +75,7 @@ any later version.
 uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
-  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF} termio, BaseUnix,{$ENDIF}
+  {$IFDEF UNIX}{$IFNDEF Debug}cmem,{$ENDIF} cthreads, termio, BaseUnix,{$ENDIF}
   SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread,
   neuraldiffusion;

@@ -5,7 +5,7 @@ program RunTests;
 
 uses
   {$IFDEF UNIX}
-  cthreads, cmem,
+  cmem, cthreads,
   {$ENDIF}
   Classes, consoletestrunner,
   TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
