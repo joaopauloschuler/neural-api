@@ -68,6 +68,7 @@ type
     procedure TestArcSinhScalarParity;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
+    procedure TestSaveLoadUnderDecimalComma;
     procedure TestSimpleXORLearning;
     // New comprehensive layer tests
     procedure TestAvgPoolForward;
@@ -1976,6 +1977,70 @@ begin
         Abs(V.FData[cd] - Ref.FData[cd]) < AbsTol);
   finally
     V.Free; Ref.Free;
+  end;
+end;
+
+// RunTests sets '.' for the reports; files and strings must not depend on it.
+procedure TTestNeuralLayers.TestSaveLoadUnderDecimalComma;
+var
+  SavedSeparator: char;
+  NN, Loaded: TNNet;
+  Volume, Copied, Input, Output, LoadedOutput: TNNetVolume;
+  Saved: string;
+  I: integer;
+begin
+  SavedSeparator := DefaultFormatSettings.DecimalSeparator;
+  DefaultFormatSettings.DecimalSeparator := ',';
+  NN := TNNet.Create();
+  Loaded := TNNet.Create();
+  Volume := TNNetVolume.Create(2, 1, 1);
+  Copied := TNNetVolume.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Output := TNNetVolume.Create();
+  LoadedOutput := TNNetVolume.Create();
+  try
+    AssertEquals('NeuralFloatToStr', '0.5', NeuralFloatToStr(0.5));
+    AssertEquals('NeuralStrToFloat', 0.25, NeuralStrToFloat('0.25'), 1e-6);
+
+    Volume.FData[0] := 0.5;
+    Volume.FData[1] := -1.25;
+    Saved := Volume.SaveToString();
+    AssertTrue('volume text uses a dot', Pos('0.5', Saved) > 0);
+    Copied.LoadFromString(Saved);
+    AssertEquals('volume value 0', 0.5, Copied.FData[0], 1e-6);
+    AssertEquals('volume value 1', -1.25, Copied.FData[1], 1e-6);
+
+    NN.AddLayer([
+      TNNetInput.Create(4),
+      TNNetFullConnectLinear.Create(3),
+      TNNetDropout.Create(0.25),
+      TNNetFullConnectLinear.Create(2)
+    ]);
+    NN.EnableDropouts(false);
+    Saved := NN.SaveToString();
+    Loaded.LoadFromString(Saved);
+    AssertEquals('layer count', NN.CountLayers(), Loaded.CountLayers());
+    Loaded.EnableDropouts(false);
+    Input.FData[0] := 0.5;
+    Input.FData[1] := -0.25;
+    Input.FData[2] := 1.5;
+    Input.FData[3] := 2.0;
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    Loaded.Compute(Input);
+    Loaded.GetOutput(LoadedOutput);
+    for I := 0 to Output.Size - 1 do
+      AssertEquals('output ' + IntToStr(I), Output.FData[I],
+        LoadedOutput.FData[I], 1e-5);
+  finally
+    DefaultFormatSettings.DecimalSeparator := SavedSeparator;
+    LoadedOutput.Free;
+    Output.Free;
+    Input.Free;
+    Copied.Free;
+    Volume.Free;
+    Loaded.Free;
+    NN.Free;
   end;
 end;
 
