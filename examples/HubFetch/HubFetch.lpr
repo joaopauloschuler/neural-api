@@ -35,7 +35,7 @@ program HubFetch;
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  {$IFDEF UNIX}cmem, cthreads,{$ENDIF}
   SysUtils,
   neuralnetwork,
   neuralhfhub,

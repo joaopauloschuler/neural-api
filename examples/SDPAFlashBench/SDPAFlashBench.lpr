@@ -51,7 +51,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
+  {$IFDEF UNIX}{$IFNDEF Debug}cmem,{$ENDIF} cthreads,{$ENDIF}
   SysUtils, Math, neuralvolume, neuralnetwork
   {$IFDEF OpenCL}, neuralopencl, cl, ctypes{$ENDIF};
 

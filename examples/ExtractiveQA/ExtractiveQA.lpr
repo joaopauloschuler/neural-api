@@ -50,7 +50,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  {$IFDEF UNIX}cmem, cthreads,{$ENDIF}
   Classes, SysUtils,
   neuralvolume, neuralnetwork, neuralhftokenizer, neuralpretrained;
 
