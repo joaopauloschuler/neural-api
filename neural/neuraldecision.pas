@@ -280,34 +280,222 @@ end;
 const
   csUnsafeKeyMsg = 'Value error, object keys longer than 255 bytes are not supported';
 
-// V (> 0) to one significant digit as "dE<exp>": FloatToStrF prints at least
-// two digits, which only a subnormal needs to avoid (5e-324 printed 4.9E-324).
-function OneDigitMantissa(V: double): string;
-var
-  Wide: string;
-  ExpPos, Digit, Exp10: integer;
+type
+  // Little-endian base 2^32 natural number, for DecisionShortestDigits.
+  TDecisionBigNum = array of cardinal;
+
+function BigNumFrom(Value: cardinal): TDecisionBigNum;
 begin
-  Wide := FloatToStrF(V, ffExponent, 17, 0, DecisionFormat);
-  ExpPos := Pos('E', Wide);
-  if ExpPos = 0 then Exp10 := 0
-  else Exp10 := StrToInt(Copy(Wide, ExpPos + 1, Length(Wide)));
-  Digit := Ord(Wide[1]) - Ord('0');
-  if (Length(Wide) >= 3) and (Wide[3] >= '5') then Inc(Digit);
-  if Digit = 10 then
+  SetLength(Result, 1);
+  Result[0] := Value;
+end;
+
+procedure BigNumMul(var Number: TDecisionBigNum; Factor: cardinal);
+var
+  Position, Size: integer;
+  Carry: QWord;
+begin
+  Carry := 0;
+  Size := Length(Number);
+  for Position := 0 to Size - 1 do
   begin
-    Digit := 1;
-    Inc(Exp10);
+    Carry := Carry + QWord(Number[Position]) * Factor;
+    Number[Position] := cardinal(Carry and $FFFFFFFF);
+    Carry := Carry shr 32;
   end;
-  Result := IntToStr(Digit) + 'E' + IntToStr(Exp10);
+  if Carry <> 0 then
+  begin
+    SetLength(Number, Size + 1);
+    Number[Size] := cardinal(Carry);
+  end;
+end;
+
+procedure BigNumShl(var Number: TDecisionBigNum; Bits: integer);
+begin
+  while Bits >= 31 do
+  begin
+    BigNumMul(Number, cardinal(1) shl 31);
+    Dec(Bits, 31);
+  end;
+  if Bits > 0 then BigNumMul(Number, cardinal(1) shl Bits);
+end;
+
+procedure BigNumMulPow10(var Number: TDecisionBigNum; Exponent: integer);
+begin
+  while Exponent >= 9 do
+  begin
+    BigNumMul(Number, 1000000000);
+    Dec(Exponent, 9);
+  end;
+  while Exponent > 0 do
+  begin
+    BigNumMul(Number, 10);
+    Dec(Exponent);
+  end;
+end;
+
+function BigNumAdd(const Left, Right: TDecisionBigNum): TDecisionBigNum;
+var
+  Position, Size: integer;
+  Carry: QWord;
+begin
+  Size := Max(Length(Left), Length(Right));
+  SetLength(Result, Size + 1);
+  Carry := 0;
+  for Position := 0 to Size - 1 do
+  begin
+    if Position < Length(Left) then Carry := Carry + Left[Position];
+    if Position < Length(Right) then Carry := Carry + Right[Position];
+    Result[Position] := cardinal(Carry and $FFFFFFFF);
+    Carry := Carry shr 32;
+  end;
+  Result[Size] := cardinal(Carry);
+end;
+
+// Left >= Right.
+procedure BigNumSub(var Left: TDecisionBigNum; const Right: TDecisionBigNum);
+var
+  Position: integer;
+  Borrow, Part: QWord;
+begin
+  Borrow := 0;
+  for Position := 0 to High(Left) do
+  begin
+    Part := Borrow;
+    if Position < Length(Right) then Part := Part + Right[Position];
+    if QWord(Left[Position]) >= Part then
+    begin
+      Left[Position] := cardinal(QWord(Left[Position]) - Part);
+      Borrow := 0;
+    end
+    else
+    begin
+      Left[Position] := cardinal((QWord(1) shl 32) + QWord(Left[Position]) - Part);
+      Borrow := 1;
+    end;
+  end;
+end;
+
+// < 0, 0 or > 0 as Left is below, equal to or above Right.
+function BigNumCompare(const Left, Right: TDecisionBigNum): integer;
+var
+  Position: integer;
+  LeftPart, RightPart: cardinal;
+begin
+  for Position := Max(Length(Left), Length(Right)) - 1 downto 0 do
+  begin
+    LeftPart := 0;
+    RightPart := 0;
+    if Position < Length(Left) then LeftPart := Left[Position];
+    if Position < Length(Right) then RightPart := Right[Position];
+    if LeftPart < RightPart then Exit(-1);
+    if LeftPart > RightPart then Exit(1);
+  end;
+  Result := 0;
+end;
+
+// Shortest digits that read back as V (> 0), and among those the closest to V:
+// Python's repr. Value = d.ddd * 10^Exp10. Exact integer arithmetic (Burger and
+// Dybvig's free-format algorithm): FloatToStrF stops at 15 digits where
+// Extended is Double (Win64), and neither Str nor Val is exact.
+function DecisionShortestDigits(V: double; out Exp10: integer): string;
+var
+  Bits, Fraction, Mantissa: QWord;
+  Rest, Scale, MarginUp, MarginDown: TDecisionBigNum;
+  BiasedExp, BinaryExp, Extra, Digit, Estimate, Order: integer;
+  EvenMantissa, LowDone, HighDone, RoundUp: boolean;
+begin
+  Bits := PQWord(@V)^;
+  Fraction := Bits and ((QWord(1) shl 52) - 1);
+  BiasedExp := integer((Bits shr 52) and $7FF);
+  if BiasedExp = 0 then
+  begin
+    Mantissa := Fraction;
+    BinaryExp := -1074;
+  end
+  else
+  begin
+    Mantissa := Fraction or (QWord(1) shl 52);
+    BinaryExp := BiasedExp - 1075;
+  end;
+  EvenMantissa := (Mantissa and 1) = 0;
+  // At a power of two, the gap to the double below is half the gap above.
+  if (Fraction = 0) and (BiasedExp > 1) then Extra := 1 else Extra := 0;
+
+  // V = Rest / Scale; the halfway points to the neighbouring doubles are
+  // MarginUp / Scale above and MarginDown / Scale below.
+  SetLength(Rest, 2);
+  Rest[0] := cardinal(Mantissa and $FFFFFFFF);
+  Rest[1] := cardinal(Mantissa shr 32);
+  BigNumShl(Rest, 1 + Extra);
+  Scale := BigNumFrom(cardinal(2) shl Extra);
+  MarginUp := BigNumFrom(cardinal(1) shl Extra);
+  MarginDown := BigNumFrom(1);
+  if BinaryExp >= 0 then
+  begin
+    BigNumShl(Rest, BinaryExp);
+    BigNumShl(MarginUp, BinaryExp);
+    BigNumShl(MarginDown, BinaryExp);
+  end
+  else
+    BigNumShl(Scale, -BinaryExp);
+
+  // The position of the first digit: the log estimate is right or one too high.
+  Estimate := Ceil(Log10(V) - 1E-10);
+  if Estimate >= 0 then
+    BigNumMulPow10(Scale, Estimate)
+  else
+  begin
+    BigNumMulPow10(Rest, -Estimate);
+    BigNumMulPow10(MarginUp, -Estimate);
+    BigNumMulPow10(MarginDown, -Estimate);
+  end;
+  Order := BigNumCompare(BigNumAdd(Rest, MarginUp), Scale);
+  if (Order > 0) or (EvenMantissa and (Order = 0)) then
+    Exp10 := Estimate
+  else
+  begin
+    Exp10 := Estimate - 1;
+    BigNumMul(Rest, 10);
+    BigNumMul(MarginUp, 10);
+    BigNumMul(MarginDown, 10);
+  end;
+
+  Result := '';
+  repeat
+    Digit := 0;
+    while BigNumCompare(Rest, Scale) >= 0 do
+    begin
+      BigNumSub(Rest, Scale);
+      Inc(Digit);
+    end;
+    Order := BigNumCompare(Rest, MarginDown);
+    LowDone := (Order < 0) or (EvenMantissa and (Order = 0));
+    Order := BigNumCompare(BigNumAdd(Rest, MarginUp), Scale);
+    HighDone := (Order > 0) or (EvenMantissa and (Order = 0));
+    if not (LowDone or HighDone) then
+    begin
+      Result := Result + Chr(Ord('0') + Digit);
+      BigNumMul(Rest, 10);
+      BigNumMul(MarginUp, 10);
+      BigNumMul(MarginDown, 10);
+    end;
+  until LowDone or HighDone;
+  if LowDone and HighDone then
+  begin
+    Order := BigNumCompare(BigNumAdd(Rest, Rest), Scale);
+    RoundUp := (Order > 0) or ((Order = 0) and Odd(Digit));
+  end
+  else
+    RoundUp := HighDone;
+  if RoundUp then Inc(Digit);
+  Result := Result + Chr(Ord('0') + Digit);
 end;
 
 function DecisionFloatToStr(V: double): string;
 var
-  Precision, ExpPos, Exp10, DigitCount, PointPos: integer;
-  Mantissa, Digits: string;
-  ExpText: shortstring;
-  Parsed: double;
-  ParsedWide: extended;
+  Exp10, DigitCount, PointPos: integer;
+  Digits: string;
   Negative: boolean;
 begin
   if IsNan(V) then Exit('NaN');
@@ -321,31 +509,8 @@ begin
   end;
   Negative := V < 0;
   if Negative then V := -V;
-  Mantissa := '';
-  for Precision := 1 to 17 do
-  begin
-    if Precision = 1 then
-      Mantissa := OneDigitMantissa(V)
-    else
-    begin
-      // Str and not FloatToStrF, which stops at 15 digits where Extended is
-      // Double (Win64). Width = sign + "E+ddd" + point + Precision digits.
-      Str(V:Precision + 7, ExpText);
-      Mantissa := Trim(ExpText);
-    end;
-    // StrToFloat returns Extended: round to double (when in range) before comparing.
-    ParsedWide := StrToFloat(Mantissa, DecisionFormat);
-    if ParsedWide > MaxDouble then continue;
-    Parsed := ParsedWide;
-    if Parsed = V then break;
-  end;
-  // Mantissa = "d.dddE+X", or "dE+X" from OneDigitMantissa
-  ExpPos := Pos('E', Mantissa);
-  Exp10 := StrToInt(Copy(Mantissa, ExpPos + 1, Length(Mantissa)));
-  Digits := StringReplace(Copy(Mantissa, 1, ExpPos - 1), '.', '', []);
+  Digits := DecisionShortestDigits(V, Exp10);
   DigitCount := Length(Digits);
-  while (DigitCount > 1) and (Digits[DigitCount] = '0') do Dec(DigitCount);
-  SetLength(Digits, DigitCount);
   if (Exp10 < -4) or (Exp10 >= 16) then
   begin
     Result := Digits[1];
