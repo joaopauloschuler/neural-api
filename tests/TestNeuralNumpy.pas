@@ -398,7 +398,7 @@ begin
   // Cross-check against arrays produced by real numpy. The fixtures are tiny
   // and committed; if absent (clean checkout without the generator run) the
   // test is skipped rather than failed.
-  FixDir := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim;
+  FixDir := 'fixtures' + PathDelim;
   NpyPath := FixDir + 'numpy_crosscheck_f32.npy';
   NpzPath := FixDir + 'numpy_crosscheck.npz';
   if not FileExists(NpyPath) then

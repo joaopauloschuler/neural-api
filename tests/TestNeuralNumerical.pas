@@ -66055,7 +66055,7 @@ var
   Parser: TJSONParser;
 begin
   Result := nil;
-  FixturePath := ExtractFilePath(ParamStr(0)) + 'fixtures' + PathDelim +
+  FixturePath := 'fixtures' + PathDelim +
     FileName;
   if not FileExists(FixturePath) then exit;
   Text := TStringStream.Create('');
