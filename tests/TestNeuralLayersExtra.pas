@@ -3799,7 +3799,7 @@ var
   RelGap: TNeuralFloat;
   FS: TFormatSettings;
 begin
-  // Format() in the report emits a '.' decimal separator regardless of locale;
+  // Format() in the report emits a '.' decimal separator (RunTests sets it);
   // parse with a matching FormatSettings so the test is locale-independent.
   FS := DefaultFormatSettings;
   FS.DecimalSeparator := '.';
