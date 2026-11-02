@@ -5,6 +5,7 @@ interface
 
 type
   QWord = UInt64;
+  PtrUInt = UIntPtr;
 
 procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
 
