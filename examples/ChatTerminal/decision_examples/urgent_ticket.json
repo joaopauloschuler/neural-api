@@ -1,0 +1,13 @@
+{
+  "state": "Our checkout is down for every customer since 9am and we are losing thousands of dollars per minute. Fix it now!",
+  "questions": {
+    "urgent": {
+      "type": "noul",
+      "instructions": "Is this ticket urgent?",
+      "criteria": {
+        "true": "money is at stake or the customer is blocked",
+        "false": "the request can wait for the normal queue"
+      }
+    }
+  }
+}

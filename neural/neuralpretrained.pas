@@ -7571,6 +7571,158 @@ function BuildModernBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// ========================= EMBEDDINGGEMMA 2 IMPORT =========================
+// BuildEmbeddingGemma2FromSafeTensors rebuilds the TEXT tower of Google's
+// EmbeddingGemma 2 (model_type "embedding_gemma2", google/embeddinggemma-2;
+// HF EmbeddingGemma2TextModel, verified against transformers
+// modeling_embedding_gemma2). It is a Gemma-4-style ENCODER - every layer
+// attends BIDIRECTIONALLY - and the vision / audio towers of the composite
+// checkpoint are out of scope (their tensors are skipped, not loaded).
+// Architecture:
+//
+//   Input(SeqLen,1,1 token ids) -> TNNetEmbedding (embed_tokens, rows scaled
+//     by sqrt(hidden_size) at load)  =: E
+//   PLE (projection-only per-layer embeddings, computed ONCE from E):
+//     P := HeadRMSNorm_{PLE}( E . W_ple^T * hidden_size^-0.5 )
+//          (ple.per_layer_model_projection [L*PLE, hidden] - the scale is
+//          folded into the rows - then ple.per_layer_projection_norm over
+//          every PLE-wide slice: one TNNetHeadRMSNorm(PLE));
+//     slice i of P (TNNetSplitChannels i*PLE..) feeds layer i.
+//   -> num_hidden_layers x blocks (i = layer index):
+//        x := x + post_attention_layernorm(o_proj(Attn(input_layernorm(x))))
+//        x := x + post_feedforward_layernorm(
+//               down(gelu_tanh(gate(h)) * up(h))), h = pre_feedforward_layernorm(x)
+//        x := x + post_per_layer_input_norm(per_layer_projection(
+//               gelu_tanh(per_layer_input_gate(x)) * P_i))
+//        x := x * layer_scalar[i]           (a stored per-layer scalar)
+//   -> norm -> embedding_projection [embedding_dim, hidden] (no bias)
+//   Output: (SeqLen,1,embedding_dim) per-token states (HF last_hidden_state).
+//   sentence-transformers then mean-pools the REAL tokens and L2-normalizes
+//   (see EmbeddingGemma2EncodeText).
+//
+// Attention (HF EmbeddingGemma2Attention): q/k/v projections, per-head
+// RMSNorm on q and k WITH a learned gain and on v WITHOUT one (v_norm,
+// with_scale=False - a unit-gain TNNetHeadRMSNorm, not loaded), RoPE on
+// q/k, softmax with scaling = 1.0 (NOT 1/sqrt(head_dim): the q_norm gains
+// carry an extra sqrt(head_dim) so the SDPA's 1/sqrt(d_k) cancels - exact,
+// the scalar commutes with RoPE). GQA with a PER-LAYER geometry:
+// "sliding_attention" layers use head_dim / num_key_value_heads, while
+// per_layer_config overrides them on the "full_attention" layers (the
+// released checkpoint: 4 x 256 with 2 kv heads vs 4 x 512 with ONE kv
+// head). RoPE theta is per layer TYPE (rope_parameters, "default" type
+// only) over that type's head_dim. Sliding layers attend |i-j| <=
+// sliding_window (an inclusive RADIUS - TNNetScaledDotProductAttention's
+// bidirectional window with W = sliding_window + 1); a net whose SeqLen is
+// <= sliding_window + 1 can never reach the band edge, so those layers fuse
+// like the full ones.
+// RMSNorm is the Gemma-4 form x_hat * w (NOT Gemma 1-3's (1 + w)); the MLP
+// is GeGLU with gelu_pytorch_tanh (gate_proj/up_proj/down_proj, no
+// biases). The tokenizer.json is the Gemma metaspace BPE (byte fallback,
+// Replace(" "->U+2581) + literal Split pre_tokenizer) that
+// TNeuralHFTokenizer loads; <bos> ... <eos> is added by
+// EmbeddingGemma2TokenizeText.
+
+type
+  TEmbeddingGemma2Config = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size (GeGLU width)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads (every layer)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    RmsNormEps: double;         // rms_norm_eps
+    SlidingWindow: integer;     // sliding_window: INCLUSIVE radius
+    HiddenSizePerLayerInput: integer; // hidden_size_per_layer_input (PLE)
+    EmbeddingDim: integer;      // embedding_dim (embedding_projection out)
+    SlidingRopeTheta: double;   // rope_parameters.sliding_attention.rope_theta
+    FullRopeTheta: double;      // rope_parameters.full_attention.rope_theta
+    LayerIsSliding: array of boolean; // layer_types[i] = sliding_attention
+    LayerHeadDim: array of integer;   // per-layer head_dim
+    LayerNumKVHeads: array of integer;// per-layer num_key_value_heads
+    PadTokenId, BosTokenId, EosTokenId: integer;
+    ModelType: string;          // 'embedding_gemma2' or 'embedding_gemma2_text'
+    Prefix: string;             // detected by the builder
+                                // ('language_model.' on the composite export)
+  end;
+
+// Reads a HF EmbeddingGemma 2 config.json: either the composite
+// (model_type "embedding_gemma2", the text tower under "text_config") or a
+// bare text config (model_type "embedding_gemma2_text"). Defaults follow
+// EmbeddingGemma2TextConfig (layer_types: sliding iff (i+1) mod 6 <> 0 with
+// the last layer forced to full_attention; per_layer_config absent = full
+// layers get global_head_dim (512) / num_global_key_value_heads (1)).
+// Rejected: attention_bias = true, a hidden_activation other than
+// gelu_pytorch_tanh, a rope_type other than "default", and layers of the
+// same type with different head_dim (RoPE is per layer type).
+function ReadEmbeddingGemma2ConfigFromJSONFile(
+  const FileName: string): TEmbeddingGemma2Config;
+
+function EmbeddingGemma2ConfigToString(
+  const Config: TEmbeddingGemma2Config): string;
+
+// Builds the EmbeddingGemma 2 text encoder described by Config ((SeqLen,1,1)
+// token ids in, (SeqLen,1,embedding_dim) out) and loads its weights from
+// FileName. pSeqLen = 0 uses 512. Tensors OUTSIDE the detected text prefix
+// (vision_tower.*, audio_tower.*, embed_vision.*, embed_audio.*) are
+// skipped; an unexpected tensor INSIDE it is rejected.
+// The encoder carries NO attention padding mask: for exact parity build the
+// net with pSeqLen = the token count (pads would be attended to).
+// pWeightOwner (a net this builder produced from the same checkpoint, its
+// weight state final): the graph is built at pSeqLen with every
+// weight-bearing layer linked to the owner's layer at the same index
+// (TNNet.BuildWeightOwner) - no weight is loaded, so one loaded net serves
+// any number of cheap per-length (or per-thread) twins. Owner and twin must
+// have the same graph: both SeqLen <= sliding_window + 1 (the windowless
+// sliding layers) or both above it; a mismatch raises.
+function BuildEmbeddingGemma2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildEmbeddingGemma2FromSafeTensorsEx(const FileName: string;
+  out Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
+
+function BuildEmbeddingGemma2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+// Prompt prefixes of config_sentence_transformers.json for the common
+// tasks (the model expects one in front of EVERY text).
+const
+  csEmbeddingGemma2QueryPrompt = 'task: search result | query: ';
+  csEmbeddingGemma2DocumentPrompt = 'title: none | text: ';
+  csEmbeddingGemma2SimilarityPrompt = 'task: sentence similarity | query: ';
+  csEmbeddingGemma2ClassificationPrompt = 'task: classification | query: ';
+  csEmbeddingGemma2ClusteringPrompt = 'task: clustering | query: ';
+
+// <bos> + Tokenizer.Encode(Prompt + Text) + <eos> (the tokenizer.json
+// TemplateProcessing post-processor), truncated to MaxTokens (> 0) keeping
+// the trailing <eos>.
+function EmbeddingGemma2TokenizeText(Tokenizer: TNeuralHFTokenizer;
+  const Config: TEmbeddingGemma2Config; const Text: string;
+  const Prompt: string = ''; MaxTokens: integer = 0): TNeuralIntegerArray;
+
+// Runs Net on TokenIds (padded with pad_token_id up to the net's SeqLen),
+// mean-pools the REAL rows and L2-normalizes into Embedding (1,1,D). Dim > 0
+// (Matryoshka: 512 / 256 / 128) keeps the first Dim components and
+// renormalizes. Exact sentence-transformers parity needs SeqLen =
+// Length(TokenIds) (no padding mask - see above).
+procedure EmbeddingGemma2EmbedIds(Net: TNNet;
+  const Config: TEmbeddingGemma2Config; const TokenIds: TNeuralIntegerArray;
+  Embedding: TNNetVolume; Dim: integer = 0);
+
+// EmbeddingGemma2TokenizeText (truncated to the net's SeqLen) +
+// EmbeddingGemma2EmbedIds.
+procedure EmbeddingGemma2EncodeText(Net: TNNet;
+  Tokenizer: TNeuralHFTokenizer; const Config: TEmbeddingGemma2Config;
+  const Text: string; Embedding: TNNetVolume; const Prompt: string = '';
+  Dim: integer = 0);
+
 // ---------------------------------------------------------------------------
 // DEBERTA-V2 / DEBERTA-V3 IMPORT (model_type "deberta-v2"; the deberta-v3
 // family - microsoft/deberta-v3-base/-small, the ms-marco cross-encoder
@@ -13778,7 +13930,8 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // decoders; vision tower and MTP head skipped), gemma,
 // gemma2, gemma3_text, rwkv, mamba, falcon_mamba, bloom, falcon (legacy
 // RefinedWebModel / RefinedWeb spellings accepted), bert, distilbert,
-// roberta, modernbert, deepseek_v2.
+// roberta, modernbert, embedding_gemma2 (+ embedding_gemma2_text),
+// deepseek_v2.
 // Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
@@ -13802,16 +13955,23 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // checkpoint again (see BuildLlamaFromSafeTensorsWithConfig). Only the
 // model types PretrainedModelTypeCanBorrowWeights accepts take it; every
 // other family raises EPretrainedImportError.
+// pLoRAAdapterDir: a HF PEFT LoRA adapter directory merged into the weights as
+// they load (TNNetLoRAMergeReader); Llama-builder model types only, and
+// unused with pWeightOwner (the owner's weights already carry the merge).
+// pOmitLMHead: the net ends at the final norm and outputs hidden states (no
+// vocab x hidden LM head; a tied embedding still loads); Llama-builder types
+// only. A twin borrowing from such a net must pass it too.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = '';
+  pOmitLMHead: boolean = false): TNNet;
 
 // True for the config.json model_type values BuildFromPretrained routes
 // through the Llama builder (llama, mistral, qwen2, qwen3, qwen3_moe,
-// qwen3_vl, qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2,
-// olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
-// twin can borrow an already-loaded net's weights (pWeightOwner).
+// qwen3_vl, qwen3_5, qwen3_5_text, qwen3_5_moe, gemma, gemma2, gemma3_text,
+// phi3, olmo2, olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) -
+// the families whose twin can borrow an already-loaded net's weights.
 function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 
 // ---------------------------------------------------------------------------
@@ -13859,6 +14019,67 @@ type
     Alpha: TNeuralFloat;
     Rank: integer;
     RankFound: boolean;
+    // target_modules when it is a list; TargetModulesIsList is false for a
+    // regex string or an absent field.
+    TargetModules: TStringArray;
+    TargetModulesIsList: boolean;
+    // rank_pattern / alpha_pattern in file order; keys are module-name
+    // suffixes (PEFT's first match wins).
+    RankPatternKeys: TStringArray;
+    RankPatternValues: array of integer;
+    AlphaPatternKeys: TStringArray;
+    AlphaPatternValues: TNeuralFloatDynArr;
+  end;
+
+  // One adapted base tensor of a TNNetLoRAMergeReader: W [OutDim, InDim]
+  // reads as W + Scale * B @ A, with A [Rank, InDim] and B [OutDim, Rank].
+  TPEFTLoRAMergeModule = record
+    AName, BName: string;
+    Rank, InDim, OutDim: integer;
+    Scale: TNeuralFloat;
+  end;
+
+  // A tensor reader over a base checkpoint with a HF PEFT LoRA adapter merged
+  // in, in HF tensor space: every base tensor the adapter targets reads as
+  // W + (lora_alpha / r) * B @ A in FP32, per whole-tensor or row-range load,
+  // so the importers' row permutations and int8/int4 quantization see the
+  // merged weights. Adapter key "base_model.model.<m>.lora_A.weight" targets
+  // the base tensor "<m>.weight", else "<text prefix><m>.weight" (the prefix
+  // of the checkpoint's embed_tokens.weight: "model.language_model.",
+  // "model." or ""). The other tensors pass through untouched. An entry's
+  // Shard field holds its index into FSourceNames (renames keep the link).
+  TNNetLoRAMergeReader = class(TNNetSafeTensorsReader)
+  private
+    FBase: TNNetSafeTensorsReader;     // owned
+    FAdapter: TNNetSafeTensorsReader;  // owned
+    FSourceNames: array of string;     // base tensor name per entry
+    FModuleOfSource: array of integer; // FModules index per entry, -1 = none
+    FModules: array of TPEFTLoRAMergeModule;
+    FCachedModule: integer;            // module whose A/B are in FA/FB
+    FA, FB, FDeltaRow: TNNetVolume;
+    function SourceOf(const pName: string): integer;
+    procedure LoadModuleFactors(ModuleIdx: integer);
+    // Adds Scale * (B @ A) of FModules[ModuleIdx] to Dest, which holds the
+    // flat elements FirstElement.. of the [OutDim, InDim] base tensor.
+    procedure AddDeltaToFlatRange(ModuleIdx: integer; Dest: TNNetVolume;
+      FirstElement: Int64);
+    function GetAdaptedTensorCount: integer;
+  public
+    // Takes ownership of pBase (also freed when Create raises). pAdapterDir
+    // holds adapter_config.json and adapter_model.safetensors (or .bin).
+    constructor Create(pBase: TNNetSafeTensorsReader;
+      const pAdapterDir: string);
+    destructor Destroy; override;
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+    function CanStreamTensorRows(const pName: string): boolean; override;
+    procedure LoadTensorRowsFlat(const pName: string;
+      FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); override;
+    function CanStreamTensorPackedQ4_0(const pName: string): boolean; override;
+    procedure LoadTensorPackedRowsQ4_0(const pName: string;
+      FirstRow, RowCount, RowSize: integer;
+      Dest: TNNetVolumeQuant4); override;
+    property AdaptedTensorCount: integer read GetAdaptedTensorCount;
   end;
 
 // Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
@@ -13871,8 +14092,8 @@ procedure LoadPlainLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   Scale: TNeuralFloat = 1.0);
 
-// Reads lora_alpha and r from a PEFT adapter_config.json. Missing fields
-// default to Alpha=Rank (scale 1.0) so a config-less adapter still loads.
+// Reads r, lora_alpha (default r), target_modules and rank/alpha_pattern from
+// adapter_config.json; raises on options (DoRA, rsLoRA, ...) beyond W + alpha/r B A.
 function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
 
 // Loads ONE wrapped module's LoRA pair from an already-open reader onto the
@@ -14048,6 +14269,14 @@ uses
 procedure ImportError(const Msg: string);
 begin
   raise EPretrainedImportError.Create(Msg);
+end;
+
+// Loads the text file FileName into JsonText; a Git LFS pointer file raises
+// EPretrainedImportError instead.
+procedure LoadImportJSONText(JsonText: TStrings; const FileName: string);
+begin
+  RaiseIfGitLfsPointer(FileName, EPretrainedImportError);
+  JsonText.LoadFromFile(FileName);
 end;
 
 function CreatePretrainedTensorReader(
@@ -15182,7 +15411,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -16893,21 +17122,82 @@ begin
 end;
 
 function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+const
+  // Options that add weights or change the merged math (W + alpha/r * B A).
+  UnsupportedOptions: array[0..13] of string = ('use_dora', 'use_rslora',
+    'use_qalora', 'use_bdlora', 'lora_bias', 'fan_in_fan_out',
+    'modules_to_save', 'trainable_token_indices', 'layer_replication',
+    'target_parameters', 'alora_invocation_tokens', 'arrow_config',
+    'kasa_config', 'monteclora_config');
 var
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
   Field: TJSONData;
+  OptionCnt, ItemCnt, MaxItemPos: integer;
+  InitText: string;
+
+  // True when the option is present with a value other than null, false,
+  // "" or an empty list/object.
+  function IsOptionSet(Value: TJSONData): boolean;
+  begin
+    if (Value = nil) or Value.IsNull then exit(false);
+    case Value.JSONType of
+      jtBoolean: Result := Value.AsBoolean;
+      jtString: Result := Value.AsString <> '';
+      jtArray, jtObject: Result := Value.Count > 0;
+    else
+      Result := true;
+    end;
+  end;
+
+  // Reads a rank_pattern / alpha_pattern object; keys must be plain dotted
+  // module-name suffixes (PEFT matches them as regexes).
+  procedure ReadPattern(const FieldName: string; out Keys: TStringArray;
+    out Values: TNeuralFloatDynArr);
+  var
+    PatternObj: TJSONObject;
+    KeyCnt, MaxKeyPos: integer;
+    Key: string;
+  begin
+    SetLength(Keys, 0);
+    SetLength(Values, 0);
+    Field := Obj.Find(FieldName);
+    if (Field = nil) or Field.IsNull then exit;
+    if not (Field is TJSONObject) then
+      ImportError('PEFT import: config "' + FieldName + '" must be an ' +
+        'object, got ' + Field.AsJSON + '.');
+    PatternObj := TJSONObject(Field);
+    SetLength(Keys, PatternObj.Count);
+    SetLength(Values, PatternObj.Count);
+    MaxKeyPos := PatternObj.Count - 1;
+    for KeyCnt := 0 to MaxKeyPos do
+    begin
+      Key := PatternObj.Names[KeyCnt];
+      if (Key = '') or (LastDelimiter('*+?[](){}|^$\', Key) > 0) then
+        ImportError('PEFT import: config "' + FieldName + '" key "' + Key +
+          '" is a regex - only plain module-name suffixes are supported.');
+      if not (PatternObj.Items[KeyCnt].JSONType = jtNumber) then
+        ImportError('PEFT import: config "' + FieldName + '" value for "' +
+          Key + '" must be a number.');
+      Keys[KeyCnt] := Key;
+      Values[KeyCnt] := PatternObj.Items[KeyCnt].AsFloat;
+    end;
+  end;
+
+var
+  PatternValues: TNeuralFloatDynArr;
+  MaxPatternPos, PatternCnt: integer;
 begin
+  Result := Default(TPEFTAdapterConfig);
   Result.Alpha := 1.0;
   Result.Rank := 1;
-  Result.RankFound := False;
   if not FileExists(FileName) then
     ImportError('PEFT import: adapter_config.json not found: ' + FileName);
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -16919,6 +17209,31 @@ begin
       ImportError('PEFT import: config "' + FileName +
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
+    if Obj.Get('peft_type', 'LORA') <> 'LORA' then
+      ImportError('PEFT import: config "' + FileName + '" has peft_type "' +
+        Obj.Get('peft_type', '') + '" - only LORA is supported.');
+    for OptionCnt := Low(UnsupportedOptions) to High(UnsupportedOptions) do
+      if IsOptionSet(Obj.Find(UnsupportedOptions[OptionCnt])) then
+        ImportError('PEFT import: config "' + FileName + '" sets "' +
+          UnsupportedOptions[OptionCnt] + '" = ' +
+          Obj.Find(UnsupportedOptions[OptionCnt]).AsJSON +
+          ' - not supported (the weights would not be base + ' +
+          '(lora_alpha/r) * B @ A).');
+    if Obj.Get('bias', 'none') <> 'none' then
+      ImportError('PEFT import: config "' + FileName + '" has bias "' +
+        Obj.Get('bias', '') + '" - only "none" is supported.');
+    // PiSSA / OLoRA / CorDA / LoftQ / LoRA-GA rewrite the base weights at
+    // initialization, so their adapters do not apply to the original base.
+    Field := Obj.Find('init_lora_weights');
+    if (Field <> nil) and (Field.JSONType = jtString) then
+    begin
+      InitText := Field.AsString;
+      if (InitText <> 'gaussian') and (InitText <> 'eva') and
+         (InitText <> 'orthogonal') then
+        ImportError('PEFT import: config "' + FileName +
+          '" has init_lora_weights "' + InitText + '" - only true, false, ' +
+          '"gaussian", "eva" and "orthogonal" leave the base weights intact.');
+    end;
     Field := Obj.Find('r');
     if (Field <> nil) and not Field.IsNull then
     begin
@@ -16930,10 +17245,56 @@ begin
     end;
     // lora_alpha defaults to r (PEFT scale 1.0) when absent.
     Result.Alpha := Obj.Get('lora_alpha', TNeuralFloat(Result.Rank));
+    Field := Obj.Find('target_modules');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      Result.TargetModulesIsList := true;
+      SetLength(Result.TargetModules, Field.Count);
+      MaxItemPos := Field.Count - 1;
+      for ItemCnt := 0 to MaxItemPos do
+        Result.TargetModules[ItemCnt] := Field.Items[ItemCnt].AsString;
+    end;
+    ReadPattern('rank_pattern', Result.RankPatternKeys, PatternValues);
+    SetLength(Result.RankPatternValues, Length(PatternValues));
+    MaxPatternPos := High(PatternValues);
+    for PatternCnt := 0 to MaxPatternPos do
+    begin
+      Result.RankPatternValues[PatternCnt] := Round(PatternValues[PatternCnt]);
+      if Result.RankPatternValues[PatternCnt] < 1 then
+        ImportError('PEFT import: config "rank_pattern" value for "' +
+          Result.RankPatternKeys[PatternCnt] + '" must be >= 1.');
+    end;
+    ReadPattern('alpha_pattern', Result.AlphaPatternKeys,
+      Result.AlphaPatternValues);
   finally
     Root.Free;
     JsonText.Free;
   end;
+end;
+
+// True when ModulePath is Suffix or ends with "." + Suffix (PEFT's module-name
+// match for target_modules lists and plain rank_pattern / alpha_pattern keys).
+function PEFTModuleNameMatches(const ModulePath, Suffix: string): boolean;
+var
+  PathLen, SuffixLen: integer;
+begin
+  PathLen := Length(ModulePath);
+  SuffixLen := Length(Suffix);
+  if PathLen = SuffixLen then exit(ModulePath = Suffix);
+  Result := (PathLen > SuffixLen) and
+    (ModulePath[PathLen - SuffixLen] = '.') and
+    (Copy(ModulePath, PathLen - SuffixLen + 1, SuffixLen) = Suffix);
+end;
+
+// Index of the first key ModulePath matches, -1 when none.
+function PEFTPatternIndex(const Keys: array of string;
+  const ModulePath: string): integer;
+var
+  KeyCnt: integer;
+begin
+  for KeyCnt := Low(Keys) to High(Keys) do
+    if PEFTModuleNameMatches(ModulePath, Keys[KeyCnt]) then exit(KeyCnt);
+  Result := -1;
 end;
 
 function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
@@ -16995,6 +17356,294 @@ begin
   // B: [d_out, Rank] -> B layer (d_out neurons, Rank weights), scaled.
   LoadPlainLinearWeights(Reader, BUp, BName, Rank, d_out, Scale);
   Result := Base;
+end;
+
+{ TNNetLoRAMergeReader }
+
+constructor TNNetLoRAMergeReader.Create(pBase: TNNetSafeTensorsReader;
+  const pAdapterDir: string);
+const
+  PEFTKeyPrefix = 'base_model.model.';
+  LoRAAMarker = '.lora_A.';
+var
+  Config: TPEFTAdapterConfig;
+  ConfigFile, AdapterFile, AdapterKey, ModulePath, WeightSuffix: string;
+  BName, BaseName, TextPrefix, DType: string;
+  PairedNames: TStringList;
+  Module: TPEFTLoRAMergeModule;
+  Alpha: TNeuralFloat;
+  SourceCnt, MaxSourcePos, AdapterCnt, MaxAdapterPos, MarkerPos: integer;
+  SourceIdx, PatternIdx, ExpectedRank, ModuleIdx: integer;
+
+  // "weight" or "<adapter name>.weight" (PEFT drops the name "default").
+  function IsLoRAWeightSuffix(const Suffix: string): boolean;
+  var
+    NamePart: string;
+  begin
+    if Suffix = 'weight' then exit(true);
+    NamePart := Copy(Suffix, 1, Length(Suffix) - Length('.weight'));
+    Result := (Length(Suffix) > Length('.weight')) and
+      (Copy(Suffix, Length(NamePart) + 1, MaxInt) = '.weight') and
+      (Pos('.', NamePart) = 0);
+  end;
+
+begin
+  inherited CreateBare;
+  FBase := pBase; // first: Destroy frees it when anything below raises
+  FCachedModule := -1;
+  FA := TNNetVolume.Create;
+  FB := TNNetVolume.Create;
+  FDeltaRow := TNNetVolume.Create;
+  FFileName := FBase.FileName;
+  ConfigFile := IncludeTrailingPathDelimiter(pAdapterDir) +
+    'adapter_config.json';
+  Config := ReadPEFTAdapterConfig(ConfigFile);
+  if not Config.RankFound then
+    ImportError('LoRA merge: ' + ConfigFile + ' has no "r".');
+  AdapterFile := IncludeTrailingPathDelimiter(pAdapterDir) +
+    'adapter_model.safetensors';
+  if not FileExists(AdapterFile) then
+    AdapterFile := IncludeTrailingPathDelimiter(pAdapterDir) +
+      'adapter_model.bin';
+  if not FileExists(AdapterFile) then
+    ImportError('LoRA merge: neither adapter_model.safetensors nor ' +
+      'adapter_model.bin found in ' + pAdapterDir + '.');
+  FAdapter := CreatePretrainedTensorReader(AdapterFile);
+  MaxSourcePos := FBase.Count - 1;
+  SetLength(FTensors, FBase.Count);
+  SetLength(FSourceNames, FBase.Count);
+  SetLength(FModuleOfSource, FBase.Count);
+  for SourceCnt := 0 to MaxSourcePos do
+  begin
+    FSourceNames[SourceCnt] := FBase.TensorName(SourceCnt);
+    FTensors[SourceCnt] := FBase.GetInfo(FSourceNames[SourceCnt]);
+    FTensors[SourceCnt].Shard := SourceCnt;
+    FModuleOfSource[SourceCnt] := -1;
+  end;
+  InvalidateTensorIndex;
+  // The text decoder's prefix, as the Llama importer detects it.
+  if FBase.HasTensor('model.language_model.embed_tokens.weight') then
+    TextPrefix := 'model.language_model.'
+  else if FBase.HasTensor('model.embed_tokens.weight') then
+    TextPrefix := 'model.'
+  else
+    TextPrefix := '';
+  PairedNames := TStringList.Create;
+  try
+    PairedNames.Sorted := true;
+    MaxAdapterPos := FAdapter.Count - 1;
+    for AdapterCnt := 0 to MaxAdapterPos do
+    begin
+      AdapterKey := FAdapter.TensorName(AdapterCnt);
+      MarkerPos := Pos(LoRAAMarker, AdapterKey);
+      if MarkerPos = 0 then continue; // paired below from its lora_A
+      WeightSuffix := Copy(AdapterKey, MarkerPos + Length(LoRAAMarker), MaxInt);
+      if not IsLoRAWeightSuffix(WeightSuffix) then continue;
+      ModulePath := Copy(AdapterKey, 1, MarkerPos - 1);
+      BName := ModulePath + '.lora_B.' + WeightSuffix;
+      if not FAdapter.HasTensor(BName) then
+        ImportError('LoRA merge: adapter tensor "' + AdapterKey +
+          '" has no matching "' + BName + '" in ' + AdapterFile + '.');
+      PairedNames.Add(AdapterKey);
+      PairedNames.Add(BName);
+      if Copy(ModulePath, 1, Length(PEFTKeyPrefix)) = PEFTKeyPrefix then
+        Delete(ModulePath, 1, Length(PEFTKeyPrefix));
+      if FBase.HasTensor(ModulePath + '.weight') then
+        BaseName := ModulePath + '.weight'
+      else if (TextPrefix <> '') and
+        FBase.HasTensor(TextPrefix + ModulePath + '.weight') then
+        BaseName := TextPrefix + ModulePath + '.weight'
+      else
+        ImportError('LoRA merge: adapter module "' + ModulePath +
+          '" matches no base tensor (tried "' + ModulePath + '.weight" and "' +
+          TextPrefix + ModulePath + '.weight") in ' + FFileName + '.');
+      if (Pos('visual.', BaseName) = 1) or (Pos('model.visual.', BaseName) = 1)
+        or (Pos('mtp.', BaseName) = 1) or (Pos('model.mtp.', BaseName) = 1) then
+        ImportError('LoRA merge: adapter module "' + ModulePath +
+          '" targets "' + BaseName + '", which the text importer skips.');
+      if Config.TargetModulesIsList and
+        (PEFTPatternIndex(Config.TargetModules, ModulePath) < 0) then
+        ImportError('LoRA merge: adapter module "' + ModulePath +
+          '" is not in the target_modules of ' + ConfigFile + '.');
+      DType := FBase.GetDType(BaseName);
+      if ((DType <> 'F32') and (DType <> 'F16') and (DType <> 'BF16')) or
+        (FBase.DimCount(BaseName) <> 2) then
+        ImportError('LoRA merge: base tensor "' + BaseName + '" (dtype ' +
+          DType + ', shape ' + FBase.ShapeAsString(BaseName) +
+          ') is not a dense F32/F16/BF16 matrix.');
+      Module.AName := AdapterKey;
+      Module.BName := BName;
+      Module.OutDim := integer(FBase.DimSize(BaseName, 0));
+      Module.InDim := integer(FBase.DimSize(BaseName, 1));
+      if (FAdapter.DimCount(AdapterKey) <> 2) or
+        (FAdapter.DimCount(BName) <> 2) or
+        (FAdapter.DimSize(AdapterKey, 1) <> Module.InDim) or
+        (FAdapter.DimSize(BName, 0) <> Module.OutDim) or
+        (FAdapter.DimSize(BName, 1) <> FAdapter.DimSize(AdapterKey, 0)) then
+        ImportError('LoRA merge: "' + AdapterKey + '" ' +
+          FAdapter.ShapeAsString(AdapterKey) + ' and "' + BName + '" ' +
+          FAdapter.ShapeAsString(BName) + ' do not fit base "' + BaseName +
+          '" ' + FBase.ShapeAsString(BaseName) +
+          ' (expected [r, in] and [out, r]).');
+      Module.Rank := integer(FAdapter.DimSize(AdapterKey, 0));
+      PatternIdx := PEFTPatternIndex(Config.RankPatternKeys, ModulePath);
+      if PatternIdx >= 0 then ExpectedRank := Config.RankPatternValues[PatternIdx]
+      else ExpectedRank := Config.Rank;
+      if Module.Rank <> ExpectedRank then
+        ImportError('LoRA merge: "' + AdapterKey + '" has rank ' +
+          IntToStr(Module.Rank) + ' but ' + ConfigFile + ' gives r = ' +
+          IntToStr(ExpectedRank) + ' for module "' + ModulePath + '".');
+      PatternIdx := PEFTPatternIndex(Config.AlphaPatternKeys, ModulePath);
+      if PatternIdx >= 0 then Alpha := Config.AlphaPatternValues[PatternIdx]
+      else Alpha := Config.Alpha;
+      Module.Scale := Alpha / Module.Rank;
+      SourceIdx := FindTensor(BaseName);
+      if FModuleOfSource[SourceIdx] >= 0 then
+        ImportError('LoRA merge: two adapter modules target "' + BaseName +
+          '" in ' + AdapterFile + '.');
+      ModuleIdx := Length(FModules);
+      SetLength(FModules, ModuleIdx + 1);
+      FModules[ModuleIdx] := Module;
+      FModuleOfSource[SourceIdx] := ModuleIdx;
+      FTensors[SourceIdx].DType := 'F32'; // served merged, in FP32
+    end;
+    for AdapterCnt := 0 to MaxAdapterPos do
+      if PairedNames.IndexOf(FAdapter.TensorName(AdapterCnt)) < 0 then
+        ImportError('LoRA merge: adapter tensor "' +
+          FAdapter.TensorName(AdapterCnt) + '" is not part of a ' +
+          'lora_A/lora_B weight pair - DoRA magnitudes, LoRA biases, ' +
+          'embedding LoRA, trainable tokens and modules_to_save are not ' +
+          'supported (' + AdapterFile + ').');
+  finally
+    PairedNames.Free;
+  end;
+  if Length(FModules) = 0 then
+    ImportError('LoRA merge: ' + AdapterFile + ' holds no LoRA weights.');
+end;
+
+destructor TNNetLoRAMergeReader.Destroy;
+begin
+  FDeltaRow.Free;
+  FB.Free;
+  FA.Free;
+  FAdapter.Free;
+  FBase.Free;
+  inherited Destroy;
+end;
+
+function TNNetLoRAMergeReader.GetAdaptedTensorCount: integer;
+begin
+  Result := Length(FModules);
+end;
+
+function TNNetLoRAMergeReader.SourceOf(const pName: string): integer;
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    raise ESafeTensorsError.CreateFmt('LoRA merge: tensor "%s" not found ' +
+      'in %s', [pName, FFileName]);
+  Result := FTensors[Idx].Shard;
+end;
+
+procedure TNNetLoRAMergeReader.LoadModuleFactors(ModuleIdx: integer);
+begin
+  if FCachedModule = ModuleIdx then exit;
+  FCachedModule := -1;
+  FAdapter.LoadTensorFlat(FModules[ModuleIdx].AName, FA);
+  FAdapter.LoadTensorFlat(FModules[ModuleIdx].BName, FB);
+  FDeltaRow.ReSize(FModules[ModuleIdx].InDim, 1, 1);
+  FCachedModule := ModuleIdx;
+end;
+
+procedure TNNetLoRAMergeReader.AddDeltaToFlatRange(ModuleIdx: integer;
+  Dest: TNNetVolume; FirstElement: Int64);
+var
+  InDim, Rank, MaxRankPos, RankPos, Row, Col, DestPos, SpanCount: integer;
+  ElemCount, BRowBase: integer;
+  Scale: TNeuralFloat;
+begin
+  LoadModuleFactors(ModuleIdx);
+  InDim := FModules[ModuleIdx].InDim;
+  Rank := FModules[ModuleIdx].Rank;
+  Scale := FModules[ModuleIdx].Scale;
+  MaxRankPos := Rank - 1;
+  ElemCount := Dest.Size;
+  Row := integer(FirstElement div InDim);
+  Col := integer(FirstElement mod InDim);
+  DestPos := 0;
+  while DestPos < ElemCount do
+  begin
+    SpanCount := InDim - Col;
+    if SpanCount > ElemCount - DestPos then SpanCount := ElemCount - DestPos;
+    // The unscaled B @ A row first, then W += Scale * row: one rounding of
+    // the delta into W, as PEFT's W + (B @ A) * scaling.
+    FDeltaRow.Fill(0);
+    BRowBase := Row * Rank;
+    for RankPos := 0 to MaxRankPos do
+      TNNetVolume.MulAdd(FDeltaRow.GetRawPtr(0), FA.GetRawPtr(RankPos * InDim),
+        FB.FData[BRowBase + RankPos], InDim);
+    TNNetVolume.MulAdd(Dest.GetRawPtr(DestPos), FDeltaRow.GetRawPtr(Col),
+      Scale, SpanCount);
+    Inc(DestPos, SpanCount);
+    Inc(Row);
+    Col := 0;
+  end;
+end;
+
+procedure TNNetLoRAMergeReader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  FBase.LoadTensorFlat(FSourceNames[SourceIdx], Dest);
+  if FModuleOfSource[SourceIdx] >= 0 then
+    AddDeltaToFlatRange(FModuleOfSource[SourceIdx], Dest, 0);
+end;
+
+function TNNetLoRAMergeReader.CanStreamTensorRows(
+  const pName: string): boolean;
+begin
+  Result := FBase.CanStreamTensorRows(FSourceNames[SourceOf(pName)]);
+end;
+
+procedure TNNetLoRAMergeReader.LoadTensorRowsFlat(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  FBase.LoadTensorRowsFlat(FSourceNames[SourceIdx], FirstRow, RowCount,
+    RowSize, Dest);
+  if FModuleOfSource[SourceIdx] >= 0 then
+    AddDeltaToFlatRange(FModuleOfSource[SourceIdx], Dest,
+      Int64(FirstRow) * RowSize);
+end;
+
+function TNNetLoRAMergeReader.CanStreamTensorPackedQ4_0(
+  const pName: string): boolean;
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  // Packed Q4_0 codes cannot take the delta; adapted tensors load as FP32.
+  Result := (FModuleOfSource[SourceIdx] < 0) and
+    FBase.CanStreamTensorPackedQ4_0(FSourceNames[SourceIdx]);
+end;
+
+procedure TNNetLoRAMergeReader.LoadTensorPackedRowsQ4_0(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolumeQuant4);
+var
+  SourceIdx: integer;
+begin
+  SourceIdx := SourceOf(pName);
+  if FModuleOfSource[SourceIdx] >= 0 then
+    raise ESafeTensorsError.CreateFmt('LoRA merge: "%s" carries a LoRA ' +
+      'delta and has no packed Q4_0 form: %s', [pName, FFileName]);
+  FBase.LoadTensorPackedRowsQ4_0(FSourceNames[SourceIdx], FirstRow, RowCount,
+    RowSize, Dest);
 end;
 
 // Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
@@ -18109,13 +18758,15 @@ end;
 // (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
 // allocated, and no quantize sweep runs. A layer count or class mismatch
 // raises. pStopBeforeFinalNorm, pDeepStackInputs: see
-// BuildLlamaFromSafeTensorsWithConfig. Coded by Claude (AI).
+// BuildLlamaFromSafeTensorsWithConfig. pOmitLMHead: the net ends at the final
+// RMSNorm (hidden states out); lm_head is neither required nor loaded.
+// Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
   pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false;
-  pDeepStackInputs: integer = 0): TNNet;
+  pDeepStackInputs: integer = 0; pOmitLMHead: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -18322,7 +18973,7 @@ begin
             '], got ' +
             Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
         if (not Config.TieWordEmbeddings) and (not pStopBeforeFinalNorm) and
-           (not Reader.HasTensor(LMHeadName)) then
+           (not pOmitLMHead) and (not Reader.HasTensor(LMHeadName)) then
           ImportError('Llama import: config says tie_word_embeddings=false ' +
             'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
       end;
@@ -18849,13 +19500,17 @@ begin
       begin
         FinalNorm := NN.AddLayer(
           TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
-        LMHead := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
-        // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
-        // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
-        // (HF applies it to the logits before any sampling softmax).
-        if Config.FinalLogitSoftCap > 0 then
-          NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+        if pOmitLMHead then LMHead := nil
+        else
+        begin
+          LMHead := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+          // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
+          // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
+          // (HF applies it to the logits before any sampling softmax).
+          if Config.FinalLogitSoftCap > 0 then
+            NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+        end;
       end;
       if not pTrainable then NN.SetTrainable();
       if QuantizeSweeps then NN.QuantizeWeightsInt8();
@@ -22014,7 +22669,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -22451,7 +23106,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -23189,7 +23844,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -23656,7 +24311,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24102,7 +24757,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24466,7 +25121,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -24923,7 +25578,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -25518,7 +26173,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26102,7 +26757,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26807,7 +27462,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -26881,7 +27536,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -28369,7 +29024,7 @@ begin
   Root := nil;
   try
     try
-      JsonText.LoadFromFile(FileName);
+      LoadImportJSONText(JsonText, FileName);
       try
         Root := GetJSON(JsonText.Text);
       except
@@ -29128,7 +29783,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -29845,7 +30500,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -30529,7 +31184,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -31281,7 +31936,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -31919,7 +32574,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -33393,7 +34048,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -33904,7 +34559,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -34516,7 +35171,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -34820,7 +35475,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MusicGen import: config "' + FileName +
@@ -34916,7 +35571,7 @@ begin
   Root := nil;
   try
     try
-      JsonText.LoadFromFile(FileName);
+      LoadImportJSONText(JsonText, FileName);
       Root := GetJSON(JsonText.Text);
     except
       // Corrupt/unreadable JSON behaves the same as an absent file.
@@ -36064,7 +36719,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Parler-TTS import: config "' + FileName +
@@ -36770,7 +37425,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MusicGen Melody import: config "' + FileName +
@@ -37729,7 +38384,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Bark import: config root is not a JSON object.');
@@ -38215,7 +38870,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -38593,7 +39248,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -38955,7 +39610,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -39850,7 +40505,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -41038,7 +41693,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -41706,7 +42361,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42247,7 +42902,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42638,7 +43293,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -42908,7 +43563,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -43862,7 +44517,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('EnCodec import: config "' + FileName +
@@ -45525,7 +46180,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Mimi import: config "' + FileName + '" is not a JSON object.');
@@ -47108,7 +47763,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('DAC import: config "' + FileName + '" is not a JSON object.');
@@ -48097,7 +48752,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -48906,7 +49561,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -49701,7 +50356,7 @@ begin
   Root := nil;
   CfgRoot := nil;
   try
-    JsonText.LoadFromFile(VocabFile);
+    LoadImportJSONText(JsonText, VocabFile);
     // Parse WITHOUT joUTF8 so multibyte char keys (e.g. the en-dash in
     // mms-tts-eng) survive as raw UTF-8 bytes.
     try
@@ -49735,7 +50390,7 @@ begin
     begin
       if not FileExists(ConfigFile) then
         ImportError('VITS tokenizer: config file not found: ' + ConfigFile);
-      JsonText.LoadFromFile(ConfigFile);
+      LoadImportJSONText(JsonText, ConfigFile);
       try
         CfgRoot := HFParseJSONRaw(JsonText.Text);
       except
@@ -50678,7 +51333,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -51153,7 +51808,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     // The HF config.json escapes some vocab keys (̃); decode them to
     // raw UTF-8 and parse without joUTF8 so every key keeps its bytes.
     try
@@ -53586,7 +54241,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -54028,7 +54683,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -55181,7 +55836,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -55576,7 +56231,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -56178,7 +56833,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -56767,7 +57422,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -57486,7 +58141,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -57893,7 +58548,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -58454,7 +59109,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -59161,6 +59816,846 @@ begin
     pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
 end;
 
+// ========================= EMBEDDINGGEMMA 2 IMPORT =========================
+// (See the interface section comment for the architecture map.)
+
+function ReadEmbeddingGemma2ConfigFromJSONFile(
+  const FileName: string): TEmbeddingGemma2Config;
+var
+  JsonText: TStringList;
+  Root, Node, TextNode: TJSONData;
+  Obj, RopeObj, TypeObj, PerLayerObj, LayerObj: TJSONObject;
+  LayerTypes: TJSONArray;
+  HiddenAct, LayerTypeStr: string;
+  LayerCnt, NumLayersM1, LayerIdx, GlobalHeadDim, GlobalKVHeads, HeadDim,
+  KVHeads, SlidingHeadDim, FullHeadDim, i: integer;
+
+  function RequiredInt(const Key: string): integer;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(Key);
+    if (Data = nil) or Data.IsNull then
+      ImportError('EmbeddingGemma2 import: config "' + FileName +
+        '" is missing required key "' + Key + '".');
+    Result := Data.AsInteger;
+  end;
+
+  function OptInt(const Key: string; DefVal: integer): integer;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(Key);
+    if (Data = nil) or Data.IsNull then Result := DefVal
+    else Result := Data.AsInteger;
+  end;
+
+  // rope_parameters[LayerType]: "default" rope_type only; returns theta.
+  function RopeTheta(const LayerType: string; DefVal: double): double;
+  var
+    RopeNode: TJSONData;
+  begin
+    Result := DefVal;
+    if RopeObj = nil then Exit;
+    RopeNode := RopeObj.Find(LayerType);
+    if (RopeNode = nil) or RopeNode.IsNull then Exit;
+    if not (RopeNode is TJSONObject) then
+      ImportError('EmbeddingGemma2 import: rope_parameters.' + LayerType +
+        ' must be an object.');
+    TypeObj := TJSONObject(RopeNode);
+    if TypeObj.Get('rope_type', 'default') <> 'default' then
+      ImportError('EmbeddingGemma2 import: rope_parameters.' + LayerType +
+        '.rope_type "' + TypeObj.Get('rope_type', '') + '" is not ' +
+        'supported (only "default").');
+    Result := TypeObj.Get('rope_theta', DefVal);
+  end;
+
+begin
+  Result := Default(TEmbeddingGemma2Config);
+  if not FileExists(FileName) then
+    ImportError('EmbeddingGemma2 import: config file "' + FileName +
+      '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('EmbeddingGemma2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('EmbeddingGemma2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', '');
+    if Result.ModelType = 'embedding_gemma2' then
+    begin
+      // Composite (text + vision + audio) export: the text tower config is
+      // nested under text_config.
+      TextNode := Obj.Find('text_config');
+      if (TextNode = nil) or not (TextNode is TJSONObject) then
+        ImportError('EmbeddingGemma2 import: config "' + FileName +
+          '" has no "text_config" object.');
+      Obj := TJSONObject(TextNode);
+      if Obj.Get('model_type', 'embedding_gemma2_text') <>
+         'embedding_gemma2_text' then
+        ImportError('EmbeddingGemma2 import: text_config.model_type is "' +
+          Obj.Get('model_type', '') + '" - expected ' +
+          '"embedding_gemma2_text".');
+    end
+    else if Result.ModelType <> 'embedding_gemma2_text' then
+      ImportError('EmbeddingGemma2 import: config model_type is "' +
+        Result.ModelType + '" - expected "embedding_gemma2" or ' +
+        '"embedding_gemma2_text".');
+    Result.HiddenSize := OptInt('hidden_size', 512);
+    Result.IntermediateSize := OptInt('intermediate_size', 2048);
+    Result.NumLayers := OptInt('num_hidden_layers', 24);
+    Result.NumHeads := OptInt('num_attention_heads', 4);
+    Result.VocabSize := OptInt('vocab_size', 262144);
+    Result.MaxPositions := OptInt('max_position_embeddings', 262144);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
+    Result.SlidingWindow := OptInt('sliding_window', 512);
+    Result.HiddenSizePerLayerInput :=
+      OptInt('hidden_size_per_layer_input', 512);
+    Result.EmbeddingDim := OptInt('embedding_dim', 768);
+    Result.PadTokenId := OptInt('pad_token_id', 0);
+    Result.BosTokenId := OptInt('bos_token_id', 2);
+    Result.EosTokenId := OptInt('eos_token_id', 1);
+    HeadDim := OptInt('head_dim', 256);
+    KVHeads := OptInt('num_key_value_heads', 2);
+    if (Result.HiddenSize < 1) or (Result.IntermediateSize < 1) or
+       (Result.NumLayers < 1) or (Result.NumHeads < 1) or
+       (Result.VocabSize < 1) or (Result.HiddenSizePerLayerInput < 1) or
+       (Result.EmbeddingDim < 1) or (Result.SlidingWindow < 1) or
+       (HeadDim < 2) or (KVHeads < 1) then
+      ImportError('EmbeddingGemma2 import: config "' + FileName +
+        '" has a non-positive dimension.');
+    HiddenAct := Obj.Get('hidden_activation', 'gelu_pytorch_tanh');
+    if (HiddenAct <> 'gelu_pytorch_tanh') and (HiddenAct <> 'gelu_new') then
+      ImportError('EmbeddingGemma2 import: hidden_activation "' + HiddenAct +
+        '" is not supported (gelu_pytorch_tanh / gelu_new).');
+    if Obj.Get('attention_bias', False) then
+      ImportError('EmbeddingGemma2 import: attention_bias = true is not ' +
+        'supported.');
+    // layer_types (default: sliding iff (i+1) mod 6 <> 0); HF forces the
+    // LAST layer to full_attention.
+    NumLayersM1 := Result.NumLayers - 1;
+    SetLength(Result.LayerIsSliding, Result.NumLayers);
+    Node := Obj.Find('layer_types');
+    if (Node <> nil) and not Node.IsNull then
+    begin
+      if (not (Node is TJSONArray)) or
+         (TJSONArray(Node).Count <> Result.NumLayers) then
+        ImportError('EmbeddingGemma2 import: layer_types must be an array ' +
+          'of ' + IntToStr(Result.NumLayers) + ' entries.');
+      LayerTypes := TJSONArray(Node);
+      for LayerCnt := 0 to NumLayersM1 do
+      begin
+        LayerTypeStr := LayerTypes.Items[LayerCnt].AsString;
+        if LayerTypeStr = 'sliding_attention' then
+          Result.LayerIsSliding[LayerCnt] := true
+        else if LayerTypeStr = 'full_attention' then
+          Result.LayerIsSliding[LayerCnt] := false
+        else
+          ImportError('EmbeddingGemma2 import: layer_types[' +
+            IntToStr(LayerCnt) + '] = "' + LayerTypeStr + '" is not ' +
+            'supported (sliding_attention / full_attention).');
+      end;
+    end
+    else
+      for LayerCnt := 0 to NumLayersM1 do
+        Result.LayerIsSliding[LayerCnt] := ((LayerCnt + 1) mod 6) <> 0;
+    Result.LayerIsSliding[NumLayersM1] := false;
+    // rope_parameters keyed by layer type.
+    RopeObj := nil;
+    Node := Obj.Find('rope_parameters');
+    if (Node <> nil) and not Node.IsNull then
+    begin
+      if not (Node is TJSONObject) then
+        ImportError('EmbeddingGemma2 import: rope_parameters must be an ' +
+          'object keyed by layer type.');
+      RopeObj := TJSONObject(Node);
+    end;
+    Result.SlidingRopeTheta := RopeTheta('sliding_attention', 10000.0);
+    Result.FullRopeTheta := RopeTheta('full_attention', 1000000.0);
+    // Per-layer geometry: head_dim / num_key_value_heads, overridden by
+    // per_layer_config (keyed by the layer index, e.g. "05"); with no
+    // per_layer_config HF derives global_head_dim / num_global_key_value_heads
+    // for the full_attention layers.
+    SetLength(Result.LayerHeadDim, Result.NumLayers);
+    SetLength(Result.LayerNumKVHeads, Result.NumLayers);
+    for LayerCnt := 0 to NumLayersM1 do
+    begin
+      Result.LayerHeadDim[LayerCnt] := HeadDim;
+      Result.LayerNumKVHeads[LayerCnt] := KVHeads;
+    end;
+    Node := Obj.Find('per_layer_config');
+    if (Node <> nil) and not Node.IsNull then
+    begin
+      if not (Node is TJSONObject) then
+        ImportError('EmbeddingGemma2 import: per_layer_config must be an ' +
+          'object keyed by layer index.');
+      PerLayerObj := TJSONObject(Node);
+      for i := 0 to PerLayerObj.Count - 1 do
+      begin
+        if not TryStrToInt(PerLayerObj.Names[i], LayerIdx) or
+           (LayerIdx < 0) or (LayerIdx > NumLayersM1) or
+           not (PerLayerObj.Items[i] is TJSONObject) then
+          ImportError('EmbeddingGemma2 import: per_layer_config key "' +
+            PerLayerObj.Names[i] + '" is not a layer index 0..' +
+            IntToStr(NumLayersM1) + ' with an object value.');
+        LayerObj := TJSONObject(PerLayerObj.Items[i]);
+        Result.LayerHeadDim[LayerIdx] := LayerObj.Get('head_dim', HeadDim);
+        Result.LayerNumKVHeads[LayerIdx] :=
+          LayerObj.Get('num_key_value_heads', KVHeads);
+      end;
+    end
+    else
+    begin
+      GlobalHeadDim := OptInt('global_head_dim', 512);
+      GlobalKVHeads := OptInt('num_global_key_value_heads', 1);
+      for LayerCnt := 0 to NumLayersM1 do
+        if not Result.LayerIsSliding[LayerCnt] then
+        begin
+          Result.LayerHeadDim[LayerCnt] := GlobalHeadDim;
+          Result.LayerNumKVHeads[LayerCnt] := GlobalKVHeads;
+        end;
+    end;
+    // RoPE is built per layer TYPE over that type's head_dim, so every layer
+    // of a type must share it; GQA needs heads divisible by kv heads.
+    SlidingHeadDim := 0;
+    FullHeadDim := 0;
+    for LayerCnt := 0 to NumLayersM1 do
+    begin
+      HeadDim := Result.LayerHeadDim[LayerCnt];
+      KVHeads := Result.LayerNumKVHeads[LayerCnt];
+      if (HeadDim < 2) or Odd(HeadDim) or (KVHeads < 1) or
+         ((Result.NumHeads mod KVHeads) <> 0) then
+        ImportError('EmbeddingGemma2 import: layer ' + IntToStr(LayerCnt) +
+          ' has head_dim=' + IntToStr(HeadDim) + ' / num_key_value_heads=' +
+          IntToStr(KVHeads) + ' (head_dim must be even and positive, ' +
+          'num_attention_heads divisible by num_key_value_heads).');
+      if Result.LayerIsSliding[LayerCnt] then
+      begin
+        if SlidingHeadDim = 0 then SlidingHeadDim := HeadDim
+        else if SlidingHeadDim <> HeadDim then
+          ImportError('EmbeddingGemma2 import: sliding_attention layers ' +
+            'with different head_dim are not supported.');
+      end
+      else
+      begin
+        if FullHeadDim = 0 then FullHeadDim := HeadDim
+        else if FullHeadDim <> HeadDim then
+          ImportError('EmbeddingGemma2 import: full_attention layers ' +
+            'with different head_dim are not supported.');
+      end;
+    end;
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function EmbeddingGemma2ConfigToString(
+  const Config: TEmbeddingGemma2Config): string;
+var
+  LayerCnt, SlidingCnt: integer;
+begin
+  SlidingCnt := 0;
+  for LayerCnt := 0 to High(Config.LayerIsSliding) do
+    if Config.LayerIsSliding[LayerCnt] then Inc(SlidingCnt);
+  Result := Config.ModelType + ' config: layers=' +
+    IntToStr(Config.NumLayers) + ' (' + IntToStr(SlidingCnt) +
+    ' sliding), heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ple=' + IntToStr(Config.HiddenSizePerLayerInput) +
+    ', embedding_dim=' + IntToStr(Config.EmbeddingDim) +
+    ', sliding_window=' + IntToStr(Config.SlidingWindow) +
+    ', rope_theta=' + FloatToStr(Config.FullRopeTheta) + '/' +
+    FloatToStr(Config.SlidingRopeTheta) +
+    ', rms_eps=' + FloatToStr(Config.RmsNormEps);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TEmbeddingGemma2BlockLayers = record
+    AttnNorm, QProj, KProj, VProj, QNorm, KNorm, VNorm, OProj,
+    PostAttnNorm, PreFFNorm, GateUp, Down, PostFFNorm,
+    PLEGate, PLEProj, PLENorm: TNNetLayer;
+  end;
+
+function BuildEmbeddingGemma2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
+const
+  csPrefixes: array[0..3] of string =
+    ('language_model.', 'model.language_model.', 'model.', '');
+var
+  ReaderMax: integer;
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TEmbeddingGemma2BlockLayers;
+  EmbeddingLayer, PLEModelProj, PLEModelNorm, FinalNorm,
+  EmbeddingProjection: TNNetLayer;
+  BranchInput, QBand, KBand, VBand, QSlice, KSlice, VSlice, HeadPack,
+  PLEGelu, PLESlice: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  Channels: array of integer;
+  LayerScalars: array of TNeuralFloat;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, KVHeads, GroupSize, LayerWindow,
+  PLEDim, i, d: integer;
+  NumLayersM1, NumHeadsM1, HeadDimM1: integer;
+  LayerTheta: TNeuralFloat;
+  BlockPrefix, TensorNameStr: string;
+  Tmp: TNNetVolume;
+  Consumed: TStringList;
+  BorrowWeights: boolean;   // pWeightOwner given: graph only, no loads
+  QuantizeSweeps: boolean;  // pQuantizeInt8 and not BorrowWeights
+  OwnerWeightLayers: integer;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // The owner's layer at the index the next AddLayer will take (nil when
+  // not borrowing): TNNetEmbedding sizes its table in its constructor.
+  function OwnerLayerForNextIndex(): TNNetLayer;
+  begin
+    if not BorrowWeights then exit(nil);
+    if NN.CountLayers() >= pWeightOwner.CountLayers() then
+      ImportError('EmbeddingGemma2 import: the borrowing twin needs a ' +
+        'layer at index ' + IntToStr(NN.CountLayers()) + ' but the owner ' +
+        'net has only ' + IntToStr(pWeightOwner.CountLayers()) +
+        ' layers (graph mismatch).');
+    Result := pWeightOwner.Layers[NN.CountLayers()];
+  end;
+
+  procedure CheckShape(const TName: string; Dim0, Dim1: integer);
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('EmbeddingGemma2 import: missing tensor "' + TName + '".');
+    if ((Dim1 > 0) and ((Reader.DimCount(TName) <> 2) or
+         (Reader.DimSize(TName, 0) <> Dim0) or
+         (Reader.DimSize(TName, 1) <> Dim1))) or
+       ((Dim1 <= 0) and (Reader.ElementCount(TName) <> Dim0)) then
+      ImportError('EmbeddingGemma2 import: "' + TName + '" has shape ' +
+        Reader.ShapeAsString(TName) + ', expected [' + IntToStr(Dim0) +
+        BoolToStr(Dim1 > 0, ', ' + IntToStr(Dim1), '') + '].');
+  end;
+
+begin
+  BorrowWeights := Assigned(pWeightOwner);
+  QuantizeSweeps := pQuantizeInt8 and (not BorrowWeights);
+  if BorrowWeights and not Assigned(pWeightOwner.GetFirstLayer()) then
+    ImportError('EmbeddingGemma2 import: the weight owner net is empty.');
+  // A borrowing build still opens the checkpoint: the prefix and the
+  // layer_scalar constants come from it (header + one-element reads).
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if (Length(Config.LayerIsSliding) <> Config.NumLayers) or
+         (Length(Config.LayerHeadDim) <> Config.NumLayers) or
+         (Length(Config.LayerNumKVHeads) <> Config.NumLayers) then
+        ImportError('EmbeddingGemma2 import: per-layer config arrays do ' +
+          'not match num_hidden_layers (use ' +
+          'ReadEmbeddingGemma2ConfigFromJSONFile).');
+      Config.Prefix := '';
+      i := -1;
+      for d := Low(csPrefixes) to High(csPrefixes) do
+        if Reader.HasTensor(csPrefixes[d] + 'embed_tokens.weight') then
+        begin
+          i := d;
+          break;
+        end;
+      if i < 0 then
+        ImportError('EmbeddingGemma2 import: no "embed_tokens.weight" ' +
+          '(under "language_model.", "model.language_model.", "model." or ' +
+          'no prefix) in ' + Reader.FileName +
+          ' - not an EmbeddingGemma 2 checkpoint?');
+      Config.Prefix := csPrefixes[i];
+      CheckShape(Config.Prefix + 'embed_tokens.weight', Config.VocabSize,
+        Config.HiddenSize);
+      if pSeqLen <= 0 then SeqLen := 512
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('EmbeddingGemma2 import: requested SeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+      NumLayersM1 := Config.NumLayers - 1;
+      NumHeadsM1 := Config.NumHeads - 1;
+      PLEDim := Config.HiddenSizePerLayerInput;
+      // layer_scalar is a stored [1] buffer per layer that scales the WHOLE
+      // residual stream - it cannot fold into a neighbor weight, so it
+      // becomes a TNNetMulByConstant (skipped when exactly 1).
+      SetLength(LayerScalars, Config.NumLayers);
+      for BlockCnt := 0 to NumLayersM1 do
+      begin
+        TensorNameStr := Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+          '.layer_scalar';
+        CheckShape(TensorNameStr, 1, 0);
+        Reader.LoadTensorFlat(TensorNameStr, Tmp);
+        LayerScalars[BlockCnt] := Tmp.FData[0];
+        if LayerScalars[BlockCnt] = 0 then
+          ImportError('EmbeddingGemma2 import: ' + TensorNameStr +
+            ' is zero.');
+      end;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.BuildQuantInt8 := QuantizeSweeps;
+      // Borrowing build: every layer links to the owner's at its index.
+      NN.BuildWeightOwner := pWeightOwner;
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: id 0 is <pad>, a real row of the table.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
+        {ScaleEmbedding=}0.02, pTrainable, QuantizeSweeps,
+        OwnerLayerForNextIndex()
+        ).SetTrainable(pTrainable) );
+      // PLE: one projection of the (scaled) embeddings into all layers'
+      // slices, then a per-slice RMSNorm (TNNetHeadRMSNorm over PLE-wide
+      // groups == HF's norm over the reshaped last dim).
+      PLEModelProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.NumLayers * PLEDim
+          ).SetTrainable(pTrainable), EmbeddingLayer);
+      PLEModelNorm := NN.AddLayerAfter(
+        TNNetHeadRMSNorm.Create(PLEDim, Config.RmsNormEps
+          ).SetTrainable(pTrainable), PLEModelProj);
+      // The residual stream continues from the embeddings.
+      NN.AddLayerAfter( TNNetIdentity.Create(), EmbeddingLayer );
+      if not pTrainable then NN.SetTrainable();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      for BlockCnt := 0 to NumLayersM1 do
+      begin
+        HeadDim := Config.LayerHeadDim[BlockCnt];
+        KVHeads := Config.LayerNumKVHeads[BlockCnt];
+        GroupSize := Config.NumHeads div KVHeads;
+        HeadDimM1 := HeadDim - 1;
+        SetLength(Channels, HeadDim);
+        // Sliding layers: |i-j| <= sliding_window (W = radius + 1 in the
+        // |i-j| < W convention). A SeqLen that cannot reach the band edge
+        // makes the window a no-op, so the layer fuses like a full one.
+        if Config.LayerIsSliding[BlockCnt] then
+        begin
+          LayerTheta := Config.SlidingRopeTheta;
+          if SeqLen > Config.SlidingWindow + 1 then
+            LayerWindow := Config.SlidingWindow + 1
+          else
+            LayerWindow := 0;
+        end
+        else
+        begin
+          LayerTheta := Config.FullRopeTheta;
+          LayerWindow := 0;
+        end;
+        // ---- attention: x := x + post_attn_norm(o(Attn(input_norm(x))))
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].AttnNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * HeadDim
+            ).SetTrainable(pTrainable), Blocks[BlockCnt].AttnNorm);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVHeads * HeadDim
+            ).SetTrainable(pTrainable), Blocks[BlockCnt].AttnNorm);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVHeads * HeadDim
+            ).SetTrainable(pTrainable), Blocks[BlockCnt].AttnNorm);
+        // Per-head q/k RMSNorm (learned, rotate_half-permuted gains; the q
+        // gains also carry sqrt(head_dim) - see the scaling note above) and
+        // the unit-gain v_norm, all BEFORE RoPE (HF order).
+        Blocks[BlockCnt].QNorm := NN.AddLayerAfter(
+          TNNetHeadRMSNorm.Create(HeadDim, Config.RmsNormEps
+            ).SetTrainable(pTrainable), Blocks[BlockCnt].QProj);
+        Blocks[BlockCnt].KNorm := NN.AddLayerAfter(
+          TNNetHeadRMSNorm.Create(HeadDim, Config.RmsNormEps
+            ).SetTrainable(pTrainable), Blocks[BlockCnt].KProj);
+        Blocks[BlockCnt].VNorm := NN.AddLayerAfter(
+          TNNetHeadRMSNorm.Create(HeadDim, Config.RmsNormEps
+            ).SetTrainable(pTrainable), Blocks[BlockCnt].VProj);
+        // One head-tiled rotary per band (pRotaryHeadDim = HeadDim).
+        QBand := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(LayerTheta,
+          rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true, {pRotaryHeadDim=}HeadDim),
+          Blocks[BlockCnt].QNorm);
+        KBand := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(LayerTheta,
+          rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true, {pRotaryHeadDim=}HeadDim),
+          Blocks[BlockCnt].KNorm);
+        VBand := Blocks[BlockCnt].VNorm;
+        if LayerWindow = 0 then
+          NN.AddGQAAttentionFromSources(QBand, KBand, VBand,
+            Config.NumHeads, KVHeads, HeadDim, {CausalMask=}false)
+        else
+        begin
+          // The fused builder has no bidirectional-window argument: one
+          // SDPA per query head, sharing its group's K/V slice.
+          for HeadCnt := 0 to NumHeadsM1 do
+          begin
+            for d := 0 to HeadDimM1 do
+              Channels[d] := HeadCnt * HeadDim + d;
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Channels), QBand);
+            for d := 0 to HeadDimM1 do
+              Channels[d] := (HeadCnt div GroupSize) * HeadDim + d;
+            KSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Channels), KBand);
+            VSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Channels), VBand);
+            HeadPack := NN.AddLayer(
+              TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+            HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+              TNNetScaledDotProductAttention.Create(HeadDim,
+                {CausalMask=}false, {pWindow=}LayerWindow,
+                {pScoreSoftCap=}0, {pBidirectionalWindow=}true),
+              HeadPack);
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        end;
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+        Blocks[BlockCnt].PostAttnNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // ---- GeGLU MLP with sandwich norms
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].PreFFNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        // TNNetGEGLU = FIRSTHALF * gelu_tanh(SECONDHALF): up_proj rows in
+        // neurons 0..I-1, gate_proj rows in I..2I-1.
+        Blocks[BlockCnt].GateUp := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize
+            ).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetGEGLU.Create() );
+        Blocks[BlockCnt].Down := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+        Blocks[BlockCnt].PostFFNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // ---- PLE block: x := x + norm(proj(gelu_tanh(gate(x)) * P_i))
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].PLEGate := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(PLEDim).SetTrainable(pTrainable) );
+        PLEGelu := NN.AddLayer( TNNetGELU.Create() );
+        PLESlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(BlockCnt * PLEDim, PLEDim), PLEModelNorm);
+        NN.AddLayer( TNNetCellMulByCell.Create(PLEGelu, PLESlice) );
+        Blocks[BlockCnt].PLEProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
+        Blocks[BlockCnt].PLENorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if LayerScalars[BlockCnt] <> 1 then
+          NN.AddLayer( TNNetMulByConstant.Create(LayerScalars[BlockCnt]) );
+        if not pTrainable then NN.SetTrainable();
+        if QuantizeSweeps then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      // Projecting per token == projecting after the mean pooling (linear).
+      EmbeddingProjection := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.EmbeddingDim).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
+
+      if BorrowWeights then
+      begin
+        // ---------------- Borrowed weights ----------------
+        // Every layer linked as it was attached; check the graph matched
+        // (a shorter twin, or a weight layer left unlinked).
+        NN.BuildWeightOwner := nil;
+        if NN.CountLayers() <> pWeightOwner.CountLayers() then
+          ImportError('EmbeddingGemma2 import: the borrowing twin has ' +
+            IntToStr(NN.CountLayers()) + ' layers, the owner net ' +
+            IntToStr(pWeightOwner.CountLayers()) + ' (graph mismatch - ' +
+            'owner and twin on different sides of SeqLen = ' +
+            'sliding_window + 1?).');
+        OwnerWeightLayers := 0;
+        for i := 0 to pWeightOwner.CountLayers() - 1 do
+          if pWeightOwner.Layers[i].CountWeights() > 0 then
+            Inc(OwnerWeightLayers);
+        if NN.LinkWeightsFrom(pWeightOwner) <> OwnerWeightLayers then
+          ImportError('EmbeddingGemma2 import: not every weight layer of ' +
+            'the owner net is borrowed by the twin (graph mismatch).');
+        Result := NN;
+        NN := nil; // ownership transferred to the caller
+        exit;      // the finally below still frees the reader
+      end;
+
+      // ---------------- Weights ----------------
+      // embed_tokens with the sqrt(hidden_size) scale folded into the rows
+      // (HF EmbeddingGemma2TextScaledWordEmbedding, fp32 scale).
+      TensorNameStr := Config.Prefix + 'embed_tokens.weight';
+      Reader.LoadTensorFlat(TensorNameStr, Tmp);
+      Tmp.Mul(Sqrt(Config.HiddenSize));
+      EnsureWritableImportWeights(EmbeddingLayer);
+      if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
+        ImportError('EmbeddingGemma2 import: embed_tokens.weight element ' +
+          'count ' + IntToStr(Tmp.Size) + ' does not match the embedding ' +
+          'table size ' +
+          IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(TensorNameStr);
+      Tmp.ReSize(1, 1, 1); // release the vocab-sized transient
+      // PLE model projection (hidden_size^-0.5 folded) + slice norm.
+      TensorNameStr := Config.Prefix + 'ple.per_layer_model_projection.weight';
+      CheckShape(TensorNameStr, Config.NumLayers * PLEDim, Config.HiddenSize);
+      LoadLlamaLinearWeights(Reader, PLEModelProj, TensorNameStr,
+        Config.HiddenSize, Config.NumLayers * PLEDim, 0, -1, 0, '',
+        {Scale=}1 / Sqrt(Config.HiddenSize));
+      MarkConsumed(TensorNameStr);
+      TensorNameStr := Config.Prefix + 'ple.per_layer_projection_norm.weight';
+      LoadLlamaRMSNormWeights(Reader, PLEModelNorm, TensorNameStr, PLEDim);
+      MarkConsumed(TensorNameStr);
+      for BlockCnt := 0 to NumLayersM1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        HeadDim := Config.LayerHeadDim[BlockCnt];
+        KVHeads := Config.LayerNumKVHeads[BlockCnt];
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
+          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        // q/k rows get the rotate_half -> interleaved-pair permutation
+        // (RotaryHeadDim), v and o load straight.
+        CheckShape(BlockPrefix + 'self_attn.q_proj.weight',
+          Config.NumHeads * HeadDim, Config.HiddenSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          BlockPrefix + 'self_attn.q_proj.weight', Config.HiddenSize,
+          Config.NumHeads * HeadDim, 0, -1, {RotaryHeadDim=}HeadDim);
+        MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
+        CheckShape(BlockPrefix + 'self_attn.k_proj.weight',
+          KVHeads * HeadDim, Config.HiddenSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          BlockPrefix + 'self_attn.k_proj.weight', Config.HiddenSize,
+          KVHeads * HeadDim, 0, -1, {RotaryHeadDim=}HeadDim);
+        MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
+        CheckShape(BlockPrefix + 'self_attn.v_proj.weight',
+          KVHeads * HeadDim, Config.HiddenSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          BlockPrefix + 'self_attn.v_proj.weight', Config.HiddenSize,
+          KVHeads * HeadDim);
+        MarkConsumed(BlockPrefix + 'self_attn.v_proj.weight');
+        // scaling = 1.0: sqrt(head_dim) on the q gains cancels the SDPA's
+        // 1/sqrt(d_k).
+        LoadLlamaHeadRMSNormWeights(Reader, [Blocks[BlockCnt].QNorm],
+          BlockPrefix + 'self_attn.q_norm.weight', HeadDim, 0,
+          {Scale=}Sqrt(HeadDim), {RotaryDims=}HeadDim);
+        MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
+        LoadLlamaHeadRMSNormWeights(Reader, [Blocks[BlockCnt].KNorm],
+          BlockPrefix + 'self_attn.k_norm.weight', HeadDim, 0, 1.0,
+          {RotaryDims=}HeadDim);
+        MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
+        // v_norm has no weight (with_scale=False): unit gain.
+        EnsureWritableImportWeights(Blocks[BlockCnt].VNorm);
+        Blocks[BlockCnt].VNorm.FArrNeurons[0].Weights.Fill(1);
+        Blocks[BlockCnt].VNorm.FlushWeightCache();
+        CheckShape(BlockPrefix + 'self_attn.o_proj.weight',
+          Config.HiddenSize, Config.NumHeads * HeadDim);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          BlockPrefix + 'self_attn.o_proj.weight',
+          Config.NumHeads * HeadDim, Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostAttnNorm,
+          BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PreFFNorm,
+          BlockPrefix + 'pre_feedforward_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'pre_feedforward_layernorm.weight');
+        CheckShape(BlockPrefix + 'mlp.up_proj.weight',
+          Config.IntermediateSize, Config.HiddenSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+          BlockPrefix + 'mlp.up_proj.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, 2 * Config.IntermediateSize, 0, '',
+          1.0, 0, 0, 0, {pFlatSlabRows=}false, {pDeferFlush=}true);
+        MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+        CheckShape(BlockPrefix + 'mlp.gate_proj.weight',
+          Config.IntermediateSize, Config.HiddenSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+          BlockPrefix + 'mlp.gate_proj.weight', Config.HiddenSize,
+          Config.IntermediateSize, Config.IntermediateSize,
+          2 * Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+        CheckShape(BlockPrefix + 'mlp.down_proj.weight',
+          Config.HiddenSize, Config.IntermediateSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+          BlockPrefix + 'mlp.down_proj.weight', Config.IntermediateSize,
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostFFNorm,
+          BlockPrefix + 'post_feedforward_layernorm.weight',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'post_feedforward_layernorm.weight');
+        TensorNameStr := BlockPrefix + 'ple_block.per_layer_input_gate.weight';
+        CheckShape(TensorNameStr, PLEDim, Config.HiddenSize);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].PLEGate,
+          TensorNameStr, Config.HiddenSize, PLEDim);
+        MarkConsumed(TensorNameStr);
+        TensorNameStr := BlockPrefix + 'ple_block.per_layer_projection.weight';
+        CheckShape(TensorNameStr, Config.HiddenSize, PLEDim);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].PLEProj,
+          TensorNameStr, PLEDim, Config.HiddenSize);
+        MarkConsumed(TensorNameStr);
+        TensorNameStr := BlockPrefix +
+          'ple_block.post_per_layer_input_norm.weight';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PLENorm,
+          TensorNameStr, Config.HiddenSize);
+        MarkConsumed(TensorNameStr);
+        MarkConsumed(BlockPrefix + 'layer_scalar'); // read at build time
+        if QuantizeSweeps then NN.QuantizeWeightsInt8();
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm, Config.Prefix + 'norm.weight',
+        Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm.weight');
+      TensorNameStr := Config.Prefix + 'embedding_projection.weight';
+      CheckShape(TensorNameStr, Config.EmbeddingDim, Config.HiddenSize);
+      LoadLlamaLinearWeights(Reader, EmbeddingProjection, TensorNameStr,
+        Config.HiddenSize, Config.EmbeddingDim);
+      MarkConsumed(TensorNameStr);
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      // Only the text tower is imported: tensors outside the prefix (the
+      // vision / audio towers and their embedders) are skipped on purpose.
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if (Config.Prefix <> '') and
+           (Copy(TensorNameStr, 1, Length(Config.Prefix)) <> Config.Prefix) then
+          continue;
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('EmbeddingGemma2 import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' +
+          Reader.ShapeAsString(TensorNameStr) + ') in ' + FileName +
+          ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildEmbeddingGemma2FromSafeTensorsEx(const FileName: string;
+  out Config: TEmbeddingGemma2Config; pSeqLen: integer = 0;
+  pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadEmbeddingGemma2ConfigFromJSONFile(ConfigPath);
+  Result := BuildEmbeddingGemma2FromSafeTensorsWithConfig(FileName, Config,
+    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner);
+end;
+
+function BuildEmbeddingGemma2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pTrainable: boolean = true;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TEmbeddingGemma2Config;
+begin
+  Result := BuildEmbeddingGemma2FromSafeTensorsEx(FileName, IgnoredConfig,
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+end;
+
+function EmbeddingGemma2TokenizeText(Tokenizer: TNeuralHFTokenizer;
+  const Config: TEmbeddingGemma2Config; const Text: string;
+  const Prompt: string = ''; MaxTokens: integer = 0): TNeuralIntegerArray;
+var
+  Body: TNeuralIntegerArray;
+  BodyLen, i: integer;
+begin
+  Body := Tokenizer.Encode(Prompt + Text);
+  BodyLen := Length(Body);
+  if (MaxTokens > 0) and (BodyLen + 2 > MaxTokens) then
+  begin
+    if MaxTokens < 2 then
+      ImportError('EmbeddingGemma2TokenizeText: MaxTokens must be >= 2.');
+    BodyLen := MaxTokens - 2;
+  end;
+  SetLength(Result, BodyLen + 2);
+  Result[0] := Config.BosTokenId;
+  for i := 0 to BodyLen - 1 do
+    Result[i + 1] := Body[i];
+  Result[BodyLen + 1] := Config.EosTokenId;
+end;
+
+procedure EmbeddingGemma2EmbedIds(Net: TNNet;
+  const Config: TEmbeddingGemma2Config; const TokenIds: TNeuralIntegerArray;
+  Embedding: TNNetVolume; Dim: integer = 0);
+var
+  Input, Hidden: TNNetVolume;
+  SeqLen, PosCnt: integer;
+begin
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 1 then
+    ImportError('EmbeddingGemma2EmbedIds: net input is not (SeqLen,1,1) - ' +
+      'not a BuildEmbeddingGemma2FromSafeTensors encoder?');
+  if (Length(TokenIds) < 1) or (Length(TokenIds) > SeqLen) then
+    ImportError('EmbeddingGemma2EmbedIds: ' + IntToStr(Length(TokenIds)) +
+      ' token ids do not fit the net SeqLen ' + IntToStr(SeqLen) + '.');
+  Input := TNNetVolume.Create();
+  Hidden := TNNetVolume.Create();
+  try
+    Input.ReSize(SeqLen, 1, 1);
+    for PosCnt := 0 to SeqLen - 1 do
+      if PosCnt < Length(TokenIds) then
+        Input.FData[PosCnt] := TokenIds[PosCnt]
+      else
+        Input.FData[PosCnt] := Config.PadTokenId;
+    Net.Compute(Input);
+    Net.GetOutput(Hidden);
+    PoolSentenceEmbedding(Hidden, Length(TokenIds), epMean, Embedding, True);
+    if (Dim > 0) and (Dim < Embedding.Depth) then
+    begin
+      // Matryoshka: keep the leading Dim components, renormalize.
+      Hidden.Copy(Embedding);
+      Embedding.ReSize(1, 1, Dim);
+      Move(Hidden.FData[0], Embedding.FData[0], Dim * csNeuralFloatSize);
+      NormalizeRowsL2(Embedding);
+    end;
+  finally
+    Hidden.Free;
+    Input.Free;
+  end;
+end;
+
+procedure EmbeddingGemma2EncodeText(Net: TNNet;
+  Tokenizer: TNeuralHFTokenizer; const Config: TEmbeddingGemma2Config;
+  const Text: string; Embedding: TNNetVolume; const Prompt: string = '';
+  Dim: integer = 0);
+begin
+  EmbeddingGemma2EmbedIds(Net, Config,
+    EmbeddingGemma2TokenizeText(Tokenizer, Config, Text, Prompt,
+      Net.Layers[0].Output.SizeX), Embedding, Dim);
+end;
+
 // ========================= DEEPSEEK-V2 IMPORT ==============================
 // (See the interface section comment for the architecture map.)
 
@@ -59199,7 +60694,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -60648,7 +62143,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -60892,7 +62387,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61039,7 +62534,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -61660,7 +63155,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -62522,7 +64017,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -62953,7 +64448,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63277,7 +64772,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -63839,7 +65334,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -64244,7 +65739,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -64757,7 +66252,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -65234,7 +66729,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -65795,7 +67290,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -66328,7 +67823,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -66758,7 +68253,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67050,7 +68545,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67496,7 +68991,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -67952,7 +69447,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -68946,7 +70441,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -69388,7 +70883,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -70036,7 +71531,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -70660,7 +72155,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -71274,7 +72769,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
@@ -72582,7 +74077,7 @@ begin
     ImportError('SD UNet import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Result := ReadSDUNetConfigFromJSONText(JsonText.Text, FileName);
   finally
     JsonText.Free;
@@ -73829,7 +75324,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -74320,7 +75815,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -74703,7 +76198,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -74960,7 +76455,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75143,7 +76638,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75698,7 +77193,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -75952,7 +77447,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76166,7 +77661,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76479,7 +77974,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -76929,7 +78424,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -77630,7 +79125,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78041,7 +79536,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78408,7 +79903,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -78747,7 +80242,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -79082,7 +80577,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('SAM mask decoder: config is not a JSON object.');
@@ -79970,7 +81465,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -80606,7 +82101,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -81190,7 +82685,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -81578,7 +83073,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -82409,7 +83904,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -83297,7 +84792,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -83868,7 +85363,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84079,7 +85574,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84467,7 +85962,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -84766,7 +86261,7 @@ begin
   Root := nil;
   TempTextCfg := '';
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -85193,7 +86688,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Qwen2-VL import: config root is not a JSON object.');
@@ -85510,7 +87005,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     Result.ImageTokenId := TJSONObject(Root).Get('image_token_id', -1);
     Result.VideoTokenId := TJSONObject(Root).Get('video_token_id', -1);
@@ -86125,7 +87620,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
@@ -86533,7 +88028,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError(csQwen3VLVisionImporter + ': "' + FileName +
@@ -88148,7 +89643,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(IndexFile);
+    LoadImportJSONText(JsonText, IndexFile);
     Root := GetJSON(JsonText.Text);
     PipelineClass := '';
     if Root is TJSONObject then
@@ -89112,7 +90607,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -89558,7 +91053,8 @@ begin
   Result := (ModelType = 'llama') or (ModelType = 'mistral') or
     (ModelType = 'qwen2') or (ModelType = 'qwen3') or
     (ModelType = 'qwen3_moe') or (ModelType = 'qwen3_vl') or
-    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
+    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_text') or
+    (ModelType = 'qwen3_5_moe') or
     (ModelType = 'gemma') or (ModelType = 'gemma2') or
     (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
     (ModelType = 'olmo2') or (ModelType = 'olmoe') or
@@ -89572,8 +91068,10 @@ end;
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; const pLoRAAdapterDir: string = '';
+  pOmitLMHead: boolean = false): TNNet;
 var
+  LlamaReader: TNNetSafeTensorsReader;
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
   Root, ArchData: TJSONData;
@@ -89601,6 +91099,7 @@ var
   IgnoredBloomConfig: TBloomConfig;
   IgnoredFalconConfig: TFalconConfig;
   IgnoredModernBertConfig: TModernBertConfig;
+  IgnoredEmbeddingGemma2Config: TEmbeddingGemma2Config;
   IgnoredDebertaV2Config: TDebertaV2Config;
   IgnoredDeepSeekV2Config: TDeepSeekV2Config;
   IgnoredWav2Vec2Config: TWav2Vec2Config;
@@ -89641,7 +91140,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(ConfigPath);
+    LoadImportJSONText(JsonText, ConfigPath);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -89691,6 +91190,15 @@ begin
       '" cannot borrow the weights of an already-loaded net - only the ' +
       'Llama-family builders can (PretrainedModelTypeCanBorrowWeights); ' +
       'build the second net without pWeightOwner.');
+  if (pLoRAAdapterDir <> '') and
+    (not PretrainedModelTypeCanBorrowWeights(ModelType)) then
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" cannot merge a LoRA adapter - only the Llama-family builders can ' +
+      '(PretrainedModelTypeCanBorrowWeights).');
+  if pOmitLMHead and (not PretrainedModelTypeCanBorrowWeights(ModelType)) then
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" cannot be built without its LM head - only the Llama-family ' +
+      'builders can (PretrainedModelTypeCanBorrowWeights).');
 
   // ---- dispatch ----
   if (ModelType = 'gpt2') and GPT2SeqCls then
@@ -89825,8 +91333,18 @@ begin
     // full attention) plus - for the MoE variant - the fused-expert +
     // gated-shared-expert sparse FFN; the vision tower and MTP head are
     // skipped (TEXT decoder only). See BuildQwen35FromSafeTensorsEx.
-    Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8, pWeightOwner)
+  begin
+    IgnoredLlamaConfig := ReadLlamaConfigFromJSONFile(ConfigPath);
+    // A borrowing build never opens the checkpoint.
+    if Assigned(pWeightOwner) then LlamaReader := nil
+    else if pLoRAAdapterDir <> '' then
+      LlamaReader := TNNetLoRAMergeReader.Create(
+        CreatePretrainedTensorReader(WeightsPath), pLoRAAdapterDir)
+    else LlamaReader := CreatePretrainedTensorReader(WeightsPath);
+    Result := BuildLlamaFromTensorReaderWithConfig(LlamaReader, WeightsPath,
+      IgnoredLlamaConfig, pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner,
+      {pStopBeforeFinalNorm=}false, {pDeepStackInputs=}0, pOmitLMHead);
+  end
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
           (ModelType = 'roberta') or (ModelType = 'xlm-roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1
@@ -89912,6 +91430,16 @@ begin
     // final hidden states. See the MODERNBERT IMPORT section.
     Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
       IgnoredModernBertConfig, pSeqLen, pTrainable, ConfigPath,
+      pQuantizeInt8)
+  else if (ModelType = 'embedding_gemma2') or
+          (ModelType = 'embedding_gemma2_text') then
+    // ENCODER route: the EmbeddingGemma 2 TEXT tower (architectures
+    // ["EmbeddingGemma2Model"]; the vision/audio towers are skipped) -
+    // input (SeqLen,1,1) token ids, output (SeqLen,1,embedding_dim)
+    // per-token states to mean-pool (EmbeddingGemma2EmbedIds). See the
+    // EMBEDDINGGEMMA 2 IMPORT section.
+    Result := BuildEmbeddingGemma2FromSafeTensorsEx(WeightsPath,
+      IgnoredEmbeddingGemma2Config, pSeqLen, pTrainable, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'deberta-v2' then
     // The third ENCODER route: DeBERTa-v2/v3 (architectures
@@ -90076,7 +91604,7 @@ begin
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
       'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
       'mamba, falcon_mamba, bloom, falcon, bert, distilbert, roberta, ' +
-      'modernbert, deepseek_v2, olmo2, wav2vec2, hubert.');
+      'modernbert, embedding_gemma2, deepseek_v2, olmo2, wav2vec2, hubert.');
   end;
   // A partly imported int4 layer runs neither as int8 nor as int4.
   if NeuralImportInt4FromRows and Assigned(Result) then
@@ -90107,7 +91635,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('DiT import: ' + FileName + ' is not a JSON object.');
@@ -90566,7 +92094,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('VAR import: ' + FileName + ' is not a JSON object.');
@@ -91174,7 +92702,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('PixArt import: ' + FileName + ' is not a JSON object.');
@@ -91670,7 +93198,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('MMDiT import: ' + FileName + ' is not a JSON object.');
@@ -91974,7 +93502,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -92487,7 +94015,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     try
       Root := GetJSON(JsonText.Text);
     except
@@ -92892,7 +94420,7 @@ begin
   JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
+    LoadImportJSONText(JsonText, FileName);
     Root := GetJSON(JsonText.Text);
     if not (Root is TJSONObject) then
       ImportError('F5-TTS import: config "' + FileName + '" is not a JSON object.');

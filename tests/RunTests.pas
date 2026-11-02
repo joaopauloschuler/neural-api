@@ -5,9 +5,9 @@ program RunTests;
 
 uses
   {$IFDEF UNIX}
-  cthreads, cmem,
+  cmem, cthreads,
   {$ENDIF}
-  Classes, consoletestrunner,
+  SysUtils, Classes, consoletestrunner,
   TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
   TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
   TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
@@ -22,7 +22,8 @@ uses
   TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
   TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks,
   TestNeuralSWA, TestNeuralFusedSDPA, TestNeuralABFun, TestNeuralReduction,
-  TestNeuralBytePrediction, TestNeuralG2P, TestNeuralPlainOps{$IFDEF OpenCL}, neuralopencl{$ENDIF};
+  TestNeuralBytePrediction, TestNeuralG2P, TestNeuralPlainOps,
+  TestNeuralDecision, TestNeuralAnyJev, TestNeuralDecisionHeads{$IFDEF OpenCL}, neuralopencl{$ENDIF};
 
 type
   TMyTestRunner = class(TTestRunner)
@@ -39,6 +40,9 @@ var
   Application: TMyTestRunner;
 
 begin
+  // The reports use Format(), which follows the user's locale, and the tests
+  // read their numbers as text with a '.' decimal separator.
+  DefaultFormatSettings.DecimalSeparator := '.';
   {$IFDEF OpenCL}
   // Few distinct local sizes keep PoCL's per-size kernel compiles low; the
   // NEURAL_OPENCL_LOCAL_SIZE_CAP environment variable picks another cap.

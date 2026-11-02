@@ -87,7 +87,7 @@ Coded by Claude (AI).
 {$mode objfpc}{$H+}
 
 uses
-  {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
+  {$IFDEF UNIX}cmem, cthreads,{$ENDIF}
   {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   SysUtils, Math, StrUtils,
   neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained,

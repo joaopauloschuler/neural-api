@@ -7,12 +7,24 @@ through the same shared engine (`TChatEngine` in
 - [**ChatTerminal**](ChatTerminal.md) — an interactive chat REPL in the
   terminal, with a one-shot `-p "prompt"` mode for scripts.
 - [**ChatServer**](ChatServer.md) — a minimal OpenAI-style HTTP server
-  (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, SSE streaming).
+  (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, SSE streaming),
+  plus `/v1/systemone` for TypeSafe/Jev typed decisions through the AnyJev
+  L0 readout, or through a Kev / Open-Jev checkpoint with
+  `--decision-adapter`. Open-Jev-2B is supported (user-tested on its
+  `Qwen/Qwen3.5-2B` base with `--int4 --gpu`); AnyJev L0, Kev and
+  Open-Jev-9B/27B are planned (coded): parity-tested on pico fixtures only.
 
 Both take the same command line: a model directory followed by the flags
 listed on this page (`ParseArgs` in `neural/neuralchatengine.pas` parses them
-for both). ChatTerminal adds `-p`; ChatServer adds `--host` and `--port`.
+for both). ChatTerminal adds `-p`; ChatServer adds `--host`, `--port` and the
+`--decision-*` flags.
 Each program's page documents only what is specific to it.
+
+`DecisionClient` (FCL only, no neural-api units) calls ChatServer's
+`/v1/systemone` from the command line, and `decision_examples/` holds five
+request files for it (see *Calling it* in [ChatServer.md](ChatServer.md)).
+To check that a decision model reads the state, send the urgent and the calm
+ticket (see *Sanity check: does the model read the state?* in [ChatServer.md](ChatServer.md)).
 
 Both programs drive the generic model importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`). It supports: qwen2, qwen2.5, qwen3,
@@ -34,12 +46,13 @@ lazbuild neural-api/examples/ChatTerminal/ChatTerminal.lpi
 lazbuild neural-api/examples/ChatTerminal/ChatServer.lpi
 git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 neural-api/bin/x86_64-linux/bin/ChatTerminal q2/ --gpu
-neural-api/bin/x86_64-linux/bin/ChatServer q2/ --gpu --port 8080
+neural-api/bin/x86_64-linux/bin/ChatServer q2/ --gpu --port 5000
 ```
 
 ### Tested models
 
-These models have been run/verified through ChatTerminal:
+These models have been run/verified through ChatTerminal (the Open-Jev
+row: through ChatServer's `POST /v1/systemone`):
 
 | Model | model_type |
 |---|---|
@@ -57,6 +70,7 @@ These models have been run/verified through ChatTerminal:
 | allenai/OLMoE-1B-7B-0125-Instruct | olmoe |
 | state-spaces/mamba-130m-hf | mamba |
 | openai-community/gpt2 | gpt2 |
+| ZefanCai/Open-Jev-2B on Qwen/Qwen3.5-2B (`--decision-adapter`, `--int4 --gpu`) | qwen3_5 |
 
 ## From your own code
 
