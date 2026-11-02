@@ -63,7 +63,7 @@ uses
     ,BaseUnix
     {$ENDIF}
   {$ELSE}
-  Generics.Collections, Windows
+  Generics.Collections, Windows, neuralDelphi
   {$ENDIF}
   , syncobjs;
 

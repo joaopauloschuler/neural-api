@@ -27,7 +27,7 @@ unit neuraldatasets;
 interface
 
 uses
-  {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, System.Generics.Collections, {$ENDIF}
+  {$IFNDEF FPC}System.Classes, Windows, Vcl.Graphics, System.JSON, System.Generics.Collections, neuraldelphi, {$ENDIF}
   neuralvolume, neuralnetwork, pascoremath32
   {$IFDEF FPC},
   FPimage, FPReadBMP, FPReadPCX, FPReadJPEG, FPReadPNG,

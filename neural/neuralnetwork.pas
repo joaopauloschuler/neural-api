@@ -50,6 +50,7 @@ uses
   {$IFDEF FPC}
   fgl,
   {$ENDIF}
+  {$IFNDEF FPC} neuraldelphi, {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
   neuralbyteprediction, neuralcache, neuralab, neuralthread,
   pascoremath32, pascoremathhelperfuncs;
@@ -131,6 +132,27 @@ const
   csDWT1DHaar  = 0;   // unnormalised Haar (default)
   csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
   csDWT1DDaub4 = 2;   // Daubechies-4 (db2) lifting
+
+{$IFDEF OpenCL}
+const
+  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
+  // tree reductions halve it) within every device's max work-group size.
+  csFusedSDPALocalSize = 256;
+  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
+  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
+  csFusedSDPALocalMemReserveBytes = 1024;
+  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
+  // widest head they take (16 column chunks of 256).
+  csFusedSDPAFlashLanes = 256;
+  csFusedSDPAFlashMaxDk = 4096;
+{$ENDIF OpenCL}
+
+{$IFDEF OpenCL}
+// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
+// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
+function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
+  Dk: integer): boolean;
+{$ENDIF OpenCL}
 
 type
   TNNetLayer = class;
@@ -4756,19 +4778,6 @@ type
   end;
 
 {$IFDEF OpenCL}
-const
-  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
-  // tree reductions halve it) within every device's max work-group size.
-  csFusedSDPALocalSize = 256;
-  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
-  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
-  csFusedSDPALocalMemReserveBytes = 1024;
-  // Lanes per work-group of cai_sdpa_flash and cai_sdpa_flash_int8, and the
-  // widest head they take (16 column chunks of 256).
-  csFusedSDPAFlashLanes = 256;
-  csFusedSDPAFlashMaxDk = 4096;
-
-type
   // The kernels the last TNNetFusedSDPACL forward ran: the split-row decode
   // (cai_sdpa_decode_split + merge) or a flash variant (+ merge when split).
   TFusedSDPAOpenCLPath = (sdpaPathNone, sdpaPathDecodeSplit, sdpaPathFlash);
@@ -5005,13 +5014,8 @@ type
     property LastPath: TFusedSDPAOpenCLPath read FLastPath;
   end;
 
-// True when a flash step's cache (KVHeads*CacheMax*Dk) and one key split of
-// partials (QHeads*TokenCnt*(Dk+2)) index in 32 bits, as the kernels do.
-function FusedSDPAFlashIndicesFit(QHeads, KVHeads, TokenCnt, CacheMax,
-  Dk: integer): boolean;
-{$ENDIF}
 
-type
+{$ENDIF}
 
   /// Fused multi-head scaled-dot-product attention (GQA-aware): ALL query
   /// heads of one attention sub-layer in ONE layer, replacing the per-head
@@ -8586,10 +8590,29 @@ type
 
   /// Dropout layer. The input parameter is the dropout rate (rate of values
   // that are zeroed).
+  //
+  // zwj: training applies INVERTED dropout -- surviving cells are scaled by
+  // 1/(1-Rate) in the forward pass, and the incoming gradient is scaled by
+  // the same factor through the mask in the backward pass, so the expected
+  // activation magnitude at train time matches inference (where the layer is
+  // fully disabled via TNNet.EnableDropouts). The rate is used EXACTLY: the
+  // old Random(FRate)=0 draw quantized the drop probability to
+  // 1/Round(1/Rate) (Rate 0.3 became 1/3). The exact rate round-trips in
+  // FFloatSt[0]; FStruct[0] keeps the legacy Round(1/Rate) value so models
+  // saved before this change reload bit-compatibly (the registry rebuilds
+  // via Create(1/St[0], St[1])) -- such old saves carry FFloatSt[0]=0 and
+  // fall back to the quantized keep 1-1/FRate.
   TNNetDropout = class(TNNetAddNoiseBase)
     protected
       FRate: integer;
       FDropoutMask: TNNetVolume;
+      // zwj: exact-rate state. FKeepRate < 0 means "not resolved yet" so a
+      // layer that just came off the serialization path resolves its keep
+      // probability on first use (Create runs with the quantized registry
+      // rate BEFORE the saved FFloatSt payload is assigned on top of it).
+      FKeepRate: TNeuralFloat;
+      FInvKeep: TNeuralFloat;
+      procedure ResolveKeepRate();
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
@@ -16202,7 +16225,7 @@ type
     FsBuf, FdBuf: array of Double;                 // ComputeCPU split bands
     FIlsBuf, FIldBuf: array of Double;             // InverseChannel working bands
     FgsBuf, FgdBuf, FsFBuf, FdFBuf, FoddInBuf: array of Double; // BackpropagateCPU
-    FhistSBuf, FhistDBuf: array of array of Double; // [step][FHalf] pre-step forward state
+    FhistSBuf, FhistDBuf: {$IFDEF FPC}array of array of Double;{$ELSE}TNeuralDoubleDynArr2D;{$ENDIF}// [step][FHalf] pre-step forward state
     procedure BuildFilter();
     function TapPtr(): TNNetVolume;     // weights when learnable, nil otherwise
     function GetTap(idx: integer): TNeuralFloat;
@@ -17911,6 +17934,30 @@ type
   TNNetGlobalSumPool = class(TNNetLayer)
   private
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
+  /// True Global Mean Pooling: parameter-free per-channel arithmetic mean
+  // over EVERY (x,y) position. Output shape is 1 x 1 x Depth.
+  //
+  // IMPORTANT -- difference vs the sibling TNNetAvgChannel: this layer is
+  // EXACT on rectangular inputs (SizeX <> SizeY) and on 1D streams shaped
+  // (SeqLen,1,Depth): each output cell is sum(cells) / (SizeX*SizeY).
+  // TNNetAvgChannel instead inherits a square FPoolSize x FPoolSize pooling
+  // window from TNNetAvgPool and divides by FPoolSize*FPoolSize regardless
+  // of the actual input shape, so on a (SeqLen,1,Depth) volume it returns
+  // sum/SeqLen^2 instead of sum/SeqLen -- a known legacy simplification
+  // (see the notes in tools/make_pico_ecapa_fixture.py and tasklist.md)
+  // whose numeric semantics are pinned by the ECAPA / VAR text-cond parity
+  // fixtures, and which is therefore intentionally left untouched. Use THIS
+  // layer whenever a true mean over non-square inputs is required; the
+  // backward pass broadcasts the incoming gradient divided by the same
+  // SizeX*SizeY cell count to every input position. Never routed to OpenCL
+  // (the device avg-pool kernel only serves the exact TNNetAvgPool class).
+  // Coded by Claude (AI).
+  TNNetMeanChannel = class(TNNetGlobalSumPool)
   public
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -23512,10 +23559,6 @@ type
     RowCount: integer; PairDst: TNeuralByteArrPtr;
     ScaleDst: TNeuralFloatArrPtr);
 
-  {$IFNDEF FPC}
-  procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-  {$ENDIF}
-
 implementation
 
 // nil-tolerant byte counts for NonWeightBytes.
@@ -23547,23 +23590,6 @@ function SelectKthSmallest(var Arr: array of TNeuralFloat;
 // FShouldOpenCL (compared against cNeuralOpenCLMinWork) and WillOpenCL routes the
 // forward, exactly as TNNetConvolution. NeuralForceOpenCL bypasses the size
 // verdict for the parity tests. Coded by Claude (AI).
-{$ENDIF}
-
-{$IFNDEF FPC}
-procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-var
-  P: PCardinal;
-  I: NativeUInt;
-  CountM1: NativeUInt;
-begin
-  P := @X;
-  CountM1 := Count - 1;
-  for I := 0 to CountM1 do
-  begin
-    P^ := Value;
-    Inc(P);
-  end;
-end;
 {$ENDIF}
 
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
@@ -54907,7 +54933,7 @@ begin
             DestPos := DestBase + TapOfs;
             for groupCount := 0 to GroupMax do
             begin
-              {$IFDEF AVXANY}
+              {$IF Defined(AVXANY) and Defined(FPC)}
               SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
               DestRawPos := FInputPrepared.GetRawPtr(DestPos);
               asm_dword_copy;
@@ -55101,12 +55127,12 @@ begin
               if (LocalLearningErrorDeriv <> 0.0) then
               begin
                   PtrPreparedInput := FInputPrepared.GetRawPtr(InPrepBase + PrevLayerGroupDStart);
-                  {$IFNDEF AVX64}
-                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                  {$ELSE}
+                  {$IF Defined(AVX64) and Defined(FPC)}
                   PtrNeuronDelta := LocalNeuron.Delta.DataPtr;
                   asm_avx64_train_neuron
-                  {$ENDIF}
+                  {$ELSE}
+                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                  {$IFEND}
 
                   {$IFDEF FPC}
                   LocalNeuron.FBiasDelta += LocalLearningErrorDeriv;
@@ -60154,7 +60180,12 @@ begin
               (PrevX + FeatureCntX < LocalPrevSizeX);
             for FeatureCntY := 0 to MaxFeatureY do
             begin
-              {$IFNDEF AVX64}
+              {$IF Defined(AVX64) and Defined(FPC)}
+              PtrA := LocalDelta.GetRawPtr(dPos);
+              PtrB := OutputErrorDerivLearningPtr;
+              PtrC := FInputCopy.GetRawPtr(inPos);
+              asm_avx64_mulladd_ptra_ptrb_ptrc_num;
+              {$ELSE}
               TNNetVolume.MulAdd
               (
                 LocalDelta.GetRawPtr(dPos),
@@ -60162,15 +60193,16 @@ begin
                 FInputCopy.GetRawPtr(inPos),
                 LocalWeightDepth
               );
-              {$ELSE}
-              PtrA := LocalDelta.GetRawPtr(dPos);
-              PtrB := OutputErrorDerivLearningPtr;
-              PtrC := FInputCopy.GetRawPtr(inPos);
-              asm_avx64_mulladd_ptra_ptrb_ptrc_num;
-              {$ENDIF}
+              {$IFEND}
+
               if XInRange and (FeatureCntY <= MaxFeatureYInRange) then
               begin
-                {$IFNDEF AVX64}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                PtrA := LocalPrevError.GetRawPtr(pePos);
+                PtrB := LocalWeight.GetRawPtr(wPos);
+                PtrC := OutputErrorDerivPtr;
+                asm_avx64_mulladd_ptra_ptrb_ptrc_num;
+                {$ELSE}
                 TNNetVolume.MulAdd
                 (
                   LocalPrevError.GetRawPtr(pePos),
@@ -60178,12 +60210,7 @@ begin
                   OutputErrorDerivPtr,
                   LocalWeightDepth
                 );
-                {$ELSE}
-                PtrA := LocalPrevError.GetRawPtr(pePos);
-                PtrB := LocalWeight.GetRawPtr(wPos);
-                PtrC := OutputErrorDerivPtr;
-                asm_avx64_mulladd_ptra_ptrb_ptrc_num;
-                {$ENDIF}
+                {$IFEND}
               end;
               Inc(dPos, dStride);
               Inc(wPos, wStride);
@@ -60452,18 +60479,19 @@ begin
           wPos := LocalW.GetRawPos(CntX, 0);
           for CntY := 0 to FeatureSizeYM1 do
           begin
-            {$IFNDEF AVX64}
+            {$IF Defined(AVX64) and Defined(FPC)}
+            PtrB := FInputCopy.GetRawPtr(inPos);
+            PtrC := LocalW.GetRawPtr(wPos);
+            asm_avx64_mulladd_ptra_ptrb_ptrc_num;
+            {$ELSE}
             TNNetVolume.MulAdd(
               OutputPtr,
               FInputCopy.GetRawPtr(inPos),
               LocalW.GetRawPtr(wPos),
               WeightDepth
             );
-            {$ELSE}
-            PtrB := FInputCopy.GetRawPtr(inPos);
-            PtrC := LocalW.GetRawPtr(wPos);
-            asm_avx64_mulladd_ptra_ptrb_ptrc_num;
-            {$ENDIF}
+            {$IFEND}
+
             Inc(inPos, inYStride);
             Inc(wPos, wYStride);
           end;
@@ -81624,7 +81652,11 @@ end;
 
 procedure TNNetLayerConcatedWeights.CountInt4ImportedRow();
 begin
+  {$IFDEF FPC}
   if InterLockedIncrement(FQuantInt4ImportedRows) > FNeurons.Count then
+  {$ELSE}
+  if TInterLocked.Increment(FQuantInt4ImportedRows) > FNeurons.Count then
+  {$ENDIF}
     FErrorProc(ClassName + '.ImportInt4QuantRow: more rows imported than the ' +
       IntToStr(FNeurons.Count) + ' neurons - a row was imported twice.');
 end;
@@ -83401,6 +83433,49 @@ begin
     MaxY := PrevErr.SizeY - 1;
     // Rule #13 + loop interchange: pixel-outer so each PrevErr depth span is a
     // contiguous AVX add of the per-channel gradient vector (mirrors forward).
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
+        TNNetVolume.Add(PrevErr.GetRawPtr(X, Y), FOutputError.DataPtr, Depth);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
+{ TNNetMeanChannel }
+procedure TNNetMeanChannel.Compute();
+begin
+  // TNNetGlobalSumPool's forward is an exact SUM over every (x,y) position
+  // per depth; scaling it by the true cell count yields the exact arithmetic
+  // mean -- including rectangular (SizeX <> SizeY) and (SeqLen,1,Depth) 1D
+  // shapes, where TNNetAvgChannel's square-window division would under-scale
+  // the average (and the gradient) by a factor of SizeY.
+  inherited Compute();
+  FOutput.Divi(FPrevLayer.Output.SizeX * FPrevLayer.Output.SizeY);
+end;
+
+procedure TNNetMeanChannel.Backpropagate();
+var
+  StartTime: double;
+  X, Y, MaxX, MaxY, Depth: integer;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    Depth := FOutput.Depth;
+    MaxX := PrevErr.SizeX - 1;
+    MaxY := PrevErr.SizeY - 1;
+    // The mean's Jacobian is a uniform 1/N broadcast: pre-scale the
+    // (1,1,Depth) gradient by 1/(SizeX*SizeY) ONCE -- after the
+    // departing-branches guard, so branching nets never scale twice -- then
+    // reuse the base contiguous per-pixel scatter (AVX vector adds).
+    FOutputError.Divi(FPrevLayer.Output.SizeX * FPrevLayer.Output.SizeY);
     for Y := 0 to MaxY do
       for X := 0 to MaxX do
         TNNetVolume.Add(PrevErr.GetRawPtr(X, Y), FOutputError.DataPtr, Depth);
@@ -90271,7 +90346,7 @@ var
   TwoDepth, PadIdx, HalfBytes: integer;
   PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
   tap, g, dsum: Double;
-  histRow: array of Double;
+  histRow: {$IFDEF FPC}array of Double;{$ELSE} TNeuralDoubleDynArr; {$ENDIF}
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
   haveTapGrad, havePrev: boolean;
 begin
@@ -101915,7 +101990,7 @@ begin
     begin
       for Y := 0 to MaxY do
       begin
-        {$IFDEF AVXANY}
+        {$IF Defined(AVXANY) and Defined(FPC)}
         SourceRawPos := LocalOutput.GetRawPtr(X,Y,OrigChannel);
         DestRawPos := FOutput.GetRawPtr(X,Y,OutputDeepCnt);
         asm_dword_copy;
@@ -103190,14 +103265,39 @@ begin
     FRate := Round(1/Rate);
     FStruct[0] := FRate;
     FEnabled := true;
+    // zwj: exact rate rides in FFloatSt[0] (serialized); FStruct[0] keeps the
+    // legacy quantized value so old saved models round-trip unchanged. The
+    // keep/scaling pair is resolved lazily on first use (see ResolveKeepRate)
+    // because the serialization path assigns the saved FFloatSt AFTER this
+    // constructor ran with the quantized registry rate.
+    FFloatSt[0] := Rate;
+    FKeepRate := -1;
+    FInvKeep := 0;
   end
   else
   begin
     FRate := -1;
     FStruct[0] := -1;
     FEnabled := false;
+    FKeepRate := 1;
+    FInvKeep := 1;
   end;
   FDropoutMask := TNNetVolume.Create();
+end;
+
+// zwj: resolve the keep probability and the inverted-dropout scale factor.
+// Exact path: keep = 1-FFloatSt[0]. Legacy fallback for layers saved before
+// the exact rate existed (FFloatSt[0]=0): keep = 1-1/FRate, i.e. the old
+// quantized drop probability 1/Round(1/Rate). Rate >= 1 degenerates to
+// drop-everything with a zero (not infinite) scale factor.
+procedure TNNetDropout.ResolveKeepRate();
+begin
+  if FFloatSt[0] > 0 then
+    FKeepRate := 1 - FFloatSt[0]
+  else
+    FKeepRate := 1 - 1/FRate;
+  if FKeepRate <= 0 then FKeepRate := 0;
+  if FKeepRate > 0 then FInvKeep := 1/FKeepRate else FInvKeep := 0;
 end;
 
 destructor TNNetDropout.Destroy();
@@ -103222,9 +103322,16 @@ begin
 
   if ( FEnabled and (FRate>0) ) then
   begin
+    // zwj: lazy resolve so layers rebuilt from serialization (quantized
+    // registry rate first, saved FFloatSt second) use the exact keep rate.
+    if FKeepRate < 0 then ResolveKeepRate();
     if FBatchUpdate and ({OneMaskPerbatch}FStruct[1]>0) then
     begin
       FOutput.Mul(FDropoutMask);
+      // zwj: inverted dropout -- scale the surviving cells by 1/keep so the
+      // expected activation magnitude matches inference (fixed factor, the
+      // PyTorch semantics; the mask's realized keep-rate may fluctuate).
+      FOutput.Mul(FInvKeep);
     end
     else
     begin
@@ -103232,12 +103339,16 @@ begin
       MaxOutput := FOutput.Size - 1;
       for CntOut := 0 to MaxOutput do
       begin
-        if (Random(FRate) = 0) then
+        // zwj: exact-rate draw on [0,1) replaces the quantized
+        // Random(FRate)=0 (drop probability 1/Round(1/Rate)).
+        if (Random() >= FKeepRate) then
         begin
           FOutput.FData[CntOut] := 0;
           FDropoutMask.FData[CntOut] := 0;
         end;
       end;
+      // zwj: inverted dropout scaling for the per-sample mask path too.
+      FOutput.Mul(FInvKeep);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -103251,7 +103362,15 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
-  if ( FEnabled and (FOutputError.Size = FOutput.Size) ) then FOutputError.Mul(FDropoutMask);
+  if ( FEnabled and (FOutputError.Size = FOutput.Size) ) then
+  begin
+    FOutputError.Mul(FDropoutMask);
+    // zwj: mirror the forward inverted scaling -- dx = dy * mask / keep, the
+    // exact Jacobian of y = x*mask/keep (mask kills dropped cells, the same
+    // factor the forward multiplied the survivors by).
+    if FKeepRate < 0 then ResolveKeepRate();
+    FOutputError.Mul(FInvKeep);
+  end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   BackpropagateNoTest();
 end;
@@ -103260,11 +103379,13 @@ procedure TNNetDropout.RefreshDropoutMask();
 var
   CntOut, MaxOutput: integer;
 begin
+  // zwj: lazy resolve (exact keep rate) + exact-rate draw, mirroring Compute.
+  if FKeepRate < 0 then ResolveKeepRate();
   FDropoutMask.Fill(1);
   MaxOutput := FDropoutMask.Size - 1;
   for CntOut := 0 to MaxOutput do
   begin
-    if (Random(FRate) = 0) then
+    if (Random() >= FKeepRate) then
     begin
       FDropoutMask.FData[CntOut] := 0;
     end;
@@ -109878,7 +109999,7 @@ begin
           TapRunDstPos := DstPos;
           for TapRunCnt := 0 to MaxTapRunPos do
           begin
-            {$IFDEF AVXANY}
+            {$IF Defined(AVXANY) and Defined(FPC)}
             SourceRawPos := FInputCopy.GetRawPtr(TapRunSrcPos);
             DestRawPos := FInputPrepared.GetRawPtr(TapRunDstPos);
             asm_dword_copy;
@@ -111049,16 +111170,16 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                {$IFNDEF AVX64}
-                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                {$ELSE}
-                {$IFDEF Debug}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                  {$IFDEF Debug}
                 if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
                 then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                {$ENDIF}
+                  {$ENDIF}
                 PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
                 asm_avx64_train_neuron
-                {$ENDIF}
+                {$ELSE}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFEND}
 
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
@@ -111072,18 +111193,18 @@ begin
                   LocalWeight := FArrNeurons[OutputD].Weights;
                   if FPointwise then
                   begin
-                    {$IFNDEF AVX64}
-                    LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
-                    {$ELSE}
-                    {$IFDEF Debug}
+                    {$IF Defined(AVX64) and Defined(FPC)}
+                      {$IFDEF Debug}
                     if PrevNumElements + PrevMissedElements <> FInputCopy.Depth
                     then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): pointwise vector size doesn''t match.');
-                    {$ENDIF}
+                      {$ENDIF}
                     PrevPtrA := LocalDestPtr;
                     PrevPtrB := LocalWeight.DataPtr;
                     SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv;
-                    asm_avx64_prev_backprop;
-                    {$ENDIF}
+                    asm_avx64_prev_backprop;                    
+                    {$ELSE}
+                    LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, FInputCopy.Depth);
+                    {$IFEND}
                   end
                   else
                   begin
@@ -111094,23 +111215,24 @@ begin
                       PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
                       begin
-                        {$IFNDEF AVX64}
+                        {$IF Defined(AVX64) and Defined(FPC)}
+                          {$IFDEF Debug}
+                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
+                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
+                          {$ENDIF}
+                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
+                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
+                        asm_avx64_prev_backprop;                        
+                        {$ELSE}
                         LocalPrevError.MulAdd
                         (
                           PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
                           PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
                           SmoothLocalOutputErrorDeriv,
                           FSizeXDepth
-                        );
-                        {$ELSE}
-                        {$IFDEF Debug}
-                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
-                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
-                        {$ENDIF}
-                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
-                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
-                        asm_avx64_prev_backprop;
-                        {$ENDIF}
+                        );                        
+                        {$IFEND}
+
                         if LocalCntY < FFeatureSizeYMinus1 then
                         begin
                           {$IFDEF FPC}
@@ -111276,16 +111398,16 @@ begin
               LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
               if (LocalLearningErrorDeriv <> 0.0) then
               begin
-                  {$IFNDEF AVX64}
-                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                  {$ELSE}
-                  {$IFDEF Debug}
+                  {$IF Defined(AVX64) and Defined(FPC)}
+                    {$IFDEF Debug}
                   if localNumElements + MissedElements <> LocalNeuron.Delta.Size
                   then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                  {$ENDIF}
+                    {$ENDIF}
                   PtrNeuronDelta := LocalNeuron.Delta.DataPtr;
                   asm_avx64_train_neuron
-                  {$ENDIF}
+                  {$ELSE}
+                  LocalNeuron.Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                  {$IFEnD}
 
                   {$IFDEF FPC}
                   LocalNeuron.FBiasDelta += LocalLearningErrorDeriv;
@@ -111299,18 +111421,18 @@ begin
                     LocalWeight := LocalNeuron.Weights;
                     if FPointwise then
                     begin
-                      {$IFNDEF AVX64}
-                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, InCopyDepth);
-                      {$ELSE}
-                      {$IFDEF Debug}
+                      {$IF Defined(AVX64) and Defined(FPC)}
+                        {$IFDEF Debug}
                       if PrevNumElements + PrevMissedElements <> InCopyDepth
                       then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): pointwise vector size doesn''t match.');
-                      {$ENDIF}
+                        {$ENDIF}
                       PrevPtrA := LocalDestPtr;
                       PrevPtrB := LocalWeight.DataPtr;
                       SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv;
-                      asm_avx64_prev_backprop;
-                      {$ENDIF}
+                      asm_avx64_prev_backprop;                      
+                      {$ELSE}
+                      LocalPrevError.MulAdd(LocalDestPtr, LocalWeight.DataPtr, LocalOutputErrorDeriv, InCopyDepth);
+                      {$IFEND}
                     end
                     else
                     begin
@@ -111330,7 +111452,10 @@ begin
                           begin
                             PrevPtrA := TNeuralFloatArrPtr(@RowPrevPtr^[TapRunCnt * TapRunSrcStep]);
                             PrevPtrB := TNeuralFloatArrPtr(@RowWeightPtr^[TapRunCnt * TapRunSize]);
-                            {$IFNDEF AVX64}
+
+                            {$IF Defined(AVX64) and Defined(FPC)}
+                            asm_avx64_prev_backprop;
+                            {$ELSE}
                             LocalPrevError.MulAdd
                             (
                               PrevPtrA,
@@ -111338,10 +111463,9 @@ begin
                               SmoothLocalOutputErrorDeriv,
                               TapRunSize
                             );
-                            {$ELSE}
-                            asm_avx64_prev_backprop;
                             {$ENDIF}
                           end;
+
                           if LocalCntY < FFeatureSizeYMinus1 then
                           begin
                             {$IFDEF FPC}
@@ -111477,16 +111601,16 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                {$IFNDEF AVX64}
-                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                {$ELSE}
-                {$IFDEF Debug}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                  {$IFDEF Debug}
                 if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
                 then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                {$ENDIF}
+                  {$ENDIF}
                 PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
-                asm_avx64_train_neuron
-                {$ENDIF}
+                asm_avx64_train_neuron                
+                {$ELSE}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFEND}
 
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
@@ -111522,23 +111646,24 @@ begin
                       PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
                       begin
-                        {$IFNDEF AVX64}
+                        {$IF Defined(AVX64) and Defined(FPC)}
+                          {$IFDEF Debug}
+                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
+                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
+                          {$ENDIF}
+                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
+                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
+                        asm_avx64_prev_backprop;                        
+                        {$ELSE}
                         LocalPrevError.MulAdd
                         (
                           PrevPtrA, //LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY),
                           PrevPtrB, //LocalWeight.GetRawPtr(0, LocalCntY),
                           SmoothLocalOutputErrorDeriv,
                           FSizeXDepth
-                        );
-                        {$ELSE}
-                        {$IFDEF Debug}
-                        if PrevNumElements + PrevMissedElements <> FSizeXDepth
-                        then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): vector size doesn''t match.');
-                        {$ENDIF}
-                        //PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + LocalCntY);
-                        //PrevPtrB := LocalWeight.GetRawPtr(0, LocalCntY);
-                        asm_avx64_prev_backprop;
-                        {$ENDIF}
+                        );                        
+                        {$IFEND}
+                        
                         if LocalCntY < FFeatureSizeYMinus1 then
                         begin
                           {$IFDEF FPC}
@@ -111680,16 +111805,16 @@ begin
             LocalLearningErrorDeriv := (-FLearningRate) * LocalOutputErrorDeriv;
             if (LocalLearningErrorDeriv <> 0.0) then
             begin
-                {$IFNDEF AVX64}
-                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
-                {$ELSE}
-                {$IFDEF Debug}
+                {$IF Defined(AVX64) and Defined(FPC)}
+                  {$IFDEF Debug}
                 if localNumElements + MissedElements <> FArrNeurons[OutputD].Delta.Size
                 then FErrorProc('Error at TNNetConvolution.BackpropagateFastCPU(): neuron size doesn''t match.');
-                {$ENDIF}
+                  {$ENDIF}
                 PtrNeuronDelta := FArrNeurons[OutputD].Delta.DataPtr;
-                asm_avx64_train_neuron
-                {$ENDIF}
+                asm_avx64_train_neuron                
+                {$ELSE}
+                FArrNeurons[OutputD].Delta.MulAdd(LocalLearningErrorDeriv, PtrPreparedInput);
+                {$IFEND}
 
                 {$IFDEF FPC}
                 FArrNeurons[OutputD].FBiasDelta += LocalLearningErrorDeriv;
@@ -132705,6 +132830,7 @@ begin
       'TNNetAdaptiveMaxPool':       Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]);
       'TNNetMaxChannel':            Result := TNNetMaxChannel.Create();
       'TNNetGlobalSumPool':         Result := TNNetGlobalSumPool.Create();
+      'TNNetMeanChannel':           Result := TNNetMeanChannel.Create();
       'TNNetMaskedMean':            Result := TNNetMaskedMean.Create();
       'TNNetMaskedMax':             Result := TNNetMaskedMax.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
@@ -133154,6 +133280,7 @@ begin
       if S[0] = 'TNNetAdaptiveMaxPool' then Result := TNNetAdaptiveMaxPool.Create(St[0], St[1]) else
       if S[0] = 'TNNetMaxChannel' then Result := TNNetMaxChannel.Create() else
       if S[0] = 'TNNetGlobalSumPool' then Result := TNNetGlobalSumPool.Create() else
+      if S[0] = 'TNNetMeanChannel' then Result := TNNetMeanChannel.Create() else
       if S[0] = 'TNNetMaskedMean' then Result := TNNetMaskedMean.Create() else
       if S[0] = 'TNNetMaskedMax' then Result := TNNetMaskedMax.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else

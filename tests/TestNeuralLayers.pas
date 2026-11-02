@@ -83,6 +83,7 @@ type
     procedure TestIdentityLayer;
     procedure TestReshapeLayer;
     procedure TestDropoutLayer;
+    procedure TestDropoutInvertedScaling;
     procedure TestMultipleLayersNetwork;
     procedure TestNetworkClone;
     procedure TestLayerCount;
@@ -145,6 +146,8 @@ type
     procedure TestTokenAndPositionalEmbeddingZeroPaddedRows;
     // Rectangular (W <> H) channel reductions + flip/padded-conv regressions
     procedure TestMaxChannelRectangular;
+    procedure TestMeanChannelRectangular;
+    procedure TestMeanChannel1DStreamVsAvgChannel;
     procedure TestMinChannelRectangular;
     procedure TestMaxChannelSquareRegression;
     procedure TestFlipXPaddedConvBackprop;
@@ -2500,6 +2503,64 @@ begin
   end;
 end;
 
+// zwj: regression for the inverted-dropout + exact-rate change: survivors
+// carry the 1/(1-Rate) scale (not the old quantized 1/Round(1/Rate)), and the
+// backward pass scales the gradient by the same factor through the mask.
+procedure TTestNeuralLayers.TestDropoutInvertedScaling;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  I: integer;
+  Kept: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1000, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1000, 1, 1, 1));
+    Layer := NN.AddLayer(TNNetDropout.Create(0.3));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    Kept := 0;
+    for I := 0 to Input.Size - 1 do
+    begin
+      if Layer.Output.Raw[I] > 0 then
+      begin
+        Inc(Kept);
+        // zwj: survivor value must be 1/keep = 1/0.7. The old quantized draw
+        // (drop 1/3) would have scaled survivors by 1.5 instead.
+        AssertEquals('Survivor value must be 1/keep',
+          1.0/0.7, Layer.Output.Raw[I], 0.0001);
+      end;
+    end;
+    // The exact 0.3 rate keeps ~70% of the cells; the old quantized draw kept
+    // ~66.7%. 0.05 slack is ~3.4 sigma at N=1000.
+    AssertTrue('Kept fraction close to 0.7',
+      Abs(Kept/Input.Size - 0.7) < 0.05);
+
+    // Backward: dx = dy * mask / keep.
+    Layer.OutputError.Fill(1.0);
+    NN.GetFirstLayer.OutputError.Fill(0);
+    Layer.IncDepartingBranchesCnt();
+    Layer.Backpropagate();
+    for I := 0 to Input.Size - 1 do
+    begin
+      if Layer.Output.Raw[I] > 0 then
+        AssertEquals('Grad scales by 1/keep at kept cells',
+          1.0/0.7, NN.GetFirstLayer.OutputError.Raw[I], 0.0001)
+      else
+        AssertEquals('Grad is zero at dropped cells',
+          0.0, NN.GetFirstLayer.OutputError.Raw[I], 0.0001);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestMultipleLayersNetwork;
 var
   NN: TNNet;
@@ -4346,6 +4407,102 @@ begin
       0.0, NN.GetFirstLayer.OutputError[0, 0, 0], 0.0001);
   finally
     NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Regression: TNNetMeanChannel true global mean over a RECTANGULAR feature
+// map + the uniform 1/N gradient broadcast. Unlike TNNetAvgChannel (square
+// window; legacy sum/SizeX^2 scaling on non-square inputs), the mean here
+// divides by the actual cell count SizeX*SizeY.
+procedure TTestNeuralLayers.TestMeanChannelRectangular;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ChannelLayer: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 5, 2); // W=3, H=5 (rectangular, 15 cells)
+  try
+    NN.AddLayer(TNNetInput.Create(3, 5, 2, 1));
+    ChannelLayer := NN.AddLayer(TNNetMeanChannel.Create());
+
+    Input.FillAtDepth(0, 1.0);
+    Input.FillAtDepth(1, -2.0);
+    // Plant distinct values so the mean exercises real cells, not just fills.
+    Input[2, 4, 0] := 16.0;  // channel 0: (14*1 + 16) / 15 = 2.0
+    Input[0, 3, 1] := -17.0; // channel 1: (14*(-2) - 17) / 15 = -3.0
+
+    NN.Compute(Input);
+
+    AssertEquals('Output collapses to (1,1,Depth)=2 elements',
+      2, ChannelLayer.Output.Size);
+    AssertEquals('Output SizeX must be 1', 1, ChannelLayer.Output.SizeX);
+    AssertEquals('Output SizeY must be 1', 1, ChannelLayer.Output.SizeY);
+    AssertEquals('True mean of channel 0 (30/15)', 2.0, ChannelLayer.Output.Raw[0], 0.0001);
+    AssertEquals('True mean of channel 1 (-45/15)', -3.0, ChannelLayer.Output.Raw[1], 0.0001);
+
+    // Backward: the mean's Jacobian broadcasts the gradient / 15 to EVERY cell.
+    ChannelLayer.OutputError.Fill(0);
+    ChannelLayer.OutputError.Raw[0] := 1.0;
+    ChannelLayer.OutputError.Raw[1] := 2.0;
+    NN.GetFirstLayer.OutputError.Fill(0);
+    ChannelLayer.IncDepartingBranchesCnt();
+    ChannelLayer.Backpropagate();
+
+    AssertEquals('Uniform grad at channel-0 winner',
+      1.0 / 15.0, NN.GetFirstLayer.OutputError[2, 4, 0], 0.0001);
+    AssertEquals('Uniform grad at channel-0 non-winner',
+      1.0 / 15.0, NN.GetFirstLayer.OutputError[0, 0, 0], 0.0001);
+    AssertEquals('Uniform grad at channel-1 cell',
+      2.0 / 15.0, NN.GetFirstLayer.OutputError[0, 3, 1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Pins the SEMANTIC DIFFERENCE on a (SeqLen,1,Depth) 1D stream:
+// TNNetMeanChannel returns the true mean (sum/SeqLen), while TNNetAvgChannel
+// keeps its legacy square-window scaling (sum/SeqLen^2).
+procedure TTestNeuralLayers.TestMeanChannel1DStreamVsAvgChannel;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    Input.Raw[0] := 3.0;
+    Input.Raw[1] := 4.0;
+    Input.Raw[2] := 5.0;
+    Input.Raw[3] := 6.0;
+    Input.Raw[4] := 7.0; // sum=25, true mean=5.0
+
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+      NN.AddLayer(TNNetMeanChannel.Create());
+      NN.Compute(Input);
+      AssertEquals('MeanChannel over a 1D stream is the true mean (25/5)',
+        5.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    finally
+      NN.Free;
+    end;
+
+    NN := TNNet.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(5, 1, 1, 1));
+      NN.AddLayer(TNNetAvgChannel.Create());
+      NN.Compute(Input);
+      // Legacy behavior, intentionally unchanged: the square-window division
+      // yields sum/SeqLen^2 = 25/25 = 1.0 (documented quirk; see the
+      // avgchannel notes in tools/make_pico_ecapa_fixture.py).
+      AssertEquals('AvgChannel keeps its legacy sum/T^2 on 1D (25/25)',
+        1.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    finally
+      NN.Free;
+    end;
+  finally
     Input.Free;
   end;
 end;
